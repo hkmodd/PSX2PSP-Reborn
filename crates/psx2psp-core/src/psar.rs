@@ -64,6 +64,24 @@ pub struct TitleConsts {
     pub data3: [u8; 128],
 }
 
+impl TitleConsts {
+    /// The constants popstation writes into every PSTITLEIMG header (`popstation.cpp` words at
+    /// +0x18 and `data3[]` at +0x28C). Used when the donor is single-disc and so carries none.
+    pub const POPSTATION: Self = Self {
+        unk18: *b"\xBC\xC5\xC9\x2C\x0F\xA9\xB5\x33\xB3\xB4\xF6\x06\xBA\x45\x59\xB2",
+        data3: [
+            0x8C, 0x0E, 0xAE, 0x9D, 0x39, 0x8C, 0xFE, 0x24, 0x65, 0x21, 0xAD, 0x2D, 0x65, 0xA9, 0x61, 0xDF, //
+            0xD4, 0x4A, 0x13, 0x03, 0xB4, 0xCD, 0x32, 0x5F, 0xBD, 0xB0, 0xF4, 0xF9, 0x8A, 0x70, 0xBE, 0x1E, //
+            0x39, 0x2C, 0x7D, 0xC0, 0xC1, 0xC6, 0x6B, 0x81, 0xAA, 0x3C, 0x06, 0x53, 0x94, 0x1B, 0xCE, 0xE5, //
+            0x44, 0x16, 0xCF, 0xDB, 0xB1, 0xE3, 0x89, 0x7B, 0xA2, 0xD2, 0xE7, 0xD6, 0xC1, 0x26, 0x6B, 0x58, //
+            0x8D, 0x2C, 0xE6, 0xC3, 0x15, 0x97, 0xD0, 0x29, 0xC9, 0x16, 0x81, 0xB6, 0xCC, 0x42, 0xEE, 0x0C, //
+            0x28, 0x10, 0xEA, 0xF2, 0x6B, 0x6F, 0x90, 0x30, 0x05, 0xBE, 0x4A, 0x2F, 0x4A, 0xBC, 0xDC, 0xE5, //
+            0x87, 0xCE, 0x19, 0xB9, 0x80, 0xDE, 0xB8, 0x32, 0xDD, 0xAD, 0x89, 0x67, 0xE0, 0x92, 0x78, 0x89, //
+            0xE8, 0xDC, 0x45, 0x1D, 0x0C, 0xBE, 0x8B, 0x99, 0x4D, 0x50, 0xB3, 0xD6, 0x58, 0x96, 0x61, 0x75,
+        ],
+    };
+}
+
 fn rd32(b: &[u8], o: usize) -> u32 {
     u32::from_le_bytes(b[o..o + 4].try_into().unwrap())
 }
@@ -447,9 +465,9 @@ pub fn write_psar<W: Write + Seek>(w: &mut W, psar: u64, job: &PsarJob<'_>, moni
         let (index, data_len, stats) = stream_disc(w, spec, level, monitor, done, total)?;
         done += spec.image.size_bytes();
         let end = start + ISO_DATA + data_len;
-        // PSXPackager semantics for per-disc headers: p1 = rounded ISO size + 0x100000, p2 = 0.
-        let iso_size = (spec.image.size_bytes().div_ceil(BLOCK as u64) * BLOCK as u64) as u32;
-        let hdr = DiscHeader { spec, toc: build_toc(spec.image), index, p1: iso_size + ISO_DATA as u32, p2: 0 };
+        // popstation semantics (PSX2PSP, 15+ years of working multi-disc EBOOTs): the per-disc
+        // header leaves p1/p2 zero; the only STARTDAT pointer lives in the PSTITLEIMG header.
+        let hdr = DiscHeader { spec, toc: build_toc(spec.image), index, p1: 0, p2: 0 };
         w.seek(SeekFrom::Start(start))?;
         w.write_all(&hdr.bytes())?;
         w.seek(SeekFrom::Start(end))?;
@@ -465,7 +483,7 @@ pub fn write_psar<W: Write + Seek>(w: &mut W, psar: u64, job: &PsarJob<'_>, moni
     let mut h = [0u8; TITLEIMG_HDR as usize];
     h[..16].copy_from_slice(MAGIC_TITLE);
     wr32(&mut h, 0x10, p1);
-    let consts = job.donor.title_consts.clone().unwrap_or(TitleConsts { unk18: [0; 16], data3: [0; 128] });
+    let consts = job.donor.title_consts.clone().unwrap_or(TitleConsts::POPSTATION);
     h[0x18..0x28].copy_from_slice(&consts.unk18);
     for (i, off) in disc_offsets.iter().enumerate() {
         wr32(&mut h, 0x200 + i * 4, *off);

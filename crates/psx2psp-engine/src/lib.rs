@@ -38,6 +38,28 @@ impl From<std::io::Error> for EngineError {
 
 pub type Result<T> = std::result::Result<T, EngineError>;
 
+/// Built-in donor: the PS1 Classic `BASE.PBP` every PSXPackager release ships (STARTDAT boot PNG
+/// + `\0PGD` trailer, verified offsets: PSAR 0x50000, STARTDAT at p1 0x100000).
+pub const BUILTIN_BASE_PBP: &[u8] = include_bytes!("../../../resources/BASE.PBP");
+/// Built-in loader: the 19 002-byte ELF `DATA.PSP` that popstation/PSX2PSP and PSXPackager write
+/// in preference to the donor's own signed module.
+pub const BUILTIN_DATA_PSP: &[u8] = include_bytes!("../../../resources/DATA.PSP");
+
+/// The donor used when the user supplies none: everything needed ships inside the binary.
+pub fn builtin_donor() -> Result<Donor> {
+    let mut donor = Donor::from_pbp(&mut PbpFile::open(std::io::Cursor::new(BUILTIN_BASE_PBP))?)?;
+    donor.data_psp = BUILTIN_DATA_PSP.to_vec();
+    Ok(donor)
+}
+
+/// `Some(path)` → that PS1 Classic EBOOT; `None` → [`builtin_donor`].
+pub fn load_donor(path: Option<&Path>) -> Result<Donor> {
+    match path {
+        Some(p) => Ok(Donor::load(p)?),
+        None => builtin_donor(),
+    }
+}
+
 /// PSAR alignment used by every known working tool (PSXPackager, popstation).
 pub const PSAR_ALIGN: u64 = 0x10000;
 /// Default deflate level.
@@ -70,7 +92,8 @@ pub struct ConvertRequest {
     pub discs: Vec<DiscInput>,
     pub title: String,
     pub output: PathBuf,
-    pub donor: PathBuf,
+    /// Custom donor EBOOT; `None` uses the built-in one.
+    pub donor: Option<PathBuf>,
     pub artwork: Artwork,
     pub level: u32,
 }
@@ -165,8 +188,11 @@ pub fn convert(req: &ConvertRequest, monitor: &dyn Monitor) -> Result<ConvertRep
     if req.title.trim().is_empty() {
         return Err(EngineError::Input("title is empty".into()));
     }
-    monitor.log(&format!("Loading donor {}", req.donor.display()));
-    let donor = Donor::load(&req.donor)?;
+    monitor.log(&match &req.donor {
+        Some(p) => format!("Loading donor {}", p.display()),
+        None => "Using built-in donor".to_owned(),
+    });
+    let donor = load_donor(req.donor.as_deref())?;
     monitor.log(&format!("Donor OK — DATA.PSP {} B, boot PNG {} B, PGD {} B", donor.data_psp.len(), donor.boot_png.len(), donor.pgd.len()));
 
     let mut images = Vec::with_capacity(req.discs.len());
@@ -333,6 +359,16 @@ pub fn extract(path: &Path, out_dir: &Path, monitor: &dyn Monitor) -> Result<Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builtin_donor_is_complete() {
+        let d = builtin_donor().unwrap();
+        assert!(d.data_psp.starts_with(b"\x7FELF") && d.data_psp.len() == 19_002);
+        assert!(d.boot_png.starts_with(b"\x89PNG") && d.boot_png.len() == 0x2CE1);
+        assert!(d.pgd.starts_with(b"\0PGD"));
+        // 0x50 + PNG = the constant 0x2D31 popstation adds to p1 for p2.
+        assert_eq!(0x50 + d.boot_png.len(), 0x2D31);
+    }
 
     #[test]
     fn outputs_follow_psp_layout_and_work_dir_stays_beside_them() {

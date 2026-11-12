@@ -20,11 +20,15 @@ use iced::widget::{
 use iced::{Alignment, Color, Element, Fill, Font, Length, Size, Subscription, Task, Theme, event, window};
 use psx2psp_engine::core::Donor;
 use psx2psp_engine::media::images::{self, Slot};
-use psx2psp_engine::media::tools::{self, At3Encoder, Ffmpeg, Snd0Request};
+use psx2psp_engine::core::Monitor;
+use psx2psp_engine::media::clip::{self, ClipMode, ClipRequest, ClipTools};
+use psx2psp_engine::media::provision::{self, Asset};
+use psx2psp_engine::media::psmf;
+use psx2psp_engine::media::tools::{self, At3Encoder, Ffmpeg, YtDlp};
 use psx2psp_engine::{self as engine, Artwork, ConvertRequest, DEFAULT_LEVEL, DiscInput, DiscSummary};
 
 use worker::JobEvent;
-use xmb::{Pixels, Screen, Xmb};
+use xmb::{Movie, Pixels, Screen, Xmb};
 
 const MAX_DISCS: usize = 5;
 const MAX_LOG: usize = 2000;
@@ -33,7 +37,13 @@ const WAVE: Color = iced::color!(0x2a55c8);
 
 const IMAGE_EXT: &[&str] = &["png", "jpg", "jpeg", "bmp", "gif", "webp"];
 const DISC_EXT: &[&str] = &["cue", "bin", "img"];
-const MEDIA_EXT: &[&str] = &["mp3", "wav", "flac", "ogg", "opus", "m4a", "aac", "mp4", "mkv", "webm"];
+const MEDIA_EXT: &[&str] = &["mp4", "mkv", "webm", "mov", "avi", "m4v", "mp3", "wav", "flac", "ogg", "opus", "m4a", "aac"];
+/// Clip length when no end is given (capped at the source's length).
+const CLIP_DEFAULT_SECS: f64 = 30.0;
+/// Frames decoded for the animated ICON1 preview (30 s at 29.97 fps, ~41 MB of RGBA at 144×80).
+const PREVIEW_FRAMES: usize = 900;
+const JOB_CLIP: &str = "Clip";
+const JOB_INSTALL: &str = "Install tools";
 
 fn main() -> iced::Result {
     iced::application(App::boot, App::update, App::view)
@@ -60,9 +70,9 @@ struct App {
     donor_boot: Option<Arc<Pixels>>,
     /// Indexed by `slot_ix` (ICON0, PIC0, PIC1, BOOT).
     art: [Option<Art>; 4],
-    icon1: Option<PathBuf>,
-    snd0: Option<PathBuf>,
-    snd0_start: f32,
+    icon1: Option<Icon1>,
+    snd0: Option<Media>,
+    clip: ClipForm,
     level: u32,
     output: Option<PathBuf>,
     screen: Screen,
@@ -124,10 +134,70 @@ struct Toast {
     text: String,
 }
 
+/// A finished media payload, embedded verbatim.
+#[derive(Debug, Clone)]
+struct Media {
+    source: String,
+    bytes: Arc<Vec<u8>>,
+}
+
+#[derive(Debug, Clone)]
+struct Icon1 {
+    media: Media,
+    secs: f64,
+    /// Decoded frames for the XMB preview (absent when no ffmpeg is installed).
+    movie: Option<Arc<Movie>>,
+}
+
+/// What a clip job produced (only the requested parts).
+#[derive(Debug, Clone)]
+struct ClipOut {
+    icon1: Option<Icon1>,
+    snd0: Option<Media>,
+}
+
+/// Clip editor: URL or file → `[start, end)` → ICON1.PMF and/or SND0.AT3.
+struct ClipForm {
+    source: String,
+    start: String,
+    end: String,
+    mode: ClipMode,
+    kbps: u32,
+    /// Probe result for `source`.
+    len: Option<f64>,
+    title: Option<String>,
+    probed: bool,
+}
+
+impl Default for ClipForm {
+    fn default() -> Self {
+        Self { source: String::new(), start: String::new(), end: String::new(), mode: ClipMode::Both, kbps: 132, len: None, title: None, probed: false }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Tools {
     ffmpeg: Option<PathBuf>,
+    x264: bool,
     at3: Option<PathBuf>,
+    yt_dlp: Option<PathBuf>,
+    /// Missing tools with a published binary for this OS/CPU.
+    missing: Vec<Asset>,
+}
+
+fn detect_tools() -> Tools {
+    let ff = Ffmpeg::detect();
+    Tools {
+        x264: ff.as_ref().is_some_and(Ffmpeg::has_x264),
+        ffmpeg: ff.map(|f| f.path),
+        at3: At3Encoder::detect().map(|e| e.path().to_path_buf()),
+        yt_dlp: YtDlp::detect().map(|y| y.path),
+        missing: provision::missing(),
+    }
+}
+
+fn detect_tools_task() -> Task<Message> {
+    worker::blocking(|| Ok(detect_tools()), Message::ToolsDetected)
 }
 
 #[derive(Debug, Clone)]
@@ -180,17 +250,31 @@ enum Message {
     ArtPicked(Slot, Option<PathBuf>),
     ArtLoaded(Slot, Result<Art, String>),
     ClearArt(Slot),
+    ClipSource(String),
+    PickClipSource,
+    ClipSourcePicked(Option<PathBuf>),
+    ProbeClip,
+    ClipProbed(String, Result<(Option<f64>, Option<String>), String>),
+    ClipStart(String),
+    ClipEnd(String),
+    ClipMode(ClipMode),
+    ClipKbps(u32),
+    MakeClip,
+    ClipJob(JobEvent<ClipOut>),
     PickIcon1,
     Icon1Picked(Option<PathBuf>),
+    Icon1Loaded(Result<Icon1, String>),
     ClearIcon1,
     PickSnd0,
     Snd0Picked(Option<PathBuf>),
+    Snd0Loaded(Result<Media, String>),
     ClearSnd0,
-    Snd0Start(f32),
+    InstallTools,
     Level(u32),
     PickOutput,
     OutputPicked(Option<PathBuf>),
     ResetOutput,
+    ResetDonor,
     Screen(Screen),
     Convert,
     Cancel,
@@ -213,6 +297,13 @@ fn pick_file(title: &str, name: &str, ext: &[&str]) -> impl Future<Output = Opti
     async move { d.pick_file().await.map(|h| h.path().to_path_buf()) }
 }
 
+/// Boot splash of the built-in donor, shown until the user picks a BOOT image or another donor.
+fn builtin_boot() -> Option<Arc<Pixels>> {
+    let d = engine::builtin_donor().ok()?;
+    let si = images::prepare(Slot::Boot, &d.boot_png).ok()?;
+    Some(Pixels::new(si.width, si.height, si.rgba))
+}
+
 fn file_name(p: &Path) -> String {
     p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned())
 }
@@ -227,11 +318,11 @@ impl App {
             discs: Vec::new(),
             next_key: 1,
             donor: None,
-            donor_boot: None,
+            donor_boot: builtin_boot(),
             art: Default::default(),
             icon1: None,
             snd0: None,
-            snd0_start: 0.0,
+            clip: ClipForm::default(),
             level: DEFAULT_LEVEL,
             output: None,
             screen: Screen::Game,
@@ -241,10 +332,7 @@ impl App {
             toasts: Vec::new(),
             tools: None,
         };
-        let detect = worker::blocking(
-            || Ok(Tools { ffmpeg: Ffmpeg::detect().map(|f| f.path), at3: At3Encoder::detect().map(|e| e.path().to_path_buf()) }),
-            Message::ToolsDetected,
-        );
+        let detect = detect_tools_task();
         // Paths on the command line ("Open with", drag onto the exe) behave like dropped files.
         let opened = std::env::args_os().skip(1).map(|a| Task::done(Message::FileDropped(PathBuf::from(a))));
         (app, Task::batch(std::iter::once(detect).chain(opened)))
@@ -416,13 +504,83 @@ impl App {
                 Err(e) => return self.toast(Kind::Error, format!("{}: {e}", slot.label())),
             },
             Message::ClearArt(slot) => self.art[slot_ix(slot)] = None,
+            Message::ClipSource(src) => {
+                if src.trim() != self.clip.source.trim() {
+                    (self.clip.len, self.clip.title, self.clip.probed) = (None, None, false);
+                }
+                self.clip.source = src;
+            }
+            Message::PickClipSource => {
+                return Task::perform(pick_file("Clip source (video or audio)", "Audio / video", MEDIA_EXT), Message::ClipSourcePicked);
+            }
+            Message::ClipSourcePicked(Some(p)) => {
+                self.clip.source = p.display().to_string();
+                (self.clip.len, self.clip.title, self.clip.probed) = (None, None, false);
+                return self.probe_clip();
+            }
+            Message::ClipSourcePicked(None) => {}
+            Message::ProbeClip => return self.probe_clip(),
+            Message::ClipProbed(src, r) => {
+                if src != self.clip.source.trim() {
+                    return Task::none(); // the source changed while probing
+                }
+                match r {
+                    Ok((len, title)) => {
+                        self.log(format!("Clip source: {} · {}", title.as_deref().unwrap_or(&src), len.map_or("length unknown".into(), tools::fmt_hms)));
+                        (self.clip.len, self.clip.title, self.clip.probed) = (len, title, true);
+                    }
+                    Err(e) => return self.toast(Kind::Error, format!("Can't read the clip source: {e}")),
+                }
+            }
+            Message::ClipStart(t) => self.clip.start = t,
+            Message::ClipEnd(t) => self.clip.end = t,
+            Message::ClipMode(m) => self.clip.mode = m,
+            Message::ClipKbps(k) => self.clip.kbps = k,
+            Message::MakeClip => return self.make_clip(),
+            Message::ClipJob(ev) => {
+                if let Some((_, r)) = self.job_event(ev) {
+                    return match r {
+                        Ok(out) => {
+                            let mut made = Vec::new();
+                            if let Some(i) = out.icon1 {
+                                made.push(format!("ICON1.PMF {:.1} s, {} KB", i.secs, i.media.bytes.len().div_ceil(1024)));
+                                self.icon1 = Some(i);
+                                self.screen = Screen::Game;
+                            }
+                            if let Some(a) = out.snd0 {
+                                made.push(format!("SND0.AT3 {} KB", a.bytes.len().div_ceil(1024)));
+                                self.snd0 = Some(a);
+                            }
+                            self.toast(Kind::Success, format!("Clip ready — {}", made.join(" + ")))
+                        }
+                        Err(e) => self.toast(Kind::Error, format!("Clip failed: {e}")),
+                    };
+                }
+            }
             Message::PickIcon1 => return Task::perform(pick_file("ICON1.PMF", "PSP movie", &["pmf"]), Message::Icon1Picked),
-            Message::Icon1Picked(p) => self.icon1 = p.or(self.icon1.take()),
+            Message::Icon1Picked(Some(p)) => return worker::blocking(move || load_icon1(&p), Message::Icon1Loaded),
+            Message::Icon1Picked(None) => {}
+            Message::Icon1Loaded(r) => match r {
+                Ok(i) => {
+                    self.log(format!("ICON1.PMF: {} ({:.1} s, {} B)", i.media.source, i.secs, i.media.bytes.len()));
+                    self.icon1 = Some(i);
+                    self.screen = Screen::Game;
+                }
+                Err(e) => return self.toast(Kind::Error, format!("ICON1.PMF rejected: {e}")),
+            },
             Message::ClearIcon1 => self.icon1 = None,
-            Message::PickSnd0 => return Task::perform(pick_file("SND0 source audio", "Audio / video", MEDIA_EXT), Message::Snd0Picked),
-            Message::Snd0Picked(p) => self.snd0 = p.or(self.snd0.take()),
+            Message::PickSnd0 => return Task::perform(pick_file("SND0.AT3", "ATRAC3 audio", &["at3"]), Message::Snd0Picked),
+            Message::Snd0Picked(Some(p)) => return worker::blocking(move || load_snd0(&p), Message::Snd0Loaded),
+            Message::Snd0Picked(None) => {}
+            Message::Snd0Loaded(r) => match r {
+                Ok(m) => {
+                    self.log(format!("SND0.AT3: {} ({} B)", m.source, m.bytes.len()));
+                    self.snd0 = Some(m);
+                }
+                Err(e) => return self.toast(Kind::Error, format!("SND0.AT3 rejected: {e}")),
+            },
             Message::ClearSnd0 => self.snd0 = None,
-            Message::Snd0Start(s) => self.snd0_start = s,
+            Message::InstallTools => return self.install_tools(),
             Message::Level(l) => self.level = l,
             Message::PickOutput => {
                 let mut d = rfd::AsyncFileDialog::new().set_title("Save EBOOT.PBP").set_file_name("EBOOT.PBP").add_filter("EBOOT", &["pbp"]);
@@ -433,6 +591,10 @@ impl App {
             }
             Message::OutputPicked(p) => self.output = p.or(self.output.take()),
             Message::ResetOutput => self.output = None,
+            Message::ResetDonor => {
+                self.donor = None;
+                self.donor_boot = builtin_boot();
+            }
             Message::Screen(s) => self.screen = s,
             Message::Convert => return self.convert(),
             Message::Cancel => {
@@ -441,21 +603,16 @@ impl App {
                     self.log("Cancelling…");
                 }
             }
-            Message::Job(ev) => match ev {
-                JobEvent::Progress(p) => {
-                    if let Some(job) = &mut self.job {
-                        job.progress = p;
-                    }
-                }
-                JobEvent::Log(l) => self.log(l),
-                JobEvent::Done(r) => {
-                    let label = self.job.take().map_or("Job", |j| j.label);
-                    return match r {
+            Message::Job(ev) => {
+                if let Some((label, r)) = self.job_event(ev) {
+                    let toast = match r {
                         Ok(msg) => self.toast(Kind::Success, format!("{label} complete — {msg}")),
                         Err(e) => self.toast(Kind::Error, format!("{label} failed: {e}")),
                     };
+                    // Re-detect after an install, whether it fully succeeded or not.
+                    return if label == JOB_INSTALL { Task::batch([toast, detect_tools_task()]) } else { toast };
                 }
-            },
+            }
             Message::ImportPbp => {
                 return Task::perform(pick_file("Import EBOOT.PBP (title, ID, artwork)", "EBOOT", &["pbp"]), Message::ImportPicked);
             }
@@ -475,12 +632,7 @@ impl App {
                         imp.discs,
                         imp.disc_id.as_deref().unwrap_or("?")
                     );
-                    let mut tasks = vec![self.toast(Kind::Info, msg)];
-                    if self.donor.is_none() && imp.discs > 0 {
-                        // A working PS1 Classic EBOOT is itself a valid donor.
-                        tasks.push(self.load_donor(imp.path));
-                    }
-                    return Task::batch(tasks);
+                    return self.toast(Kind::Info, msg);
                 }
                 Err(e) => return self.toast(Kind::Error, format!("Import failed: {e}")),
             },
@@ -519,6 +671,9 @@ impl App {
                 let ext = p.extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase();
                 return match ext.as_str() {
                     "pbp" => worker::blocking(move || import(p), Message::Imported),
+                    "pmf" => Task::done(Message::Icon1Picked(Some(p))),
+                    "at3" => Task::done(Message::Snd0Picked(Some(p))),
+                    e if MEDIA_EXT.contains(&e) => Task::done(Message::ClipSourcePicked(Some(p))),
                     "ppf" => match self.discs.last().map(|d| d.key) {
                         Some(key) => Task::done(Message::PpfPicked(key, Some(p))),
                         None => self.toast(Kind::Error, "Add a disc before dropping a PPF patch"),
@@ -528,17 +683,20 @@ impl App {
                         Some(slot) => Task::done(Message::ArtPicked(slot, Some(p))),
                         None => self.toast(Kind::Error, format!("{}: name it ICON0 / PIC0 / PIC1 / BOOT, or use Browse", file_name(&p))),
                     },
-                    _ => self.toast(Kind::Error, format!("{}: drop a .cue/.bin disc, a .ppf, an EBOOT.PBP or artwork", file_name(&p))),
+                    _ => self.toast(Kind::Error, format!("{}: drop a .cue/.bin disc, a .ppf, an EBOOT.PBP, artwork, a video/audio clip, a .pmf or an .at3", file_name(&p))),
                 };
             }
             Message::ToggleLog => self.log_open = !self.log_open,
             Message::Dismiss(id) => self.toasts.retain(|t| t.id != id),
             Message::ToolsDetected(r) => {
                 if let Ok(t) = r {
+                    let at = |p: &Option<PathBuf>| p.as_deref().map_or("not found".into(), |p| p.display().to_string());
                     self.log(format!(
-                        "Tools: ffmpeg {} · ATRAC3 encoder {}",
-                        t.ffmpeg.as_deref().map_or("not found".into(), |p| p.display().to_string()),
-                        t.at3.as_deref().map_or("not found".into(), |p| p.display().to_string())
+                        "Tools: ffmpeg {}{} · ATRAC3 {} · yt-dlp {}",
+                        at(&t.ffmpeg),
+                        if t.ffmpeg.is_some() && !t.x264 { " (no libx264: ICON1 disabled)" } else { "" },
+                        at(&t.at3),
+                        at(&t.yt_dlp)
                     ));
                     self.tools = Some(t);
                 }
@@ -567,12 +725,10 @@ impl App {
             Some("Add at least one disc image (.cue or .bin)".to_owned())
         } else if let Some(d) = self.discs.iter().find(|d| d.effective_id().is_none()) {
             Some(format!("{}: no game ID detected — type it (e.g. SLUS00594)", file_name(&d.path)))
-        } else if self.donor.is_none() {
-            Some("Pick a donor PS1 Classic EBOOT.PBP (provides DATA.PSP and the boot trailer)".to_owned())
         } else if self.title.trim().is_empty() {
             Some("Enter a title".to_owned())
-        } else if self.snd0.is_some() && self.tools.as_ref().is_some_and(|t| t.ffmpeg.is_none() || t.at3.is_none()) {
-            Some("SND0 needs ffmpeg and at3tool/atracdenc next to the app or on PATH".to_owned())
+        } else if self.media_bytes() > tools::SND0_BUDGET {
+            Some(format!("ICON1 + SND0 take {} KB; the XMB allows 500 KB — make a shorter clip", self.media_bytes().div_ceil(1024)))
         } else {
             None
         };
@@ -589,15 +745,122 @@ impl App {
                 .collect(),
             title: self.title.trim().to_owned(),
             output,
-            donor: self.donor.clone().unwrap_or_default(),
-            artwork: Artwork { icon0: png(Slot::Icon0), pic0: png(Slot::Pic0), pic1: png(Slot::Pic1), boot: png(Slot::Boot), icon1_pmf: None, snd0: None },
+            donor: self.donor.clone(),
+            artwork: Artwork {
+                icon0: png(Slot::Icon0),
+                pic0: png(Slot::Pic0),
+                pic1: png(Slot::Pic1),
+                boot: png(Slot::Boot),
+                icon1_pmf: self.icon1.as_ref().map(|i| i.media.bytes.to_vec()),
+                snd0: self.snd0.as_ref().map(|m| m.bytes.to_vec()),
+            },
             level: self.level,
         };
-        let (icon1, snd0, start) = (self.icon1.clone(), self.snd0.clone(), self.snd0_start as f64);
+        let Some(cancel) = self.start_job("Build") else { return Task::none() };
+        worker::job(cancel, move |m| build(&req, m), Message::Job)
+    }
+
+    /// Shared progress/log handling; yields the label and result once the job is done.
+    fn job_event<T>(&mut self, ev: JobEvent<T>) -> Option<(&'static str, Result<T, String>)> {
+        match ev {
+            JobEvent::Progress(p) => {
+                if let Some(job) = &mut self.job {
+                    job.progress = p;
+                }
+                None
+            }
+            JobEvent::Log(l) => {
+                self.log(l);
+                None
+            }
+            JobEvent::Done(r) => Some((self.job.take().map_or("Job", |j| j.label), r)),
+        }
+    }
+
+    fn start_job(&mut self, label: &'static str) -> Option<Arc<AtomicBool>> {
+        if self.job.is_some() {
+            return None;
+        }
         let cancel = Arc::new(AtomicBool::new(false));
-        self.job = Some(Job { label: "Build", progress: 0.0, cancel: cancel.clone() });
+        self.job = Some(Job { label, progress: 0.0, cancel: cancel.clone() });
         self.log_open = true;
-        worker::job(cancel, move |m| build(req, icon1, snd0, start, m), Message::Job)
+        Some(cancel)
+    }
+
+    fn media_bytes(&self) -> u64 {
+        (self.icon1.as_ref().map_or(0, |i| i.media.bytes.len()) + self.snd0.as_ref().map_or(0, |m| m.bytes.len())) as u64
+    }
+
+    /// `[start, end)` in seconds: empty start = 0, empty end = start + 30 s (capped at the source).
+    fn clip_span(&self) -> Option<(f64, f64)> {
+        let c = &self.clip;
+        let start = if c.start.trim().is_empty() { 0.0 } else { tools::parse_hms(&c.start)? };
+        let end = if c.end.trim().is_empty() {
+            let e = start + CLIP_DEFAULT_SECS;
+            c.len.map_or(e, |l| e.min(l))
+        } else {
+            tools::parse_hms(&c.end)?
+        };
+        (end - start >= 1.0 && c.len.is_none_or(|l| start < l)).then_some((start, end))
+    }
+
+    fn probe_clip(&mut self) -> Task<Message> {
+        let src = self.clip.source.trim().to_owned();
+        if src.is_empty() {
+            return Task::none();
+        }
+        let key = src.clone();
+        worker::blocking(
+            move || {
+                let tools = ClipTools::detect().map_err(|e| e.to_string())?;
+                clip::probe(&tools, &src).map_err(|e| e.to_string())
+            },
+            move |r| Message::ClipProbed(key.clone(), r),
+        )
+    }
+
+    fn make_clip(&mut self) -> Task<Message> {
+        let source = self.clip.source.trim().to_owned();
+        let Some((start, end)) = self.clip_span() else {
+            return self.toast(Kind::Error, "Clip times: seconds or m:ss, end at least 1 s after start and start inside the source");
+        };
+        let (mode, kbps) = (self.clip.mode, self.clip.kbps);
+        // The part not being re-made keeps its share of the 500 KB.
+        let kept = match mode {
+            ClipMode::Both => 0,
+            ClipMode::Icon1 => self.snd0.as_ref().map_or(0, |m| m.bytes.len()),
+            ClipMode::Snd0 => self.icon1.as_ref().map_or(0, |i| i.media.bytes.len()),
+        } as u64;
+        let budget = tools::SND0_BUDGET.saturating_sub(kept);
+        let name = self.clip.title.clone().unwrap_or_else(|| if clip::is_url(&source) { "web clip".into() } else { file_name(Path::new(&source)) });
+        let label = format!("{name} [{}–{}]", tools::fmt_hms(start), tools::fmt_hms(end));
+        let Some(cancel) = self.start_job(JOB_CLIP) else { return self.toast(Kind::Error, "A job is already running") };
+        self.log(format!("Clip: {label} → {mode}"));
+        worker::job(cancel, move |m| run_clip(&ClipRequest { source: &source, start, end, mode, snd0_kbps: kbps, budget }, label, m), Message::ClipJob)
+    }
+
+    fn install_tools(&mut self) -> Task<Message> {
+        let assets = self.tools.as_ref().map_or_else(Vec::new, |t| t.missing.clone());
+        if assets.is_empty() {
+            return Task::none();
+        }
+        let Some(cancel) = self.start_job(JOB_INSTALL) else { return self.toast(Kind::Error, "A job is already running") };
+        worker::job(
+            cancel,
+            move |m| {
+                for (i, a) in assets.iter().enumerate() {
+                    if m.cancelled() {
+                        return Err("cancelled".into());
+                    }
+                    m.progress(i as u64, assets.len() as u64);
+                    provision::install(a, &|s: &str| m.log(s)).map_err(|e| e.to_string())?;
+                }
+                m.progress(1, 1);
+                let names: Vec<_> = assets.iter().map(|a| a.tool.exe()).collect();
+                Ok(format!("{} → {}", names.join(", "), tools::tools_dir().map_or_else(String::new, |d| d.display().to_string())))
+            },
+            Message::Job,
+        )
     }
 
     fn layers(&self) -> [Option<Arc<Pixels>>; 4] {
@@ -611,27 +874,60 @@ impl App {
     }
 }
 
-/// Worker side of "Build": media → EBOOT.PBP.
-fn build(mut req: ConvertRequest, icon1: Option<PathBuf>, snd0: Option<PathBuf>, start: f64, m: &dyn psx2psp_engine::core::Monitor) -> Result<String, String> {
-    if let Some(p) = &icon1 {
-        let pmf = std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()))?;
-        m.log(&format!("ICON1.PMF: {} ({} B, passthrough)", p.display(), pmf.len()));
-        req.artwork.icon1_pmf = Some(pmf);
+/// Private scratch folder for one media job (small: a clip section, a WAV, an H.264 stream).
+fn scratch(tag: &str) -> PathBuf {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    std::env::temp_dir().join(format!("psx2psp-reborn-{}-{tag}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)))
+}
+
+/// Validates an ICON1.PMF and decodes its frames for the animated preview (needs ffmpeg).
+fn icon1_from(source: String, bytes: Vec<u8>) -> Result<Icon1, String> {
+    let info = psmf::parse(&bytes).map_err(|e| e.to_string())?;
+    let work = scratch("icon1");
+    let movie = Ffmpeg::detect().and_then(|ff| clip::icon1_frames(&ff, &bytes, &work, PREVIEW_FRAMES).ok()).map(|(w, h, f)| Movie::new(w, h, f));
+    let _ = std::fs::remove_dir_all(&work);
+    Ok(Icon1 { secs: info.duration_secs(), media: Media { source, bytes: Arc::new(bytes) }, movie })
+}
+
+fn load_icon1(p: &Path) -> Result<Icon1, String> {
+    icon1_from(file_name(p), std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()))?)
+}
+
+fn load_snd0(p: &Path) -> Result<Media, String> {
+    let bytes = std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()))?;
+    if !tools::is_riff_atrac3(&bytes) {
+        return Err(format!("{}: not a RIFF ATRAC3 file", file_name(p)));
     }
-    if let Some(src) = &snd0 {
-        let ff = Ffmpeg::detect().ok_or("ffmpeg not found")?;
-        let enc = At3Encoder::detect().ok_or("ATRAC3 encoder (at3tool/atracdenc) not found")?;
-        let used = req.artwork.icon1_pmf.as_ref().map_or(0, |v| v.len() as u64);
-        let work = engine::work_dir(&req.output);
-        std::fs::create_dir_all(&work).map_err(|e| format!("{}: {e}", work.display()))?;
-        m.log(&format!("SND0.AT3: encoding {} from {start:.1}s with {}", src.display(), enc.path().display()));
-        let r = tools::make_snd0(&ff, &enc, &Snd0Request { input: src, start_secs: start, kbps: 132, budget: tools::SND0_BUDGET.saturating_sub(used) }, &work);
-        let _ = std::fs::remove_dir_all(&work);
-        let at3 = r.map_err(|e| e.to_string())?;
-        m.log(&format!("SND0.AT3: {} B", at3.len()));
-        req.artwork.snd0 = Some(at3);
+    if bytes.len() as u64 > tools::SND0_BUDGET {
+        return Err(format!("{}: {} KB, the XMB allows 500 KB", file_name(p), bytes.len().div_ceil(1024)));
     }
-    let rep = engine::convert(&req, m).map_err(|e| e.to_string())?;
+    Ok(Media { source: file_name(p), bytes: Arc::new(bytes) })
+}
+
+/// Worker side of "Make clip": source → ICON1.PMF and/or SND0.AT3 (+ decoded preview).
+fn run_clip(req: &ClipRequest<'_>, label: String, m: &dyn Monitor) -> Result<ClipOut, String> {
+    let tools = ClipTools::detect().map_err(|e| e.to_string())?;
+    let work = scratch("clip");
+    let r = clip::make_clip(&tools, req, &work, &|s: &str| m.log(s));
+    let _ = std::fs::remove_dir_all(&work);
+    let c = r.map_err(|e| e.to_string())?;
+    if m.cancelled() {
+        return Err("cancelled".into());
+    }
+    Ok(ClipOut {
+        icon1: c.icon1.map(|b| icon1_from(format!("{label}.pmf"), b)).transpose()?,
+        snd0: c.snd0.map(|b| Media { source: format!("{label}.at3"), bytes: Arc::new(b) }),
+    })
+}
+
+/// Worker side of "Build": EBOOT.PBP with the prepared artwork and media.
+fn build(req: &ConvertRequest, m: &dyn Monitor) -> Result<String, String> {
+    for (name, b) in [("ICON1.PMF", &req.artwork.icon1_pmf), ("SND0.AT3", &req.artwork.snd0)] {
+        if let Some(b) = b {
+            m.log(&format!("{name}: {} B", b.len()));
+        }
+    }
+    let rep = engine::convert(req, m).map_err(|e| e.to_string())?;
     Ok(format!(
         "{} ({:.1} MB, {:.1}% of raw) in {:.1}s",
         rep.output.display(),
@@ -797,31 +1093,111 @@ impl App {
     }
 
     fn media_card(&self) -> Element<'_, Message> {
-        let status = match &self.tools {
-            None => label("Detecting ffmpeg / ATRAC3 encoder…"),
+        let c = &self.clip;
+        let idle = self.job.is_none();
+        let tools: Element<'_, Message> = match &self.tools {
+            None => label("Detecting ffmpeg / x264 / ATRAC3 / yt-dlp…").into(),
             Some(t) => {
-                let ok = t.ffmpeg.is_some() && t.at3.is_some();
-                text(format!(
-                    "ffmpeg {} · ATRAC3 encoder {}",
-                    if t.ffmpeg.is_some() { "✓" } else { "✗" },
-                    if t.at3.is_some() { "✓" } else { "✗ (at3tool / atracdenc)" }
+                let mark = |ok: bool| if ok { "✓" } else { "✗" };
+                let all = t.ffmpeg.is_some() && t.x264 && t.at3.is_some() && t.yt_dlp.is_some();
+                let line = text(format!(
+                    "ffmpeg {} · x264 {} · ATRAC3 {} · yt-dlp {}",
+                    mark(t.ffmpeg.is_some()),
+                    mark(t.x264),
+                    mark(t.at3.is_some()),
+                    mark(t.yt_dlp.is_some())
                 ))
                 .size(12)
-                .color(if ok { style::GREEN } else { style::AMBER })
+                .color(if all { style::GREEN } else { style::AMBER });
+                if t.missing.is_empty() {
+                    line.into()
+                } else {
+                    let mb: u32 = t.missing.iter().map(|a| a.approx_mb).sum();
+                    row![
+                        line.width(Fill),
+                        button(text(format!("Install missing (~{mb} MB)")).size(12))
+                            .padding([5, 10])
+                            .style(style::ghost)
+                            .on_press_maybe(idle.then_some(Message::InstallTools)),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center)
+                    .into()
+                }
             }
         };
+        let source_info = if c.probed {
+            let name = c.title.clone().unwrap_or_else(|| file_name(Path::new(c.source.trim())));
+            label(format!("{name} · {}", c.len.map_or("length unknown".into(), tools::fmt_hms))).wrapping(text::Wrapping::None)
+        } else {
+            label("Paste a YouTube (or any yt-dlp) link, browse or drop a video/audio file")
+        };
+        let span = self.clip_span();
+        let end_hint = span.map_or_else(|| "end".into(), |(_, e)| tools::fmt_hms(e));
+        let tab = |t: String, on: bool, msg: Message| button(text(t).size(12)).padding([5, 10]).style(style::tab(on)).on_press(msg);
+        let modes = ClipMode::ALL.iter().fold(row![].spacing(4), |r, &m| r.push(tab(m.label().into(), c.mode == m, Message::ClipMode(m))));
+        let audio: Element<'_, Message> = match c.mode {
+            ClipMode::Snd0 => [66, 105, 132]
+                .into_iter()
+                .fold(row![label("ATRAC3").width(50)].spacing(4).align_y(Alignment::Center), |r, k| {
+                    r.push(tab(format!("{k} kbps"), c.kbps == k, Message::ClipKbps(k)))
+                })
+                .into(),
+            ClipMode::Both => label(format!("SND0 at {} kbps; the video gets the rest of the 500 KB", clip::SHARED_KBPS)).into(),
+            ClipMode::Icon1 => label("144×80 H.264 at 29.97 fps, bitrate fitted to the free budget").into(),
+        };
+        let can_make = idle && !c.source.trim().is_empty() && span.is_some();
+        let make = button(text(format!("Make {}", c.mode.label())).size(13))
+            .padding([8, 16])
+            .style(style::solid(style::PINK))
+            .on_press_maybe(can_make.then_some(Message::MakeClip));
+        let used = self.media_bytes();
+        let budget = text(format!("{} / 500 KB used by ICON1 + SND0", used.div_ceil(1024)))
+            .size(12)
+            .color(if used > tools::SND0_BUDGET { style::RED } else { style::MUTED });
+        let icon1 = self.icon1.as_ref().map_or_else(
+            || "none".into(),
+            |i| format!("{} · {:.1} s · {} KB{}", i.media.source, i.secs, i.media.bytes.len().div_ceil(1024), if i.movie.is_some() { "" } else { " · no preview" }),
+        );
+        let snd0 = self.snd0.as_ref().map_or_else(|| "none".into(), |m| format!("{} · {} KB", m.source, m.bytes.len().div_ceil(1024)));
         card(
             "Media",
             style::PINK,
             column![
-                label("ICON1.PMF — animated icon (ready-made PMF)"),
-                file_row(self.icon1.as_deref().map_or("none".into(), file_name), Message::PickIcon1, self.icon1.as_ref().map(|_| Message::ClearIcon1)),
-                label("SND0.AT3 — XMB music from any audio / video"),
-                file_row(self.snd0.as_deref().map_or("none".into(), file_name), Message::PickSnd0, self.snd0.as_ref().map(|_| Message::ClearSnd0)),
-                row![label(format!("Start at {:.0}s", self.snd0_start)).width(110), slider(0.0..=600.0, self.snd0_start, Message::Snd0Start).step(1.0)]
-                    .spacing(10)
-                    .align_y(Alignment::Center),
-                status,
+                label("Clip source"),
+                row![
+                    text_input("https://youtu.be/…  or  a video / audio file", &c.source)
+                        .on_input(Message::ClipSource)
+                        .on_submit(Message::ProbeClip)
+                        .size(13)
+                        .padding(7)
+                        .width(Fill)
+                        .style(style::input),
+                    ghost("Browse").on_press(Message::PickClipSource),
+                    ghost("Probe").on_press_maybe((!c.source.trim().is_empty()).then_some(Message::ProbeClip)),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+                source_info,
+                row![
+                    label("From"),
+                    text_input("0:00", &c.start).on_input(Message::ClipStart).size(13).padding(7).width(78).style(style::input),
+                    label("to"),
+                    text_input(&end_hint, &c.end).on_input(Message::ClipEnd).size(13).padding(7).width(78).style(style::input),
+                    space().width(Fill),
+                    label(span.map_or_else(|| "invalid span".into(), |(s, e)| format!("{:.1} s", e - s))),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+                modes,
+                audio,
+                row![space().width(Fill), make],
+                label("ICON1.PMF — animated icon (made above, or a ready .pmf)"),
+                file_row(icon1, Message::PickIcon1, self.icon1.as_ref().map(|_| Message::ClearIcon1)),
+                label("SND0.AT3 — XMB music (made above, or a ready .at3)"),
+                file_row(snd0, Message::PickSnd0, self.snd0.as_ref().map(|_| Message::ClearSnd0)),
+                budget,
+                tools,
             ]
             .spacing(8),
         )
@@ -833,8 +1209,12 @@ impl App {
             "Build",
             style::GREEN,
             column![
-                label("Donor PS1 Classic EBOOT (DATA.PSP + boot trailer)"),
-                file_row(self.donor.as_deref().map_or("required".into(), file_name), Message::PickDonor, None),
+                label("Donor (DATA.PSP + boot trailer)"),
+                file_row(
+                    self.donor.as_deref().map_or("Built-in PS1 Classic donor".into(), file_name),
+                    Message::PickDonor,
+                    self.donor.as_ref().map(|_| Message::ResetDonor)
+                ),
                 label("Output"),
                 file_row(output, Message::PickOutput, self.output.as_ref().map(|_| Message::ResetOutput)),
                 row![
@@ -877,13 +1257,14 @@ impl App {
         let screen = self.screen;
         let title = if self.title.trim().is_empty() { "Untitled".to_owned() } else { self.title.trim().to_owned() };
         let subtitle = self.discs.first().and_then(Disc::effective_id).unwrap_or_default();
-        let empty = self.discs.is_empty() && layers.iter().all(Option::is_none);
+        let movie = self.icon1.as_ref().and_then(|i| i.movie.clone());
+        let empty = self.discs.is_empty() && layers.iter().all(Option::is_none) && movie.is_none();
         let preview = responsive(move |size| {
             let k = (size.width / 480.0).min(size.height / 272.0).max(0.1);
             let (w, h) = (480.0 * k, 272.0 * k);
             let at = |x: f32, y: f32, e: Element<'static, Message>| -> Element<'static, Message> { pin(e).x(x * k).y(y * k).into() };
             let mut layers_ui: Vec<Element<'static, Message>> =
-                vec![shader(Xmb { screen, layers: layers.clone(), accent: WAVE }).width(w).height(h).into()];
+                vec![shader(Xmb { screen, layers: layers.clone(), movie: movie.clone(), accent: WAVE }).width(w).height(h).into()];
             match screen {
                 Screen::Game => {
                     layers_ui.push(at(172.0, 112.0, text(title.clone()).size(13.0 * k).color(Color::WHITE).into()));
@@ -911,7 +1292,9 @@ impl App {
     fn footer(&self) -> Element<'_, Message> {
         let bar: Element<'_, Message> = match &self.job {
             Some(job) => row![
-                text(format!("{} {:>5.1}%", job.label, job.progress * 100.0)).size(13).width(120),
+                text(if job.progress > 0.0 { format!("{} {:>5.1}%", job.label, job.progress * 100.0) } else { format!("{}…", job.label) })
+                    .size(13)
+                    .width(120),
                 progress_bar(0.0..=1.0, job.progress).girth(10),
                 button(text("Cancel").size(13)).padding([8, 18]).style(style::solid(style::RED)).on_press(Message::Cancel),
             ]
@@ -967,5 +1350,36 @@ mod tests {
         assert_eq!(art_slot_for(Path::new("STARTDAT.PNG")), Some(Slot::Boot));
         assert_eq!(art_slot_for(Path::new("boot.png")), Some(Slot::Boot));
         assert_eq!(art_slot_for(Path::new("cover.png")), None);
+    }
+
+    #[test]
+    fn clip_span_defaults_and_validation() {
+        let mut app = App::boot().0;
+        assert_eq!(app.clip_span(), Some((0.0, 30.0)), "no probe: start + 30 s");
+        app.clip.len = Some(12.0);
+        assert_eq!(app.clip_span(), Some((0.0, 12.0)), "capped at the source");
+        (app.clip.start, app.clip.end) = ("0:05".into(), "1:00.5".into());
+        assert_eq!(app.clip_span(), Some((5.0, 60.5)));
+        app.clip.end = "0:05.5".into();
+        assert_eq!(app.clip_span(), None, "under 1 s");
+        app.clip.end = "x".into();
+        assert_eq!(app.clip_span(), None);
+        (app.clip.start, app.clip.end) = ("20".into(), String::new());
+        assert_eq!(app.clip_span(), None, "start past the end of the source");
+    }
+
+    /// A Sony ICON1.PMF loads, validates and (with ffmpeg) decodes into preview frames.
+    #[test]
+    fn sony_icon1_loads_with_preview() {
+        let p = Path::new(r"E:\Programmi VARI\Consoles TOOLS\PSP\PSX2PSPv1.4.2_BASE\Pics\icon1.pmf");
+        if !p.is_file() {
+            return;
+        }
+        let i = load_icon1(p).unwrap();
+        assert!((i.secs - 605.0 * 1001.0 / 30000.0).abs() < 0.05, "{}", i.secs);
+        if let Some(m) = &i.movie {
+            assert_eq!((m.width, m.height, m.frames.len()), (144, 80, 605));
+        }
+        assert!(load_snd0(p).is_err(), "a PMF is not an AT3");
     }
 }

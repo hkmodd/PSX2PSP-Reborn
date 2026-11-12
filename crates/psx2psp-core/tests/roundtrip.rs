@@ -200,7 +200,22 @@ fn multi_disc_roundtrip_with_patch() {
     pbp.inner_mut().rewind().unwrap();
     let back = Donor::from_pbp(&mut pbp).unwrap();
     assert_eq!(back.pgd, donor.pgd);
-    assert!(back.title_consts.is_some());
+    // A single-disc donor carries no PSTITLEIMG constants: popstation's are written instead.
+    assert_eq!(back.title_consts, Some(psar::TitleConsts::POPSTATION));
+
+    // popstation layout: per-disc PSISOIMG headers leave p1 (+0x0C) and p2 (+0x1220) zero; the
+    // STARTDAT pointer lives only in the PSTITLEIMG header (+0x10), the PGD one at +0x284.
+    let raw = pbp.into_inner().into_inner();
+    let h = &raw[psar_at as usize..];
+    let rd = |o: usize| u32::from_le_bytes(h[o..o + 4].try_into().unwrap()) as usize;
+    assert_eq!(&h[..16], b"PSTITLEIMG000000");
+    for d in &discs {
+        let o = d.offset as usize;
+        assert_eq!(&h[o..o + 12], b"PSISOIMG0000");
+        assert_eq!((rd(o + 0x0C), rd(o + 0x1220)), (0, 0), "disc at {o:#x}");
+    }
+    assert_eq!(&h[rd(0x10)..rd(0x10) + 8], b"STARTDAT");
+    assert_eq!(&h[rd(0x284)..rd(0x284) + 4], b"\0PGD");
 }
 
 #[test]

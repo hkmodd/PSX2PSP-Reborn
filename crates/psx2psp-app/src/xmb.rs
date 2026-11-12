@@ -24,11 +24,43 @@ pub struct Pixels {
     pub rgba: Vec<u8>,
 }
 
+fn next_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 impl Pixels {
     pub fn new(width: u32, height: u32, rgba: Vec<u8>) -> Arc<Self> {
-        static NEXT: AtomicU64 = AtomicU64::new(1);
         debug_assert_eq!(rgba.len(), (width * height * 4) as usize);
-        Arc::new(Self { id: NEXT.fetch_add(1, Ordering::Relaxed), width, height, rgba })
+        Arc::new(Self { id: next_id(), width, height, rgba })
+    }
+}
+
+/// Decoded ICON1.PMF: RGBA8 frames played at 29.97 fps in the ICON0 slot, as the XMB does when
+/// the game is focused.
+pub struct Movie {
+    pub id: u64,
+    pub width: u32,
+    pub height: u32,
+    pub frames: Vec<Vec<u8>>,
+}
+
+impl Movie {
+    pub const FPS: f32 = 30000.0 / 1001.0;
+
+    pub fn new(width: u32, height: u32, frames: Vec<Vec<u8>>) -> Arc<Self> {
+        debug_assert!(!frames.is_empty() && frames.iter().all(|f| f.len() == (width * height * 4) as usize));
+        Arc::new(Self { id: next_id(), width, height, frames })
+    }
+
+    fn frame_at(&self, secs: f32) -> usize {
+        (secs.max(0.0) * Self::FPS) as usize % self.frames.len()
+    }
+}
+
+impl fmt::Debug for Movie {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Movie#{}({}x{}, {} frames)", self.id, self.width, self.height, self.frames.len())
     }
 }
 
@@ -68,7 +100,20 @@ pub const BOOT: usize = 3;
 pub struct Xmb {
     pub screen: Screen,
     pub layers: [Option<Arc<Pixels>>; 4],
+    /// ICON1 animation; replaces the ICON0 still while present.
+    pub movie: Option<Arc<Movie>>,
     pub accent: Color,
+}
+
+impl Xmb {
+    /// GPU cache key of each slot (the movie owns the ICON0 slot when present).
+    fn ids(&self) -> [u64; 4] {
+        let mut ids = self.layers.each_ref().map(|l| l.as_ref().map_or(0, |p| p.id));
+        if let Some(m) = &self.movie {
+            ids[ICON0] = m.id;
+        }
+        ids
+    }
 }
 
 /// Per-widget animation state (lives in the widget tree).
@@ -144,8 +189,7 @@ impl<M> shader::Program<M> for Xmb {
             s.screen = self.screen;
             s.screen_at = s.now;
         }
-        for (i, layer) in self.layers.iter().enumerate() {
-            let id = layer.as_ref().map_or(0, |p| p.id);
+        for (i, id) in self.ids().into_iter().enumerate() {
             if s.ids[i] != id {
                 s.ids[i] = id;
                 s.ids_at[i] = s.now;
@@ -156,8 +200,9 @@ impl<M> shader::Program<M> for Xmb {
 
     fn draw(&self, s: &State, _: mouse::Cursor, _: Rectangle) -> XmbPrimitive {
         let mut fade = [0.0f32; 4];
+        let ids = self.ids();
         for (i, f) in fade.iter_mut().enumerate() {
-            if self.layers[i].is_some() {
+            if ids[i] != 0 {
                 *f = ease_out_cubic((s.now - s.ids_at[i]) / LAYER_FADE);
             }
         }
@@ -174,6 +219,7 @@ impl<M> shader::Program<M> for Xmb {
                 radius: 0.0,
             },
             layers: self.layers.clone(),
+            movie: self.movie.as_ref().map(|m| (m.clone(), m.frame_at(s.now - s.ids_at[ICON0]))),
         }
     }
 }
@@ -196,6 +242,7 @@ struct Uniforms {
 pub struct XmbPrimitive {
     uniforms: Uniforms,
     layers: [Option<Arc<Pixels>>; 4],
+    movie: Option<(Arc<Movie>, usize)>,
 }
 
 /// Corner radius of the preview, in logical pixels.
@@ -206,15 +253,27 @@ impl Primitive for XmbPrimitive {
 
     fn prepare(&self, p: &mut XmbPipeline, device: &wgpu::Device, queue: &wgpu::Queue, bounds: &Rectangle, viewport: &Viewport) {
         let mut dirty = false;
-        for (slot, layer) in p.slots.iter_mut().zip(&self.layers) {
-            let id = layer.as_ref().map_or(0, |px| px.id);
+        for (i, (slot, layer)) in p.slots.iter_mut().zip(&self.layers).enumerate() {
+            let movie = self.movie.as_ref().filter(|_| i == ICON0);
+            let (id, image) = match (movie, layer) {
+                (Some((m, f)), _) => (m.id, Some((m.width, m.height, &m.frames[*f], *f))),
+                (None, Some(px)) => (px.id, Some((px.width, px.height, &px.rgba, 0))),
+                (None, None) => (0, None),
+            };
             if slot.id != id {
-                slot.view = match layer {
-                    Some(px) => upload(device, queue, px.width, px.height, &px.rgba),
-                    None => p.empty.clone(),
+                (slot.texture, slot.view) = match image {
+                    Some((w, h, rgba, _)) => upload(device, queue, w, h, rgba),
+                    None => (None, p.empty.clone()),
                 };
                 slot.id = id;
+                slot.frame = image.map_or(0, |i| i.3);
                 dirty = true;
+            } else if let (Some((w, h, rgba, f)), Some(tex)) = (image, &slot.texture)
+                && slot.frame != f
+            {
+                // Next movie frame: rewrite the texture in place, no reallocation or rebind.
+                write(queue, tex, w, h, rgba);
+                slot.frame = f;
             }
         }
         if dirty {
@@ -240,7 +299,10 @@ impl Primitive for XmbPrimitive {
 
 struct Slot {
     id: u64,
+    texture: Option<wgpu::Texture>,
     view: wgpu::TextureView,
+    /// Movie frame currently in `texture`.
+    frame: usize,
 }
 
 pub struct XmbPipeline {
@@ -254,7 +316,7 @@ pub struct XmbPipeline {
     srgb: bool,
 }
 
-fn upload(device: &wgpu::Device, queue: &wgpu::Queue, width: u32, height: u32, rgba: &[u8]) -> wgpu::TextureView {
+fn upload(device: &wgpu::Device, queue: &wgpu::Queue, width: u32, height: u32, rgba: &[u8]) -> (Option<wgpu::Texture>, wgpu::TextureView) {
     let size = wgpu::Extent3d { width, height, depth_or_array_layers: 1 };
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("xmb.layer"),
@@ -266,13 +328,18 @@ fn upload(device: &wgpu::Device, queue: &wgpu::Queue, width: u32, height: u32, r
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
+    write(queue, &texture, width, height, rgba);
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (Some(texture), view)
+}
+
+fn write(queue: &wgpu::Queue, texture: &wgpu::Texture, width: u32, height: u32, rgba: &[u8]) {
     queue.write_texture(
-        wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+        wgpu::TexelCopyTextureInfo { texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
         rgba,
         wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * width), rows_per_image: Some(height) },
-        size,
+        wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
     );
-    texture.create_view(&wgpu::TextureViewDescriptor::default())
 }
 
 fn bind_group(
@@ -384,8 +451,8 @@ impl Pipeline for XmbPipeline {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let empty = upload(device, queue, 1, 1, &[0; 4]);
-        let slots = std::array::from_fn(|_| Slot { id: 0, view: empty.clone() });
+        let (_, empty) = upload(device, queue, 1, 1, &[0; 4]);
+        let slots = std::array::from_fn(|_| Slot { id: 0, texture: None, view: empty.clone(), frame: 0 });
         Self {
             bind_group: bind_group(device, &layout, &uniforms, &sampler, [&empty; 4]),
             pipeline,
@@ -420,8 +487,19 @@ mod tests {
 
     /// Renders one frame and returns tightly packed RGBA8 (sRGB-encoded) pixels.
     fn render(device: &wgpu::Device, queue: &wgpu::Queue, mode: Screen, layers: [Option<Arc<Pixels>>; 4]) -> Vec<u8> {
+        let mut pipeline = XmbPipeline::new(device, queue, wgpu::TextureFormat::Rgba8UnormSrgb);
+        render_with(device, queue, &mut pipeline, mode, layers, None)
+    }
+
+    fn render_with(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pipeline: &mut XmbPipeline,
+        mode: Screen,
+        layers: [Option<Arc<Pixels>>; 4],
+        movie: Option<(Arc<Movie>, usize)>,
+    ) -> Vec<u8> {
         let format = wgpu::TextureFormat::Rgba8UnormSrgb;
-        let mut pipeline = XmbPipeline::new(device, queue, format);
         let primitive = XmbPrimitive {
             uniforms: Uniforms {
                 time: 0.0,
@@ -435,9 +513,10 @@ mod tests {
                 radius: 0.0,
             },
             layers,
+            movie,
         };
         let bounds = Rectangle::new(Point::ORIGIN, Size::new(W as f32, H as f32));
-        primitive.prepare(&mut pipeline, device, queue, &bounds, &Viewport::with_physical_size(Size::new(W, H), 1.0));
+        primitive.prepare(pipeline, device, queue, &bounds, &Viewport::with_physical_size(Size::new(W, H), 1.0));
 
         let size = wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 };
         let target = device.create_texture(&wgpu::TextureDescriptor {
@@ -471,7 +550,7 @@ mod tests {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            assert!(primitive.draw(&pipeline, &mut pass));
+            assert!(primitive.draw(pipeline, &mut pass));
         }
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo { texture: &target, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
@@ -493,6 +572,25 @@ mod tests {
         let (tx, ty) = ((x / 480.0 * W as f32) as u32, y as u32);
         let i = ((ty * W + tx) * 4) as usize;
         px[i..i + 4].try_into().unwrap()
+    }
+
+    /// ICON1 frames replace ICON0 and advance in place on the same pipeline (texture rewrite path).
+    #[test]
+    fn movie_frames_play_in_icon0_slot() {
+        let Some((device, queue)) = gpu() else { return };
+        let mut pipeline = XmbPipeline::new(&device, &queue, wgpu::TextureFormat::Rgba8UnormSrgb);
+        let mut layers: [Option<Arc<Pixels>>; 4] = Default::default();
+        layers[ICON0] = Some(solid(144, 80, [0, 255, 0, 255]));
+        let frame = |c: [u8; 4]| c.repeat(144 * 80);
+        let movie = Movie::new(144, 80, vec![frame([255, 0, 0, 255]), frame([0, 0, 255, 255])]);
+        assert_eq!((movie.frame_at(0.0), movie.frame_at(0.04), movie.frame_at(0.07)), (0, 1, 0));
+        let icon = (92.0, 136.0);
+        for (f, rgba) in [(0, [255, 0, 0, 255]), (1, [0, 0, 255, 255]), (0, [255, 0, 0, 255])] {
+            let px = render_with(&device, &queue, &mut pipeline, Screen::Game, layers.clone(), Some((movie.clone(), f)));
+            assert_eq!(at(&px, icon.0, icon.1), rgba, "frame {f}");
+        }
+        let px = render_with(&device, &queue, &mut pipeline, Screen::Game, layers, None);
+        assert_eq!(at(&px, icon.0, icon.1), [0, 255, 0, 255], "ICON0 returns when the movie is removed");
     }
 
     #[test]

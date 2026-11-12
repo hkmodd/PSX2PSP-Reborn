@@ -22,21 +22,21 @@ where
 }
 
 #[derive(Debug, Clone)]
-pub enum JobEvent {
+pub enum JobEvent<T = String> {
     /// 0.0..=1.0
     Progress(f32),
     Log(String),
-    Done(Result<String, String>),
+    Done(Result<T, String>),
 }
 
-struct ChannelMonitor {
-    tx: mpsc::UnboundedSender<JobEvent>,
+struct ChannelMonitor<T> {
+    tx: mpsc::UnboundedSender<JobEvent<T>>,
     cancel: Arc<AtomicBool>,
     /// Last reported progress in 1/1000 steps: throttles UI messages to ≤1000 per job.
     last: AtomicU32,
 }
 
-impl Monitor for ChannelMonitor {
+impl<T: Send> Monitor for ChannelMonitor<T> {
     fn progress(&self, done: u64, total: u64) {
         let permille = (done.saturating_mul(1000) / total.max(1)).min(1000) as u32;
         if self.last.swap(permille, Ordering::Relaxed) != permille {
@@ -52,10 +52,10 @@ impl Monitor for ChannelMonitor {
 }
 
 /// Long-running cancellable job streaming progress/log events and a final `Done`.
-pub fn job<M: Send + 'static>(
+pub fn job<T: Send + 'static, M: Send + 'static>(
     cancel: Arc<AtomicBool>,
-    f: impl FnOnce(&dyn Monitor) -> Result<String, String> + Send + 'static,
-    map: impl Fn(JobEvent) -> M + Send + 'static,
+    f: impl FnOnce(&dyn Monitor) -> Result<T, String> + Send + 'static,
+    map: impl Fn(JobEvent<T>) -> M + Send + 'static,
 ) -> Task<M> {
     let (tx, rx) = mpsc::unbounded();
     std::thread::spawn(move || {

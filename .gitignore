@@ -2,3 +2,4 @@
 *.pbp
 *.PBP
 
+!/resources/BASE.PBP
