@@ -18,7 +18,6 @@ use iced::widget::{
     text_input,
 };
 use iced::{Alignment, Color, Element, Fill, Font, Length, Size, Subscription, Task, Theme, event, window};
-use psx2psp_engine::core::Donor;
 use psx2psp_engine::media::images::{self, Slot};
 use psx2psp_engine::core::Monitor;
 use psx2psp_engine::media::clip::{self, ClipMode, ClipRequest, ClipTools};
@@ -66,7 +65,6 @@ struct App {
     title: String,
     discs: Vec<Disc>,
     next_key: u64,
-    donor: Option<PathBuf>,
     donor_boot: Option<Arc<Pixels>>,
     /// Indexed by `slot_ix` (ICON0, PIC0, PIC1, BOOT).
     art: [Option<Art>; 4],
@@ -243,9 +241,6 @@ enum Message {
     PickPpf(u64),
     PpfPicked(u64, Option<PathBuf>),
     ClearPpf(u64),
-    PickDonor,
-    DonorPicked(Option<PathBuf>),
-    DonorLoaded(PathBuf, Result<Arc<Pixels>, String>),
     PickArt(Slot),
     ArtPicked(Slot, Option<PathBuf>),
     ArtLoaded(Slot, Result<Art, String>),
@@ -274,7 +269,6 @@ enum Message {
     PickOutput,
     OutputPicked(Option<PathBuf>),
     ResetOutput,
-    ResetDonor,
     Screen(Screen),
     Convert,
     Cancel,
@@ -297,7 +291,7 @@ fn pick_file(title: &str, name: &str, ext: &[&str]) -> impl Future<Output = Opti
     async move { d.pick_file().await.map(|h| h.path().to_path_buf()) }
 }
 
-/// Boot splash of the built-in donor, shown until the user picks a BOOT image or another donor.
+/// Standard PS1 boot splash (built into the binary), shown until the user picks a BOOT image.
 fn builtin_boot() -> Option<Arc<Pixels>> {
     let d = engine::builtin_donor().ok()?;
     let si = images::prepare(Slot::Boot, &d.boot_png).ok()?;
@@ -317,7 +311,6 @@ impl App {
             title: String::new(),
             discs: Vec::new(),
             next_key: 1,
-            donor: None,
             donor_boot: builtin_boot(),
             art: Default::default(),
             icon1: None,
@@ -471,19 +464,6 @@ impl App {
                     d.ppf = None;
                 }
             }
-            Message::PickDonor => {
-                return Task::perform(pick_file("Donor PS1 Classic EBOOT.PBP", "EBOOT", &["pbp"]), Message::DonorPicked);
-            }
-            Message::DonorPicked(Some(p)) => return self.load_donor(p),
-            Message::DonorPicked(None) => {}
-            Message::DonorLoaded(path, r) => match r {
-                Ok(boot) => {
-                    self.donor_boot = Some(boot);
-                    self.log(format!("Donor: {}", path.display()));
-                    self.donor = Some(path);
-                }
-                Err(e) => return self.toast(Kind::Error, format!("Donor rejected: {e}")),
-            },
             Message::PickArt(slot) => {
                 let (w, h) = slot.size();
                 return Task::perform(pick_file(&format!("{} ({w}×{h})", slot.label()), "Image", IMAGE_EXT), move |p| Message::ArtPicked(slot, p));
@@ -591,10 +571,6 @@ impl App {
             }
             Message::OutputPicked(p) => self.output = p.or(self.output.take()),
             Message::ResetOutput => self.output = None,
-            Message::ResetDonor => {
-                self.donor = None;
-                self.donor_boot = builtin_boot();
-            }
             Message::Screen(s) => self.screen = s,
             Message::Convert => return self.convert(),
             Message::Cancel => {
@@ -705,18 +681,6 @@ impl App {
         Task::none()
     }
 
-    fn load_donor(&mut self, p: PathBuf) -> Task<Message> {
-        let path = p.clone();
-        worker::blocking(
-            move || {
-                let d = Donor::load(&p).map_err(|e| e.to_string())?;
-                let si = images::prepare(Slot::Boot, &d.boot_png).map_err(|e| format!("boot image: {e}"))?;
-                Ok(Pixels::new(si.width, si.height, si.rgba))
-            },
-            move |r| Message::DonorLoaded(path.clone(), r),
-        )
-    }
-
     fn convert(&mut self) -> Task<Message> {
         if self.job.is_some() {
             return self.toast(Kind::Error, "A job is already running");
@@ -745,7 +709,7 @@ impl App {
                 .collect(),
             title: self.title.trim().to_owned(),
             output,
-            donor: self.donor.clone(),
+            donor: None,
             artwork: Artwork {
                 icon0: png(Slot::Icon0),
                 pic0: png(Slot::Pic0),
@@ -1088,7 +1052,7 @@ impl App {
                 .align_y(Alignment::Center),
             );
         }
-        let hint = if self.art[slot_ix(Slot::Boot)].is_none() && self.donor_boot.is_some() { "BOOT falls back to the donor's image" } else { "Any image format; auto-fitted to the PSP slot" };
+        let hint = if self.art[slot_ix(Slot::Boot)].is_none() && self.donor_boot.is_some() { "No BOOT image: the standard PS1 boot screen is used" } else { "Any image format; auto-fitted to the PSP slot" };
         card("Artwork", style::RED, column![col, label(hint)].spacing(10))
     }
 
@@ -1209,12 +1173,6 @@ impl App {
             "Build",
             style::GREEN,
             column![
-                label("Donor (DATA.PSP + boot trailer)"),
-                file_row(
-                    self.donor.as_deref().map_or("Built-in PS1 Classic donor".into(), file_name),
-                    Message::PickDonor,
-                    self.donor.as_ref().map(|_| Message::ResetDonor)
-                ),
                 label("Output"),
                 file_row(output, Message::PickOutput, self.output.as_ref().map(|_| Message::ResetOutput)),
                 row![

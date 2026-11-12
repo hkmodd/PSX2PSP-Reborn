@@ -41,8 +41,8 @@ How it compares with PSXPackager, PSX2PSP-Enhanced and pop-fe: [docs/COMPARISON.
 None of these are needed to build an EBOOT. They are looked up next to the executable, in
 `<exe>/tools/` and on `PATH`. The **Install missing** button in the GUI fetches the official
 release binaries into `<exe>/tools/`, and `psx2psp tools install` does the same from the CLI.
-The download size is shown before it starts. The donor is optional too: `--donor` or the
-**Browse** button in the GUI overrides the built-in one.
+The download size is shown before it starts. The GUI never asks for a donor. The CLI still takes
+`--donor` as an expert override of the built-in one.
 
 ## Build and test
 
