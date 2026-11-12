@@ -1,0 +1,20 @@
+[package]
+name = "psx2psp-engine"
+description = "Application layer: ConvertIsoToPbp / ExtractPbp / InspectPbp use cases + the `psx2psp` CLI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "psx2psp"
+path = "src/main.rs"
+
+[dependencies]
+psx2psp-core.workspace = true
+psx2psp-patching.workspace = true
+psx2psp-media.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

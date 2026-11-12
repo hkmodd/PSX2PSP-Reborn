@@ -1,0 +1,11 @@
+[package]
+name = "psx2psp-patching"
+description = "Raw CD sector patching: EDC/ECC regeneration, PPF 1/2/3, pattern patches — applied in-stream, never touching the source BIN"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+psx2psp-core.workspace = true
+thiserror.workspace = true

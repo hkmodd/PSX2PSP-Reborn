@@ -1,0 +1,15 @@
+[package]
+name = "psx2psp-core"
+description = "PBP / PARAM.SFO / PSISOIMG / PSTITLEIMG model, parser and writer for PS1 (POPS) EBOOTs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+flate2.workspace = true
+rayon.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,20 @@
+﻿[package]
+name = "psx2psp-app"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "PSX2PSP-Reborn desktop GUI"
+
+[[bin]]
+name = "psx2psp-reborn"
+path = "src/main.rs"
+
+[dependencies]
+psx2psp-engine = { path = "../psx2psp-engine" }
+iced = { version = "0.14", features = ["wgpu", "image", "advanced"] }
+rfd = "0.18"
+bytemuck.workspace = true
+
+[dev-dependencies]
+pollster = "1"

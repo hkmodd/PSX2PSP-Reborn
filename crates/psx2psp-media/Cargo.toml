@@ -1,0 +1,14 @@
+[package]
+name = "psx2psp-media"
+description = "Media pipeline: XMB image normalisation (in-process), SND0.AT3 via FFmpeg + ATRAC3 encoder, yt-dlp audio fetch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+image.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
