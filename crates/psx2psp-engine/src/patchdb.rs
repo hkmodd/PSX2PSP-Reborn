@@ -777,9 +777,9 @@ pub(crate) mod tests {
         let kinds: Vec<Kind> = sheep().iter().map(|p| p.kind).collect();
         assert_eq!(kinds, [Kind::Fix, Kind::Fps, Kind::Fps, Kind::Ntsc60]);
         assert!(sheep().iter().all(|p| p.pattern().is_some_and(|r| r.1 == 4) && p.md5.is_empty() && p.origin == Origin::BuiltIn && !p.note.is_empty()));
-        // Clamp, frame cap and 60 Hz verified together on a real PSP (2026-11-12): on by default,
-        // every switch. Adaptive VSync (sorted with the fps kind) stays off until tried on one.
-        assert_eq!(sheep().iter().map(|p| p.default_on).collect::<Vec<_>>(), [true, true, false, true]);
+        // All verified on a real PSP (clamp, frame cap, 60 Hz 2026-11-12; adaptive VSync,
+        // sorted with the fps kind, 2026-11-14): on by default, every switch.
+        assert!(sheep().iter().all(|p| p.default_on));
         assert_eq!(g.switches, Switches { fixes: true, fps: true, ntsc60: true });
         assert_eq!(db.default_switches("SLES_028.95"), g.switches);
         assert_eq!(db.default_switches("SLUS01262"), Switches::RECOMMENDED);
@@ -868,7 +868,7 @@ pub(crate) mod tests {
         assert!(off.wanted(fixes, &[(off.name.clone(), true)]), "a choice turns it on");
         let c = vec![("physics STEP clamp 41.5 -> 62.3 ms".to_owned(), true), ("Frame cap VSync(2) -> VSync(0)".to_owned(), false)];
         let all = Switches { fixes: true, fps: true, ntsc60: true };
-        assert_eq!(on(all, &c), [true, false, false, true], "choices win, names are case-insensitive");
+        assert_eq!(on(all, &c), [true, false, true, true], "choices win, names are case-insensitive");
         assert!(config_wanted(fixes, &[]) && !config_wanted(Switches::default(), &[]));
         assert!(!config_wanted(fixes, &[(CONFIG.into(), false)]));
     }
