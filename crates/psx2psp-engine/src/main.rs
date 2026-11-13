@@ -475,10 +475,18 @@ fn cmd_patches(args: &[String]) -> R {
     let game = l.db.game(&id);
     let built_as = if id == disc_id { String::new() } else { format!(" (built as {id})") };
     println!("{disc_id}{built_as}: {}", game.map_or("not in the patch database", |g| g.title.as_str()));
-    match (psx2psp_engine::core::subq::find_beside(&disc), l.db.libcrypt(&id)) {
-        (Some(f), _) => println!("  LibCrypt: the EBOOT carries the subchannel table of {}", f.display()),
-        (None, Some(magic)) => println!("  LibCrypt magic word 0x{magic:04X}: no .sbi beside the disc, table from the magic word"),
-        (None, None) => {}
+    match (psx2psp_engine::core::subq::find_beside(&disc), psx2psp_engine::sbidb::lookup(&disc_id), l.db.libcrypt(&id)) {
+        (Some(f), ..) => println!("  LibCrypt: the EBOOT carries the subchannel table of {}", f.display()),
+        (None, [s], _) => println!("  LibCrypt: the EBOOT carries the built-in SBI for {} ({} sectors)", s.serial, s.entries.len()),
+        (None, dumps, magic) => {
+            if let [s, ..] = dumps {
+                let titles = psx2psp_engine::sbidb::titles(dumps);
+                println!("  LibCrypt: {} different built-in SBIs for {} ({titles}): put the .sbi of this dump beside the disc", dumps.len(), s.serial);
+            }
+            if let Some(magic) = magic {
+                println!("  LibCrypt magic word 0x{magic:04X}: no .sbi beside the disc, table from the magic word");
+            }
+        }
     }
     // [on ]/[off] = what `convert` does without switches or --patch/--no-patch.
     let def = l.db.default_switches(&id);
@@ -516,6 +524,14 @@ fn cmd_info(p: &Path) -> R {
         println!("md5      {} (track 1, raw)", psx2psp_engine::track1_md5(&img)?);
         if let Some(r) = psx2psp_engine::core::subq::load_beside(p, &img.tracks)? {
             println!("subq     {} ({} sectors, {} damaged)", r.path.display(), r.sectors, r.damaged);
+        } else {
+            let dumps = d.disc_id.as_deref().map_or(&[][..], psx2psp_engine::sbidb::lookup);
+            for s in dumps {
+                println!("subq     built-in SBI for {} ({} sectors) — {}, {}", s.serial, s.entries.len(), s.title, s.region);
+            }
+            if dumps.len() > 1 {
+                println!("         {} dumps share this ID: convert uses none, put the .sbi of this dump beside the disc", dumps.len());
+            }
         }
         return Ok(());
     }

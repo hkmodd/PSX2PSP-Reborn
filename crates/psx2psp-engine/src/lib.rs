@@ -20,6 +20,7 @@ use psx2psp_patching::{PatternPatch, PpfPatch};
 pub mod gamedb;
 pub mod md5;
 pub mod patchdb;
+pub mod sbidb;
 pub mod update;
 
 use patchdb::{Kind, Patch, PatchDb};
@@ -605,13 +606,29 @@ fn exe_crc_for(img: &DiscImage, base: &[&PpfPatch], code: Vec<&PatternPatch>, n:
 }
 
 /// The disc's LibCrypt subchannel table. A `.sbi`/`.lsd` beside the image is the dump of the
-/// real disc and wins: the magic word only says which bits are set, and some discs (MediEvil
+/// real disc and wins, then redump's SBI for the disc's product code from the built-in set
+/// ([`sbidb`]): the magic word only says which bits are set, and some discs (MediEvil
 /// SCES-01494) damage other sectors than the 32 the magic-word model assumes.
-fn subchannels_for(d: &DiscInput, img: &DiscImage, magic: Option<u16>, n: usize, monitor: &dyn Monitor) -> Result<Option<Vec<u8>>> {
+fn subchannels_for(d: &DiscInput, img: &DiscImage, disc_id: &str, magic: Option<u16>, n: usize, monitor: &dyn Monitor) -> Result<Option<Vec<u8>>> {
     if let Some(r) = subq::load_beside(&d.path, &img.tracks)? {
         let name = r.path.file_name().map_or_else(|| r.path.display().to_string(), |f| f.to_string_lossy().into_owned());
         monitor.log(&format!("Disc {}: LibCrypt — subchannel table from {name} ({} sectors, {} damaged)", n + 1, r.sectors, r.damaged));
         return Ok(Some(r.table));
+    }
+    match sbidb::lookup(disc_id) {
+        [] => {}
+        [s] => {
+            monitor.log(&format!("Disc {}: LibCrypt — subchannel table from the built-in SBI for {} ({} sectors)", n + 1, s.serial, s.entries.len()));
+            return Ok(Some(subq::table(&s.entries, &img.tracks)));
+        }
+        many => monitor.log(&format!(
+            "Disc {}: LibCrypt — the built-in SBI set has {} different dumps for {} ({}) and cannot tell which one \
+             this is: put the redump .sbi of this dump next to the CUE and rebuild",
+            n + 1,
+            many.len(),
+            many[0].serial,
+            sbidb::titles(many)
+        )),
     }
     Ok(magic.map(|magic| {
         monitor.log(&format!(
@@ -674,7 +691,7 @@ pub fn convert(req: &ConvertRequest, monitor: &dyn Monitor) -> Result<ConvertRep
         let base: Vec<&PpfPatch> = ppf.iter().collect();
         let pal = if d.pal_ntsc { pal_ntsc_for(&img, &base, &id, n, monitor)? } else { None };
         crcs.push(exe_crc_for(&img, &base, pal.iter().chain(&fix).collect(), n, monitor)?);
-        subqs.push(subchannels_for(d, &img, req.patches.libcrypt(&id), n, monitor)?);
+        subqs.push(subchannels_for(d, &img, &disc_id, req.patches.libcrypt(&id), n, monitor)?);
         pals.push(pal);
         configs.push(config);
         fixes.push(fix);
@@ -1093,13 +1110,28 @@ mod tests {
         std::fs::write(t.path().join("g.sbi"), b"SBI\0\x00\x02\x10\x01AAAAAAAAAA\x00\x02\x05\x01AAAAAAAAAA").unwrap();
         let disc = DiscInput { path: cue.clone(), disc_id: Some("SCES-99998".into()), ..Default::default() };
         let out2 = t.path().join("s").join("EBOOT.PBP");
-        convert(&ConvertRequest { discs: vec![disc], patches: db, title: "T".into(), output: out2.clone(), donor: None, artwork: Artwork::default(), level: 1 }, &()).unwrap();
+        convert(&ConvertRequest { discs: vec![disc], patches: db.clone(), title: "T".into(), output: out2.clone(), donor: None, artwork: Artwork::default(), level: 1 }, &()).unwrap();
         let tracks = DiscImage::open(&cue).unwrap().tracks;
         let expect = subq::load_beside(&cue, &tracks).unwrap().unwrap();
         assert_eq!((expect.sectors, expect.damaged), (2, 2));
         assert_eq!(inspect(&out2).unwrap().discs[0].subchannels, expect.table);
         // LBA 155 (00:02:05) answers 154: rel 00:00:04, abs 00:02:04; sorted before LBA 160.
         assert_eq!(&expect.table[12..24], &[5, 0, 0, 0, 1, 1, 0, 0, 4, 0, 2, 4]);
+
+        // No file beside: the built-in SBI of the disc's product code; none when the set has two
+        // dumps for it (Spyro: Year of the Dragon v1.0 / v1.1) and the database no magic word.
+        std::fs::remove_file(t.path().join("g.sbi")).unwrap();
+        for (id, name) in [("SCES-01494", "m"), ("SCES-02835", "y")] {
+            let disc = DiscInput { path: cue.clone(), disc_id: Some(id.into()), ..Default::default() };
+            let out3 = t.path().join(name).join("EBOOT.PBP");
+            convert(&ConvertRequest { discs: vec![disc], patches: db.clone(), title: "T".into(), output: out3.clone(), donor: None, artwork: Artwork::default(), level: 1 }, &()).unwrap();
+            let want = match sbidb::lookup(id) {
+                [s] => subq::table(&s.entries, &tracks),
+                _ => Vec::new(),
+            };
+            assert_eq!(want.len(), if name == "m" { 18 * psar::SUBQ_ENTRY } else { 0 }, "{id}");
+            assert_eq!(inspect(&out3).unwrap().discs[0].subchannels, want, "{id}");
+        }
     }
 
     /// The real-PSP hang of every patched Sheep Dog build: its loader checks two CRC words in each

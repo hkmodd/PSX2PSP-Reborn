@@ -144,7 +144,8 @@ The Media card asks one question first: **From YouTube** or **From my files**.
   [pop-fe](https://github.com/sahlberg/pop-fe): most are the configs Sony shipped in its own PS1
   Classics. They are written into the `PSISOIMG` header, where POPS reads them.
 - **LibCrypt** without cracking the disc: for 230 protected product codes the EBOOT carries the
-  subchannel table that POPS answers the protection from.
+  subchannel table that POPS answers the protection from, built from redump's own `.sbi` for 196
+  of them (a `.sbi`/`.lsd` beside the disc still wins).
 - **Per-dump PPF fixes**, limited by the MD5 of track 1 so they never land on the wrong dump.
 - **PAL→NTSC preset**: the six generic rules of PSX2PSP v1.4.2, applied only on discs where its
   video-mode fix matches, every hit listed in the log.
@@ -400,6 +401,9 @@ lets you check the file first.
 - **[pop-fe](https://github.com/sahlberg/pop-fe)** by sahlberg and contributors (LGPL-2.1):
   the POPS configs, LibCrypt magic words and PPF fixes in `resources/popfe.ini`, with the community
   work it credits (among others The_Ho's POPS config research and krHACKen's LibCrypt patches).
+- **[redump.org](http://redump.org)** and **[psxdatacenter.com](https://psxdatacenter.com/sbifiles.html)**:
+  the LibCrypt `.sbi` files in `resources/libcrypt_sbi.tsv.z`, dumped by redump and collected by
+  psxdatacenter.
 - **PSX2PSP v1.4.2** and the **Popstation GUI GameID Database** (SeattleMan): the generic PAL→NTSC
   rules and the 10,109-serial title database.
 - **popstation / popstationr**, **[PSXPackager](https://github.com/RupertAvery/PSXPackager)** and
