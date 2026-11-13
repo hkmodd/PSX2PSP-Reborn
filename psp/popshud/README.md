@@ -35,7 +35,23 @@ ps1, ms0:/SEPLUGINS/popshud.prx, on
 
 It works next to `popsfs` and with any EBOOT. Set it to `off` to remove the overlay.
 
+Each start appends a few lines to `ms0:/SEPLUGINS/popshud.log`:
+
+```
+start 4b4b4b4b 4b4b4b4b 4b4b0000 ...   how each function was found: 4b K kernel lib, 55 U user lib, 2d - missing
+pops gp text end <gp|0>                 the pops module and the gp used (0 = rejected, FPS/EMU show dashes)
+stats fps emu cpu <n>                   the first three one-second windows
+fb ret addr stride format               the frame buffer the line is drawn into
+```
+
+No `start` line means the module did not run; no `pops` line means the start-module
+handler never saw POPS.
+
 ## How it works
+
+Like popsfs, the module imports systemctrl only: the kernel NIDs of 6.61 differ from the
+pspsdk stubs, so the Sony functions are looked up at run time with `sctrlHENFindFunction`,
+in the kernel library first and then in the user library of the same module.
 
 The start-module handler of systemctrl catches the `pops` module and keeps its gp. A kernel
 thread wakes at each vblank, reads two POPS globals (gp+0x360C emulated cycles, gp+0x3610
