@@ -1,5 +1,9 @@
 # popsfs: full-screen PS1 games on PSP (ARK-4 / ARK-5)
 
+> **Status: broken, do not use.** Version 1 failed on a real PSP (ARK-5, 2026-11-13). MediEvil and
+> Abe's Exoddus show vertical streaks and a split picture, and the bottom band stays in the FMVs.
+> The patch below is kept for reference while the cause is investigated.
+
 POPS, the PSP's PS1 emulator, scales a fixed 240 lines (NTSC) or 288 lines (PAL) to the screen.
 A game that shows fewer lines, such as a 256-line PAL game, keeps an empty band at the bottom,
 whatever the screen mode.
