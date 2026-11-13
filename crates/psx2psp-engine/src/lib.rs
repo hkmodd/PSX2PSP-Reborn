@@ -1015,7 +1015,7 @@ mod tests {
         let db_config = PatchDb::builtin().game("SLES02895").unwrap().config.clone().unwrap();
         assert_eq!(&cfg_on[..db_config.len()], &db_config[..], "60 Hz patch: config untouched, no POPS NTSC bit");
         // POPS config word 19 (cycle shift) at blob 0x0C + 4 * 19 and its mirror 0x84 further on.
-        assert_eq!((&cfg_on[0x58..0x5C], &cfg_on[0xDC..0xE0]), (&[3u8, 0, 0, 0][..], &[3u8, 0, 0, 0][..]), "CPU cycle shift 3");
+        assert_eq!((&cfg_on[0x58..0x5C], &cfg_on[0xDC..0xE0]), (&[5u8, 0, 0, 0][..], &[5u8, 0, 0, 0][..]), "CPU cycle shift 5");
         let s20: &[u8; SECTOR] = on[20 * SECTOR..21 * SECTOR].try_into().unwrap();
         let w = |o: usize| u32::from_le_bytes(s20[24 + o..28 + o].try_into().unwrap());
         assert_eq!((w(0x1E4), w(0x1F0)), (0x2881_0100, 0x2404_00FF), "clamp 0xFF");
