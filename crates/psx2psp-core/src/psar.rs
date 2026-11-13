@@ -10,6 +10,7 @@
 //!                    0x4000 index[N] {u32 off (rel. ISO+0x100000), u32 len, 24×0}
 //!                    0x4000+N×32 subchannel table: 12-byte Q entries (LibCrypt), if any
 //!                    0x100000 raw-deflate blocks of 0x9300 (16 raw sectors); len==0x9300 ⇒ stored
+//!                    (read only; the writer never emits it, see `compress_block`)
 //! STARTDAT           "STARTDAT" 1 1 0x50 png_len … | boot PNG | PGD trailer (donor)
 //! ```
 //!
@@ -324,7 +325,7 @@ pub struct PsarJob<'a> {
     pub discs: Vec<DiscSpec<'a>>,
     /// Game title for the PSTITLEIMG header (multi-disc).
     pub title: String,
-    /// Deflate level, clamped to 1..=9 (fully-uncompressed EBOOTs are reported not to boot).
+    /// Deflate level, clamped to 1..=9 (raw blocks never load on fw 6.61: see `compress_block`).
     pub level: u32,
     pub boot_png: &'a [u8],
     pub donor: &'a Donor,
@@ -364,11 +365,17 @@ fn read_full(r: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
     Ok(n)
 }
 
-fn compress_block(block: &[u8], level: Compression) -> Option<Vec<u8>> {
-    let mut e = DeflateEncoder::new(Vec::with_capacity(BLOCK / 2), level);
-    e.write_all(block).ok()?;
-    let v = e.finish().ok()?;
-    (v.len() < BLOCK).then_some(v)
+/// Every block is a deflate stream, never stored raw. POPS reads a len == 0x9300 block through
+/// popsman `sceMeAudio_3771229c`, which returns 0 without reading once the compiled SDK version is
+/// above 3.02 (POPS 6.61 sets 6.06): the block never becomes valid and the game hangs on it. An
+/// incompressible block becomes deflate stored blocks instead (0x9300 + 5 bytes, never 0x9300).
+fn compress_block(block: &[u8], level: Compression) -> Vec<u8> {
+    let deflate = |l| {
+        let mut e = DeflateEncoder::new(Vec::with_capacity(BLOCK / 2), l);
+        e.write_all(block).and_then(|()| e.finish()).expect("deflate into a Vec cannot fail")
+    };
+    let v = deflate(level);
+    if v.len() < BLOCK { v } else { deflate(Compression::none()) }
 }
 
 struct DiscHeader<'a> {
@@ -450,7 +457,7 @@ fn stream_disc<W: Write + Seek>(
         buf[got..].fill(0); // last block zero-padded to 0x9300
         let base = first as u64 * BLOCK as u64;
 
-        let out: Vec<Option<Vec<u8>>> = buf
+        let out: Vec<Vec<u8>> = buf
             .par_chunks_mut(BLOCK)
             .enumerate()
             .map(|(i, blk)| {
@@ -462,8 +469,7 @@ fn stream_disc<W: Write + Seek>(
             })
             .collect();
 
-        for (i, c) in out.iter().enumerate() {
-            let data: &[u8] = c.as_deref().unwrap_or(&buf[i * BLOCK..(i + 1) * BLOCK]);
+        for data in &out {
             w.write_all(data)?;
             let off = u32::try_from(pos).map_err(|_| Error::Unsupported("disc data exceeds 4 GiB".into()))?;
             index.push((off, data.len() as u32));
@@ -718,4 +724,23 @@ fn inflate(p: &[u8]) -> Result<Vec<u8>> {
         return Err(Error::format("PSISOIMG", format!("block inflated to {} bytes", v.len())));
     }
     Ok(v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incompressible_block_is_never_stored_raw() {
+        let mut x = 0x2545_f491_4f6c_dd1d_u64;
+        let blk: Vec<u8> = (0..BLOCK).map(|_| { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x as u8 }).collect();
+        for level in [Compression::fast(), Compression::best()] {
+            let c = compress_block(&blk, level);
+            assert!(c.len() > BLOCK && c.len() <= 0xFFFF, "len {:#x}", c.len());
+            assert_eq!(inflate(&c).unwrap(), blk);
+        }
+        let z = compress_block(&[0u8; BLOCK], Compression::fast());
+        assert!(z.len() < BLOCK);
+        assert_eq!(inflate(&z).unwrap(), vec![0u8; BLOCK]);
+    }
 }
