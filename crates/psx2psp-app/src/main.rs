@@ -1440,7 +1440,7 @@ impl App {
             label("PS1 → PSP / PS Vita EBOOT studio"),
         ]
         .spacing(2);
-        let top = row![logo, name, space().width(Fill), chip(concat!("v", env!("CARGO_PKG_VERSION")), style::BLUE)].spacing(14).align_y(Alignment::Center);
+        let top = row![logo, name, space().width(Fill), self.updater.version_button().map(Message::Update)].spacing(14).align_y(Alignment::Center);
 
         let done = self.steps();
         let current = done.iter().position(|d| !d);
@@ -1954,7 +1954,6 @@ impl App {
                     .style(style::tab(!self.muted))
                     .on_press(Message::ToggleMute)
             }),
-            self.updater.version_button().map(Message::Update),
             container(tabs).padding(4).style(style::well),
         ]
         .align_y(Alignment::Center)

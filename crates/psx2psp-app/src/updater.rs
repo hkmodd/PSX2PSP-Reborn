@@ -345,10 +345,11 @@ impl Updater {
         Some(container(body).padding(12).width(Fill).style(style::toast(accent)).into())
     }
 
-    /// Version chip for the header; clicking it checks for updates.
+    /// Version chip for the brand header; clicking it checks for updates.
     pub fn version_button(&self) -> Element<'_, Msg> {
         let idle = !matches!(self.state, State::Checking | State::Downloading { .. } | State::Ready { .. });
-        let chip = button(text(format!("v{CURRENT}")).size(12)).padding([5, 10]).style(style::ghost).on_press_maybe(idle.then_some(Msg::CheckNow));
+        let label = text(format!("v{CURRENT}")).size(11).font(style::BOLD).wrapping(text::Wrapping::None);
+        let chip = button(label).padding([2, 9]).style(style::chip_button(style::BLUE)).on_press_maybe(idle.then_some(Msg::CheckNow));
         let bubble = container(text("Check for updates").size(12)).padding([6, 10]).style(style::toast(style::BLUE));
         tooltip(chip, bubble, tooltip::Position::Bottom).gap(6).into()
     }

@@ -147,6 +147,24 @@ pub fn chip(accent: Color) -> impl Fn(&Theme) -> container::Style {
     }
 }
 
+/// A `chip` that can be pressed: same pill, brighter and glowing on hover.
+pub fn chip_button(accent: Color) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_, status| {
+        let (fill, stroke, shadow) = match status {
+            button::Status::Active | button::Status::Disabled => (0.13, 0.38, Shadow::default()),
+            button::Status::Hovered => (0.24, 0.80, glow(accent, 0.35, 10.0, 0.0)),
+            button::Status::Pressed => (0.34, 1.0, Shadow::default()),
+        };
+        button::Style {
+            background: Some(Background::Color(alpha(accent, fill))),
+            text_color: lighten(accent, 0.25),
+            border: Border { color: alpha(accent, stroke), width: 1.0, radius: 999.0.into() },
+            shadow,
+            snap: true,
+        }
+    }
+}
+
 /// Progress-tracker node: done (filled, glowing), current (outlined) or pending (dim).
 pub fn step(accent: Color, done: bool, current: bool) -> impl Fn(&Theme) -> container::Style {
     move |_| {

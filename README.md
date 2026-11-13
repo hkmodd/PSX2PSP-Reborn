@@ -34,7 +34,7 @@
 ---
 
 <p align="center">
-  <img src="docs/assets/screenshot.png" alt="PSX2PSP-Reborn: the Game, Artwork and Media cards on the left, the live XMB preview with its animated wave on the right" width="100%">
+  <img src="docs/assets/screenshot.png" alt="PSX2PSP-Reborn: brand header with the Game, Artwork, Media and Build step tracker, the project bar and the section cards on the left, the live XMB preview with its animated wave on the right" width="100%">
 </p>
 
 ## ⚡ What is this?
@@ -153,10 +153,13 @@ Paste a YouTube link (or any URL yt-dlp understands), or pick a local video or a
   (atracdenc or Sony's at3tool). **Install missing** in the GUI, or `psx2psp tools install`,
   downloads the official release binaries into `<exe folder>/tools/`, with the size shown first.
   None of them are needed to build a plain EBOOT.
-- **Projects with save slots and autosave.** Your work, including the clips you made from
-  YouTube, survives a crash or closing the window.
-- **Built-in updater.** The app finds new versions on GitHub Releases and updates its single
-  executable in place.
+- **Projects with save slots and autosave.** Everything is autosaved as you work, including the
+  ICON1/SND0 you made from YouTube, and comes back on the next start, after a crash or an
+  accidental close, with an **Undo** toast if you wanted a clean slate. **Save as…** keeps named
+  projects (`projects/<name>/`, media included) that **Open…** brings back at any time.
+- **Built-in updater.** The app checks GitHub Releases, verifies the download against
+  `SHA256SUMS.txt` and swaps its own executable in place, rolling back if anything fails. Click
+  the version chip to check by hand; from the CLI, `psx2psp update` (or `update --check`).
 
 ## 🩹 The patch database
 
