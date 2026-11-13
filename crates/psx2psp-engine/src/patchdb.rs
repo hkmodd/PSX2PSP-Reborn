@@ -775,10 +775,11 @@ pub(crate) mod tests {
         assert_eq!(&c[..4], &[0x70, 0, 7, 6]);
         assert_eq!(&c[268..], &[0xff; 4]);
         let kinds: Vec<Kind> = sheep().iter().map(|p| p.kind).collect();
-        assert_eq!(kinds, [Kind::Fix, Kind::Fps, Kind::Ntsc60]);
+        assert_eq!(kinds, [Kind::Fix, Kind::Fps, Kind::Fps, Kind::Ntsc60]);
         assert!(sheep().iter().all(|p| p.pattern().is_some_and(|r| r.1 == 4) && p.md5.is_empty() && p.origin == Origin::BuiltIn && !p.note.is_empty()));
-        // All three verified together on a real PSP (2026-11-12): on by default, every switch.
-        assert!(sheep().iter().all(|p| p.default_on));
+        // Clamp, frame cap and 60 Hz verified together on a real PSP (2026-11-12): on by default,
+        // every switch. Adaptive VSync (sorted with the fps kind) stays off until tried on one.
+        assert_eq!(sheep().iter().map(|p| p.default_on).collect::<Vec<_>>(), [true, true, false, true]);
         assert_eq!(g.switches, Switches { fixes: true, fps: true, ntsc60: true });
         assert_eq!(db.default_switches("SLES_028.95"), g.switches);
         assert_eq!(db.default_switches("SLUS01262"), Switches::RECOMMENDED);
@@ -849,7 +850,7 @@ pub(crate) mod tests {
         // SLES_028.95 0x80100008..: addiu t0,1 · addiu a0,-2 · addiu a1,1 · addiu v1,0x10.
         let code = [1, 0, 8, 0x24, 0xFE, 0xFF, 4, 0x24, 1, 0, 5, 0x24, 0x10, 0, 3, 0x24];
         let mut sector = sector_with(&code, 8);
-        assert!(patterns("t", &[sheep()[2]])[0].apply_sector(&mut sector));
+        assert!(patterns("t", &[sheep()[3]])[0].apply_sector(&mut sector));
         let mut want = code;
         want[8] = 0; // addiu a1,zero,0: the flag stores NTSC
         assert_eq!(&sector[24 + 8..24 + 24], &want);
@@ -860,14 +861,14 @@ pub(crate) mod tests {
         let ps = sheep();
         let on = |s: Switches, c: &[(String, bool)]| ps.iter().map(|p| p.wanted(s, c)).collect::<Vec<_>>();
         let fixes = Switches::RECOMMENDED;
-        assert_eq!(on(fixes, &[]), [true, false, false], "each patch follows its kind's switch");
+        assert_eq!(on(fixes, &[]), [true, false, false, false], "each patch follows its kind's switch");
         let mut off = ps[0].clone();
         off.default_on = false;
         assert!(!off.wanted(fixes, &[]), "default = off: the switch alone does not apply it");
         assert!(off.wanted(fixes, &[(off.name.clone(), true)]), "a choice turns it on");
         let c = vec![("physics STEP clamp 41.5 -> 62.3 ms".to_owned(), true), ("Frame cap VSync(2) -> VSync(0)".to_owned(), false)];
         let all = Switches { fixes: true, fps: true, ntsc60: true };
-        assert_eq!(on(all, &c), [true, false, true], "choices win, names are case-insensitive");
+        assert_eq!(on(all, &c), [true, false, false, true], "choices win, names are case-insensitive");
         assert!(config_wanted(fixes, &[]) && !config_wanted(Switches::default(), &[]));
         assert!(!config_wanted(fixes, &[(CONFIG.into(), false)]));
     }
@@ -957,7 +958,7 @@ pub(crate) mod tests {
 
         let db = load_from(Some(path.clone())).db;
         let ps = db.patches_for("SLES02895");
-        assert_eq!(ps.len(), 4);
+        assert_eq!(ps.len(), 5);
         let clamp = ps.iter().find(|p| p.kind == Kind::Fix).unwrap();
         assert_eq!((clamp.origin, clamp.note.as_str()), (Origin::User, "my clamp"));
         assert!(ps.iter().any(|p| p.name == "Skip logos"));

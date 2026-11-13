@@ -996,6 +996,12 @@ mod tests {
         const CLAMP: [u8; 16] = [0xAB, 0x00, 0x81, 0x28, 0x03, 0x00, 0x20, 0x14, 0, 0, 0, 0, 0xAA, 0x00, 0x04, 0x24];
         const CAP: [u8; 24] = [0xC0, 0x47, 0x02, 0x0C, 0x02, 0x00, 0x04, 0x24, 0x03, 0x00, 0x00, 0x10, 0, 0, 0, 0, 0xC0, 0x47, 0x02, 0x0C, 0x21, 0x20, 0x00, 0x00];
         const BOOT: [u8; 16] = [1, 0, 8, 0x24, 0xFE, 0xFF, 4, 0x24, 1, 0, 5, 0x24, 0x10, 0, 3, 0x24];
+        // LEV00.EXE libetc VSync, 0x80091F70..0x80091FDC.
+        const VSYNC: [u32; 27] = [
+            0x2402_0001, 0x1082_003A, 0, 0x1880_0007, 0, 0x3C02_800A, 0x8C42_76B4, 0, 0x2442_FFFF, 0x0802_47E9, 0x0044_1021,
+            0x3C02_800A, 0x8C42_76B4, 0x1880_0002, 0x0000_2821, 0x2485_FFFF, 0x0C02_481E, 0x0040_2021, 0x3C02_800A,
+            0x8C42_76A8, 0, 0x8C50_0000, 0x3C04_800B, 0x8C84_87E0, 0x2405_0001, 0x0C02_481E, 0x2484_0001,
+        ];
         let t = tempfile::tempdir().unwrap();
         let mut raw = Vec::new();
         for lba in 0..30u32 {
@@ -1008,13 +1014,19 @@ mod tests {
             if lba == 21 {
                 user[8..24].copy_from_slice(&BOOT);
             }
+            if lba == 22 {
+                for (i, w) in VSYNC.iter().enumerate() {
+                    user[0x670 + 4 * i..0x674 + 4 * i].copy_from_slice(&w.to_le_bytes());
+                }
+            }
             raw.extend_from_slice(&build_mode2_form1(lba, &user));
         }
         std::fs::write(t.path().join("s.bin"), &raw).unwrap();
         let cue = touch(t.path(), "s.cue", "FILE \"s.bin\" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n");
         let run = |name: &str, title_fixes: bool, fps_unlock: bool, ntsc_60hz: bool| {
             let output = t.path().join(name).join("EBOOT.PBP");
-            let disc = DiscInput { path: cue.clone(), disc_id: Some("SLES-02895".into()), title_fixes, fps_unlock, ntsc_60hz, ..Default::default() };
+            let patch_choice = vec![("Adaptive VSync (a late frame does not wait)".to_owned(), fps_unlock)];
+            let disc = DiscInput { path: cue.clone(), disc_id: Some("SLES-02895".into()), title_fixes, fps_unlock, ntsc_60hz, patch_choice, ..Default::default() };
             convert(&ConvertRequest { discs: vec![disc], patches: PatchDb::builtin().clone(), title: "T".into(), output: output.clone(), donor: None, artwork: Artwork::default(), level: 1 }, &()).unwrap();
             let out = t.path().join(name).join("x");
             extract(&output, &out, &()).unwrap();
@@ -1041,8 +1053,18 @@ mod tests {
         let s21: &[u8; SECTOR] = on[21 * SECTOR..22 * SECTOR].try_into().unwrap();
         assert_eq!(&s21[24 + 16..24 + 20], &[0, 0, 5, 0x24], "addiu a1,zero,0 (NTSC)");
         assert!(verify_edc(s21));
+        // Adaptive VSync: blez -> nop, sltiu v1,a0,1 / addu v0,v0,v1 (target last+n, at least 1),
+        // budget a1 = n (at least 1), the second wait for the next vblank dropped.
+        let s22: &[u8; SECTOR] = on[22 * SECTOR..23 * SECTOR].try_into().unwrap();
+        let v = |i: usize| u32::from_le_bytes(s22[24 + 0x670 + 4 * i..28 + 0x670 + 4 * i].try_into().unwrap());
+        let mut want = VSYNC;
+        for (i, w) in [(3, 0), (7, 0x2C83_0001), (8, 0x0043_1021), (14, 0x2405_0001), (15, 0x0080_2821), (25, 0)] {
+            want[i] = w;
+        }
+        assert_eq!((0..27).map(v).collect::<Vec<_>>(), want, "adaptive VSync");
+        assert!(verify_edc(s22));
         let diff = on[..raw.len()].iter().zip(&raw).filter(|(a, b)| a != b).count();
-        assert!(diff <= 6 + 2 * (4 + 276), "only 6 code bytes + EDC/ECC change ({diff} bytes)");
+        assert!(diff <= 6 + 24 + 3 * (4 + 276), "only the code bytes + EDC/ECC change ({diff} bytes)");
 
         // Without 60 Hz the config is the built-in one, untouched.
         let (_, cfg_50) = run("50", true, false, false);
