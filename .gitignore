@@ -3,3 +3,24 @@
 *.PBP
 
 !/resources/BASE.PBP
+
+# Release staging and the converter's scratch folders
+/dist
+.psx2psp-work-*/
+
+# Editors and IDEs
+.idea/
+.vscode/
+*.swp
+*~
+
+# Leftovers
+*.old
+*.bak
+*.orig
+*.rej
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini

@@ -1,78 +1,80 @@
-# Confronto: PSX2PSP-Reborn vs PSXPackager, PSX2PSP-Enhanced, pop-fe
+# PSX2PSP-Reborn vs PSXPackager, PSX2PSP-Enhanced and pop-fe
 
-Stato al 2026-11-12. Fonti:
-- i repository pubblici dei tre progetti (sorgenti, README, release);
-- il codice di questo workspace, con i test che dimostrano ogni ✓ nostro.
+State as of 2026-11-13. Sources:
+- the public repositories of the three projects (sources, READMEs, releases);
+- the code of this workspace, with the tests behind each of our ✓.
 
-Legenda:
-- ✓ supportato;
-- ◐ parziale;
-- ✗ assente;
-- *test* = coperto da un test automatico in questo repo.
-- ? = non verificato nelle fonti lette: da controllare prima di usarlo come argomento.
+Legend: ✓ supported · ◐ partial · ✗ absent · *test* = covered by an automated test in this repo ·
+? = not verified in the sources read; check it before using it as an argument.
 
-## Matrice delle funzionalità
+## Feature matrix
 
-| Funzionalità | **Reborn** | PSXPackager | PSX2PSP-Enhanced | pop-fe |
+| Feature | **Reborn** | PSXPackager | PSX2PSP-Enhanced | pop-fe |
 |---|---|---|---|---|
-| Linguaggio / runtime | Rust nativo, binario unico | C# / .NET (WPF) | Python + `popstation.dll` | Python |
+| Language / runtime | native Rust, single binary | C# / .NET (WPF) | Python + `popstation.dll` | Python |
 | Windows / Linux / macOS | ✓ / ✓ / ✓ | ✓ / ? / ? | ✓ / ✗ / ✗ | ✓ / ✓ / ? |
-| BIN/CUE → EBOOT single-disc | ✓ *test bit-exact* | ✓ | ✓ | ✓ |
-| Multi-disco PSTITLEIMG (2–5) | ✓ *test, costanti popstation* | ✓ (m3u) | ◐ fino a 4 | ✓ |
-| Estrazione EBOOT → BIN/CUE | ✓ *test bit-exact* | ✓ | ? | ? |
-| **BASE.PBP + DATA.PSP inclusi** | ✓ incorporati nel binario | ✓ | ✓ | ✓ |
-| Patch PPF 1/2/3 | ✓ *test* | ? | ? | ✓ |
-| Patch PAL→NTSC | ✓ preset `patches.ini` (6 regole) + PPF per titolo, *test end-to-end* | ✗ | ✓ `patches.ini` | ◐ |
-| Artwork da qualsiasi immagine (auto-fit) | ✓ | ? | ? | ? |
-| **Anteprima XMB animata (onda) Game/Save/Boot** | ✓ shader WGSL, *test GPU* | ◐ onda, senza le 3 schermate | ✗ | ✗ |
-| **ICON1.PMF generato** | ✓ **muxer PSMF nativo**, *test vs sample Sony* | ✗ | ✗ (solo GIF) | ✗ |
-| **ICON1 animato in anteprima** | ✓ *test GPU* | ✗ | ✗ | ✗ |
-| SND0.AT3 da file audio/video | ✓ | ✗ | ✓ (at3tool) | ✓ (atracdenc) |
-| SND0 da YouTube | ✓ yt-dlp | ✗ | ✓ | ✓ |
-| **Taglio dei secondi (inizio/fine)** | ✓ qualsiasi intervallo | ✗ | ? | ◐ (taglio fisso 59 s) |
-| **YouTube → ICON1 + SND0 dallo stesso clip** | ✓ | ✗ | ✗ | ✗ |
-| **Solo colonna sonora, staccata dal video** | ✓ modalità `SND0 only` | ✗ | ✓ | ✓ |
-| **Budget XMB 500 KB condiviso, bitrate auto-adattato** | ✓ ICON1 adattato a ciò che resta | ✗ | ✗ | ✗ |
-| Download dei tool con un clic | ✓ ffmpeg, yt-dlp, atracdenc | n/a | ? | ? |
-| Formati in ingresso CHD / ZIP / 7z / RAR | ✗ | ✓ | ✗ | ✓ CHD |
-| Database dei giochi (titolo e copertina automatici) | ◐ titolo e save ID (10 109 seriali), copertine no | ✓ | ✗ | ✓ Redump |
-| Patch LibCrypt | ✗ | ✗ | ✗ | ✓ |
-| Target PS3 / PS Classic / Vita bubble | ✗ | ✗ | ✗ | ✓ |
-| Compressione parallela in streaming | ✓ rayon | ? | ? | ? |
-| Annullamento, log e UI mai bloccata | ✓ | ? | ? | ? |
+| BIN/CUE → EBOOT, single disc | ✓ *test, bit-exact* | ✓ | ✓ | ✓ |
+| Multi-disc PSTITLEIMG (2–5) | ✓ *test, popstation constants* | ✓ (m3u) | ◐ up to 4 | ✓ |
+| EBOOT → BIN/CUE extraction | ✓ *test, bit-exact* | ✓ | ? | ? |
+| **BASE.PBP + DATA.PSP included** | ✓ built into the binary | ✓ | ✓ | ✓ |
+| PPF 1/2/3 patches | ✓ *test* | ? | ? | ✓ |
+| PAL→NTSC | ✓ PSX2PSP's 6 generic rules, gated on the video-mode fix, *test end-to-end*; per-game 60 Hz switches | ✗ | ✓ `patches.ini` | ◐ |
+| Per-game POPS configs | ✓ ~1,800 games imported from pop-fe, user-overridable | ? | ? | ✓ |
+| LibCrypt | ✓ subchannel table in PSISOIMG (230 codes), *test*; cracks opt-in | ✗ | ✗ | ✓ |
+| Per-dump PPF fixes (track-1 MD5) | ✓ *test* | ? | ? | ✓ |
+| Code patches with loader CRC recomputed | ✓ *test* | ? | ? | ? |
+| User patch database (INI) | ✓ portable or per-user `patches.ini` | ? | ✓ `patches.ini` | ? |
+| Artwork from any image (auto-fit) | ✓ | ? | ? | ? |
+| **Animated XMB preview (wave), Game/Save/Boot** | ✓ WGSL shader, *GPU test* | ◐ wave, without the 3 screens | ✗ | ✗ |
+| **ICON1.PMF generated** | ✓ **native PSMF muxer**, *test vs Sony layout* | ✗ | ✗ (GIF only) | ✗ |
+| **Animated ICON1 in the preview** | ✓ *GPU test* | ✗ | ✗ | ✗ |
+| SND0.AT3 from an audio/video file | ✓ | ✗ | ✓ (at3tool) | ✓ (atracdenc) |
+| SND0 from YouTube | ✓ yt-dlp | ✗ | ✓ | ✓ |
+| **Start/end trimming** | ✓ any span | ✗ | ? | ◐ (fixed 59 s cut) |
+| **YouTube → ICON1 + SND0 from the same clip** | ✓ | ✗ | ✗ | ✗ |
+| **Soundtrack only, detached from the video** | ✓ `SND0 only` mode | ✗ | ✓ | ✓ |
+| **Shared 500 KB XMB budget, bitrate fitted** | ✓ ICON1 fitted to what is left | ✗ | ✗ | ✗ |
+| One-click tool download | ✓ ffmpeg, yt-dlp, atracdenc | n/a | ? | ? |
+| CHD / ZIP / 7z / RAR input | ✗ | ✓ | ✗ | ✓ CHD |
+| Game database (automatic title and cover) | ◐ title (10,109 serials), no covers | ✓ | ✗ | ✓ Redump |
+| PS3 / PS Classic / Vita bubble targets | ✗ | ✗ | ✗ | ✓ |
+| Parallel streaming compression | ✓ rayon | ? | ? | ? |
+| Cancel, log, UI never blocked | ✓ | ? | ? | ? |
 
-## Dove siamo gli unici
+## Where we are the only one
 
-1. **ICON1.PMF dal nulla.** Il muxer PSMF è nativo: pack MPEG-PS da 2048 B, tabella AU 0xBF per
-   GOP, PTS/DTS ed estensione P-STD.
-   - Sul sample Sony (605 frame) il re-mux è bit-identico nel video, nelle tabelle AU e nei PTS.
-   - Nessuno degli altri tre genera ICON1: si fermano al passthrough o a una GIF.
-2. **Clip editor unico.** Da un URL o da un file si scelgono inizio e fine, poi si ottiene:
-   - ICON1 e SND0 insieme;
-   - oppure solo ICON1;
-   - oppure solo la colonna sonora, con ATRAC3 a 66, 105 o 132 kbps.
+1. **ICON1.PMF from scratch.** The PSMF muxer is native: 2048-byte MPEG-PS packs, the 0xBF AU
+   table per GOP, PTS/DTS and the P-STD extension.
+   - On Sony's sample (605 frames) the re-mux is bit-identical in its video, AU tables and PTS.
+   - None of the other three generates ICON1: they stop at passthrough or a GIF.
+2. **A real clip editor.** From a URL or a file, pick start and end, then get:
+   - ICON1 and SND0 together;
+   - or ICON1 alone;
+   - or the soundtrack alone, as ATRAC3 at 66, 105 or 132 kbps.
 
-   Il budget di 500 KB della XMB viene diviso automaticamente: SND0 è CBR, quindi si fa per
-   primo, e il video riceve il resto con un bitrate ricalcolato a ogni tentativo.
-3. **Anteprima WYSIWYG animata.** L'onda XMB, i layer e l'ICON1 che scorre nello slot ICON0 sono
-   resi su GPU, con le tre schermate Game, Save e Boot.
-4. **Tutto compreso.** Il donor (`BASE.PBP` e `DATA.PSP`) è incorporato nel binario. I tool
-   esterni si installano con un clic in `<exe>/tools`: FFmpeg GPL con libx264, yt-dlp e
-   atracdenc, tutti dalle release ufficiali.
+   The XMB's 500 KB budget is split automatically: SND0 is constant-rate, so it goes first, and
+   the video gets the rest, with its bitrate recomputed on every attempt.
+3. **Animated WYSIWYG preview.** The XMB wave, the layers and the ICON1 playing in the ICON0 slot
+   are rendered on the GPU, with the three screens Game, Save and Boot.
+4. **Everything included.** The donor (`BASE.PBP` and `DATA.PSP`) is built into the binary. The
+   external tools install with one click into `<exe>/tools`: FFmpeg GPL with libx264, yt-dlp and
+   atracdenc, all from their official releases.
+5. **Verified per-game code patches.** Each patch comes from reverse engineering, with its exact
+   pattern and expected hit count, and executables guarded by a loader CRC get it recomputed.
 
-## Lacune ancora aperte
+## Gaps still open
 
-| Lacuna | Chi ce l'ha | Costo stimato |
+| Gap | Who has it | Estimated cost |
 |---|---|---|
-| Input CHD e archivi | PSXPackager, pop-fe | medio: decoder CHD (zstd/lzma/flac) e lettura degli archivi |
-| Database dei giochi e copertine automatiche | PSXPackager (`gameInfo.db`), pop-fe (Redump) | medio: va ricostruito su una fonte con licenza compatibile |
-| Patch LibCrypt | pop-fe | basso–medio: tabella dei settori e chiavi per titolo |
-| Set di patch PAL→NTSC pronto (`patches.ini`) | PSX2PSP-Enhanced | basso: import del formato ini nel pattern patcher |
-| Target PS3 / PS Classic | pop-fe | alto, ed è fuori dallo scope di AGENTS.md |
+| CHD and archive input | PSXPackager, pop-fe | medium: a CHD decoder (zstd/lzma/flac) and archive reading |
+| Game database with automatic covers | PSXPackager (`gameInfo.db`), pop-fe (Redump) | medium: needs a source with a compatible licence |
+| Import of PSX2PSP's own `patches.ini` | PSX2PSP-Enhanced | low: map its format onto the pattern patcher |
+| Batch mode (N games → N EBOOTs) | PSX2PSP, PSXPackager | low–medium |
+| PS3 / PS Classic targets | pop-fe | high, and outside this project's scope |
 
-## Non ancora verificato
+## Not yet verified on hardware
 
-- **Hardware reale.** Nessun EBOOT è stato ancora avviato su PSP o Vita, inclusi gli ICON1
-  generati. La struttura è validata contro i sample Sony, non ancora contro il firmware.
-- **atracdenc 0.2.3 e yt-dlp.** Sono provisionati dal codice, ma non scaricati né eseguiti su
-  questa macchina: il download richiede il consenso dell'Host.
+- **Verified:** a PAL title (Sheep, Dog 'n' Wolf) with its POPS config, code patches and 60 Hz
+  switch boots and plays on a real PSP.
+- **Still to confirm:** a PS Vita; disc swapping in a multi-disc EBOOT; a LibCrypt title; the
+  generated ICON1.PMF and SND0.AT3 on the XMB (their structure matches Sony's samples).

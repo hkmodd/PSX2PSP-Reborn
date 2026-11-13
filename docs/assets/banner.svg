@@ -1,0 +1,196 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 560" width="1600" height="560" role="img" aria-labelledby="t d">
+  <title id="t">PSX2PSP-Reborn</title>
+  <desc id="d">PS1 discs to PSP and PS Vita EBOOTs, natively in Rust, with a live GPU-rendered XMB preview.</desc>
+  <defs>
+    <radialGradient id="bg" cx="74%" cy="38%" r="78%">
+      <stop offset="0" stop-color="#132a66"/>
+      <stop offset=".42" stop-color="#081230"/>
+      <stop offset="1" stop-color="#03050c"/>
+    </radialGradient>
+    <linearGradient id="shade" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#03050c" stop-opacity=".92"/>
+      <stop offset=".45" stop-color="#03050c" stop-opacity=".35"/>
+      <stop offset="1" stop-color="#03050c" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="ribbon" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2f6bff" stop-opacity=".30"/>
+      <stop offset="1" stop-color="#2f6bff" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="waveline" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#7fb2ff" stop-opacity="0"/>
+      <stop offset=".3" stop-color="#7fb2ff" stop-opacity=".75"/>
+      <stop offset=".8" stop-color="#bcd6ff" stop-opacity=".9"/>
+      <stop offset="1" stop-color="#7fb2ff" stop-opacity=".2"/>
+    </linearGradient>
+    <linearGradient id="reborn" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#6fb0ff"/>
+      <stop offset=".36" stop-color="#f58fd0"/>
+      <stop offset=".68" stop-color="#ff5a6e"/>
+      <stop offset="1" stop-color="#3fe0a8"/>
+    </linearGradient>
+    <linearGradient id="rule" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#6fb0ff" stop-opacity="0"/>
+      <stop offset="1" stop-color="#6fb0ff"/>
+    </linearGradient>
+    <linearGradient id="body" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#262d42"/>
+      <stop offset=".5" stop-color="#141927"/>
+      <stop offset="1" stop-color="#0a0d16"/>
+    </linearGradient>
+    <linearGradient id="screen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2450c4"/>
+      <stop offset=".6" stop-color="#132f86"/>
+      <stop offset="1" stop-color="#0b1b52"/>
+    </linearGradient>
+    <linearGradient id="cover" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ff6fae"/>
+      <stop offset=".55" stop-color="#8a5cff"/>
+      <stop offset="1" stop-color="#2b7bff"/>
+    </linearGradient>
+    <linearGradient id="gloss" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity=".16"/>
+      <stop offset=".45" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <pattern id="scan" width="4" height="4" patternUnits="userSpaceOnUse">
+      <rect width="4" height="1" fill="#6fb0ff" fill-opacity=".035"/>
+    </pattern>
+    <pattern id="dots" width="28" height="28" patternUnits="userSpaceOnUse">
+      <circle cx="2" cy="2" r="1.2" fill="#6fb0ff" fill-opacity=".16"/>
+    </pattern>
+    <radialGradient id="dotfade" cx="20%" cy="45%" r="60%">
+      <stop offset="0" stop-color="#fff"/>
+      <stop offset="1" stop-color="#fff" stop-opacity="0"/>
+    </radialGradient>
+    <mask id="dotmask"><rect width="1600" height="560" fill="url(#dotfade)"/></mask>
+    <filter id="glow" x="-20%" y="-40%" width="140%" height="180%">
+      <feGaussianBlur in="SourceGraphic" stdDeviation="7" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="soft" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="3"/>
+    </filter>
+    <filter id="halo" x="-25%" y="-40%" width="150%" height="180%">
+      <feDropShadow dx="0" dy="0" stdDeviation="22" flood-color="#2b6bff" flood-opacity=".6"/>
+      <feDropShadow dx="0" dy="18" stdDeviation="18" flood-color="#000" flood-opacity=".6"/>
+    </filter>
+    <clipPath id="lcd"><rect x="132" y="40" width="336" height="190" rx="3"/></clipPath>
+  </defs>
+
+  <!-- backdrop -->
+  <rect width="1600" height="560" fill="url(#bg)"/>
+  <rect width="1600" height="560" fill="url(#dots)" mask="url(#dotmask)"/>
+
+  <!-- XMB wave -->
+  <g fill="none">
+    <path d="M0 440 C 260 380, 520 520, 800 450 S 1300 350, 1600 420 L1600 560 L0 560 Z" fill="url(#ribbon)"/>
+    <path d="M0 470 C 280 420, 560 540, 820 475 S 1320 385, 1600 450 L1600 560 L0 560 Z" fill="url(#ribbon)" opacity=".7"/>
+    <g stroke="url(#waveline)" stroke-linecap="round">
+      <path d="M0 440 C 260 380, 520 520, 800 450 S 1300 350, 1600 420" stroke-width="2.4" filter="url(#glow)"/>
+      <path d="M0 452 C 270 396, 530 526, 806 459 S 1306 364, 1600 431" stroke-width="1" opacity=".7"/>
+      <path d="M0 463 C 276 408, 540 532, 812 467 S 1312 376, 1600 441" stroke-width="1" opacity=".55"/>
+      <path d="M0 474 C 282 420, 552 538, 818 475 S 1318 388, 1600 451" stroke-width="1" opacity=".42"/>
+      <path d="M0 486 C 290 432, 564 544, 824 484 S 1324 400, 1600 462" stroke-width="1.6" opacity=".6"/>
+      <path d="M0 410 C 300 470, 620 380, 900 420 S 1360 470, 1600 390" stroke-width="1" opacity=".35"/>
+    </g>
+  </g>
+  <rect width="1600" height="560" fill="url(#shade)"/>
+  <rect width="1600" height="560" fill="url(#scan)"/>
+
+  <!-- PlayStation face-button glyphs, floating -->
+  <g fill="none" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" filter="url(#glow)" opacity=".55">
+    <path d="M1480 46 l26 44 h-52 z" stroke="#3fe0a8"/>
+    <circle cx="1556" cy="168" r="20" stroke="#ff5a6e"/>
+    <path d="M846 58 l30 30 M876 58 l-30 30" stroke="#6fb0ff"/>
+    <rect x="1438" y="470" width="38" height="38" rx="3" stroke="#f58fd0"/>
+  </g>
+
+  <!-- a PSP showing its XMB -->
+  <g transform="translate(925 132) rotate(-4 300 135)" filter="url(#halo)">
+    <!-- shoulders -->
+    <path d="M60 18 Q 110 -6 190 2" stroke="#3b4766" stroke-width="7" fill="none" stroke-linecap="round"/>
+    <path d="M540 18 Q 490 -6 410 2" stroke="#3b4766" stroke-width="7" fill="none" stroke-linecap="round"/>
+    <!-- body -->
+    <rect x="0" y="0" width="600" height="270" rx="122" fill="url(#body)" stroke="#45527a" stroke-width="1.6"/>
+    <rect x="0" y="0" width="600" height="270" rx="122" fill="url(#gloss)"/>
+    <!-- screen -->
+    <rect x="120" y="28" width="360" height="214" rx="12" fill="#04060b" stroke="#2a3350"/>
+    <g clip-path="url(#lcd)">
+      <rect x="132" y="40" width="336" height="190" fill="url(#screen)"/>
+      <path d="M132 168 C 190 140, 250 200, 320 170 S 420 140, 468 160 L468 230 L132 230 Z" fill="#ffffff" fill-opacity=".08"/>
+      <path d="M132 168 C 190 140, 250 200, 320 170 S 420 140, 468 160" stroke="#ffffff" stroke-opacity=".55" stroke-width="1.4" fill="none"/>
+      <path d="M132 176 C 196 152, 256 206, 326 178 S 424 150, 468 168" stroke="#ffffff" stroke-opacity=".3" stroke-width="1" fill="none"/>
+      <path d="M132 184 C 200 162, 262 212, 330 186 S 428 160, 468 176" stroke="#ffffff" stroke-opacity=".18" stroke-width="1" fill="none"/>
+      <!-- XMB clock -->
+      <text x="458" y="56" text-anchor="end" font-family="Segoe UI, Inter, Helvetica Neue, Arial, sans-serif" font-size="10" fill="#ffffff" fill-opacity=".85">12/11  20:26</text>
+      <!-- ICON0 -->
+      <rect x="146" y="107" width="101" height="56" rx="3" fill="url(#cover)"/>
+      <rect x="146" y="107" width="101" height="56" rx="3" fill="url(#gloss)"/>
+      <g fill="none" stroke="#ffffff" stroke-width="2" stroke-opacity=".9">
+        <path d="M168 128 l8 13 h-16 z"/>
+        <circle cx="190" cy="135" r="7"/>
+        <path d="M205 129 l12 12 M217 129 l-12 12"/>
+        <rect x="224" y="129" width="12" height="12"/>
+      </g>
+      <!-- PIC0: title and info -->
+      <text x="262" y="122" font-family="Segoe UI, Inter, Helvetica Neue, Arial, sans-serif" font-size="15" font-weight="600" fill="#ffffff">My PS1 Classic</text>
+      <rect x="262" y="132" width="120" height="5" rx="2.5" fill="#ffffff" fill-opacity=".55"/>
+      <rect x="262" y="143" width="88" height="5" rx="2.5" fill="#ffffff" fill-opacity=".35"/>
+      <rect x="262" y="154" width="104" height="5" rx="2.5" fill="#ffffff" fill-opacity=".25"/>
+      <rect x="132" y="40" width="336" height="190" fill="url(#gloss)"/>
+    </g>
+    <!-- d-pad and analog nub -->
+    <g fill="#1c2235" stroke="#45527a" stroke-width="1.4">
+      <path d="M54 104 h22 v20 h20 v22 h-20 v20 h-22 v-20 h-20 v-22 h20 z"/>
+      <circle cx="65" cy="206" r="15"/>
+    </g>
+    <circle cx="65" cy="206" r="9" fill="#2a3150"/>
+    <!-- face buttons -->
+    <g stroke="#45527a" stroke-width="1.4" fill="#151a28">
+      <circle cx="535" cy="104" r="15"/>
+      <circle cx="566" cy="135" r="15"/>
+      <circle cx="535" cy="166" r="15"/>
+      <circle cx="504" cy="135" r="15"/>
+    </g>
+    <g fill="none" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M535 96 l7 12 h-14 z" stroke="#3fe0a8"/>
+      <circle cx="566" cy="135" r="7" stroke="#ff5a6e"/>
+      <path d="M529 160 l12 12 M541 160 l-12 12" stroke="#6fb0ff"/>
+      <rect x="498" y="129" width="12" height="12" stroke="#f58fd0"/>
+    </g>
+    <!-- system buttons -->
+    <g fill="#1c2235" stroke="#45527a" stroke-width="1.2">
+      <rect x="150" y="250" width="34" height="9" rx="4.5"/>
+      <rect x="250" y="250" width="22" height="9" rx="4.5"/>
+      <rect x="286" y="250" width="28" height="9" rx="4.5"/>
+      <rect x="328" y="250" width="22" height="9" rx="4.5"/>
+      <rect x="416" y="250" width="34" height="9" rx="4.5"/>
+    </g>
+  </g>
+
+  <!-- corner brackets -->
+  <path d="M44 78 V30 H92" fill="none" stroke="#6fb0ff" stroke-opacity=".6" stroke-width="2"/>
+  <path d="M1556 482 V530 H1508" fill="none" stroke="#6fb0ff" stroke-opacity=".6" stroke-width="2"/>
+
+  <!-- copy -->
+  <g font-family="Segoe UI, Inter, Helvetica Neue, Arial, sans-serif">
+    <rect x="110" y="133" width="64" height="2" fill="url(#rule)"/>
+    <text x="190" y="141" font-size="19" font-weight="700" letter-spacing="5.5" fill="#8cc0ff">PS1 → PSP · PS VITA · POPS EBOOT</text>
+
+    <text x="104" y="262" font-size="118" font-weight="900" fill="#eef4ff" filter="url(#glow)" letter-spacing="-1">PSX2PSP</text>
+    <text x="110" y="330" font-size="56" font-weight="800" letter-spacing="22" fill="url(#reborn)" filter="url(#glow)">REBORN</text>
+
+    <text x="110" y="382" font-size="25" font-weight="500" fill="#b4c6e4">PS1 discs to PSP &amp; PS Vita EBOOTs, natively in <tspan fill="#ffffff" font-weight="700">Rust</tspan>,</text>
+    <text x="110" y="414" font-size="25" font-weight="500" fill="#b4c6e4">with a <tspan fill="#ffffff" font-weight="700">live GPU-rendered XMB</tspan> preview.</text>
+
+    <g font-size="15" font-weight="700" letter-spacing="2" fill="#e4efff">
+      <path d="M110 444 h222 l12 12 v26 h-222 l-12 -12 z" fill="#0c1a3a" fill-opacity=".75" stroke="#6fb0ff" stroke-opacity=".5"/>
+      <text x="130" y="468" textLength="196" lengthAdjust="spacing"><tspan fill="#3fe0a8">◆ </tspan>BIT-PERFECT EBOOT</text>
+      <path d="M360 444 h222 l12 12 v26 h-222 l-12 -12 z" fill="#0c1a3a" fill-opacity=".75" stroke="#6fb0ff" stroke-opacity=".5"/>
+      <text x="380" y="468" textLength="196" lengthAdjust="spacing"><tspan fill="#ff5a6e">◆ </tspan>MULTI-DISC × 5</text>
+      <path d="M610 444 h222 l12 12 v26 h-222 l-12 -12 z" fill="#0c1a3a" fill-opacity=".75" stroke="#6fb0ff" stroke-opacity=".5"/>
+      <text x="630" y="468" textLength="196" lengthAdjust="spacing"><tspan fill="#f58fd0">◆ </tspan>YOUTUBE → ICON1</text>
+    </g>
+
+    <text x="110" y="526" font-size="14" font-weight="600" letter-spacing="4.5" fill="#b4c6e4" fill-opacity=".7">RUST · WGPU · ICED · WINDOWS · LINUX · MACOS</text>
+  </g>
+</svg>

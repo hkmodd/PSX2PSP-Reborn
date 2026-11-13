@@ -1,0 +1,127 @@
+name: Release
+
+# Push a tag `vX.Y.Z` (matching the psx2psp-app version) to build every binary and publish them
+# as a GitHub Release. The in-app updater relies on the asset names below and on SHA256SUMS.txt:
+# do not rename them.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    name: Tag matches the app version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Compare
+        shell: bash
+        run: |
+          app=$(cargo metadata --no-deps --format-version 1 --locked \
+            | jq -r '.packages[] | select(.name == "psx2psp-app") | .version')
+          echo "tag ${GITHUB_REF_NAME}, psx2psp-app ${app}"
+          if [ "v${app}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match psx2psp-app version ${app}"
+            exit 1
+          fi
+
+  build:
+    name: Build (${{ matrix.suffix }})
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: windows-latest
+            suffix: windows-x86_64
+            ext: .exe
+          # 22.04: the oldest glibc of the hosted runners, so the binary runs on more distros.
+          - os: ubuntu-22.04
+            suffix: linux-x86_64
+            ext: ""
+          # macos-14 and later are Apple Silicon runners.
+          - os: macos-14
+            suffix: macos-aarch64
+            ext: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Linux system libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libasound2-dev libudev-dev \
+            libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxi-dev libxrandr-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+
+      - name: Build GUI and CLI
+        run: cargo build --release --locked -p psx2psp-app -p psx2psp-engine
+
+      - name: Name the binaries
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/release/psx2psp-reborn${{ matrix.ext }}" "dist/psx2psp-reborn-${{ matrix.suffix }}${{ matrix.ext }}"
+          cp "target/release/psx2psp${{ matrix.ext }}" "dist/psx2psp-${{ matrix.suffix }}${{ matrix.ext }}"
+          chmod +x dist/*
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.suffix }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish the release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
+          path: dist
+          merge-multiple: true
+
+      - name: Check the asset set and write SHA256SUMS.txt
+        shell: bash
+        working-directory: dist
+        run: |
+          expected="psx2psp-linux-x86_64
+          psx2psp-macos-aarch64
+          psx2psp-reborn-linux-x86_64
+          psx2psp-reborn-macos-aarch64
+          psx2psp-reborn-windows-x86_64.exe
+          psx2psp-windows-x86_64.exe"
+          actual=$(ls -1 | LC_ALL=C sort)
+          if [ "$(echo "$expected" | sed 's/^ *//' | LC_ALL=C sort)" != "$actual" ]; then
+            echo "::error::unexpected asset set:"; echo "$actual"; exit 1
+          fi
+          # sha256sum format, written explicitly: "<lowercase hex>  <file name>" (two spaces,
+          # no "*" binary marker), one line per binary.
+          for f in $actual; do
+            printf '%s  %s\n' "$(sha256sum < "$f" | cut -d' ' -f1)" "$f"
+          done > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
