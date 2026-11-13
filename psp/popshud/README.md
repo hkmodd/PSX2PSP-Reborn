@@ -7,7 +7,7 @@ A diagnostic tool for tuning per-game settings, not part of the release.
 FPS 30 EMU 100% CPU  85%
 ```
 
-Refreshed every second in the top left corner of the picture:
+Refreshed every second in the bottom left corner of the picture:
 
 | Field | Meaning | Source |
 |---|---|---|
@@ -41,6 +41,11 @@ The start-module handler of systemctrl catches the `pops` module and keeps its g
 thread wakes at each vblank, reads two POPS globals (gp+0x360C emulated cycles, gp+0x3610
 display start; same offsets in pops_01g..09g) and draws the line into the frame buffer on
 screen. POPS itself is not modified.
+
+POPS redraws the whole picture with the GE right after every vblank, so a line drawn at the
+vblank is erased before the screen shows it. The thread draws 12 ms after the vblank, at the
+bottom of the screen, which the PSP scans 15-16 ms after the vblank. When the game runs below
+full speed (EMU under 100) POPS's picture can land in between, and the line flickers.
 
 ## Build and test
 

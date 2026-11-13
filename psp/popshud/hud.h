@@ -34,7 +34,8 @@ int hud_height(void);
 /*
  * Draws `text` in white on a black box whose top left corner is (x, y). `stride` is the
  * buffer width in pixels, `format` a PSP display pixel format: 0 = 565, 1 = 5551, 2 = 4444
- * (16 bits per pixel), 3 = 8888 (32 bits). Characters without a glyph are drawn as spaces.
+ * (16 bits per pixel), 3 = 8888 (32 bits). Characters without a glyph are drawn as spaces;
+ * at most HUD_TEXT_MAX - 1 characters are drawn.
  */
 void hud_draw(void *fb, int stride, int format, int x, int y, const char *text);
 

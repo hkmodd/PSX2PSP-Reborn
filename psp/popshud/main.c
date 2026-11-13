@@ -1,7 +1,7 @@
 /*
  * popshud: measurement overlay for POPS on ARK-4 / ARK-5 (diagnostic, not for release).
  *
- * Draws one line in the top left corner of the PS1 picture, refreshed every second:
+ * Draws one line in the bottom left corner of the PS1 picture, refreshed every second:
  *   FPS  frames the game showed: changes of its GP1(05h) display start, sampled each vblank
  *   EMU  emulated time over real time: POPS's emulated cycle count at the last emulated
  *        vblank, over the real microseconds, at 33.8688 MHz (100% = full speed)
@@ -11,8 +11,8 @@
  *
  * Nothing in POPS is written. The two counters are POPS globals at fixed offsets from its gp,
  * the same in pops_01g..09g of firmware 6.61 (written at 0x11920 in 01g, 0x11930 in 02g/03g,
- * 0x119c0 in 04g/07g/09g). A kernel thread reads them after each vblank and draws into the
- * frame buffer on screen.
+ * 0x119c0 in 04g/07g/09g). A kernel thread reads them after each vblank and, once POPS has
+ * drawn its picture of that frame, draws into the frame buffer on screen.
  */
 #include <pspsdk.h>
 #include <pspkernel.h>
@@ -41,6 +41,18 @@ STMOD_HANDLER sctrlHENSetStartModuleHandler(STMOD_HANDLER handler);
 
 #define GP_VBLANK_CYCLES 0x360C /* emulated cycle count at the last emulated vblank */
 #define GP_DISPLAY_START 0x3610 /* GP1(05h) display start: x (low half), y (high half) */
+
+/*
+ * POPS redraws the whole picture with the GE on every frame, right after the vblank: its
+ * emulation thread (priority 0x11) waits in sceDisplayWaitVblankStartCB and then sends the
+ * display list (0x118e0 in pops_01g). Drawn at the vblank, the box is erased before the
+ * screen shows it. It is drawn DRAW_DELAY_US later instead, in the bottom left corner: the
+ * PSP scans line n about 0.8 + n * 0.0583 ms after the vblank, so the box (lines 244-263)
+ * goes out at 15.0-16.2 ms. When POPS runs behind real time its picture can land at any
+ * moment, and the box then misses the frames where it lands between the two.
+ */
+#define DRAW_DELAY_US 12000
+#define HUD_X 8
 
 static STMOD_HANDLER previous;
 static volatile u32 pops_gp;
@@ -109,10 +121,13 @@ static int hud_thread(SceSize args, void *argp)
             idle0 = idle;
             flips = 0;
         }
+        /* After POPS's picture of this frame, before the scan reaches the box. */
+        sceKernelDelayThread(DRAW_DELAY_US);
         if (sceDisplayGetFrameBuf(&fb, &stride, &format, PSP_DISPLAY_SETBUF_IMMEDIATE) >= 0 && fb &&
             stride >= 480 && format >= 0 && format <= 3)
             /* Uncached alias: the display reads memory, not the CPU cache. */
-            hud_draw((void *)(((u32)fb & 0x1FFFFFFF) | 0x40000000), stride, format, 8, 8, text);
+            hud_draw((void *)(((u32)fb & 0x1FFFFFFF) | 0x40000000), stride, format, HUD_X,
+                     272 - HUD_X - hud_height(), text);
     }
     return 0;
 }

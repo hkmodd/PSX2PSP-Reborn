@@ -115,38 +115,40 @@ static const unsigned char *glyph(char c)
     return 0;
 }
 
-/* 1 when pixel (px, py) of the text box is lit. */
-static int lit(const char *text, int len, int px, int py)
-{
-    const unsigned char *g;
-    int col, row;
-
-    px -= PAD;
-    py -= PAD;
-    if (px < 0 || py < 0 || py >= CELL_H || px >= len * CELL_W)
-        return 0;
-    col = px % CELL_W / SCALE;
-    row = py / SCALE;
-    g = col < 5 ? glyph(text[px / CELL_W]) : 0;
-    return g && ((g[row] >> (4 - col)) & 1);
-}
-
+/*
+ * The box is drawn on every frame, so the glyphs are looked up once and each row is built
+ * in `on` before it is written: the frame buffer only sees one store per pixel.
+ */
 void hud_draw(void *fb, int stride, int format, int x, int y, const char *text)
 {
-    int len = 0, w, h = hud_height(), px, py;
+    const unsigned char *g[HUD_TEXT_MAX];
+    unsigned char on[HUD_TEXT_MAX * CELL_W + 2 * PAD];
+    int len = 0, w, h = hud_height(), px, py, i, c;
 
-    while (text[len])
+    while (len < HUD_TEXT_MAX - 1 && text[len]) {
+        g[len] = glyph(text[len]);
         len++;
+    }
     w = hud_width(len);
     for (py = 0; py < h; py++) {
+        int row = py - PAD;
+
+        for (px = 0; px < w; px++)
+            on[px] = 0;
+        if (row >= 0 && row < CELL_H)
+            for (i = 0; i < len; i++)
+                if (g[i])
+                    for (c = 0; c < 5 * SCALE; c++)
+                        on[PAD + i * CELL_W + c] =
+                            (unsigned char)((g[i][row / SCALE] >> (4 - c / SCALE)) & 1);
         if (format == 3) {
-            unsigned int *row = (unsigned int *)fb + (y + py) * stride + x;
+            unsigned int *p = (unsigned int *)fb + (y + py) * stride + x;
             for (px = 0; px < w; px++)
-                row[px] = lit(text, len, px, py) ? 0xFFFFFFFFu : 0xFF000000u;
+                p[px] = on[px] ? 0xFFFFFFFFu : 0xFF000000u;
         } else {
-            unsigned short *row = (unsigned short *)fb + (y + py) * stride + x;
+            unsigned short *p = (unsigned short *)fb + (y + py) * stride + x;
             for (px = 0; px < w; px++)
-                row[px] = (unsigned short)(lit(text, len, px, py) ? 0xFFFF : 0x0000);
+                p[px] = (unsigned short)(on[px] ? 0xFFFF : 0x0000);
         }
     }
 }
