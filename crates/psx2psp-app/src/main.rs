@@ -5,6 +5,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod audio;
+mod icons;
 mod style;
 mod worker;
 mod xmb;
@@ -14,11 +15,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use iced::animation::{Animation, Easing};
+use iced::time::Instant;
 use iced::widget::{
-    button, center, column, container, image, pin, progress_bar, responsive, row, scrollable, shader, slider, space, stack, text,
-    text_input, tooltip,
+    button, center, column, container, image, pin, progress_bar, responsive, row, scrollable, sensor, shader, slider, space, stack,
+    text, text_input, tooltip,
 };
-use iced::{Alignment, Color, Element, Fill, Font, Length, Size, Subscription, Task, Theme, event, window};
+use iced::{Alignment, Color, ContentFit, Element, Fill, Font, Length, Size, Subscription, Task, Theme, event, padding, window};
+use icons::Icon;
 use psx2psp_engine::media::images::{self, Slot};
 use psx2psp_engine::core::Monitor;
 use psx2psp_engine::media::clip::{self, ClipMode, ClipRequest, ClipTools};
@@ -53,6 +57,9 @@ fn main() -> iced::Result {
         .title(App::title)
         .theme(App::theme)
         .subscription(App::subscription)
+        .font(include_bytes!("../assets/fonts/Inter-Regular.ttf").as_slice())
+        .font(include_bytes!("../assets/fonts/Inter-Bold.ttf").as_slice())
+        .default_font(style::FONT)
         .window(window::Settings {
             size: Size::new(1320.0, 820.0),
             min_size: Some(Size::new(1000.0, 640.0)),
@@ -90,6 +97,7 @@ struct App {
     tools: Option<Tools>,
     /// Built-in patch database with the user's patches.ini merged on top.
     patches: PatchDb,
+    chrome: Chrome,
 }
 
 struct Disc {
@@ -418,6 +426,11 @@ enum Message {
     ToggleLog,
     Dismiss(u64),
     ToolsDetected(Result<Tools, String>),
+    /// Left panel: expand/collapse a section, its measured height, animation tick, drag-over.
+    Section(usize),
+    SectionSize(usize, Size),
+    Frame(Instant),
+    DragHover(bool),
 }
 
 // ───────────────────────────────── dialogs ────────────────────────────────
@@ -465,6 +478,7 @@ impl App {
             toasts: Vec::new(),
             tools: None,
             patches: loaded.db,
+            chrome: Chrome::new(),
         };
         app.audio.set_active(app.screen == Screen::Game);
         let detect = detect_tools_task();
@@ -484,10 +498,15 @@ impl App {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        event::listen_with(|e, _, _| match e {
+        let events = event::listen_with(|e, _, _| match e {
             iced::Event::Window(window::Event::FileDropped(p)) => Some(Message::FileDropped(p)),
+            iced::Event::Window(window::Event::FileHovered(_)) => Some(Message::DragHover(true)),
+            iced::Event::Window(window::Event::FilesHoveredLeft) => Some(Message::DragHover(false)),
             _ => None,
-        })
+        });
+        // Frame ticks only while a section animates: an idle panel costs nothing.
+        let frames = self.chrome.animating().then(|| window::frames().map(Message::Frame));
+        Subscription::batch(std::iter::once(events).chain(frames))
     }
 
     fn log(&mut self, line: impl Into<String>) {
@@ -886,6 +905,7 @@ impl App {
             }
             Message::ExtractPicked(None) => {}
             Message::FileDropped(p) => {
+                self.chrome.drag = false;
                 let ext = p.extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase();
                 return match ext.as_str() {
                     "pbp" => worker::blocking(move || import(p), Message::Imported),
@@ -919,6 +939,10 @@ impl App {
                     self.tools = Some(t);
                 }
             }
+            Message::Section(i) => self.chrome.toggle(i),
+            Message::SectionSize(i, s) => self.chrome.measured(i, s.height),
+            Message::Frame(now) => self.chrome.now = now,
+            Message::DragHover(on) => self.chrome.drag = on,
         }
         Task::none()
     }
@@ -1233,23 +1257,83 @@ fn import(path: PathBuf) -> Result<Imported, String> {
 
 // ────────────────────────────────── view ──────────────────────────────────
 
+/// Left-panel sections in order: title, face-button glyph, accent. They double as the steps of
+/// the progress tracker at the top of the panel.
+const SECTIONS: [(&str, Icon, Color); 4] = [
+    ("Game", Icon::Cross, style::BLUE),
+    ("Artwork", Icon::Circle, style::RED),
+    ("Media", Icon::Square, style::PINK),
+    ("Build", Icon::Triangle, style::GREEN),
+];
+const GAME: usize = 0;
+const ART: usize = 1;
+const MEDIA: usize = 2;
+const BUILD: usize = 3;
+
+/// View-only state of the left panel: collapsible sections (animated) and the drag-over glow.
+struct Chrome {
+    open: [Animation<bool>; 4],
+    /// Last measured height of each section body while open; the collapse animation spans it.
+    height: [f32; 4],
+    now: Instant,
+    /// Files are being dragged over the window.
+    drag: bool,
+}
+
+impl Chrome {
+    fn new() -> Self {
+        let open = || Animation::new(true).duration(Duration::from_millis(260)).easing(Easing::EaseOutCubic);
+        Self { open: [open(), open(), open(), open()], height: [0.0; 4], now: Instant::now(), drag: false }
+    }
+
+    fn animating(&self) -> bool {
+        self.open.iter().any(|a| a.is_animating(self.now))
+    }
+
+    fn toggle(&mut self, i: usize) {
+        self.now = Instant::now();
+        let open = self.open[i].value();
+        self.open[i].go_mut(!open, self.now);
+    }
+
+    fn measured(&mut self, i: usize, h: f32) {
+        if self.open[i].value() && !self.open[i].is_animating(self.now) {
+            self.height[i] = h;
+        }
+    }
+}
+
 fn label<'a>(s: impl text::IntoFragment<'a>) -> text::Text<'a> {
     text(s).size(12).color(style::MUTED)
 }
 
-fn heading<'a>(s: &'a str, accent: Color) -> Element<'a, Message> {
-    row![container(space().width(4).height(16)).style(move |_| container::Style::default().background(accent)), text(s).size(15)]
-        .spacing(10)
-        .align_y(Alignment::Center)
-        .into()
+/// Small bold all-caps field caption.
+fn caption<'a>(s: impl text::IntoFragment<'a>) -> text::Text<'a> {
+    text(s).size(11).font(style::BOLD).color(style::alpha(style::MUTED, 0.85))
 }
 
-fn card<'a>(title: &'a str, accent: Color, body: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
-    container(column![heading(title, accent), body.into()].spacing(14)).padding(16).width(Fill).style(style::card).into()
+fn chip<'a>(s: impl text::IntoFragment<'a>, accent: Color) -> Element<'a, Message> {
+    container(text(s).size(11).font(style::BOLD).wrapping(text::Wrapping::None)).padding([2, 9]).style(style::chip(accent)).into()
+}
+
+/// Glyph in a glowing rounded square.
+fn badge<'a>(glyph: Icon, accent: Color, side: f32) -> Element<'a, Message> {
+    container(icons::icon(glyph, side * 0.5, style::lighten(accent, 0.2))).center(side).style(style::badge(accent)).into()
+}
+
+fn icon_button<'a>(glyph: Icon, accent: Color, on_press: Option<Message>) -> button::Button<'a, Message> {
+    let ink = if on_press.is_some() { style::TEXT } else { style::alpha(style::MUTED, 0.35) };
+    button(container(icons::icon(glyph, 15.0, ink)).center(Fill)).width(32).height(32).padding(0).style(style::icon_button(accent)).on_press_maybe(on_press)
 }
 
 fn ghost(s: &str) -> button::Button<'_, Message> {
     button(text(s).size(13)).padding([6, 12]).style(style::ghost)
+}
+
+fn ghost_icon<'a>(glyph: Icon, s: impl text::IntoFragment<'a>) -> button::Button<'a, Message> {
+    button(container(row![icons::icon(glyph, 14.0, style::TEXT), text(s).size(13)].spacing(8).align_y(Alignment::Center)).center_x(Fill))
+        .padding([8, 12])
+        .style(style::ghost)
 }
 
 /// `content` with a hover explanation above it.
@@ -1258,224 +1342,431 @@ fn hint<'a>(content: impl Into<Element<'a, Message>>, explanation: String) -> El
     tooltip(content, bubble, tooltip::Position::Top).gap(6).into()
 }
 
-fn file_row<'a>(name: String, browse: Message, clear: Option<Message>) -> Element<'a, Message> {
-    row![
-        container(text(name).size(13).wrapping(text::Wrapping::None)).padding([7, 10]).width(Fill).clip(true).style(style::well),
-        ghost("Browse").on_press(browse),
-        ghost("✕").on_press_maybe(clear),
-    ]
-    .spacing(6)
-    .align_y(Alignment::Center)
+fn hairline<'a>() -> Element<'a, Message> {
+    container(space().height(1)).width(Fill).style(style::hairline(style::alpha(style::STROKE, 0.8))).into()
+}
+
+/// A payload slot (ICON1, SND0, output): glyph, name, detail, browse and clear/reset.
+fn slot_row<'a>(glyph: Icon, accent: Color, name: &'a str, detail: String, filled: bool, browse: Message, clear: (Icon, &str, Option<Message>)) -> Element<'a, Message> {
+    let tint = if filled { style::lighten(accent, 0.2) } else { style::MUTED };
+    let plate = container(icons::icon(glyph, 18.0, tint)).center(38).style(move |t| if filled { style::badge(accent)(t) } else { style::thumb(t) });
+    container(
+        row![
+            plate,
+            column![text(name).size(13).font(style::BOLD), container(label(detail).wrapping(text::Wrapping::None)).width(Fill).clip(true)].spacing(3).width(Fill),
+            hint(icon_button(Icon::Folder, accent, Some(browse)), "Browse…".into()),
+            hint(icon_button(clear.0, style::RED, clear.2), clear.1.into()),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center),
+    )
+    .padding([8, 10])
+    .style(style::well)
     .into()
+}
+
+/// Dashed outline (rounded corners left open) for drop targets; a few dozen 1.5 px quads.
+fn dashed<'a>(color: Color, across: usize, down: usize) -> Element<'a, Message> {
+    let dash = move |w: Length, h: Length| container(space()).width(w).height(h).style(style::hairline(color));
+    let edge = || container((0..across).fold(row![].spacing(7), |r, _| r.push(dash(Fill, Length::Fixed(1.5))))).padding([0, 16]).width(Fill);
+    let side = || container((0..down).fold(column![].spacing(7), |c, _| c.push(dash(Length::Fixed(1.5), Fill)))).padding([14, 0]).height(Fill);
+    column![edge(), row![side(), space().width(Fill), side()].height(Fill), edge()].width(Fill).height(Fill).into()
+}
+
+fn region_color(region: &str) -> Color {
+    match region {
+        "NTSC-U" => style::BLUE,
+        "NTSC-J" => style::RED,
+        "PAL" => style::PINK,
+        _ => style::MUTED,
+    }
 }
 
 impl App {
     fn view(&self) -> Element<'_, Message> {
-        let sidebar = scrollable(column![self.game_card(), self.art_card(), self.media_card(), self.build_card()].spacing(14).padding(16))
-            .width(440)
-            .height(Fill);
         let main = column![self.header(), self.preview(), self.footer()].spacing(14).padding(16).width(Fill);
-        let body = row![container(sidebar).style(style::panel).height(Fill), main];
+        let divider = container(space().width(1).height(Fill)).style(style::hairline(style::alpha(style::STROKE, 0.7)));
+        let body = row![self.left_panel(), divider, main];
         stack![body, self.toasts()].into()
     }
 
-    fn game_card(&self) -> Element<'_, Message> {
-        let mut discs = column![].spacing(8);
-        for (i, d) in self.discs.iter().enumerate() {
-            let probed = d.summary.as_ref();
-            let info = match (probed, &d.error) {
-                (_, Some(e)) => text(e.as_str()).size(12).color(style::RED),
-                (Some(s), None) => label(format!(
-                    "{} · {} track(s){} · {:.0} MB",
-                    s.region.label(),
-                    s.tracks,
-                    if s.audio_tracks > 0 { format!(" ({} CDDA)", s.audio_tracks) } else { String::new() },
-                    s.size as f64 / 1e6
-                )),
-                (None, None) => label("Probing…"),
-            };
-            let placeholder = probed.and_then(|s| s.disc_id.clone()).unwrap_or_else(|| "GAME ID".into());
-            let ppf = match &d.ppf {
-                Some(p) => row![text(format!("PPF {}", file_name(p))).size(12).color(style::GREEN), ghost("✕").on_press(Message::ClearPpf(d.key))]
-                    .spacing(6)
-                    .align_y(Alignment::Center),
-                None => row![ghost("+ PPF").on_press(Message::PickPpf(d.key))],
-            };
-            let key = d.key;
-            let switch = |on: bool, name: &str, msg: Message| {
-                button(text(if on { format!("✓ {name}") } else { name.to_owned() }).size(12).wrapping(text::Wrapping::None))
-                    .padding([6, 10])
-                    .style(style::tab(on))
-                    .on_press(msg)
-            };
-            // The generic preset only where the game has no 60 Hz switch of its own.
-            let db = &self.patches;
-            let pal: Element<'_, Message> = if d.native_60hz(db) {
-                space().into()
-            } else {
-                hint(
-                    switch(d.pal_ntsc, "PAL→NTSC", Message::TogglePalNtsc(key)),
-                    "Generic PAL→NTSC (PSX2PSP Graphic Fix / Y Fix). Applied only if this game's code matches                      the patterns; otherwise the disc is left untouched and the log says why."
-                        .into(),
-                )
-            };
-            let mut body = column![
-                row![
-                    text(format!("{}", i + 1)).size(20).color(style::BLUE),
-                    column![text(file_name(&d.path)).size(13).wrapping(text::Wrapping::None), info].spacing(2).width(Fill),
-                    ghost("↑").on_press_maybe((i > 0).then_some(Message::MoveDiscUp(key))),
-                    ghost("✕").on_press(Message::RemoveDisc(key)),
-                ]
-                .spacing(10)
-                .align_y(Alignment::Center),
-                row![
-                    text_input(&placeholder, &d.id).on_input(move |s| Message::DiscId(key, s)).size(13).padding(7).width(140).style(style::input),
-                    space().width(Fill),
-                    pal,
-                    ppf,
-                ]
-                .spacing(8)
-                .align_y(Alignment::Center),
+    /// The left column. Extra panel widgets (project slots, update banner…) go first in the
+    /// `column!` below, above the brand header.
+    fn left_panel(&self) -> Element<'_, Message> {
+        let panel = column![self.brand(), self.game_card(), self.art_card(), self.media_card(), self.build_card()].spacing(14).padding(16);
+        let bar = scrollable::Scrollbar::new().width(6).scroller_width(6).margin(3).spacing(2);
+        container(scrollable(panel).direction(scrollable::Direction::Vertical(bar)).width(470).height(Fill)).style(style::panel).height(Fill).into()
+    }
+
+    /// Step completion: Game (discs probed with an ID, title set), Artwork (any image),
+    /// Media (ICON1 or SND0), Build (everything the build checks is in place).
+    fn steps(&self) -> [bool; 4] {
+        let game = !self.discs.is_empty() && self.discs.iter().all(|d| d.error.is_none() && d.effective_id().is_some()) && !self.title.trim().is_empty();
+        let art = self.art.iter().any(Option::is_some);
+        let media = self.icon1.is_some() || self.snd0.is_some();
+        [game, art, media, game && self.media_bytes() <= tools::SND0_BUDGET]
+    }
+
+    /// Logo, name and the Game → Artwork → Media → Build tracker.
+    fn brand(&self) -> Element<'_, Message> {
+        let glyph = |i: Icon, c: Color| icons::icon(i, 13.0, c);
+        let gap = || space().width(13).height(13);
+        let logo = container(
+            column![
+                row![gap(), glyph(Icon::Triangle, style::GREEN), gap()],
+                row![glyph(Icon::Square, style::PINK), gap(), glyph(Icon::Circle, style::RED)],
+                row![gap(), glyph(Icon::Cross, style::BLUE), gap()],
             ]
-            .spacing(8);
-            // Only for IDs the patch database knows (POPS config and/or patches).
-            let (game, ps) = (d.config(db), d.patches(db));
-            if game.is_some() || !ps.is_empty() {
-                let names = |k: patchdb::Kind| ps.iter().filter(|p| p.kind == k).map(|p| p.name.as_str()).collect::<Vec<_>>().join("; ");
-                let mut what = names(patchdb::Kind::Fix);
-                if game.is_some() {
-                    what = if what.is_empty() { patchdb::CONFIG.to_owned() } else { format!("{}; {what}", patchdb::CONFIG) };
-                }
-                let mut fixes = row![
-                    label("Patches for this game"),
-                    space().width(Fill),
-                    hint(switch(d.title_fixes, "Game fixes", Message::ToggleTitleFixes(key)), format!("Recommended: {what}. Patches marked \"off by default\" stay off until you pick them below."))
+            .spacing(1),
+        )
+        .center(50)
+        .style(style::logo);
+        let name = column![
+            row![text("PSX2PSP").size(21).font(style::BOLD), text("REBORN").size(21).font(style::BOLD).color(style::lighten(style::BLUE, 0.15))].spacing(7),
+            label("PS1 → PSP / PS Vita EBOOT studio"),
+        ]
+        .spacing(2);
+        let top = row![logo, name, space().width(Fill), chip(concat!("v", env!("CARGO_PKG_VERSION")), style::BLUE)].spacing(14).align_y(Alignment::Center);
+
+        let done = self.steps();
+        let current = done.iter().position(|d| !d);
+        let mut track = row![].align_y(Alignment::Start);
+        for (i, &(name, glyph, accent)) in SECTIONS.iter().enumerate() {
+            if i > 0 {
+                let prev = SECTIONS[i - 1].2;
+                let rail = container(space().height(2)).width(Fill).style(style::rail(prev, accent, done[i - 1]));
+                track = track.push(column![space().height(16), rail].width(Fill));
+            }
+            let (lit, here) = (done[i], current == Some(i));
+            let ink = if lit { Color::WHITE } else if here { accent } else { style::MUTED };
+            track = track.push(
+                column![
+                    container(icons::icon(glyph, 15.0, ink)).center(34).style(style::step(accent, lit, here)),
+                    text(name).size(11).font(if lit || here { style::BOLD } else { style::FONT }).color(if lit || here { style::TEXT } else { style::MUTED }),
                 ]
-                .spacing(8)
+                .spacing(6)
+                .align_x(Alignment::Center)
+                .width(58),
+            );
+        }
+        container(column![top, track].spacing(18)).padding([16, 16]).width(Fill).style(style::card).into()
+    }
+
+    /// Accent card with a collapsible body. `body` is only built while the section is open.
+    fn section<'a>(&'a self, ix: usize, status: Element<'a, Message>, body: impl FnOnce() -> Element<'a, Message>) -> Element<'a, Message> {
+        let (title, glyph, accent) = SECTIONS[ix];
+        let (anim, now) = (&self.chrome.open[ix], self.chrome.now);
+        let t: f32 = anim.interpolate(0.0, 1.0, now);
+        let header = button(
+            row![
+                badge(glyph, accent, 32.0),
+                text(title).size(16).font(style::BOLD),
+                space().width(Fill),
+                status,
+                icons::rotated(Icon::ChevronDown, 16.0, style::MUTED, -std::f32::consts::FRAC_PI_2 * (1.0 - t)),
+            ]
+            .spacing(12)
+            .align_y(Alignment::Center),
+        )
+        .padding([6, 8])
+        .width(Fill)
+        .style(style::section_header(accent))
+        .on_press(Message::Section(ix));
+        let h = self.chrome.height[ix];
+        let content: Option<Element<'a, Message>> = if anim.is_animating(now) && h > 0.0 {
+            Some(space().height(t * h).into())
+        } else if anim.value() {
+            Some(sensor(container(body()).padding(padding::top(12).bottom(6).left(6).right(6))).on_resize(move |s| Message::SectionSize(ix, s)).into())
+        } else {
+            None
+        };
+        container(container(column![header].push(content)).padding([8, 8]).width(Fill).style(style::card_body(accent))).padding(1).width(Fill).style(style::card_frame(accent)).into()
+    }
+
+    fn game_card(&self) -> Element<'_, Message> {
+        let status = if self.discs.is_empty() {
+            chip("No disc", style::MUTED)
+        } else {
+            chip(format!("{} / {MAX_DISCS} disc{}", self.discs.len(), if self.discs.len() == 1 { "" } else { "s" }), style::BLUE)
+        };
+        self.section(GAME, status, || {
+            let discs = self.discs.iter().enumerate().fold(column![].spacing(10), |c, (i, d)| c.push(self.disc_row(i, d)));
+            column![
+                caption("XMB TITLE"),
+                text_input("Game title", &self.title).on_input(Message::Title).size(14).padding([10, 12]).style(style::input),
+                space().height(4),
+                caption(format!("DISCS  {}/{MAX_DISCS}", self.discs.len())),
+                discs,
+                self.drop_zone(),
+            ]
+            .spacing(8)
+            .into()
+        })
+    }
+
+    fn disc_row<'a>(&'a self, i: usize, d: &'a Disc) -> Element<'a, Message> {
+        let key = d.key;
+        let db = &self.patches;
+        let probed = d.summary.as_ref();
+        let facts: Element<'_, Message> = match (probed, &d.error) {
+            (_, Some(e)) => row![icons::icon(Icon::Alert, 14.0, style::RED), text(e.as_str()).size(12).color(style::RED)].spacing(6).align_y(Alignment::Center).into(),
+            (Some(s), None) => {
+                let id = d.effective_id();
+                let mut r = row![
+                    chip(id.clone().unwrap_or_else(|| "NO ID".into()), if id.is_some() { style::BLUE } else { style::AMBER }),
+                    chip(s.region.label(), region_color(s.region.label())),
+                ]
+                .spacing(6)
                 .align_y(Alignment::Center);
-                if d.has_kind(db, patchdb::Kind::Fps) {
-                    fixes = fixes.push(hint(
-                        switch(d.fps_unlock, "Unlock fps", Message::ToggleFpsUnlock(key)),
-                        format!("{}. The game's timing follows real elapsed time, so speed stays correct.", names(patchdb::Kind::Fps)),
-                    ));
+                if s.audio_tracks > 0 {
+                    r = r.push(chip(format!("{} CDDA", s.audio_tracks), style::GREEN));
                 }
-                if d.native_60hz(db) {
-                    fixes = fixes.push(hint(
-                        switch(d.ntsc_60hz, "60 Hz", Message::Toggle60Hz(key)),
-                        format!("{}. Uses the game's own NTSC code: no generic PAL→NTSC, POPS config left as is.", names(patchdb::Kind::Ntsc60)),
-                    ));
-                }
-                // One line per entry: its own toggle (wins over the switches), kind and origin.
-                let entry = |on: bool, name: &str, tag: String, note: String| -> Element<'_, Message> {
-                    row![
-                        hint(switch(on, name, Message::TogglePatch(key, name.to_owned())), note),
-                        space().width(Fill),
-                        text(tag).size(11).color(style::MUTED),
-                    ]
+                r.push(label(format!("{} track(s) · {:.0} MB", s.tracks, s.size as f64 / 1e6))).wrap().vertical_spacing(6).into()
+            }
+            (None, None) => chip("Probing…", style::AMBER),
+        };
+        let placeholder = probed.and_then(|s| s.disc_id.clone()).unwrap_or_else(|| "GAME ID".into());
+        let ppf: Element<'_, Message> = match &d.ppf {
+            Some(p) => row![chip(format!("PPF {}", file_name(p)), style::GREEN), hint(icon_button(Icon::Close, style::RED, Some(Message::ClearPpf(key))), "Remove the PPF".into())]
+                .spacing(6)
+                .align_y(Alignment::Center)
+                .into(),
+            None => hint(ghost_icon(Icon::Plus, "PPF").padding([6, 10]).on_press(Message::PickPpf(key)), "Apply a .ppf patch to this disc".into()),
+        };
+        let switch = |on: bool, name: &str, msg: Message| -> Element<'_, Message> {
+            let mut r = row![].spacing(6).align_y(Alignment::Center);
+            if on {
+                r = r.push(icons::icon(Icon::Check, 12.0, Color::WHITE));
+            }
+            button(r.push(text(name.to_owned()).size(12).wrapping(text::Wrapping::None))).padding([5, 11]).style(style::toggle(on, style::BLUE)).on_press(msg).into()
+        };
+        // The generic preset only where the game has no 60 Hz switch of its own.
+        let pal: Element<'_, Message> = if d.native_60hz(db) {
+            space().into()
+        } else {
+            hint(
+                switch(d.pal_ntsc, "PAL→NTSC", Message::TogglePalNtsc(key)),
+                "Generic PAL→NTSC (PSX2PSP Graphic Fix / Y Fix). Applied only if this game's code matches                      the patterns; otherwise the disc is left untouched and the log says why."
+                    .into(),
+            )
+        };
+        let number = container(text(format!("{}", i + 1)).size(14).font(style::BOLD).color(Color::WHITE)).center(30).style(style::step(style::BLUE, true, false));
+        let mut body = column![
+            row![
+                number,
+                column![container(text(file_name(&d.path)).size(13).font(style::BOLD).wrapping(text::Wrapping::None)).width(Fill).clip(true), facts].spacing(6).width(Fill),
+                hint(icon_button(Icon::ArrowUp, style::BLUE, (i > 0).then_some(Message::MoveDiscUp(key))), "Move up (disc order)".into()),
+                hint(icon_button(Icon::Close, style::RED, Some(Message::RemoveDisc(key))), "Remove this disc".into()),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
+            row![
+                hint(
+                    text_input(&placeholder, &d.id).on_input(move |s| Message::DiscId(key, s)).size(13).padding([7, 10]).width(140).style(style::input),
+                    "Game ID override; leave empty to use the detected one".into()
+                ),
+                space().width(Fill),
+                pal,
+                ppf,
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        ]
+        .spacing(10);
+        // Only for IDs the patch database knows (POPS config and/or patches).
+        let (game, ps) = (d.config(db), d.patches(db));
+        if game.is_some() || !ps.is_empty() {
+            let names = |k: patchdb::Kind| ps.iter().filter(|p| p.kind == k).map(|p| p.name.as_str()).collect::<Vec<_>>().join("; ");
+            let mut what = names(patchdb::Kind::Fix);
+            if game.is_some() {
+                what = if what.is_empty() { patchdb::CONFIG.to_owned() } else { format!("{}; {what}", patchdb::CONFIG) };
+            }
+            let mut fixes = row![hint(
+                switch(d.title_fixes, "Game fixes", Message::ToggleTitleFixes(key)),
+                format!("Recommended: {what}. Patches marked \"off by default\" stay off until you pick them below.")
+            )]
+            .spacing(6)
+            .align_y(Alignment::Center);
+            if d.has_kind(db, patchdb::Kind::Fps) {
+                fixes = fixes.push(hint(
+                    switch(d.fps_unlock, "Unlock fps", Message::ToggleFpsUnlock(key)),
+                    format!("{}. The game's timing follows real elapsed time, so speed stays correct.", names(patchdb::Kind::Fps)),
+                ));
+            }
+            if d.native_60hz(db) {
+                fixes = fixes.push(hint(
+                    switch(d.ntsc_60hz, "60 Hz", Message::Toggle60Hz(key)),
+                    format!("{}. Uses the game's own NTSC code: no generic PAL→NTSC, POPS config left as is.", names(patchdb::Kind::Ntsc60)),
+                ));
+            }
+            // One line per entry: its own toggle (wins over the switches), kind and origin.
+            let entry = |on: bool, name: &str, tag: String, note: String| -> Element<'_, Message> {
+                row![hint(switch(on, name, Message::TogglePatch(key, name.to_owned())), note), space().width(Fill), text(tag).size(11).color(style::MUTED)]
                     .spacing(8)
                     .align_y(Alignment::Center)
                     .into()
-                };
-                let mut list = column![].spacing(4);
-                if let Some(g) = game {
-                    let size = g.config.as_ref().map_or(0, Vec::len);
-                    let note = format!("POPS emulator settings for this game ({size} B, {}). {}", g.source, g.note);
-                    let origin = if g.origin == patchdb::Origin::User { " · user" } else { "" };
-                    list = list.push(entry(d.config_on(), patchdb::CONFIG, format!("Game fix{origin}"), note));
-                }
-                for p in &ps {
-                    let mut tag = p.kind.to_string();
-                    if !p.default_on {
-                        tag.push_str(" · off by default");
-                    }
-                    if p.origin == patchdb::Origin::User {
-                        tag.push_str(" · user");
-                    }
-                    list = list.push(entry(d.patch_on(p), &p.name, tag, p.note.clone()));
-                }
-                let mut result = row![text(d.outcome(db)).size(12).color(style::GREEN), space().width(Fill)].align_y(Alignment::Center);
-                if !d.all_on(db) {
-                    result = result.push(hint(ghost("★ All on").on_press(Message::AllFixes(key)), "Turn on every switch this game offers (patches off by default stay off).".into()));
-                }
-                body = body.push(fixes).push(list).push(result);
+            };
+            let mut list = column![].spacing(5);
+            if let Some(g) = game {
+                let size = g.config.as_ref().map_or(0, Vec::len);
+                let note = format!("POPS emulator settings for this game ({size} B, {}). {}", g.source, g.note);
+                let origin = if g.origin == patchdb::Origin::User { " · user" } else { "" };
+                list = list.push(entry(d.config_on(), patchdb::CONFIG, format!("Game fix{origin}"), note));
             }
-            discs = discs.push(container(body).padding(10).style(style::well));
+            for p in &ps {
+                let mut tag = p.kind.to_string();
+                if !p.default_on {
+                    tag.push_str(" · off by default");
+                }
+                if p.origin == patchdb::Origin::User {
+                    tag.push_str(" · user");
+                }
+                list = list.push(entry(d.patch_on(p), &p.name, tag, p.note.clone()));
+            }
+            let mut result =
+                row![icons::icon(Icon::Check, 13.0, style::GREEN), text(d.outcome(db)).size(12).color(style::GREEN), space().width(Fill)].spacing(6).align_y(Alignment::Center);
+            if !d.all_on(db) {
+                result = result.push(hint(ghost_icon(Icon::Star, "All on").padding([5, 10]).on_press(Message::AllFixes(key)), "Turn on every switch this game offers (patches off by default stay off).".into()));
+            }
+            let heading = row![icons::icon(Icon::Shield, 15.0, style::GREEN), caption("PATCHES FOR THIS GAME")].spacing(8).align_y(Alignment::Center);
+            body = body.push(hairline()).push(heading).push(fixes.wrap().vertical_spacing(6)).push(list).push(result);
         }
-        let add = button(text(if self.discs.is_empty() { "+ Add disc image (.cue / .bin) — or drop it here" } else { "+ Add disc" }).size(13))
-            .padding([8, 12])
-            .width(Fill)
-            .style(style::ghost)
-            .on_press_maybe((self.discs.len() < MAX_DISCS).then_some(Message::AddDiscs));
-        card(
-            "Game",
-            style::BLUE,
+        container(body).padding(12).style(style::well).into()
+    }
+
+    /// Click-to-browse target that glows while files are dragged over the window.
+    fn drop_zone(&self) -> Element<'_, Message> {
+        let (hot, room, empty) = (self.chrome.drag, self.discs.len() < MAX_DISCS, self.discs.is_empty());
+        let accent = style::BLUE;
+        let ink = if hot { Color::WHITE } else { style::lighten(accent, 0.25) };
+        let content: Element<'_, Message> = if empty {
             column![
-                label("XMB title"),
-                text_input("Game title", &self.title).on_input(Message::Title).size(14).padding(9).style(style::input),
-                label(format!("Discs ({}/{MAX_DISCS})", self.discs.len())),
-                discs,
-                add,
+                container(icons::icon(if hot { Icon::Drop } else { Icon::Disc }, 26.0, ink)).center(54).style(style::badge(accent)),
+                text(if hot { "Release to add the disc" } else { "Drop a PS1 disc image here" }).size(15).font(style::BOLD),
+                label("or click to browse  ·  .cue  .bin  .img  .m3u  ·  up to 5 discs"),
             ]
-            .spacing(8),
-        )
+            .spacing(8)
+            .align_x(Alignment::Center)
+            .into()
+        } else {
+            row![
+                icons::icon(Icon::Plus, 15.0, ink),
+                text(match (room, hot) {
+                    (false, _) => "Disc limit reached",
+                    (true, true) => "Release to add",
+                    (true, false) => "Add another disc",
+                })
+                .size(13)
+                .font(style::BOLD),
+                label(if room { "or drop it here" } else { "a PBP holds 5 discs" }),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center)
+            .into()
+        };
+        let frame = dashed(style::alpha(accent, if hot { 0.95 } else { 0.5 }), if empty { 22 } else { 26 }, if empty { 8 } else { 2 });
+        button(stack![container(content).padding(if empty { [24, 12] } else { [12, 12] }).center_x(Fill), frame])
+            .padding(0)
+            .width(Fill)
+            .style(style::drop_zone(hot, accent))
+            .on_press_maybe(room.then_some(Message::AddDiscs))
+            .into()
     }
 
     fn art_card(&self) -> Element<'_, Message> {
-        let mut col = column![].spacing(10);
-        for slot in Slot::ALL {
-            let (w, h) = slot.size();
-            let art = self.art[slot_ix(slot)].as_ref();
-            let thumb: Element<'_, Message> = match art {
-                Some(a) => image(a.thumb.clone()).width(72).height(41).content_fit(iced::ContentFit::Contain).into(),
-                None => container(text("—").size(12).color(style::MUTED)).center(Length::Fixed(41.0)).width(72).style(style::well).into(),
+        let n = self.art.iter().filter(|a| a.is_some()).count();
+        let status = chip(format!("{n} / 4"), if n > 0 { style::RED } else { style::MUTED });
+        self.section(ART, status, || {
+            let [icon0, pic0, pic1, boot] = Slot::ALL.map(|s| self.art_tile(s));
+            let hint = if self.art[slot_ix(Slot::Boot)].is_none() && self.donor_boot.is_some() {
+                "No BOOT image: the standard PS1 boot screen is used"
+            } else {
+                "Any image format; auto-fitted to the PSP slot"
             };
-            let name = art.map_or_else(|| format!("{w}×{h} · none"), |a| a.source.clone());
-            col = col.push(
-                row![
-                    thumb,
-                    column![text(slot.label()).size(13), label(name).wrapping(text::Wrapping::None)].spacing(2).width(Fill),
-                    ghost("Browse").on_press(Message::PickArt(slot)),
-                    ghost("✕").on_press_maybe(art.map(|_| Message::ClearArt(slot))),
-                ]
-                .spacing(10)
-                .align_y(Alignment::Center),
-            );
+            column![
+                row![icon0, pic0].spacing(10),
+                row![pic1, boot].spacing(10),
+                row![icons::icon(Icon::Image, 13.0, style::MUTED), label(hint)].spacing(6).align_y(Alignment::Center),
+            ]
+            .spacing(10)
+            .into()
+        })
+    }
+
+    /// One artwork slot: the real thumbnail (or an invitation), its name and PSP size; the whole
+    /// tile browses, the corner button clears.
+    fn art_tile(&self, slot: Slot) -> Element<'_, Message> {
+        let (w, h) = slot.size();
+        let art = self.art[slot_ix(slot)].as_ref();
+        let accent = style::RED;
+        let picture: Element<'_, Message> = match art {
+            Some(a) => image(a.thumb.clone()).width(Fill).height(Fill).content_fit(if slot.fill() { ContentFit::Cover } else { ContentFit::Contain }).into(),
+            None => column![icons::icon(Icon::Image, 22.0, style::alpha(style::lighten(accent, 0.2), 0.85)), text("Drop or browse").size(11).color(style::MUTED)]
+                .spacing(6)
+                .align_x(Alignment::Center)
+                .into(),
+        };
+        let shot = container(picture).center_x(Fill).center_y(Length::Fixed(98.0)).clip(true).style(style::thumb);
+        let name = art.map_or_else(
+            || if slot == Slot::Boot && self.donor_boot.is_some() { "Default PS1 boot screen".into() } else { "Empty".into() },
+            |a| a.source.clone(),
+        );
+        let caption = column![
+            row![text(slot.label()).size(12).font(style::BOLD), space().width(Fill), text(format!("{w}×{h}")).size(11).color(style::MUTED)].align_y(Alignment::Center),
+            container(label(name).wrapping(text::Wrapping::None)).width(Fill).clip(true),
+        ]
+        .spacing(2);
+        let tile = button(column![shot, caption].spacing(8)).padding(6).width(Fill).style(style::tile(accent, art.is_some())).on_press(Message::PickArt(slot));
+        match art {
+            Some(_) => stack![tile, container(hint(icon_button(Icon::Close, style::RED, Some(Message::ClearArt(slot))), "Remove".into())).align_right(Fill).padding(11)]
+                .width(Fill)
+                .into(),
+            None => tile.into(),
         }
-        let hint = if self.art[slot_ix(Slot::Boot)].is_none() && self.donor_boot.is_some() { "No BOOT image: the standard PS1 boot screen is used" } else { "Any image format; auto-fitted to the PSP slot" };
-        card("Artwork", style::RED, column![col, label(hint)].spacing(10))
     }
 
     fn media_card(&self) -> Element<'_, Message> {
+        let used = self.media_bytes();
+        let accent = if used > tools::SND0_BUDGET {
+            style::RED
+        } else if used > 0 {
+            style::PINK
+        } else {
+            style::MUTED
+        };
+        self.section(MEDIA, chip(format!("{} / 500 KB", used.div_ceil(1024)), accent), || self.media_body())
+    }
+
+    fn media_body(&self) -> Element<'_, Message> {
         let c = &self.clip;
         let idle = self.job.is_none();
+        let accent = style::PINK;
         let tools: Element<'_, Message> = match &self.tools {
-            None => label("Detecting ffmpeg / x264 / ATRAC3 / yt-dlp…").into(),
+            None => row![icons::icon(Icon::Wrench, 14.0, style::MUTED), label("Detecting ffmpeg / x264 / ATRAC3 / yt-dlp…")].spacing(8).align_y(Alignment::Center).into(),
             Some(t) => {
-                let mark = |ok: bool| if ok { "✓" } else { "✗" };
-                let all = t.ffmpeg.is_some() && t.x264 && t.at3.is_some() && t.yt_dlp.is_some();
-                let line = text(format!(
-                    "ffmpeg {} · x264 {} · ATRAC3 {} · yt-dlp {}",
-                    mark(t.ffmpeg.is_some()),
-                    mark(t.x264),
-                    mark(t.at3.is_some()),
-                    mark(t.yt_dlp.is_some())
-                ))
-                .size(12)
-                .color(if all { style::GREEN } else { style::AMBER });
+                let tool = |name: &'static str, ok: bool| -> Element<'_, Message> {
+                    let tone = if ok { style::GREEN } else { style::AMBER };
+                    container(row![icons::icon(if ok { Icon::Check } else { Icon::Close }, 11.0, tone), text(name).size(11).font(style::BOLD)].spacing(4).align_y(Alignment::Center))
+                        .padding([3, 9])
+                        .style(style::chip(tone))
+                        .into()
+                };
+                let line = row![
+                    icons::icon(Icon::Wrench, 14.0, style::MUTED),
+                    tool("ffmpeg", t.ffmpeg.is_some()),
+                    tool("x264", t.x264),
+                    tool("ATRAC3", t.at3.is_some()),
+                    tool("yt-dlp", t.yt_dlp.is_some()),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center);
                 if t.missing.is_empty() {
                     line.into()
                 } else {
                     let mb: u32 = t.missing.iter().map(|a| a.approx_mb).sum();
-                    row![
-                        line.width(Fill),
-                        button(text(format!("Install missing (~{mb} MB)")).size(12))
-                            .padding([5, 10])
-                            .style(style::ghost)
-                            .on_press_maybe(idle.then_some(Message::InstallTools)),
-                    ]
-                    .spacing(8)
-                    .align_y(Alignment::Center)
-                    .into()
+                    column![line, ghost_icon(Icon::Import, format!("Install missing tools (~{mb} MB)")).width(Fill).on_press_maybe(idle.then_some(Message::InstallTools))]
+                        .spacing(8)
+                        .into()
                 }
             }
         };
@@ -1487,109 +1778,153 @@ impl App {
         };
         let span = self.clip_span();
         let end_hint = span.map_or_else(|| "end".into(), |(_, e)| tools::fmt_hms(e));
-        let tab = |t: String, on: bool, msg: Message| button(text(t).size(12)).padding([5, 10]).style(style::tab(on)).on_press(msg);
-        let modes = ClipMode::ALL.iter().fold(row![].spacing(4), |r, &m| r.push(tab(m.label().into(), c.mode == m, Message::ClipMode(m))));
+        let segment = |content: Element<'static, Message>, on: bool, msg: Message| {
+            button(container(content).center_x(Fill)).padding([8, 2]).width(Fill).style(style::segment(on, accent)).on_press(msg)
+        };
+        let modes = ClipMode::ALL.iter().fold(row![].spacing(4), |r, &m| {
+            let on = c.mode == m;
+            let ink = if on { Color::WHITE } else { style::MUTED };
+            let mut glyphs = row![].spacing(2);
+            if m.video() {
+                glyphs = glyphs.push(icons::icon(Icon::Video, 13.0, ink));
+            }
+            if m.audio() {
+                glyphs = glyphs.push(icons::icon(Icon::Music, 13.0, ink));
+            }
+            r.push(segment(row![glyphs, text(m.label()).size(12).font(style::BOLD).wrapping(text::Wrapping::None)].spacing(6).align_y(Alignment::Center).into(), on, Message::ClipMode(m)))
+        });
         let audio: Element<'_, Message> = match c.mode {
-            ClipMode::Snd0 => [66, 105, 132]
-                .into_iter()
-                .fold(row![label("ATRAC3").width(50)].spacing(4).align_y(Alignment::Center), |r, k| {
-                    r.push(tab(format!("{k} kbps"), c.kbps == k, Message::ClipKbps(k)))
-                })
-                .into(),
+            ClipMode::Snd0 => row![
+                caption("ATRAC3"),
+                space().width(Fill),
+                container([66, 105, 132].into_iter().fold(row![].spacing(3), |r, k| {
+                    r.push(button(text(format!("{k} kbps")).size(12)).padding([4, 10]).style(style::segment(c.kbps == k, accent)).on_press(Message::ClipKbps(k)))
+                }))
+                .padding(3)
+                .style(style::segmented),
+            ]
+            .align_y(Alignment::Center)
+            .into(),
             ClipMode::Both => label(format!("SND0 at {} kbps; the video gets the rest of the 500 KB", clip::SHARED_KBPS)).into(),
             ClipMode::Icon1 => label("144×80 H.264 at 29.97 fps, bitrate fitted to the free budget").into(),
         };
         let can_make = idle && !c.source.trim().is_empty() && span.is_some();
-        let make = button(text(format!("Make {}", c.mode.label())).size(13))
-            .padding([8, 16])
-            .style(style::solid(style::PINK))
-            .on_press_maybe(can_make.then_some(Message::MakeClip));
+        let cta = |ink: Color, s: String| container(row![icons::icon(Icon::Sparkles, 17.0, ink), text(s).size(14).font(style::BOLD)].spacing(10).align_y(Alignment::Center)).center_x(Fill);
+        let make = match self.job.as_ref().filter(|j| j.label == JOB_CLIP) {
+            Some(j) => button(cta(
+                Color::WHITE,
+                if j.progress > 0.0 { format!("Making {}…  {:.0}%", c.mode.label(), j.progress * 100.0) } else { format!("Making {}…", c.mode.label()) },
+            ))
+            .style(style::busy_button(accent)),
+            None => button(cta(if can_make { Color::WHITE } else { style::MUTED }, format!("Make {}", c.mode.label())))
+                .style(style::primary_button(accent, style::VIOLET))
+                .on_press_maybe(can_make.then_some(Message::MakeClip)),
+        }
+        .padding([12, 16])
+        .width(Fill);
         let used = self.media_bytes();
-        let budget = text(format!("{} / 500 KB used by ICON1 + SND0", used.div_ceil(1024)))
-            .size(12)
-            .color(if used > tools::SND0_BUDGET { style::RED } else { style::MUTED });
+        let over = used > tools::SND0_BUDGET;
+        let budget = column![
+            row![
+                caption("XMB MEDIA BUDGET"),
+                space().width(Fill),
+                text(format!("{} / 500 KB used by ICON1 + SND0", used.div_ceil(1024))).size(12).color(if over { style::RED } else { style::MUTED }),
+            ]
+            .align_y(Alignment::Center),
+            progress_bar(0.0..=tools::SND0_BUDGET as f32, used.min(tools::SND0_BUDGET) as f32).girth(6).style(style::meter(if over { style::RED } else { accent })),
+        ]
+        .spacing(7);
         let icon1 = self.icon1.as_ref().map_or_else(
-            || "none".into(),
+            || "Animated icon · make one above or browse a .pmf".into(),
             |i| format!("{} · {:.1} s · {} KB{}", i.media.source, i.secs, i.media.bytes.len().div_ceil(1024), if i.movie.is_some() { "" } else { " · no preview" }),
         );
         let snd0 = self.snd0.as_ref().map_or_else(
-            || "none".into(),
+            || "XMB music · make one above or browse a .at3".into(),
             |m| match &m.sound {
                 Some(s) => format!("{} · {:.1} s · {} KB", m.media.source, s.secs(), m.media.bytes.len().div_ceil(1024)),
                 None => format!("{} · {} KB · no preview", m.media.source, m.media.bytes.len().div_ceil(1024)),
             },
         );
-        card(
-            "Media",
-            style::PINK,
-            column![
-                label("Clip source"),
-                row![
-                    text_input("https://youtu.be/…  or  a video / audio file", &c.source)
-                        .on_input(Message::ClipSource)
-                        .on_submit(Message::ProbeClip)
-                        .size(13)
-                        .padding(7)
-                        .width(Fill)
-                        .style(style::input),
-                    ghost("Browse").on_press(Message::PickClipSource),
-                    ghost("Probe").on_press_maybe((!c.source.trim().is_empty()).then_some(Message::ProbeClip)),
-                ]
-                .spacing(6)
-                .align_y(Alignment::Center),
-                source_info,
-                row![
-                    label("From"),
-                    text_input("0:00", &c.start).on_input(Message::ClipStart).size(13).padding(7).width(78).style(style::input),
-                    label("to"),
-                    text_input(&end_hint, &c.end).on_input(Message::ClipEnd).size(13).padding(7).width(78).style(style::input),
-                    space().width(Fill),
-                    label(span.map_or_else(|| "invalid span".into(), |(s, e)| format!("{:.1} s", e - s))),
-                ]
-                .spacing(8)
-                .align_y(Alignment::Center),
-                modes,
-                audio,
-                row![space().width(Fill), make],
-                label("ICON1.PMF — animated icon (made above, or a ready .pmf)"),
-                file_row(icon1, Message::PickIcon1, self.icon1.as_ref().map(|_| Message::ClearIcon1)),
-                label("SND0.AT3 — XMB music (made above, or a ready .at3)"),
-                file_row(snd0, Message::PickSnd0, self.snd0.as_ref().map(|_| Message::ClearSnd0)),
-                budget,
-                tools,
+        column![
+            caption("CLIP SOURCE"),
+            row![
+                text_input("https://youtu.be/…  or  a video / audio file", &c.source)
+                    .on_input(Message::ClipSource)
+                    .on_submit(Message::ProbeClip)
+                    .size(13)
+                    .padding([9, 12])
+                    .width(Fill)
+                    .style(style::input),
+                hint(icon_button(Icon::Folder, accent, Some(Message::PickClipSource)), "Browse a video / audio file".into()),
+                hint(icon_button(Icon::Search, accent, (!c.source.trim().is_empty()).then_some(Message::ProbeClip)), "Probe: read length and title".into()),
             ]
-            .spacing(8),
-        )
+            .spacing(6)
+            .align_y(Alignment::Center),
+            row![icons::icon(Icon::Link, 13.0, style::MUTED), container(source_info).width(Fill).clip(true)].spacing(6).align_y(Alignment::Center),
+            row![
+                icons::icon(Icon::Clock, 14.0, style::MUTED),
+                label("From"),
+                text_input("0:00", &c.start).on_input(Message::ClipStart).size(13).padding([7, 10]).width(80).style(style::input),
+                label("to"),
+                text_input(&end_hint, &c.end).on_input(Message::ClipEnd).size(13).padding([7, 10]).width(80).style(style::input),
+                space().width(Fill),
+                chip(span.map_or_else(|| "invalid span".into(), |(s, e)| format!("{:.1} s", e - s)), if span.is_some() { accent } else { style::RED }),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+            container(modes).padding(4).style(style::segmented),
+            audio,
+            make,
+            space().height(2),
+            hairline(),
+            caption("PAYLOADS"),
+            slot_row(Icon::Video, accent, "ICON1.PMF", icon1, self.icon1.is_some(), Message::PickIcon1, (Icon::Close, "Remove", self.icon1.as_ref().map(|_| Message::ClearIcon1))),
+            slot_row(Icon::Music, accent, "SND0.AT3", snd0, self.snd0.is_some(), Message::PickSnd0, (Icon::Close, "Remove", self.snd0.as_ref().map(|_| Message::ClearSnd0))),
+            budget,
+            tools,
+        ]
+        .spacing(9)
+        .into()
     }
 
     fn build_card(&self) -> Element<'_, Message> {
-        let output = self.output_path().map_or_else(|| "<disc folder>/<GAME ID>/EBOOT.PBP".into(), |p| p.display().to_string());
-        card(
-            "Build",
-            style::GREEN,
+        let status = chip(format!("Level {}", self.level), style::GREEN);
+        self.section(BUILD, status, || {
+            let output = self.output_path().map_or_else(|| "<disc folder>/<GAME ID>/EBOOT.PBP".into(), |p| p.display().to_string());
+            let reset = (Icon::Reset, "Back to the default location", self.output.as_ref().map(|_| Message::ResetOutput));
             column![
-                label("Output"),
-                file_row(output, Message::PickOutput, self.output.as_ref().map(|_| Message::ResetOutput)),
+                caption("OUTPUT"),
+                slot_row(Icon::Package, style::GREEN, "EBOOT.PBP", output, self.output_path().is_some(), Message::PickOutput, reset),
+                space().height(2),
                 row![
-                    label(format!("Compression {}", self.level)).width(110),
-                    slider(1..=9, self.level, Message::Level),
-                    label(match self.level {
-                        1..=4 => "faster, larger",
-                        5..=6 => "recommended",
-                        _ => "slower, ~same size",
-                    })
-                    .width(130),
+                    icons::icon(Icon::Layers, 14.0, style::MUTED),
+                    caption(format!("COMPRESSION  {}", self.level)),
+                    space().width(Fill),
+                    chip(
+                        match self.level {
+                            1..=4 => "faster, larger",
+                            5..=6 => "recommended",
+                            _ => "slower, ~same size",
+                        },
+                        if (5..=6).contains(&self.level) { style::GREEN } else { style::MUTED },
+                    ),
                 ]
-                .spacing(10)
+                .spacing(8)
                 .align_y(Alignment::Center),
+                container(slider(1..=9, self.level, Message::Level).style(style::slider(style::GREEN))).padding([2, 4]),
+                space().height(2),
                 row![
-                    ghost("Import EBOOT…").on_press(Message::ImportPbp).width(Fill),
-                    ghost("Extract EBOOT…").on_press_maybe(self.job.is_none().then_some(Message::ExtractPbp)).width(Fill),
+                    hint(ghost_icon(Icon::Import, "Import EBOOT…").on_press(Message::ImportPbp).width(Fill), "Take title, ID and artwork from an existing EBOOT.PBP".into()),
+                    hint(
+                        ghost_icon(Icon::Export, "Extract EBOOT…").on_press_maybe(self.job.is_none().then_some(Message::ExtractPbp)).width(Fill),
+                        "Unpack an EBOOT.PBP back to disc images and its files".into()
+                    ),
                 ]
                 .spacing(8),
             ]
-            .spacing(8),
-        )
+            .spacing(9)
+            .into()
+        })
     }
 
     fn header(&self) -> Element<'_, Message> {
@@ -1597,7 +1932,7 @@ impl App {
             r.push(button(text(s.label()).size(13)).padding([6, 18]).style(style::tab(self.screen == s)).on_press(Message::Screen(s)))
         });
         row![
-            column![text("PSX2PSP Reborn").size(22), label("PS1 → PSP / PS Vita EBOOT.PBP studio")].spacing(2),
+            column![text("XMB preview").size(20).font(style::BOLD), label("How the EBOOT looks on the PSP")].spacing(2),
             space().width(Fill),
             self.snd0.as_ref().filter(|s| s.sound.is_some()).map(|_| {
                 button(text(if self.muted { "Sound off" } else { "Sound on" }).size(13))
@@ -1672,7 +2007,10 @@ impl App {
                     .wrapping(text::Wrapping::None)
                     .width(Fill),
                 ghost(if self.log_open { "Hide log" } else { "Show log" }).on_press(Message::ToggleLog),
-                button(text("Build EBOOT.PBP").size(14)).padding([10, 22]).style(style::solid(style::GREEN)).on_press(Message::Convert),
+                button(row![icons::icon(Icon::Package, 17.0, Color::WHITE), text("Build EBOOT.PBP").size(14).font(style::BOLD)].spacing(9).align_y(Alignment::Center))
+                    .padding([11, 24])
+                    .style(style::primary_button(style::GREEN, style::TEAL))
+                    .on_press(Message::Convert),
             ]
             .spacing(12)
             .align_y(Alignment::Center)
