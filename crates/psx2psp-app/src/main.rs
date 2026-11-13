@@ -5,6 +5,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod audio;
+mod project;
 mod style;
 mod worker;
 mod xmb;
@@ -49,13 +50,14 @@ const JOB_INSTALL: &str = "Install tools";
 const CANCELLED: &str = "cancelled";
 
 fn main() -> iced::Result {
-    iced::application(App::boot, App::update, App::view)
+    iced::application(App::boot, project::update, App::view)
         .title(App::title)
         .theme(App::theme)
-        .subscription(App::subscription)
+        .subscription(project::subscription)
         .window(window::Settings {
             size: Size::new(1320.0, 820.0),
             min_size: Some(Size::new(1000.0, 640.0)),
+            exit_on_close_request: false,
             ..Default::default()
         })
         .antialiasing(true)
@@ -90,6 +92,7 @@ struct App {
     tools: Option<Tools>,
     /// Built-in patch database with the user's patches.ini merged on top.
     patches: PatchDb,
+    project: project::State,
 }
 
 struct Disc {
@@ -418,6 +421,7 @@ enum Message {
     ToggleLog,
     Dismiss(u64),
     ToolsDetected(Result<Tools, String>),
+    Project(project::Msg),
 }
 
 // ───────────────────────────────── dialogs ────────────────────────────────
@@ -465,6 +469,7 @@ impl App {
             toasts: Vec::new(),
             tools: None,
             patches: loaded.db,
+            project: Default::default(),
         };
         app.audio.set_active(app.screen == Screen::Game);
         let detect = detect_tools_task();
@@ -472,7 +477,8 @@ impl App {
         let warn = loaded.error.map(|e| app.toast(Kind::Error, format!("{e} — your patches.ini is ignored")));
         // Paths on the command line ("Open with", drag onto the exe) behave like dropped files.
         let opened = std::env::args_os().skip(1).map(|a| Task::done(Message::FileDropped(PathBuf::from(a))));
-        (app, Task::batch(std::iter::once(detect).chain(warn).chain(opened)))
+        let restore = project::boot(&mut app);
+        (app, Task::batch(std::iter::once(detect).chain(warn).chain(opened).chain([restore])))
     }
 
     fn title(&self) -> String {
@@ -906,6 +912,7 @@ impl App {
             }
             Message::ToggleLog => self.log_open = !self.log_open,
             Message::Dismiss(id) => self.toasts.retain(|t| t.id != id),
+            Message::Project(m) => return project::handle(self, m),
             Message::ToolsDetected(r) => {
                 if let Ok(t) = r {
                     let at = |p: &Option<PathBuf>| p.as_deref().map_or("not found".into(), |p| p.display().to_string());
@@ -1271,7 +1278,7 @@ fn file_row<'a>(name: String, browse: Message, clear: Option<Message>) -> Elemen
 
 impl App {
     fn view(&self) -> Element<'_, Message> {
-        let sidebar = scrollable(column![self.game_card(), self.art_card(), self.media_card(), self.build_card()].spacing(14).padding(16))
+        let sidebar = scrollable(column![project::view(self), self.game_card(), self.art_card(), self.media_card(), self.build_card()].spacing(14).padding(16))
             .width(440)
             .height(Fill);
         let main = column![self.header(), self.preview(), self.footer()].spacing(14).padding(16).width(Fill);
