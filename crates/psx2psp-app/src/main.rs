@@ -70,11 +70,18 @@ fn main() -> iced::Result {
             size: Size::new(1320.0, 820.0),
             min_size: Some(Size::new(1000.0, 640.0)),
             exit_on_close_request: false,
-            icon: window::icon::from_file_data(include_bytes!("../assets/icon.png"), None).ok(),
+            icon: app_icon(),
             ..Default::default()
         })
         .antialiasing(true)
         .run()
+}
+
+/// The window/taskbar icon, decoded with the workspace `image` (iced's own helper needs every codec).
+fn app_icon() -> Option<window::Icon> {
+    let rgba = ::image::load_from_memory_with_format(include_bytes!("../assets/icon.png"), ::image::ImageFormat::Png).ok()?.into_rgba8();
+    let (w, h) = rgba.dimensions();
+    window::icon::from_rgba(rgba.into_raw(), w, h).ok()
 }
 
 // ───────────────────────────────── state ─────────────────────────────────
@@ -107,6 +114,14 @@ struct App {
     tools: Option<Tools>,
     /// Built-in patch database with the user's patches.ini merged on top.
     patches: PatchDb,
+    /// The user's patches.ini (may not exist yet); `None` on a system without a config folder.
+    patches_path: Option<PathBuf>,
+    /// Bumped on every reload of [`App::patches`]: hit counts of an older database are stale.
+    patches_gen: u64,
+    /// The "Add patch" form, open under one disc at a time.
+    patch_form: Option<PatchForm>,
+    /// A user patch whose remove button was clicked once (the second click removes it).
+    confirm_remove: Option<String>,
     updater: updater::Updater,
     project: project::State,
     chrome: Chrome,
@@ -134,6 +149,33 @@ struct Disc {
     /// Per-patch choices by name ([`patchdb::CONFIG`] = the POPS config); they win over the
     /// switches. Cleared for a kind when its switch is toggled.
     patch_choice: Vec<(String, bool)>,
+    /// What the patch hits were last asked for ([`App::rescan`]).
+    scan: Option<ScanKey>,
+    /// Hits per patch name ([`engine::scan_patches`]) and what they were counted for.
+    hits: Option<(ScanKey, Vec<(String, usize)>)>,
+}
+
+/// What a disc's patch hits depend on: database ID, the user's PPF, database generation.
+type ScanKey = (String, Option<PathBuf>, u64);
+
+/// The "Add patch" form (a byte-pattern patch for the disc's game).
+#[derive(Debug, Clone)]
+struct PatchForm {
+    disc: u64,
+    name: String,
+    kind: patchdb::Kind,
+    search: String,
+    replace: String,
+    note: String,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PatchField {
+    Name,
+    Search,
+    Replace,
+    Note,
 }
 
 impl Disc {
@@ -151,7 +193,24 @@ impl Disc {
             ntsc_60hz: false,
             seeded_for: None,
             patch_choice: Vec::new(),
+            scan: None,
+            hits: None,
         }
+    }
+
+    /// The scan this disc needs now: probed, and the database has patches for its game.
+    fn scan_key(&self, db: &PatchDb, generation: u64) -> Option<ScanKey> {
+        if self.summary.is_none() || self.error.is_some() {
+            return None;
+        }
+        let id = self.db_id(db)?;
+        (!db.patches_for(&id).is_empty()).then(|| (id, self.ppf.clone(), generation))
+    }
+
+    /// Hits of patch `name` on this disc, if counted for the current state.
+    fn hits_of(&self, name: &str) -> Option<usize> {
+        let (k, hits) = self.hits.as_ref()?;
+        (Some(k) == self.scan.as_ref()).then(|| hits.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|h| h.1))?
     }
 
     /// When the disc's ID changes (probe, or typed by hand), its switches start over from that
@@ -484,6 +543,20 @@ enum Message {
     TogglePatch(u64, String),
     /// Turn on every fix the game offers.
     AllFixes(u64),
+    /// Patch hits of a disc, counted for the given state.
+    Scanned(u64, ScanKey, Result<Vec<(String, usize)>, String>),
+    /// Open the "Add patch" form under a disc / edit it / close it / save it to patches.ini.
+    AddPatch(u64),
+    PatchField(PatchField, String),
+    PatchKind(patchdb::Kind),
+    CancelPatch,
+    SavePatch,
+    /// A user patch's remove button (name, game IDs): the first click asks, the second removes.
+    RemoveUserPatch(String, Vec<String>),
+    OpenPatches,
+    ReloadPatches,
+    /// patches.ini was written and/or re-read: the new database, what happened, close the form.
+    PatchesLoaded(Result<(patchdb::Loaded, String, bool), String>),
     PickArt(Slot),
     ArtPicked(Slot, Option<PathBuf>),
     ArtLoaded(Slot, Result<Art, String>),
@@ -594,6 +667,10 @@ impl App {
             toasts: Vec::new(),
             tools: None,
             patches: loaded.db,
+            patches_path: loaded.user_path,
+            patches_gen: 0,
+            patch_form: None,
+            confirm_remove: None,
             updater,
             project: Default::default(),
             chrome: Chrome::new(),
@@ -683,7 +760,7 @@ impl App {
             self.next_key += 1;
             // A CUE replacing a BIN that was already listed inherits its PPF, typed ID and switches.
             let disc = match old.iter().find(|d| engine::companion_cue(&d.path).as_deref() == Some(path.as_path())) {
-                Some(d) => Disc { key, path: path.clone(), summary: None, error: None, id: d.id.clone(), ppf: d.ppf.clone(), patch_choice: d.patch_choice.clone(), seeded_for: d.seeded_for.clone(), ..*d },
+                Some(d) => Disc { key, path: path.clone(), summary: None, error: None, id: d.id.clone(), ppf: d.ppf.clone(), patch_choice: d.patch_choice.clone(), seeded_for: d.seeded_for.clone(), scan: None, hits: None, ..*d },
                 None => Disc::new(key, path.clone()),
             };
             self.discs.push(disc);
@@ -711,6 +788,30 @@ impl App {
 
     fn disc_mut(&mut self, key: u64) -> Option<&mut Disc> {
         self.discs.iter_mut().find(|d| d.key == key)
+    }
+
+    /// Starts a background patch scan for every disc whose hits are missing or stale (new ID,
+    /// PPF or database). Runs after every message; a disc that needs nothing costs a lookup.
+    fn rescan(&mut self) -> Task<Message> {
+        let (db, generation) = (&self.patches, self.patches_gen);
+        let mut tasks = Vec::new();
+        for d in &mut self.discs {
+            let k = d.scan_key(db, generation);
+            if k == d.scan {
+                continue;
+            }
+            d.scan.clone_from(&k);
+            let (Some(k), Some(id)) = (k, d.effective_id()) else { continue };
+            let (key, path, db) = (d.key, d.path.clone(), db.clone());
+            tasks.push(worker::blocking(
+                {
+                    let k = k.clone();
+                    move || engine::scan_patches(&path, k.1.as_deref(), &id, &db).map_err(|e| e.to_string())
+                },
+                move |r| Message::Scanned(key, k.clone(), r),
+            ));
+        }
+        Task::batch(tasks)
     }
 
     /// Flips one kind's switch and drops the per-patch choices of that kind, so the switch
@@ -823,6 +924,123 @@ impl App {
                     (d.title_fixes, d.fps_unlock, d.ntsc_60hz) = (true, true, true);
                     d.patch_choice.retain(|(_, on)| *on);
                 }
+            }
+            Message::Scanned(key, k, r) => {
+                let Some(d) = self.disc_mut(key) else { return Task::none() };
+                if d.scan.as_ref() != Some(&k) {
+                    return Task::none(); // the disc changed while scanning
+                }
+                match r {
+                    Ok(hits) => d.hits = Some((k, hits)),
+                    Err(e) => {
+                        let name = file_name(&d.path);
+                        self.log(format!("{name}: patch scan failed: {e}"));
+                    }
+                }
+            }
+            Message::AddPatch(key) => {
+                self.patch_form = Some(PatchForm {
+                    disc: key,
+                    name: String::new(),
+                    kind: patchdb::Kind::Fix,
+                    search: String::new(),
+                    replace: String::new(),
+                    note: String::new(),
+                    error: None,
+                });
+            }
+            Message::PatchField(f, v) => {
+                if let Some(p) = &mut self.patch_form {
+                    *match f {
+                        PatchField::Name => &mut p.name,
+                        PatchField::Search => &mut p.search,
+                        PatchField::Replace => &mut p.replace,
+                        PatchField::Note => &mut p.note,
+                    } = v;
+                    p.error = None;
+                }
+            }
+            Message::PatchKind(k) => {
+                if let Some(p) = &mut self.patch_form {
+                    p.kind = k;
+                }
+            }
+            Message::CancelPatch => self.patch_form = None,
+            Message::SavePatch => {
+                let Some(f) = &mut self.patch_form else { return Task::none() };
+                let id = self.discs.iter().find(|d| d.key == f.disc).and_then(|d| d.db_id(&self.patches));
+                let made = match (&self.patches_path, id) {
+                    (None, _) => Err("this system has no config folder for patches.ini".to_owned()),
+                    (_, None) => Err("the disc has no game ID yet: type it above".to_owned()),
+                    (Some(_), Some(id)) => Patch::new(&[id.as_str()], &f.name, f.kind, &f.search, &f.replace, &f.note),
+                };
+                let p = match made {
+                    Ok(p) => p,
+                    Err(e) => {
+                        f.error = Some(e);
+                        return Task::none();
+                    }
+                };
+                let path = self.patches_path.clone().expect("checked above");
+                return worker::blocking(
+                    move || {
+                        patchdb::append_user(&path, &p)?;
+                        Ok((patchdb::load_from(Some(path)), format!("Patch “{}” saved to patches.ini", p.name), true))
+                    },
+                    Message::PatchesLoaded,
+                );
+            }
+            Message::RemoveUserPatch(name, ids) => {
+                if self.confirm_remove.as_deref() != Some(name.as_str()) {
+                    self.confirm_remove = Some(name);
+                    return Task::none();
+                }
+                self.confirm_remove = None;
+                let Some(path) = self.patches_path.clone() else { return Task::none() };
+                return worker::blocking(
+                    move || {
+                        let what = if patchdb::remove_user(&path, &name, &ids)? { format!("Patch “{name}” removed from patches.ini") } else { format!("“{name}” is no longer in patches.ini") };
+                        Ok((patchdb::load_from(Some(path)), what, false))
+                    },
+                    Message::PatchesLoaded,
+                );
+            }
+            Message::OpenPatches => {
+                let Some(path) = self.patches_path.clone() else { return self.toast(Kind::Error, "This system has no config folder for patches.ini") };
+                // A missing file opens as its folder (created): there is nothing to edit yet.
+                let target = match path.parent() {
+                    Some(dir) if !path.is_file() => {
+                        let _ = std::fs::create_dir_all(dir);
+                        dir.to_path_buf()
+                    }
+                    _ => path,
+                };
+                updater::open_url(&target.to_string_lossy());
+            }
+            Message::ReloadPatches => {
+                let path = self.patches_path.clone();
+                return worker::blocking(move || Ok((patchdb::load_from(path), "patches.ini reloaded".to_owned(), false)), Message::PatchesLoaded);
+            }
+            Message::PatchesLoaded(r) => {
+                let (loaded, what, close_form) = match r {
+                    Ok(x) => x,
+                    Err(e) => {
+                        if let Some(f) = &mut self.patch_form {
+                            f.error = Some(e.clone());
+                        }
+                        return self.toast(Kind::Error, e);
+                    }
+                };
+                self.patches = loaded.db;
+                self.patches_path = loaded.user_path;
+                self.patches_gen += 1;
+                if let Some(e) = loaded.error {
+                    return self.toast(Kind::Error, format!("{e} — your patches.ini is ignored"));
+                }
+                if close_form {
+                    self.patch_form = None;
+                }
+                return self.toast(Kind::Info, what);
             }
             Message::TogglePatch(key, name) => {
                 let db = &self.patches;
@@ -1618,6 +1836,11 @@ fn ghost_icon<'a>(glyph: Icon, s: impl text::IntoFragment<'a>) -> button::Button
         .style(style::ghost)
 }
 
+/// Compact glyph + word button that keeps its natural width inside a crowded row.
+fn pill<'a>(glyph: Icon, s: &'a str) -> button::Button<'a, Message> {
+    button(row![icons::icon(glyph, 13.0, style::TEXT), text(s).size(12).wrapping(text::Wrapping::None)].spacing(6).align_y(Alignment::Center)).padding([6, 10]).style(style::ghost)
+}
+
 /// `content` with a hover explanation above it.
 fn hint<'a>(content: impl Into<Element<'a, Message>>, explanation: String) -> Element<'a, Message> {
     let bubble = container(text(explanation).size(12)).padding([6, 10]).max_width(340).style(style::toast(style::BLUE));
@@ -1836,7 +2059,7 @@ impl App {
                 .spacing(6)
                 .align_y(Alignment::Center)
                 .into(),
-            None => hint(ghost_icon(Icon::Plus, "PPF").padding([6, 10]).on_press(Message::PickPpf(key)), "Apply a .ppf patch to this disc".into()),
+            None => hint(pill(Icon::Plus, "PPF").on_press(Message::PickPpf(key)), "Apply a .ppf patch to this disc".into()),
         };
         let switch = |on: bool, name: &str, msg: Message| -> Element<'_, Message> {
             let mut r = row![].spacing(6).align_y(Alignment::Center);
@@ -1867,13 +2090,16 @@ impl App {
             .align_y(Alignment::Center),
             row![
                 hint(
-                    text_input(&placeholder, &d.id).on_input(move |s| Message::DiscId(key, s)).size(13).padding([7, 10]).width(140).style(style::input),
+                    text_input(&placeholder, &d.id).on_input(move |s| Message::DiscId(key, s)).size(13).padding([7, 10]).width(104).style(style::input),
                     "Game ID override; leave empty to use the detected one".into()
                 ),
                 space().width(Fill),
                 pal,
                 ppf,
             ]
+            .extend((d.summary.is_some() && d.effective_id().is_some() && d.config(db).is_none() && d.patches(db).is_empty() && self.patch_form.as_ref().is_none_or(|f| f.disc != key)).then(|| {
+                hint(pill(Icon::Wrench, "Patch").on_press(Message::AddPatch(key)), "Write your own byte patch for this game (saved to your patches.ini)".into())
+            }))
             .spacing(8)
             .align_y(Alignment::Center),
         ]
@@ -1904,19 +2130,42 @@ impl App {
                     format!("{}. Uses the game's own NTSC code: no generic PAL→NTSC, POPS config left as is.", names(patchdb::Kind::Ntsc60)),
                 ));
             }
-            // One line per entry: its own toggle (wins over the switches), kind and origin.
-            let entry = |on: bool, name: &str, tag: String, note: String| -> Element<'_, Message> {
-                row![hint(switch(on, name, Message::TogglePatch(key, name.to_owned())), note), space().width(Fill), text(tag).size(11).color(style::MUTED)]
+            // One line per entry: its own toggle (wins over the switches), hits on this disc, kind
+            // and origin, and a remove button for the user's own patches.
+            let entry = |on: bool, name: &str, tag: String, note: String, found: Element<'a, Message>, remove: Option<Element<'a, Message>>| -> Element<'a, Message> {
+                let r = row![hint(switch(on, name, Message::TogglePatch(key, name.to_owned())), note), found, space().width(Fill), text(tag).size(11).color(style::MUTED)]
                     .spacing(8)
-                    .align_y(Alignment::Center)
-                    .into()
+                    .align_y(Alignment::Center);
+                r.extend(remove).into()
+            };
+            let found = |p: &Patch| -> Element<'a, Message> {
+                let ppf = matches!(p.body, patchdb::Body::Ppf(_));
+                let (text, accent, why) = match d.hits_of(&p.name) {
+                    None if d.scan.is_some() => return label("scanning…").into(),
+                    None => return space().into(),
+                    Some(0) if ppf => ("other dump".to_owned(), style::AMBER, "This PPF was made for another dump of the game: it is skipped."),
+                    Some(0) => ("no match".to_owned(), style::AMBER, "The search bytes are not on this disc: the patch would change nothing."),
+                    Some(_) if ppf => ("fits".to_owned(), style::GREEN, "This PPF matches this dump."),
+                    Some(n) => (format!("×{n}"), style::GREEN, "Places on this disc where the search bytes match."),
+                };
+                hint(chip(text, accent), why.into())
+            };
+            let remove = |p: &Patch| -> Option<Element<'a, Message>> {
+                (p.origin == patchdb::Origin::User).then(|| {
+                    let msg = Message::RemoveUserPatch(p.name.clone(), p.ids.clone());
+                    if self.confirm_remove.as_deref() == Some(p.name.as_str()) {
+                        button(text("Remove?").size(11).font(style::BOLD)).padding([4, 9]).style(style::solid(style::RED)).on_press(msg).into()
+                    } else {
+                        hint(icon_button(Icon::Close, style::RED, Some(msg)).width(26).height(26), "Remove from your patches.ini".into())
+                    }
+                })
             };
             let mut list = column![].spacing(5);
             if let Some(g) = game {
                 let size = g.config.as_ref().map_or(0, Vec::len);
                 let note = format!("POPS emulator settings for this game ({size} B, {}). {}", g.source, g.note);
                 let origin = if g.origin == patchdb::Origin::User { " · user" } else { "" };
-                list = list.push(entry(d.config_on(), patchdb::CONFIG, format!("Game fix{origin}"), note));
+                list = list.push(entry(d.config_on(), patchdb::CONFIG, format!("Game fix{origin}"), note, space().into(), None));
             }
             for p in &ps {
                 let mut tag = p.kind.to_string();
@@ -1926,17 +2175,72 @@ impl App {
                 if p.origin == patchdb::Origin::User {
                     tag.push_str(" · user");
                 }
-                list = list.push(entry(d.patch_on(p), &p.name, tag, p.note.clone()));
+                list = list.push(entry(d.patch_on(p), &p.name, tag, p.note.clone(), found(p), remove(p)));
             }
             let mut result =
                 row![icons::icon(Icon::Check, 13.0, style::GREEN), text(d.outcome(db)).size(12).color(style::GREEN), space().width(Fill)].spacing(6).align_y(Alignment::Center);
             if !d.all_on(db) {
                 result = result.push(hint(ghost_icon(Icon::Star, "All on").padding([5, 10]).on_press(Message::AllFixes(key)), "Turn on every switch this game offers (patches off by default stay off).".into()));
             }
-            let heading = row![icons::icon(Icon::Shield, 15.0, style::GREEN), caption("PATCHES FOR THIS GAME")].spacing(8).align_y(Alignment::Center);
+            let heading = row![icons::icon(Icon::Shield, 15.0, style::GREEN), caption("PATCHES FOR THIS GAME"), space().width(Fill), self.patch_tools(key)].spacing(8).align_y(Alignment::Center);
             body = body.push(hairline()).push(heading).push(fixes.wrap().vertical_spacing(6)).push(list).push(result);
         }
+        if let Some(f) = self.patch_form.as_ref().filter(|f| f.disc == key) {
+            body = body.push(hairline()).push(self.patch_form_view(f, d.db_id(db).unwrap_or_default()));
+        }
         container(body).padding(12).style(style::well).into()
+    }
+
+    /// patches.ini buttons in a disc's patch heading: new patch, open, reload.
+    fn patch_tools(&self, key: u64) -> Element<'_, Message> {
+        let add = self.patch_form.as_ref().is_none_or(|f| f.disc != key).then_some(Message::AddPatch(key));
+        let file = self.patches_path.as_ref().map_or_else(|| "no config folder on this system".to_owned(), |p| p.display().to_string());
+        row![
+            hint(icon_button(Icon::Plus, style::GREEN, add).width(28).height(28), "Write your own byte patch for this game".into()),
+            hint(icon_button(Icon::Folder, style::BLUE, self.patches_path.as_ref().map(|_| Message::OpenPatches)).width(28).height(28), format!("Open your patches.ini — {file}")),
+            hint(icon_button(Icon::Reset, style::BLUE, Some(Message::ReloadPatches)).width(28).height(28), "Reload patches.ini after editing it".into()),
+        ]
+        .spacing(4)
+        .into()
+    }
+
+    /// The "Add patch" form: a search/replace byte pattern for the disc's game.
+    fn patch_form_view<'a>(&'a self, f: &'a PatchForm, id: String) -> Element<'a, Message> {
+        let field = |hint_text: &'a str, value: &'a str, which: PatchField| {
+            text_input(hint_text, value).on_input(move |s| Message::PatchField(which, s)).size(13).padding([7, 10]).style(style::input)
+        };
+        let kinds = patchdb::Kind::ALL.into_iter().fold(row![].spacing(3), |r, k| {
+            r.push(button(text(k.to_string()).size(12)).padding([4, 10]).style(style::segment(f.kind == k, style::BLUE)).on_press(Message::PatchKind(k)))
+        });
+        let follows = match f.kind {
+            patchdb::Kind::Fix => "On with “Game fixes”.",
+            patchdb::Kind::Fps => "On with “Unlock fps”.",
+            patchdb::Kind::Ntsc60 => "On with “60 Hz”.",
+            patchdb::Kind::Other => "Off until you pick it.",
+        };
+        let mut form = column![
+            row![icons::icon(Icon::Wrench, 14.0, style::BLUE), caption(format!("NEW PATCH FOR {id}"))].spacing(8).align_y(Alignment::Center),
+            field("Name — e.g. Skip intro", &f.name, PatchField::Name),
+            container(kinds).padding(3).style(style::segmented),
+            field("Search hex, e.g. 0C 00 ?? 14", &f.search, PatchField::Search).font(Font::MONOSPACE),
+            field("Replace hex, same length (?? keeps)", &f.replace, PatchField::Replace).font(Font::MONOSPACE),
+            field("Note (optional): what it does, its source", &f.note, PatchField::Note),
+            label(format!("{follows} Matched on every data sector, 4-byte aligned; saved to your patches.ini.")),
+        ]
+        .spacing(8);
+        if let Some(e) = &f.error {
+            form = form.push(row![icons::icon(Icon::Alert, 13.0, style::RED), text(e.as_str()).size(12).color(style::RED)].spacing(6).align_y(Alignment::Center));
+        }
+        form.push(
+            row![
+                space().width(Fill),
+                ghost("Cancel").on_press(Message::CancelPatch),
+                button(text("Save patch").size(13).font(style::BOLD).wrapping(text::Wrapping::None)).padding([6, 14]).style(style::solid(style::GREEN)).on_press(Message::SavePatch),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        )
+        .into()
     }
 
     /// Click-to-browse target that glows while files are dragged over the window.
@@ -2636,9 +2940,17 @@ impl App {
             .align_y(Alignment::Center)
             .into(),
             None => row![
-                label(self.output_path().map_or_else(|| "Add a disc to choose the output".into(), |p| format!("→ {}", p.display())))
-                    .wrapping(text::Wrapping::None)
-                    .width(Fill),
+                // The tail of the path (folder\EBOOT.PBP) is what tells outputs apart; the whole
+                // path is in the hover hint.
+                container(match self.output_path() {
+                    None => Element::from(label("Add a disc to choose the output")),
+                    Some(p) => {
+                        let tail = p.parent().and_then(Path::file_name).map_or_else(|| file_name(&p), |d| format!("{}{}{}", d.to_string_lossy(), std::path::MAIN_SEPARATOR, file_name(&p)));
+                        hint(label(format!("→ …{}{tail}", std::path::MAIN_SEPARATOR)).wrapping(text::Wrapping::None), p.display().to_string())
+                    }
+                })
+                .width(Fill)
+                .clip(true),
                 ghost(if self.log_open { "Hide log" } else { "Show log" }).on_press(Message::ToggleLog),
                 button(row![icons::icon(Icon::Package, 17.0, Color::WHITE), text("Build EBOOT.PBP").size(14).font(style::BOLD)].spacing(9).align_y(Alignment::Center))
                     .padding([11, 24])
@@ -2718,5 +3030,66 @@ mod tests {
             assert_eq!((m.width, m.height, m.frames.len()), (144, 80, 605));
         }
         assert!(load_snd0(p).is_err(), "a PMF is not an AT3");
+    }
+
+    /// The window icon decodes with the trimmed codec set (no silent `None`).
+    #[test]
+    fn window_icon_decodes() {
+        assert!(app_icon().is_some());
+    }
+
+    /// The "Add patch" form validates in place, a saved patch reaches the disc after a reload,
+    /// the disc is scanned once per state, stale hits are dropped, and removal asks first.
+    #[test]
+    fn user_patch_form_scan_and_remove() {
+        use engine::core::disc::Region;
+        let t = tempfile::tempdir().unwrap();
+        let mut app = App::boot().0;
+        let ini = t.path().join("patches.ini");
+        app.patches_path = Some(ini.clone());
+        app.discs.push(Disc::new(7, t.path().join("g.cue")));
+        let summary = DiscSummary { path: t.path().join("g.cue"), disc_id: None, volume_id: None, region: Region::NtscU, title: None, tracks: 1, audio_tracks: 0, size: 0 };
+        app.discs[0].summary = Some(summary);
+        app.discs[0].id = "SLUS99999".into();
+        assert!(app.discs[0].scan_key(&app.patches, app.patches_gen).is_none(), "nothing to scan for an unknown game");
+
+        let _ = app.update(Message::AddPatch(7));
+        let _ = app.update(Message::PatchField(PatchField::Name, "Skip intro".into()));
+        let _ = app.update(Message::PatchField(PatchField::Search, "AB CD".into()));
+        let _ = app.update(Message::PatchField(PatchField::Replace, "00".into()));
+        let _ = app.update(Message::SavePatch);
+        assert!(app.patch_form.as_ref().unwrap().error.as_deref().unwrap().contains("equal length"));
+        assert!(!ini.exists(), "an invalid patch is never written");
+
+        // What SavePatch's worker does, then its reply.
+        let p = Patch::new(&["SLUS99999"], "Skip intro", patchdb::Kind::Fix, "ab cd", "00 00", "").unwrap();
+        patchdb::append_user(&ini, &p).unwrap();
+        let _ = app.update(Message::PatchesLoaded(Ok((patchdb::load_from(Some(ini.clone())), "saved".into(), true))));
+        assert!(app.patch_form.is_none());
+        let d = &app.discs[0];
+        assert!(d.patch_on(d.patches(&app.patches).iter().find(|p| p.name == "Skip intro").unwrap()), "a fix is on with Game fixes");
+
+        let _ = app.rescan();
+        let k = app.discs[0].scan.clone().expect("scan started");
+        assert_eq!(k, ("SLUS99999".to_owned(), None, 1));
+        let _ = app.rescan();
+        assert_eq!(app.discs[0].scan.as_ref(), Some(&k), "no second scan for the same state");
+        let _ = app.update(Message::Scanned(7, ("SLUS99999".into(), None, 0), Ok(vec![("Skip intro".into(), 9)])));
+        assert_eq!(app.discs[0].hits_of("Skip intro"), None, "hits of an older database are dropped");
+        let _ = app.update(Message::Scanned(7, k, Ok(vec![("Skip intro".into(), 3)])));
+        assert_eq!(app.discs[0].hits_of("skip INTRO"), Some(3));
+        app.discs[0].ppf = Some(t.path().join("x.ppf"));
+        let _ = app.rescan();
+        assert_eq!(app.discs[0].hits_of("Skip intro"), None, "a new PPF makes the hits stale");
+
+        let ids = vec!["SLUS99999".to_owned()];
+        let _ = app.update(Message::RemoveUserPatch("Skip intro".into(), ids.clone()));
+        assert_eq!(app.confirm_remove.as_deref(), Some("Skip intro"), "the first click only asks");
+        assert!(std::fs::read_to_string(&ini).unwrap().contains("Skip intro"));
+        assert!(patchdb::remove_user(&ini, "Skip intro", &ids).unwrap());
+        let _ = app.update(Message::PatchesLoaded(Ok((patchdb::load_from(Some(ini)), "removed".into(), false))));
+        assert!(app.discs[0].patches(&app.patches).is_empty());
+        let _ = app.rescan();
+        assert_eq!(app.discs[0].scan, None);
     }
 }

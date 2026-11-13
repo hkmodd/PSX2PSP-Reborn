@@ -120,6 +120,16 @@ jobs:
           done > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
+      # Licence notices of the crates inside the binaries, shipped next to them (not hashed: the
+      # updater only verifies binaries).
+      - uses: actions/checkout@v4
+        with:
+          path: src
+          sparse-checkout: THIRD-PARTY-LICENSES.md
+          sparse-checkout-cone-mode: false
+      - name: Add the third-party licences
+        run: cp src/THIRD-PARTY-LICENSES.md dist/
+
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*

@@ -110,6 +110,15 @@ fn main() -> ExitCode {
         Some("tools") if args.len() == 2 && args[1] == "install" => cmd_tools(true),
         Some("update") if args.len() == 1 => cmd_update(false),
         Some("update") if args.len() == 2 && args[1] == "--check" => cmd_update(true),
+        // Asked-for help goes to stdout with success; a wrong command line stays an error (2).
+        Some("-h" | "--help" | "help") if args.len() == 1 => {
+            print!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
+        Some("-V" | "--version") if args.len() == 1 => {
+            println!("psx2psp {}", env!("CARGO_PKG_VERSION"));
+            return ExitCode::SUCCESS;
+        }
         _ => {
             eprint!("{USAGE}");
             return ExitCode::from(2);

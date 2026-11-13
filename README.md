@@ -223,6 +223,11 @@ note    = Lets the game render up to 50/60 fps instead of 25/30.
   skipped and logged, never half-applied.
 - `psx2psp patches disc.cue` lists everything the database has for a game, which entries are on by
   default, how many times each one hits the disc, and where your user file lives.
+- The GUI shows the same thing under each disc: every patch with its hits on *that* disc (green
+  `×N`, amber "no match", "fits"/"other dump" for PPFs), scanned in the background. **+** writes a
+  new search/replace patch into your `patches.ini` (validated before saving), the folder button
+  opens the file, reload re-reads it after a hand edit, and your own patches get a remove button
+  that asks first. A game the database does not know gets a **Patch** button next to **PPF**.
 
 ## ⌨️ Command line
 
@@ -305,6 +310,13 @@ Sony's ICON1 layout, PPF, patterns, EDC/ECC, loader CRCs, the patch database and
 that need a Sony sample or an external tool skip themselves when it is missing. The GUI test
 `xmb::tests::screens_composite_layers_correctly` renders the three preview screens off-screen on
 the real GPU, and skips itself on a machine without a GPU adapter.
+
+Dependencies are checked with [cargo-deny](https://github.com/EmbarkStudios/cargo-deny) against
+[`deny.toml`](deny.toml) (licences, sources, RustSec advisories; CI runs it on every push):
+
+```bash
+cargo deny check
+```
 
 ## 📊 How it compares
 
@@ -401,7 +413,11 @@ lets you check the file first.
 ## ⚖️ Licence
 
 The source code is dual-licensed under **[MIT](LICENSE-MIT)** or **[Apache-2.0](LICENSE-APACHE)**,
-at your option. Some files in `resources/` are not covered by that licence:
+at your option. The binaries also contain third-party Rust crates (MIT, Apache-2.0, BSD, ISC,
+Zlib, MPL-2.0 for the MP3 decoder…) and the Inter font (OFL-1.1): their notices are in
+[`THIRD-PARTY-LICENSES.md`](THIRD-PARTY-LICENSES.md), also attached to every release. Regenerate it
+with `cargo about generate --workspace --frozen about.hbs -o THIRD-PARTY-LICENSES.md`.
+Some files in `resources/` are not covered by the code licence:
 
 - `resources/popfe.ini` is generated from pop-fe and keeps **pop-fe's LGPL-2.1** licence.
 - `resources/BASE.PBP` and `resources/DATA.PSP` are the PS1 Classic donor (from Sony's

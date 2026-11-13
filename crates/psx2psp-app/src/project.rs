@@ -929,7 +929,7 @@ pub fn boot(app: &mut App) -> Task<Message> {
 
 /// `App::update` followed by change detection (installed as the iced update function).
 pub fn update(app: &mut App, m: Message) -> Task<Message> {
-    let task = app.update(m);
+    let task = Task::batch([app.update(m), app.rescan()]);
     let fp = fingerprint(app);
     if fp == app.project.fp {
         return task;

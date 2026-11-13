@@ -47,3 +47,11 @@ jobs:
       # The GPU test of the XMB preview skips itself when the runner has no adapter.
       - name: Test
         run: cargo test --workspace --locked
+
+  deny:
+    name: Dependencies (advisories, licences, sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Policy in deny.toml; fetches the RustSec advisory database on the runner.
+      - uses: EmbarkStudios/cargo-deny-action@v2

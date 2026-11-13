@@ -48,15 +48,26 @@ impl From<std::io::Error> for EngineError {
 pub type Result<T> = std::result::Result<T, EngineError>;
 
 /// Built-in donor: the PS1 Classic `BASE.PBP` every PSXPackager release ships (STARTDAT boot PNG
-/// + `\0PGD` trailer, verified offsets: PSAR 0x50000, STARTDAT at p1 0x100000).
-pub const BUILTIN_BASE_PBP: &[u8] = include_bytes!("../../../resources/BASE.PBP");
+/// and `\0PGD` trailer, verified offsets: PSAR 0x50000, STARTDAT at p1 0x100000).
+/// Stored zlib-compressed by `build.rs` (1.4 MB → ~60 KB) and inflated once, on first use.
+pub fn builtin_base_pbp() -> &'static [u8] {
+    static PBP: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    PBP.get_or_init(|| inflate(include_bytes!(concat!(env!("OUT_DIR"), "/BASE.PBP.z"))))
+}
+
+/// Inflates a zlib resource compressed by `build.rs`.
+pub(crate) fn inflate(z: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    flate2::read::ZlibDecoder::new(z).read_to_end(&mut out).expect("built-in resource is valid zlib");
+    out
+}
 /// Built-in loader: the 19 002-byte ELF `DATA.PSP` that popstation/PSX2PSP and PSXPackager write
 /// in preference to the donor's own signed module.
 pub const BUILTIN_DATA_PSP: &[u8] = include_bytes!("../../../resources/DATA.PSP");
 
 /// The donor used when the user supplies none: everything needed ships inside the binary.
 pub fn builtin_donor() -> Result<Donor> {
-    let mut donor = Donor::from_pbp(&mut PbpFile::open(std::io::Cursor::new(BUILTIN_BASE_PBP))?)?;
+    let mut donor = Donor::from_pbp(&mut PbpFile::open(std::io::Cursor::new(builtin_base_pbp()))?)?;
     donor.data_psp = BUILTIN_DATA_PSP.to_vec();
     Ok(donor)
 }

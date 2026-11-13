@@ -136,8 +136,8 @@ fn check_task(manual: bool) -> Task<Msg> {
     )
 }
 
-/// Opens `url` in the default browser through the OS opener.
-fn open_url(url: &str) {
+/// Opens `url` (a web address, file or folder) with the OS opener.
+pub fn open_url(url: &str) {
     let (program, pre): (&str, &[&str]) = if cfg!(windows) {
         ("rundll32.exe", &["url.dll,FileProtocolHandler"])
     } else if cfg!(target_os = "macos") {

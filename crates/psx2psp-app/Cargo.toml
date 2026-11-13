@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+publish.workspace = true
 description = "PSX2PSP-Reborn desktop GUI"
 
 [[bin]]
@@ -12,11 +13,14 @@ path = "src/main.rs"
 
 [dependencies]
 psx2psp-engine = { path = "../psx2psp-engine" }
-iced = { version = "0.14", features = ["wgpu", "image", "advanced", "svg"] }
+# Codecs come from the workspace `image` (png, jpeg, bmp, gif, webp): iced's plain "image" feature would
+# switch on image/default and compile every codec into the GUI (AVIF encoder, EXR, TIFF...).
+iced = { version = "0.14", features = ["wgpu", "image-without-codecs", "advanced", "svg"] }
 rfd = "0.18"
 cpal = "0.18"
 symphonia = { version = "0.5", default-features = false, features = ["mp3"] }
 bytemuck.workspace = true
+image.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
