@@ -16,6 +16,9 @@ iced = { version = "0.14", features = ["wgpu", "image", "advanced"] }
 rfd = "0.18"
 cpal = "0.18"
 bytemuck.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [dev-dependencies]
 pollster = "1"
+tempfile.workspace = true

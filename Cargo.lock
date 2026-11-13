@@ -3010,6 +3010,9 @@ dependencies = [
  "pollster",
  "psx2psp-engine",
  "rfd",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
