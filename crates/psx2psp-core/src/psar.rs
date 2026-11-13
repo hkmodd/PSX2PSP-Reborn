@@ -3,9 +3,12 @@
 //! Byte layout cross-checked against PSXPackager, popstationr and pop-fe (see `docs/FORMAT.md`).
 //!
 //! ```text
-//! PSISOIMG (ISO+x)   0x000 magic · 0x00C p1 · 0x400 "_SLUS_00594" · 0x800 TOC (10-byte BCD entries)
+//! PSISOIMG (ISO+x)   0x000 magic · 0x00C p1 · 0x400 "_SLUS_00594" · 0x420 POPS config (optional)
+//!                    0x800 TOC (10-byte BCD entries)
 //!                    0xBFC 0x00100000 · 0x1220 p2 · 0x1228 0x7FF · 0x122C title[128] · 0x12AC 3
+//!                    0x12D4 subchannel table offset (rel. ISO) · 0x12D8 its entry count (optional)
 //!                    0x4000 index[N] {u32 off (rel. ISO+0x100000), u32 len, 24×0}
+//!                    0x4000+N×32 subchannel table: 12-byte Q entries (LibCrypt), if any
 //!                    0x100000 raw-deflate blocks of 0x9300 (16 raw sectors); len==0x9300 ⇒ stored
 //! STARTDAT           "STARTDAT" 1 1 0x50 png_len … | boot PNG | PGD trailer (donor)
 //! ```
@@ -33,6 +36,15 @@ const INDEX_AT: usize = 0x4000;
 const INDEX_CAP: usize = (ISO_DATA as usize - INDEX_AT) / 32;
 const TOC_AT: usize = 0x800;
 const TOC_MAX: usize = 0x3FC;
+/// Per-game POPS emulator config inside the PSISOIMG header (pop-fe `encode_psiso`, PSP path:
+/// block #2 + 0x20). It must end before the TOC.
+pub const POPS_CONFIG_AT: usize = 0x420;
+pub const POPS_CONFIG_MAX: usize = TOC_AT - POPS_CONFIG_AT;
+/// Subchannel table pointer: u32 offset relative to the PSISOIMG, then u32 count of 12-byte
+/// entries. Read by popsman.prx (firmware 6.61, `lw a1,0x12d4` / `lw a3,0x12d8`, count × 12
+/// bytes) and by pops_0Xg.prx, which then answers the game's subchannel Q reads from it.
+const SUBQ_PTR_AT: usize = 0x12D4;
+pub const SUBQ_ENTRY: usize = 12;
 const STARTDAT_HDR: usize = 0x50;
 const TITLEIMG_HDR: u64 = 0x400;
 const TITLEIMG_DISC_ALIGN: u64 = 0x8000;
@@ -248,6 +260,39 @@ pub fn toc_to_cue(bin_name: &str, tracks: &[TocTrack]) -> String {
     s
 }
 
+// ──────────────────────────────── LibCrypt subchannels ────────────────────────────────
+
+/// The 32 sectors (16 pairs) whose subchannel Q LibCrypt reads: pair `i` encodes bit `15 - i`
+/// of the disc's magic word (PSX `libcrypt` protection, as in the redump SBI files).
+const LIBCRYPT_PAIRS: [(u32, u32); 16] = [
+    (14105, 14110), (14231, 14236), (14485, 14490), (14579, 14584),
+    (14649, 14654), (14899, 14904), (15056, 15061), (15130, 15135),
+    (15242, 15247), (15312, 15317), (15378, 15383), (15628, 15633),
+    (15919, 15924), (16031, 16036), (16101, 16106), (16167, 16172),
+];
+
+/// The PSISOIMG subchannel table for a LibCrypt disc with `magic` (pop-fe
+/// `generate_subchannels`): a start sentinel, then for bit 15 down to 0 both sectors of its pair,
+/// then an end sentinel. Each entry: u32 sector (LBA − 150, as pop-fe stores it), 1, 1, relative
+/// M S F, absolute M S F (BCD). A set bit is a corrupt Q: both times one frame early.
+pub fn libcrypt_subchannels(magic: u16) -> Vec<u8> {
+    let msf = |s: u32| [bcd(s / 75 / 60), bcd(s / 75 % 60), bcd(s % 75)];
+    let mut t = Vec::with_capacity((LIBCRYPT_PAIRS.len() * 2 + 2) * SUBQ_ENTRY);
+    t.extend([0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF]);
+    for (bit, &(a, b)) in (0..16).rev().zip(&LIBCRYPT_PAIRS) {
+        let corrupt = u32::from(magic >> bit & 1);
+        for sector in [a, b] {
+            let rel = sector - LEAD_IN_FRAMES;
+            t.extend(rel.to_le_bytes());
+            t.extend([1, 1]);
+            t.extend(msf(rel - corrupt));
+            t.extend(msf(sector - corrupt));
+        }
+    }
+    t.extend([0xFF; SUBQ_ENTRY]);
+    t
+}
+
 // ───────────────────────────────────── writer ─────────────────────────────────────
 
 pub struct DiscSpec<'a> {
@@ -257,6 +302,11 @@ pub struct DiscSpec<'a> {
     pub title: String,
     /// Applied in order to each block before compression.
     pub patches: Vec<&'a dyn ImagePatch>,
+    /// POPS emulator config written at [`POPS_CONFIG_AT`] (at most [`POPS_CONFIG_MAX`] bytes).
+    pub pops_config: Option<&'a [u8]>,
+    /// Subchannel table ([`SUBQ_ENTRY`]-byte entries, e.g. [`libcrypt_subchannels`]), written
+    /// after the block index and pointed to from 0x12D4/0x12D8.
+    pub subchannels: Option<&'a [u8]>,
 }
 
 pub struct PsarJob<'a> {
@@ -328,6 +378,9 @@ impl DiscHeader<'_> {
         h[0x401..0x405].copy_from_slice(&id[..4]);
         h[0x405] = b'_';
         h[0x406..0x40B].copy_from_slice(&id[4..9]);
+        if let Some(c) = self.spec.pops_config {
+            h[POPS_CONFIG_AT..POPS_CONFIG_AT + c.len()].copy_from_slice(c);
+        }
         h[TOC_AT..TOC_AT + self.toc.len()].copy_from_slice(&self.toc);
         wr32(&mut h, 0xBFC, ISO_DATA as u32);
         wr32(&mut h, 0x1220, self.p2);
@@ -338,6 +391,13 @@ impl DiscHeader<'_> {
             let e = INDEX_AT + i * 32;
             wr32(&mut h, e, off);
             wr32(&mut h, e + 4, len);
+        }
+        if let Some(t) = self.spec.subchannels {
+            // Right after the index, as pop-fe places it; capacity checked by `stream_disc`.
+            let at = INDEX_AT + self.index.len() * 32;
+            h[at..at + t.len()].copy_from_slice(t);
+            wr32(&mut h, SUBQ_PTR_AT, at as u32);
+            wr32(&mut h, SUBQ_PTR_AT + 4, (t.len() / SUBQ_ENTRY) as u32);
         }
         h
     }
@@ -358,7 +418,7 @@ fn stream_disc<W: Write + Seek>(
 ) -> Result<(BlockIndex, u64, PsarStats)> {
     let size = spec.image.size_bytes();
     let nblocks = size.div_ceil(BLOCK as u64) as usize;
-    if nblocks > INDEX_CAP {
+    if nblocks + spec.subchannels.map_or(0, |t| t.len().div_ceil(32)) > INDEX_CAP {
         return Err(Error::Unsupported(format!("disc of {size} bytes exceeds the PSISOIMG index capacity")));
     }
     w.write_all(&vec![0u8; ISO_DATA as usize])?;
@@ -433,6 +493,12 @@ pub fn write_psar<W: Write + Seek>(w: &mut W, psar: u64, job: &PsarJob<'_>, moni
     }
     for d in &job.discs {
         validate_id(&d.disc_id)?;
+        if d.pops_config.is_some_and(|c| c.len() > POPS_CONFIG_MAX) {
+            return Err(Error::format("POPS config", format!("larger than {POPS_CONFIG_MAX} bytes")));
+        }
+        if d.subchannels.is_some_and(|t| t.is_empty() || t.len() % SUBQ_ENTRY != 0) {
+            return Err(Error::format("subchannel table", format!("not a whole number of {SUBQ_ENTRY}-byte entries")));
+        }
     }
     let level = Compression::new(job.level.clamp(1, 9));
     let total: u64 = job.discs.iter().map(|d| d.image.size_bytes()).sum();
@@ -522,6 +588,8 @@ pub struct PsarDisc {
     pub title: String,
     pub toc: Vec<u8>,
     pub index: BlockIndex,
+    /// The subchannel table (0x12D4/0x12D8), empty if none.
+    pub subchannels: Vec<u8>,
 }
 
 impl PsarDisc {
@@ -564,8 +632,16 @@ pub fn read_discs<R: Read + Seek>(r: &mut R, psar: u64) -> Result<Vec<PsarDisc>>
         let title = String::from_utf8_lossy(&title_raw[..title_raw.iter().position(|&c| c == 0).unwrap_or(128)]).into_owned();
         let toc_len = h[TOC_AT..TOC_AT + TOC_MAX].chunks_exact(10).take_while(|e| e.iter().any(|&b| b != 0)).count() * 10;
         let toc = h[TOC_AT..TOC_AT + toc_len].to_vec();
+        let (sub_at, sub_n) = (rd32(&h, SUBQ_PTR_AT) as usize, rd32(&h, SUBQ_PTR_AT + 4) as usize);
+        let subchannels = match sub_n.checked_mul(SUBQ_ENTRY).map(|n| sub_at..sub_at + n) {
+            Some(r) if sub_at >= INDEX_AT && r.end <= h.len() => h[r].to_vec(),
+            _ if sub_at == 0 => Vec::new(),
+            _ => return Err(Error::format("PSISOIMG", format!("subchannel table {sub_n}×12 at {sub_at:#x} out of range"))),
+        };
+        // The index ends at its first empty entry, or where the subchannel table begins.
+        let index_end = if subchannels.is_empty() { ISO_DATA as usize } else { sub_at };
         let mut index = Vec::new();
-        for i in 0..INDEX_CAP {
+        for i in 0..(index_end - INDEX_AT) / 32 {
             let e = INDEX_AT + i * 32;
             let (off, len) = (rd32(&h, e), rd32(&h, e + 4));
             if len == 0 {
@@ -576,7 +652,7 @@ pub fn read_discs<R: Read + Seek>(r: &mut R, psar: u64) -> Result<Vec<PsarDisc>>
             }
             index.push((off, len));
         }
-        discs.push(PsarDisc { offset, disc_id, title, toc, index });
+        discs.push(PsarDisc { offset, disc_id, title, toc, index, subchannels });
     }
     Ok(discs)
 }

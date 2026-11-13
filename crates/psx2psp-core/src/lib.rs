@@ -13,7 +13,7 @@ pub mod pbp;
 pub mod psar;
 pub mod sfo;
 
-pub use disc::{DiscImage, DiscInfo, Region, Track, TrackKind};
+pub use disc::{DiscImage, DiscInfo, IsoFile, Region, Track, TrackKind};
 pub use error::{Error, Result};
 pub use pbp::{PbpFile, PbpHeader, PbpSections, Section};
 pub use psar::{DiscSpec, Donor, PsarJob, PsarStats};

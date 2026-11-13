@@ -15,6 +15,7 @@ psx2psp-core.workspace = true
 psx2psp-patching.workspace = true
 psx2psp-media.workspace = true
 thiserror.workspace = true
+flate2.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

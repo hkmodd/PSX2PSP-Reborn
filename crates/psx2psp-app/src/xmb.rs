@@ -102,6 +102,9 @@ pub struct Xmb {
     pub layers: [Option<Arc<Pixels>>; 4],
     /// ICON1 animation; replaces the ICON0 still while present.
     pub movie: Option<Arc<Movie>>,
+    /// SND0 playback clock: when audio is playing the movie follows it (lip-sync), otherwise
+    /// it runs on the widget's own timer.
+    pub clock: Option<crate::audio::Clock>,
     pub accent: Color,
 }
 
@@ -219,7 +222,10 @@ impl<M> shader::Program<M> for Xmb {
                 radius: 0.0,
             },
             layers: self.layers.clone(),
-            movie: self.movie.as_ref().map(|m| (m.clone(), m.frame_at(s.now - s.ids_at[ICON0]))),
+            movie: self.movie.as_ref().map(|m| {
+                let t = self.clock.as_ref().and_then(crate::audio::Clock::secs).unwrap_or(s.now - s.ids_at[ICON0]);
+                (m.clone(), m.frame_at(t))
+            }),
         }
     }
 }

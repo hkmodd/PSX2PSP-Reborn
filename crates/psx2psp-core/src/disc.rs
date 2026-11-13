@@ -98,6 +98,15 @@ pub struct DiscInfo {
     pub volume_id: Option<String>,
 }
 
+/// A file of the ISO9660 filesystem ([`DiscImage::iso_files`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IsoFile {
+    /// `/`-separated path without the `;1` version, e.g. `/LEV00.EXE`.
+    pub path: String,
+    pub lba: u32,
+    pub size: u32,
+}
+
 fn parse_msf(s: &str) -> Result<u32> {
     let mut it = s.split(':').map(|p| p.trim().parse::<u32>());
     match (it.next(), it.next(), it.next(), it.next()) {
@@ -134,6 +143,16 @@ fn tokenize(line: &str) -> Vec<String> {
         out.push(cur);
     }
     out
+}
+
+/// Names of the files a CUE sheet references (`FILE "<name>" <type>`), in order of appearance.
+pub fn cue_file_names(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|l| {
+            let tok = tokenize(l);
+            (tok.first().is_some_and(|c| c.eq_ignore_ascii_case("FILE"))).then(|| tok.get(1).cloned()).flatten()
+        })
+        .collect()
 }
 
 impl DiscImage {
@@ -253,7 +272,10 @@ impl DiscImage {
                                 let Some(Segment::File { path, offset, len }) = segments.pop() else {
                                     return Err(err("PREGAP must follow a FILE"));
                                 };
-                                let cut = rel as u64 * RAW_SECTOR - offset;
+                                let cut = (rel as u64 * RAW_SECTOR)
+                                    .checked_sub(offset)
+                                    .filter(|c| *c <= len)
+                                    .ok_or_else(|| err("INDEX 01 lies outside the current FILE segment (times going backwards?)"))?;
                                 if cut > 0 {
                                     segments.push(Segment::File { path: path.clone(), offset, len: cut });
                                 }
@@ -351,16 +373,58 @@ impl DiscImage {
         };
         let mut cnf = Vec::new();
         for i in 0..cnf_len.div_ceil(2048).min(4) {
-            cnf.extend_from_slice(&self.read_user(&mut rd, cnf_lba + i)?);
+            cnf.extend_from_slice(&self.read_user(&mut rd, cnf_lba.saturating_add(i))?);
         }
         cnf.truncate(cnf_len as usize);
         info.disc_id = parse_system_cnf(&String::from_utf8_lossy(&cnf));
         Ok(info)
     }
 
+    /// Every file of the ISO9660 filesystem on the first data track, depth first. A damaged
+    /// filesystem cannot loop: each directory is read once, at most 64 sectors of it, 8 levels deep.
+    pub fn iso_files(&self) -> Result<Vec<IsoFile>> {
+        let mut rd = self.reader();
+        let pvd = self.read_user(&mut rd, 16)?;
+        if &pvd[1..6] != b"CD001" {
+            return Err(Error::format("ISO9660", "no primary volume descriptor"));
+        }
+        let u32_at = |b: &[u8], at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+        let (mut files, mut seen) = (Vec::new(), std::collections::HashSet::new());
+        let mut dirs = vec![(String::new(), u32_at(&pvd, 156 + 2), u32_at(&pvd, 156 + 10), 0u8)];
+        while let Some((dir, lba, len, depth)) = dirs.pop() {
+            if !seen.insert(lba) {
+                continue;
+            }
+            for s in 0..len.div_ceil(2048).min(64) {
+                let sec = self.read_user(&mut rd, lba.saturating_add(s))?;
+                let mut p = 0usize;
+                while p + 34 <= 2048 {
+                    let rl = sec[p] as usize;
+                    if rl < 34 || p + rl > 2048 {
+                        break;
+                    }
+                    let raw = &sec[p + 33..(p + 33 + sec[p + 32] as usize).min(p + rl)];
+                    let (flba, flen, is_dir) = (u32_at(&sec, p + 2), u32_at(&sec, p + 10), sec[p + 25] & 2 != 0);
+                    p += rl;
+                    if raw == [0] || raw == [1] {
+                        continue; // "." and ".."
+                    }
+                    let name = String::from_utf8_lossy(raw.split(|&c| c == b';').next().unwrap_or_default());
+                    let path = format!("{dir}/{name}");
+                    if !is_dir {
+                        files.push(IsoFile { path, lba: flba, size: flen });
+                    } else if depth < 8 {
+                        dirs.push((path, flba, flen, depth + 1));
+                    }
+                }
+            }
+        }
+        Ok(files)
+    }
+
     fn find_in_dir(&self, rd: &mut DiscReader, lba: u32, len: u32, name: &str) -> Result<Option<(u32, u32)>> {
         for s in 0..len.div_ceil(2048) {
-            let sec = self.read_user(rd, lba + s)?;
+            let sec = self.read_user(rd, lba.saturating_add(s))?;
             let mut p = 0usize;
             while p < 2048 {
                 let rl = sec[p] as usize;

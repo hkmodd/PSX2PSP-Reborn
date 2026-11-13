@@ -77,7 +77,12 @@ fn fake_donor() -> Donor {
     Donor { data_psp: b"~PSP-fake-loader".to_vec(), boot_png: b"\x89PNG-boot".to_vec(), pgd, title_consts: None }
 }
 
+const CONFIG: &[u8] = b"\x70\x00\x07\x06pops-config";
+
+const MAGIC: u16 = 0xA5C3;
+
 fn build(discs: &[(&DiscImage, &str)], patches: &[&dyn ImagePatch], donor: &Donor) -> Vec<u8> {
+    let subq = psar::libcrypt_subchannels(MAGIC);
     let job = PsarJob {
         discs: discs
             .iter()
@@ -87,6 +92,10 @@ fn build(discs: &[(&DiscImage, &str)], patches: &[&dyn ImagePatch], donor: &Dono
                 disc_id: id.to_string(),
                 title: format!("Test Game (Disc {})", i + 1),
                 patches: patches.to_vec(),
+                // Only disc 2 carries a POPS config: per-disc placement is part of the contract.
+                pops_config: (i == 1).then_some(CONFIG),
+                // Likewise the LibCrypt subchannel table.
+                subchannels: (i == 1).then_some(&subq[..]),
             })
             .collect(),
         title: "Test Game".into(),
@@ -135,6 +144,7 @@ fn single_disc_roundtrip_is_bit_exact() {
     assert_eq!(tracks.len(), 2);
     assert_eq!(tracks[1].start, 250);
     assert_eq!(d.image_size(), 300 * RAW_SECTOR);
+    assert!(d.subchannels.is_empty());
 
     let mut extracted = Vec::new();
     psar::extract_disc(pbp.inner_mut(), psar_at, d, &mut extracted, &()).unwrap();
@@ -157,6 +167,7 @@ fn single_disc_roundtrip_is_bit_exact() {
     assert_eq!(&h[p2..p2 + 4], b"\0PGD");
     assert_eq!(p1 % 16, 0);
     assert_eq!(&h[0x400..0x40B], b"_SLUS_00594");
+    assert!(h[psar::POPS_CONFIG_AT..0x800].iter().all(|&b| b == 0), "no config ⇒ zeros");
     assert_eq!(u32::from_le_bytes(h[0xBFC..0xC00].try_into().unwrap()), ISO_DATA as u32);
     assert_eq!(&h[0x800..0x80A], &[0x41, 0, 0xA0, 0, 0, 0, 0, 0x01, 0x20, 0]);
 }
@@ -214,8 +225,23 @@ fn multi_disc_roundtrip_with_patch() {
         assert_eq!(&h[o..o + 12], b"PSISOIMG0000");
         assert_eq!((rd(o + 0x0C), rd(o + 0x1220)), (0, 0), "disc at {o:#x}");
     }
+    let cfg = |d: &psar::PsarDisc| &h[d.offset as usize + psar::POPS_CONFIG_AT..][..CONFIG.len()];
+    assert_eq!(cfg(&discs[0]), &[0; CONFIG.len()]);
+    assert_eq!(cfg(&discs[1]), CONFIG);
     assert_eq!(&h[rd(0x10)..rd(0x10) + 8], b"STARTDAT");
     assert_eq!(&h[rd(0x284)..rd(0x284) + 4], b"\0PGD");
+
+    // LibCrypt table: disc 2 only, right after its block index, pointed to from 0x12D4/0x12D8;
+    // the index still ends at its last block (the image above extracted bit-exact).
+    let subq = psar::libcrypt_subchannels(MAGIC);
+    assert_eq!(subq.len(), 34 * psar::SUBQ_ENTRY);
+    assert!(discs[0].subchannels.is_empty());
+    assert_eq!((rd(discs[0].offset as usize + 0x12D4), rd(discs[0].offset as usize + 0x12D8)), (0, 0));
+    assert_eq!(discs[1].subchannels, subq);
+    assert_eq!(discs[1].index.len(), (333 * S).div_ceil(BLOCK));
+    let o = discs[1].offset as usize;
+    assert_eq!(rd(o + 0x12D4), 0x4000 + discs[1].index.len() * 32);
+    assert_eq!(rd(o + 0x12D8), 34);
 }
 
 #[test]
@@ -230,7 +256,7 @@ fn cancellation_is_honoured() {
     let disc = DiscImage::open(make_disc(dir.path(), "c", "SLUS_000.01", 100)).unwrap();
     let donor = fake_donor();
     let job = PsarJob {
-        discs: vec![DiscSpec { image: &disc, disc_id: "SLUS00001".into(), title: "t".into(), patches: vec![] }],
+        discs: vec![DiscSpec { image: &disc, disc_id: "SLUS00001".into(), title: "t".into(), patches: vec![], pops_config: None, subchannels: None }],
         title: "t".into(),
         level: 1,
         boot_png: &donor.boot_png,
@@ -239,4 +265,16 @@ fn cancellation_is_honoured() {
     let mut c = Cursor::new(Vec::new());
     c.write_all(b"x").unwrap();
     assert!(matches!(psar::write_psar(&mut c, 1, &job, &Stop), Err(psx2psp_core::Error::Cancelled)));
+
+    // A config that would overrun the TOC is rejected before anything is written.
+    let big = vec![0u8; psar::POPS_CONFIG_MAX + 1];
+    let job = PsarJob { discs: vec![DiscSpec { pops_config: Some(&big), ..job.discs.into_iter().next().unwrap() }], ..job };
+    assert!(psar::write_psar(&mut Cursor::new(Vec::new()), 0, &job, &()).is_err());
+    // So is a subchannel table that is not whole 12-byte entries.
+    let ragged = [0u8; 13];
+    let job = PsarJob {
+        discs: vec![DiscSpec { pops_config: None, subchannels: Some(&ragged), ..job.discs.into_iter().next().unwrap() }],
+        ..job
+    };
+    assert!(psar::write_psar(&mut Cursor::new(Vec::new()), 0, &job, &()).is_err());
 }

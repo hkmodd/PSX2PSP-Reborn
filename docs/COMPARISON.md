@@ -22,7 +22,7 @@ Legenda:
 | Estrazione EBOOT → BIN/CUE | ✓ *test bit-exact* | ✓ | ? | ? |
 | **BASE.PBP + DATA.PSP inclusi** | ✓ incorporati nel binario | ✓ | ✓ | ✓ |
 | Patch PPF 1/2/3 | ✓ *test* | ? | ? | ✓ |
-| Patch PAL→NTSC | ◐ pattern + PPF per titolo | ✗ | ✓ `patches.ini` | ◐ |
+| Patch PAL→NTSC | ✓ preset `patches.ini` (6 regole) + PPF per titolo, *test end-to-end* | ✗ | ✓ `patches.ini` | ◐ |
 | Artwork da qualsiasi immagine (auto-fit) | ✓ | ? | ? | ? |
 | **Anteprima XMB animata (onda) Game/Save/Boot** | ✓ shader WGSL, *test GPU* | ◐ onda, senza le 3 schermate | ✗ | ✗ |
 | **ICON1.PMF generato** | ✓ **muxer PSMF nativo**, *test vs sample Sony* | ✗ | ✗ (solo GIF) | ✗ |
@@ -35,7 +35,7 @@ Legenda:
 | **Budget XMB 500 KB condiviso, bitrate auto-adattato** | ✓ ICON1 adattato a ciò che resta | ✗ | ✗ | ✗ |
 | Download dei tool con un clic | ✓ ffmpeg, yt-dlp, atracdenc | n/a | ? | ? |
 | Formati in ingresso CHD / ZIP / 7z / RAR | ✗ | ✓ | ✗ | ✓ CHD |
-| Database dei giochi (titolo e copertina automatici) | ✗ | ✓ | ✗ | ✓ Redump |
+| Database dei giochi (titolo e copertina automatici) | ◐ titolo e save ID (10 109 seriali), copertine no | ✓ | ✗ | ✓ Redump |
 | Patch LibCrypt | ✗ | ✗ | ✗ | ✓ |
 | Target PS3 / PS Classic / Vita bubble | ✗ | ✗ | ✗ | ✓ |
 | Compressione parallela in streaming | ✓ rayon | ? | ? | ? |

@@ -8,6 +8,7 @@
 
 pub mod clip;
 pub mod images;
+pub mod proc;
 pub mod provision;
 pub mod psmf;
 pub mod tools;
@@ -26,6 +27,8 @@ pub enum MediaError {
     Missing(&'static str),
     #[error("SND0.AT3 is {size} bytes, over the {budget}-byte XMB budget")]
     Budget { size: u64, budget: u64 },
+    #[error("cancelled")]
+    Cancelled,
     #[error("format: {0}")]
     Format(String),
 }

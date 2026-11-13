@@ -9,6 +9,7 @@ use psx2psp_engine::media::images::{self, Slot};
 use psx2psp_engine::media::clip::{self, Clip, ClipMode, ClipRequest, ClipTools};
 use psx2psp_engine::media::provision::{self, Tool};
 use psx2psp_engine::media::tools::{self, At3Encoder, Ffmpeg, Snd0Request};
+use psx2psp_engine::patchdb::{self, PatchDb};
 use psx2psp_engine::{Artwork, ConvertRequest, DEFAULT_LEVEL, DiscInput, convert, core::Monitor, extract, inspect, probe_disc};
 
 const USAGE: &str = "\
@@ -18,6 +19,8 @@ USAGE:
   psx2psp convert [options] <disc.cue|disc.bin>...
   psx2psp extract <EBOOT.PBP> <out-dir>
   psx2psp info    <EBOOT.PBP | disc.cue>
+  psx2psp patches <disc.cue|disc.bin> [--id <code>] [--ppf <file>]
+                                     the patch database's entries for the game, with hits
   psx2psp clip    <video|audio|URL> [clip options] [-o <dir>]   → ICON1.PMF / SND0.AT3
   psx2psp tools   [install]          show / download ffmpeg, yt-dlp, atracdenc into <exe>/tools
 
@@ -27,11 +30,22 @@ CONVERT OPTIONS:
   --title <text>     XMB title (default: volume label)
   --id <code>        product code override for disc 1, e.g. SLUS00594
   --ppf <file>       PPF patch for disc 1 (repeat after each extra disc via --ppfN, N=2..5)
+  --pal-ntsc         try the generic PAL→NTSC preset on every disc (applied only where its
+                     video-mode fix matches; the log lists every rule hit)
+  --no-title-fixes   skip the game's \"fix\" patches and POPS config from the patch database;
+                     a <image>.pspconfig beside the disc always applies
+  --fps-unlock       apply the game's \"fps\" patches (frame-rate unlock)
+  --60hz             apply the game's \"60hz\" patches (its own 60 Hz NTSC mode)
+  --no-fps-unlock, --50hz   turn those off (on by default for games verified on hardware;
+                     psx2psp patches <disc> shows the defaults)
+  --patch <name>     turn one patch on by name, even one that is off by default; the name
+                     \"POPS config\" selects the config (list: psx2psp patches <disc>)
+  --no-patch <name>  turn one patch off by name
   --icon0/--pic0/--pic1/--boot <image>   artwork (any format; auto-fitted)
   --icon1 <pmf>      ready-made ICON1.PMF
   --snd0 <audio>     any audio/video → SND0.AT3 (needs ffmpeg + at3tool/atracdenc)
   --snd0-start <s>   start offset in seconds (default 0)
-  --level <1-9>      deflate level (default 9)
+  --level <1-9>      deflate level (default 5; 9 is ~0.1% smaller and twice as slow)
   --clip <src>       video/audio file or YouTube URL → ICON1.PMF + SND0.AT3 (see CLIP OPTIONS)
 
 CLIP OPTIONS:
@@ -39,6 +53,11 @@ CLIP OPTIONS:
   --end <t>          clip end (default start + 30 s, capped at the source length)
   --mode <m>         both | icon1 | snd0   (default both; snd0 = soundtrack only, no video)
   --snd0-kbps <k>    ATRAC3 rate when SND0 is alone: 66 | 105 | 132 (default 132)
+
+PATCH DATABASE:
+  Built in, with your own patches.ini merged on top (same name for the same game wins): a
+  patches.ini next to the executable if present, else the one in the user config folder
+  (psx2psp patches prints its path). The format is documented in the built-in file.
 ";
 
 struct Cli {
@@ -58,6 +77,24 @@ impl Monitor for Cli {
     }
 }
 
+/// Monitor for media jobs, whose progress is a plain fraction (no byte counts).
+struct Pct {
+    last: AtomicU64,
+}
+
+impl Monitor for Pct {
+    fn progress(&self, done: u64, total: u64) {
+        let pct = done * 100 / total.max(1);
+        if self.last.swap(pct, Ordering::Relaxed) != pct {
+            eprint!("\r  {pct:>3}%");
+            let _ = std::io::stderr().flush();
+        }
+    }
+    fn log(&self, m: &str) {
+        eprintln!("\r{m}");
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let r = match args.first().map(String::as_str) {
@@ -65,6 +102,7 @@ fn main() -> ExitCode {
         Some("extract") if args.len() == 3 => cmd_extract(Path::new(&args[1]), Path::new(&args[2])),
         Some("info") if args.len() == 2 => cmd_info(Path::new(&args[1])),
         Some("clip") => cmd_clip(&args[1..]),
+        Some("patches") => cmd_patches(&args[1..]),
         Some("tools") if args.len() == 1 => cmd_tools(false),
         Some("tools") if args.len() == 2 && args[1] == "install" => cmd_tools(true),
         _ => {
@@ -136,7 +174,8 @@ impl ClipArgs {
         let end = len.map_or(end, |l| end.min(l));
         eprintln!("Clip {} → {} ({}), {}", tools::fmt_hms(self.start), tools::fmt_hms(end), self.mode, src);
         let req = ClipRequest { source: src, start: self.start, end, mode: self.mode, snd0_kbps: self.kbps, budget };
-        let r = clip::make_clip(&tools, &req, work, &|m| eprintln!("{m}"));
+        let r = clip::make_clip(&tools, &req, work, &Pct { last: AtomicU64::new(u64::MAX) });
+        eprintln!();
         let _ = std::fs::remove_dir_all(work);
         Ok(r?)
     }
@@ -204,6 +243,9 @@ fn cmd_convert(args: &[String]) -> R {
     let mut level = DEFAULT_LEVEL;
     let mut discs: Vec<DiscInput> = Vec::new();
     let mut ppfs: Vec<(usize, PathBuf)> = Vec::new();
+    // Switches the user did not set follow the game's defaults in the patch database.
+    let (mut pal_ntsc, mut title_fixes, mut fps_unlock, mut ntsc_60hz) = (false, None, None, None);
+    let mut patch_choice: Vec<(String, bool)> = Vec::new();
     while let Some(a) = it.next() {
         let mut val = || it.next().cloned().ok_or_else(|| format!("{a} needs a value"));
         if clip_args.take(a, &mut val)? {
@@ -222,6 +264,14 @@ fn cmd_convert(args: &[String]) -> R {
             "--snd0" => snd0 = Some(PathBuf::from(val()?)),
             "--snd0-start" => snd0_start = val()?.parse()?,
             "--level" => level = val()?.parse()?,
+            "--pal-ntsc" => pal_ntsc = true,
+            "--no-title-fixes" => title_fixes = Some(false),
+            "--fps-unlock" => fps_unlock = Some(true),
+            "--no-fps-unlock" => fps_unlock = Some(false),
+            "--60hz" => ntsc_60hz = Some(true),
+            "--50hz" => ntsc_60hz = Some(false),
+            "--patch" => patch_choice.push((val()?, true)),
+            "--no-patch" => patch_choice.push((val()?, false)),
             "--ppf" => ppfs.push((0, PathBuf::from(val()?))),
             s if s.starts_with("--ppf") => {
                 let n: usize = s[5..].parse().map_err(|_| format!("bad flag {s}"))?;
@@ -231,6 +281,12 @@ fn cmd_convert(args: &[String]) -> R {
             s => discs.push(DiscInput { path: PathBuf::from(s), ..Default::default() }),
         }
     }
+    let given: Vec<PathBuf> = discs.into_iter().map(|d| d.path).collect();
+    let plan = psx2psp_engine::resolve_discs(&[], &given);
+    for note in &plan.notes {
+        eprintln!("{note}");
+    }
+    let mut discs: Vec<DiscInput> = plan.discs.into_iter().map(|path| DiscInput { path, ..Default::default() }).collect();
     if discs.is_empty() {
         return Err("no disc image given".into());
     }
@@ -239,10 +295,19 @@ fn cmd_convert(args: &[String]) -> R {
         discs.get_mut(n).ok_or(format!("--ppf for disc {} but only {count} discs", n + 1))?.ppf = Some(p);
     }
     discs[0].disc_id = id;
+    let patches = load_patches();
 
     let first = probe_disc(&discs[0].path)?;
     let disc_id = discs[0].disc_id.clone().or(first.disc_id.clone()).ok_or("cannot detect game ID; pass --id")?;
-    let title = title.or(first.volume_id.clone()).unwrap_or_else(|| disc_id.clone());
+    // One set of switches for the whole game, from disc 1 (each disc still gets only the
+    // patches its own ID has).
+    let def = patches.default_switches(&patches.pops_id(&disc_id));
+    for d in &mut discs {
+        (d.pal_ntsc, d.title_fixes, d.fps_unlock, d.ntsc_60hz) =
+            (pal_ntsc, title_fixes.unwrap_or(def.fixes), fps_unlock.unwrap_or(def.fps), ntsc_60hz.unwrap_or(def.ntsc60));
+        d.patch_choice.clone_from(&patch_choice);
+    }
+    let title = title.or_else(|| psx2psp_engine::gamedb::lookup(&disc_id).map(|g| g.title.clone())).or(first.volume_id.clone()).unwrap_or_else(|| disc_id.clone());
     let output = out.unwrap_or_else(|| psx2psp_engine::default_output(Path::new("."), &disc_id));
 
     let mut clip = Clip::default();
@@ -259,7 +324,7 @@ fn cmd_convert(args: &[String]) -> R {
             let icon1_len = icon1.as_ref().and_then(|p: &PathBuf| std::fs::metadata(p).ok()).map_or(0, |m| m.len());
             let work = psx2psp_engine::work_dir(&output);
             std::fs::create_dir_all(&work)?;
-            let r = tools::make_snd0(&ff, &enc, &Snd0Request { input: &src, start_secs: snd0_start, max_secs: None, kbps: 132, budget: tools::SND0_BUDGET.saturating_sub(icon1_len) }, &work);
+            let r = tools::make_snd0(&ff, &enc, &Snd0Request { input: &src, start_secs: snd0_start, max_secs: None, kbps: 132, budget: tools::SND0_BUDGET.saturating_sub(icon1_len) }, &work, &());
             let _ = std::fs::remove_dir_all(&work);
             Some(r?)
         }
@@ -273,9 +338,64 @@ fn cmd_convert(args: &[String]) -> R {
         icon1_pmf: icon1.map(std::fs::read).transpose()?.or(clip.icon1),
         snd0,
     };
-    let req = ConvertRequest { discs, title, output, donor, artwork, level };
+    let req = ConvertRequest { discs, patches, title, output, donor, artwork, level };
     let rep = convert(&req, &Cli { last: AtomicU64::new(u64::MAX) })?;
     println!("{}", rep.output.display());
+    Ok(())
+}
+
+/// The patch database with the user file merged on top; a broken user file is reported and
+/// left out (the built-in database still applies).
+fn load_patches() -> PatchDb {
+    let l = patchdb::load();
+    if let Some(e) = &l.error {
+        eprintln!("warning: {e} — your patches.ini is ignored");
+    }
+    l.db
+}
+
+fn cmd_patches(args: &[String]) -> R {
+    let (mut disc, mut id, mut ppf) = (None, None, None);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let mut val = || it.next().cloned().ok_or_else(|| format!("{a} needs a value"));
+        match a.as_str() {
+            "--id" => id = Some(val()?),
+            "--ppf" => ppf = Some(PathBuf::from(val()?)),
+            s if s.starts_with('-') => return Err(format!("unknown flag {s}").into()),
+            s => disc = Some(PathBuf::from(s)),
+        }
+    }
+    let l = patchdb::load();
+    match (&l.user_path, &l.error) {
+        (_, Some(e)) => println!("user patches: {e} (ignored)"),
+        (Some(p), None) => println!("user patches: {}{}", p.display(), if p.is_file() { "" } else { " (not created yet)" }),
+        (None, None) => println!("user patches: no config folder on this system"),
+    }
+    let given = [disc.ok_or("no disc image given")?];
+    let disc = psx2psp_engine::resolve_discs(&[], &given).discs.into_iter().next().ok_or("no disc image given")?;
+    let disc_id = match id {
+        Some(id) => patchdb::normalise_id(&id),
+        None => probe_disc(&disc)?.disc_id.ok_or("cannot detect game ID; pass --id")?,
+    };
+    let id = l.db.pops_id(&disc_id);
+    let game = l.db.game(&id);
+    let built_as = if id == disc_id { String::new() } else { format!(" (built as {id})") };
+    println!("{disc_id}{built_as}: {}", game.map_or("not in the patch database", |g| g.title.as_str()));
+    if let Some(magic) = l.db.libcrypt(&id) {
+        println!("  LibCrypt magic word 0x{magic:04X}: the EBOOT carries its subchannel table");
+    }
+    // [on ]/[off] = what `convert` does without switches or --patch/--no-patch.
+    let def = l.db.default_switches(&id);
+    let mark = |on: bool| if on { "on " } else { "off" };
+    if let Some((g, c)) = game.and_then(|g| g.config.as_ref().map(|c| (g, c))) {
+        println!("  [{}] {:<40} fix   {} B, {}", mark(patchdb::config_wanted(def, &[])), patchdb::CONFIG, c.len(), g.source);
+    }
+    let hits = psx2psp_engine::scan_patches(&disc, ppf.as_deref(), &id, &l.db)?;
+    for (p, (_, h)) in l.db.patches_for(&id).iter().zip(&hits) {
+        let user = if p.origin == patchdb::Origin::User { "  [user]" } else { "" };
+        println!("  [{}] {:<40} {:<5} ×{h}{user}", mark(p.wanted(def, &[])), p.name, p.kind.key());
+    }
     Ok(())
 }
 
@@ -292,10 +412,12 @@ fn cmd_info(p: &Path) -> R {
         let d = probe_disc(p)?;
         println!("disc     {}", d.path.display());
         println!("id       {}", d.disc_id.as_deref().unwrap_or("?"));
+        println!("title    {}", d.title.as_deref().unwrap_or("? (not in game DB)"));
         println!("volume   {}", d.volume_id.as_deref().unwrap_or("?"));
         println!("region   {}", d.region.label());
         println!("tracks   {} ({} audio)", d.tracks, d.audio_tracks);
         println!("size     {} bytes", d.size);
+        println!("md5      {} (track 1, raw)", psx2psp_engine::track1_md5(&psx2psp_engine::core::DiscImage::open(p)?)?);
         return Ok(());
     }
     let s = inspect(p)?;
@@ -307,6 +429,9 @@ fn cmd_info(p: &Path) -> R {
     }
     for (i, d) in s.discs.iter().enumerate() {
         println!("DISC {} {} \"{}\" {} blocks, {} tracks, {} B", i + 1, d.disc_id, d.title, d.index.len(), d.tracks().len(), d.image_size());
+        if !d.subchannels.is_empty() {
+            println!("     subchannel table: {} entries (LibCrypt)", d.subchannels.len() / psx2psp_engine::core::psar::SUBQ_ENTRY);
+        }
     }
     Ok(())
 }

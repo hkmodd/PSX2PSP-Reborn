@@ -348,6 +348,9 @@ pub fn parse(pmf: &[u8]) -> Result<PsmfInfo, MediaError> {
     if off != HEADER || off + size != pmf.len() || !size.is_multiple_of(PACK) {
         return Err(fmt(format!("PSMF framing: offset {off:#x}, stream {size:#x}, file {:#x}", pmf.len())));
     }
+    if pmf[0x8E] == 0 || pmf[0x8F] == 0 {
+        return Err(fmt("PSMF declares a 0×0 video stream"));
+    }
     let ts = |o: usize| be32(pmf, o + 2) as u64;
     let mut info = PsmfInfo {
         version: pmf[4..8].try_into().unwrap(),
@@ -383,8 +386,11 @@ pub fn parse(pmf: &[u8]) -> Result<PsmfInfo, MediaError> {
                     }
                     let hdl = body[2] as usize;
                     if body[1] & 0x80 != 0 && info.first_pts.is_none() {
-                        let dts = (body[1] & 0x40 != 0).then(|| read_ts(&body[8..13]));
-                        info.first_pts = Some((read_ts(&body[3..8]), dts));
+                        let has_dts = body[1] & 0x40 != 0;
+                        let ts = |r: std::ops::Range<usize>| body.get(r).filter(|_| hdl >= if has_dts { 10 } else { 5 }).map(read_ts);
+                        let pts = ts(3..8).ok_or_else(|| fmt(format!("pack {k}: PTS truncated")))?;
+                        let dts = if has_dts { Some(ts(8..13).ok_or_else(|| fmt(format!("pack {k}: DTS truncated")))?) } else { None };
+                        info.first_pts = Some((pts, dts));
                     }
                     info.video.extend(body.get(3 + hdl..).ok_or_else(|| fmt(format!("pack {k}: PES header overruns")))?);
                 }
