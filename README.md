@@ -1,9 +1,9 @@
-﻿<p align="center">
+<p align="center">
   <img src="docs/assets/banner.svg" alt="PSX2PSP-Reborn: PS1 discs to PSP and PS Vita EBOOTs, natively in Rust, with a live GPU-rendered XMB preview" width="100%">
 </p>
 
 <p align="center">
-  <a href="#-quick-start"><img alt="Windows Â· Linux Â· macOS" src="https://img.shields.io/badge/Windows%20%C2%B7%20Linux%20%C2%B7%20macOS-native-0070D1?style=for-the-badge"></a>
+  <a href="#-quick-start"><img alt="Windows · Linux · macOS" src="https://img.shields.io/badge/Windows%20%C2%B7%20Linux%20%C2%B7%20macOS-native-0070D1?style=for-the-badge"></a>
   <a href="https://www.rust-lang.org"><img alt="Rust 2024" src="https://img.shields.io/badge/Rust-2024-CE422B?style=for-the-badge&logo=rust&logoColor=white"></a>
   <a href="#-features"><img alt="PSP and PS Vita, POPS" src="https://img.shields.io/badge/PSP%20%C2%B7%20PS%20Vita-POPS%20EBOOT-f58fd0?style=for-the-badge&logo=playstation&logoColor=white"></a>
   <a href="#%EF%B8%8F-licence"><img alt="MIT or Apache-2.0" src="https://img.shields.io/badge/licence-MIT%20%7C%20Apache--2.0-3fe0a8?style=for-the-badge"></a>
@@ -22,12 +22,12 @@
 </p>
 
 <p align="center">
-  <a href="#-quick-start">Quick start</a> Â·
-  <a href="#-features">Features</a> Â·
-  <a href="#-the-patch-database">Patch database</a> Â·
-  <a href="#%EF%B8%8F-command-line">Command line</a> Â·
-  <a href="#-faq">FAQ</a> Â·
-  <a href="docs/FORMAT.md">Format deep dive</a> Â·
+  <a href="#-quick-start">Quick start</a> ·
+  <a href="#-features">Features</a> ·
+  <a href="#-the-patch-database">Patch database</a> ·
+  <a href="#%EF%B8%8F-command-line">Command line</a> ·
+  <a href="#-faq">FAQ</a> ·
+  <a href="docs/FORMAT.md">Format deep dive</a> ·
   <a href="docs/COMPARISON.md">Comparison</a>
 </p>
 
@@ -37,23 +37,23 @@
   <img src="docs/assets/screenshot.png" alt="PSX2PSP-Reborn: brand header with the Game, Artwork, Media and Build step tracker, the project bar and the section cards on the left, the live XMB preview with its animated wave on the right" width="100%">
 </p>
 
-## âš¡ What is this?
+## ⚡ What is this?
 
 **PSX2PSP-Reborn** is a from-scratch, native successor to the classic PSX2PSP v1.4.2. It builds
 the same kind of PS1 Classic (POPS) `EBOOT.PBP` that Sony shipped on the PlayStation Store, from
 your own BIN/CUE dumps, and it does the parts the old tools never did: it writes the animated
 icon itself, fits icon and music into the XMB's budget, and knows the fixes ~2,000 games need.
 
-- ðŸ¦€ **Written in Rust.** A GUI (`psx2psp-reborn`) and a CLI (`psx2psp`), each a single
+- 🦀 **Written in Rust.** A GUI (`psx2psp-reborn`) and a CLI (`psx2psp`), each a single
   self-contained executable. No installer, no runtime, no .NET, no Python.
-- ðŸŽ¯ **Bit-perfect.** `PBP`, `PARAM.SFO`, `PSISOIMG` and `PSTITLEIMG` are written to the byte, and
+- 🎯 **Bit-perfect.** `PBP`, `PARAM.SFO`, `PSISOIMG` and `PSTITLEIMG` are written to the byte, and
   an EBOOT extracts back to the very disc image that went into it (round trips are covered by tests).
-- ðŸŒŠ **What you see is what you get.** The preview is the XMB: the wave is a WGSL shader, the
+- 🌊 **What you see is what you get.** The preview is the XMB: the wave is a WGSL shader, the
   artwork is laid out like the PSP's XMB, and the icon and music play as they will on the PSP.
-- ðŸ”’ **Your discs are never touched.** Every patch is applied to the stream on its way into the
+- 🔒 **Your discs are never touched.** Every patch is applied to the stream on its way into the
   EBOOT, never to the source files.
 
-## ðŸš€ Quick start
+## 🚀 Quick start
 
 1. **Download** the GUI for your system from the [latest release](../../releases/latest):
 
@@ -82,9 +82,9 @@ icon itself, fits icon and music into the XMB's budget, and knows the fixes ~2,0
 > A PSP needs **custom firmware** to run a home-made POPS EBOOT. The EBOOT itself needs nothing
 > else: the PS1 Classic donor files are built into the program.
 
-## âœ¨ Features
+## ✨ Features
 
-### ðŸ’¿ EBOOTs, to the byte
+### 💿 EBOOTs, to the byte
 
 - **Single disc** (`PSISOIMG`) and **multi-disc up to five** (`PSTITLEIMG`). A `.m3u` playlist expands to its discs in order; BIN and CUE picked together
   count as one disc; CDDA audio tracks are carried in the TOC.
@@ -96,20 +96,20 @@ icon itself, fits icon and music into the XMB's budget, and knows the fixes ~2,0
 - **Game database** of 10,109 serials: the XMB title is filled in from the disc's product code.
 - The byte layout is documented in **[docs/FORMAT.md](docs/FORMAT.md)**.
 
-### ðŸŒŠ A live XMB, on the GPU
+### 🌊 A live XMB, on the GPU
 
 - **iced 0.14 + wgpu.** The XMB wave and every layer are composed in a single WGSL full-screen
   pass, at your monitor's refresh rate.
-- **Game, Save and Boot** tabs, WYSIWYG at 480Ã—272: `PIC1` behind, `PIC0` over it, `ICON0` in its
+- **Game, Save and Boot** tabs, WYSIWYG at 480×272: `PIC1` behind, `PIC0` over it, `ICON0` in its
   slot, or the boot screen POPS shows on start.
 - **Animated ICON1 in the ICON0 slot, with its SND0 playing.** The preview plays the *encoded*
   ATRAC3, not the source: you hear what goes onto the PSP, and the video follows the audio clock.
-- **Artwork in any format** (PNG, JPEG, BMP, GIF, WebP) is fitted to `ICON0` 144Ã—80, `PIC0` 310Ã—180
-  and `PIC1`/boot 480Ã—272.
+- **Artwork in any format** (PNG, JPEG, BMP, GIF, WebP) is fitted to `ICON0` 144×80, `PIC0` 310×180
+  and `PIC1`/boot 480×272.
 - **Never blocks.** Probing, clips, downloads and builds run in background jobs with progress,
   cancel, a log panel and toasts.
 
-### ðŸŽ¬ ICON1 and SND0 from YouTube, or from any video
+### 🎬 ICON1 and SND0 from YouTube, or from any video
 
 Paste a YouTube link (or any URL yt-dlp understands), or pick a local video or audio file, set
 **From** and **To** in seconds or `m:ss`, and choose:
@@ -120,7 +120,7 @@ Paste a YouTube link (or any URL yt-dlp understands), or pick a local video or a
 | **ICON1 only** | the animated icon, silent |
 | **SND0 only** | the soundtrack alone, detached from the video, at 66, 105 or 132 kbps |
 
-- **Native PSMF muxer.** `ICON1.PMF` is H.264 144Ã—80 in a PSMF container written by the program
+- **Native PSMF muxer.** `ICON1.PMF` is H.264 144×80 in a PSMF container written by the program
   itself, not by a script around a Sony tool. Re-muxing Sony's own sample comes out bit-identical
   in its video, AU tables and timestamps.
 - **The 500 KB budget is shared automatically.** `ICON1` and `SND0` together must fit the XMB's
@@ -128,7 +128,7 @@ Paste a YouTube link (or any URL yt-dlp understands), or pick a local video or a
   is left.
 - Ready-made `.pmf` and `.at3` files are accepted as they are.
 
-### ðŸ©¹ Fixes for ~2,000 games, built in
+### 🩹 Fixes for ~2,000 games, built in
 
 - **POPS configs** for about 1,800 games (1,979 product codes), imported from
   [pop-fe](https://github.com/sahlberg/pop-fe): most are the configs Sony shipped in its own PS1
@@ -136,7 +136,7 @@ Paste a YouTube link (or any URL yt-dlp understands), or pick a local video or a
 - **LibCrypt** without cracking the disc: for 230 protected product codes the EBOOT carries the
   subchannel table that POPS answers the protection from.
 - **Per-dump PPF fixes**, limited by the MD5 of track 1 so they never land on the wrong dump.
-- **PALâ†’NTSC preset**: the six generic rules of PSX2PSP v1.4.2, applied only on discs where its
+- **PAL→NTSC preset**: the six generic rules of PSX2PSP v1.4.2, applied only on discs where its
   video-mode fix matches, every hit listed in the log.
 - **Per-game switches**: *Game fixes*, *Unlock fps* and *60 Hz* (the game's own NTSC mode), with
   defaults that turn the last two on only for games verified on hardware.
@@ -145,7 +145,7 @@ Paste a YouTube link (or any URL yt-dlp understands), or pick a local video or a
 - **Yours to extend**: a plain INI file, merged over the built-in one. See
   [the patch database](#-the-patch-database).
 
-### ðŸ§° Everything included
+### 🧰 Everything included
 
 - **Donor built in.** The PS1 Classic `DATA.PSP` and `BASE.PBP` are compiled into the binary;
   `--donor` overrides them from the CLI if you have your own.
@@ -155,13 +155,13 @@ Paste a YouTube link (or any URL yt-dlp understands), or pick a local video or a
   None of them are needed to build a plain EBOOT.
 - **Projects with save slots and autosave.** Everything is autosaved as you work, including the
   ICON1/SND0 you made from YouTube, and comes back on the next start, after a crash or an
-  accidental close, with an **Undo** toast if you wanted a clean slate. **Save asâ€¦** keeps named
-  projects (`projects/<name>/`, media included) that **Openâ€¦** brings back at any time.
+  accidental close, with an **Undo** toast if you wanted a clean slate. **Save as…** keeps named
+  projects (`projects/<name>/`, media included) that **Open…** brings back at any time.
 - **Built-in updater.** The app checks GitHub Releases, verifies the download against
   `SHA256SUMS.txt` and swaps its own executable in place, rolling back if anything fails. Click
   the version chip to check by hand; from the CLI, `psx2psp update` (or `update --check`).
 
-## ðŸ©¹ The patch database
+## 🩹 The patch database
 
 What the converter knows about each game lives in INI files, layered like this (a later layer
 wins):
@@ -183,7 +183,7 @@ flowchart LR
   |---|---|
   | Windows | `%APPDATA%\PSX2PSP-Reborn\patches.ini` |
   | macOS | `~/Library/Application Support/PSX2PSP-Reborn/patches.ini` |
-  | Linux | `$XDG_CONFIG_HOME/psx2psp-reborn/patches.ini` (`~/.config/â€¦`) |
+  | Linux | `$XDG_CONFIG_HOME/psx2psp-reborn/patches.ini` (`~/.config/…`) |
 
   A `[patch]` with the same name for the same game, or a `[game]` with the same ID, replaces the
   built-in one. A user file that does not parse is reported and ignored: the built-in database
@@ -196,7 +196,7 @@ A game entry and a code patch look like this:
 [game SLES-02895 SLUS-01369]
 title   = Sheep, Dog 'n' Wolf / Sheep Raider
 default = fix fps 60hz          ; switches that start on (default: fix)
-config  = 70 00 07 06 â€¦         ; POPS config, hex (at most 992 bytes)
+config  = 70 00 07 06 …         ; POPS config, hex (at most 992 bytes)
 
 [patch SLES-02895]
 name    = Frame cap VSync(2) -> VSync(0)
@@ -208,13 +208,13 @@ note    = Lets the game render up to 50/60 fps instead of 25/30.
 
 - `search`/`replace` are equal-length hex with `??` wildcards, matched inside each sector's 2048
   data bytes (EDC/ECC are regenerated). `ppf = <hex>` embeds a whole PPF 1/2/3 instead, and
-  `md5 = â€¦` limits a patch to one dump (the track-1 MD5 that `psx2psp info disc.cue` prints).
+  `md5 = …` limits a patch to one dump (the track-1 MD5 that `psx2psp info disc.cue` prints).
 - A patch that matches nothing, belongs to another dump, or whose PPF validation block disagrees is
   skipped and logged, never half-applied.
 - `psx2psp patches disc.cue` lists everything the database has for a game, which entries are on by
   default, how many times each one hits the disc, and where your user file lives.
 
-## âŒ¨ï¸ Command line
+## ⌨️ Command line
 
 ```text
 psx2psp convert [options] <disc.cue|disc.bin>...   build an EBOOT (2-5 discs = multi-disc)
@@ -232,8 +232,8 @@ psx2psp tools   [install]                          show / download ffmpeg, yt-dl
 | `--icon0` / `--pic0` / `--pic1` / `--boot <image>` | artwork in any format, auto-fitted |
 | `--icon1 <pmf>`, `--snd0 <audio>`, `--snd0-start <s>` | ready-made ICON1, any audio as SND0 |
 | `--clip <file\|URL>` `--start` `--end` `--mode both\|icon1\|snd0` `--snd0-kbps 66\|105\|132` | cut ICON1 + SND0 from a video |
-| `--ppf <file>`, `--ppf2` â€¦ `--ppf5` | your own PPF, for disc 1 or disc N |
-| `--pal-ntsc` | the generic PALâ†’NTSC preset, where it matches |
+| `--ppf <file>`, `--ppf2` … `--ppf5` | your own PPF, for disc 1 or disc N |
+| `--pal-ntsc` | the generic PAL→NTSC preset, where it matches |
 | `--fps-unlock` / `--no-fps-unlock`, `--60hz` / `--50hz` | the game's fps and 60 Hz switches |
 | `--no-title-fixes` | skip the game's fixes and POPS config |
 | `--patch <name>`, `--no-patch <name>` | turn one database entry on or off |
@@ -249,30 +249,30 @@ psx2psp convert --icon0 cover.jpg --pic1 bg.png \
 psx2psp clip intro.mp4 --start 0:05 --end 0:25 --mode icon1 -o out
 ```
 
-## ðŸ§  How it works
+## 🧠 How it works
 
 ```mermaid
 flowchart LR
     CUE["BIN / CUE / M3U"] --> PPF["PPF chain<br/>database fixes, then yours"]
-    PPF --> PAT["PALâ†’NTSC preset<br/>pattern patches<br/>EXE loader CRCs"]
+    PPF --> PAT["PAL→NTSC preset<br/>pattern patches<br/>EXE loader CRCs"]
     PAT --> BLK["0x9300-byte blocks<br/>deflated on every core"]
-    BLK --> PSAR["DATA.PSAR<br/>PSISOIMG / PSTITLEIMG<br/>POPS config Â· LibCrypt table"]
-    ART["artwork Â· ICON1.PMF Â· SND0.AT3"] --> PBP
+    BLK --> PSAR["DATA.PSAR<br/>PSISOIMG / PSTITLEIMG<br/>POPS config · LibCrypt table"]
+    ART["artwork · ICON1.PMF · SND0.AT3"] --> PBP
     DON["built-in DATA.PSP"] --> PBP
     PSAR --> PBP(["EBOOT.PBP"])
 ```
 
 ```text
 crates/
-  psx2psp-core      PBP Â· SFO Â· CUE/BIN Â· PSISOIMG/PSTITLEIMG writer and reader Â· TOC
-  psx2psp-patching  sector model Â· EDC/ECC Â· PPF 1/2/3 Â· pattern patches Â· EXE loader CRCs
-  psx2psp-media     artwork fitting Â· PSMF (ICON1) muxer and parser Â· clip pipeline Â·
-                    ffmpeg / yt-dlp / atracdenc / at3tool adapters Â· tool provisioning
-  psx2psp-engine    use cases (convert / extract / inspect / probe) Â· patch DB Â· the `psx2psp` CLI
-  psx2psp-app       the iced GUI `psx2psp-reborn` Â· XMB WGSL shader Â· preview audio
+  psx2psp-core      PBP · SFO · CUE/BIN · PSISOIMG/PSTITLEIMG writer and reader · TOC
+  psx2psp-patching  sector model · EDC/ECC · PPF 1/2/3 · pattern patches · EXE loader CRCs
+  psx2psp-media     artwork fitting · PSMF (ICON1) muxer and parser · clip pipeline ·
+                    ffmpeg / yt-dlp / atracdenc / at3tool adapters · tool provisioning
+  psx2psp-engine    use cases (convert / extract / inspect / probe) · patch DB · the `psx2psp` CLI
+  psx2psp-app       the iced GUI `psx2psp-reborn` · XMB WGSL shader · preview audio
 ```
 
-## ðŸ› ï¸ Build from source
+## 🛠️ Build from source
 
 You need Rust 1.88 or newer (edition 2024). On Linux, also the ALSA headers
 (`sudo apt install libasound2-dev pkg-config`).
@@ -284,7 +284,7 @@ cargo build --release
 The binaries are `target/release/psx2psp-reborn` (GUI) and `target/release/psx2psp` (CLI).
 Set `PSX2PSP_FPS=1` to have the GUI print its frame rate and worst frame time every 2 s.
 
-## ðŸ§ª Tests
+## 🧪 Tests
 
 ```bash
 cargo test --workspace
@@ -296,20 +296,20 @@ that need a Sony sample or an external tool skip themselves when it is missing. 
 `xmb::tests::screens_composite_layers_correctly` renders the three preview screens off-screen on
 the real GPU, and skips itself on a machine without a GPU adapter.
 
-## ðŸ“Š How it compares
+## 📊 How it compares
 
 | | **Reborn** | PSXPackager | PSX2PSP-Enhanced | pop-fe |
 |---|:---:|:---:|:---:|:---:|
-| Native single binary | âœ“ | .NET | Python + DLL | Python |
-| Animated XMB preview, Game / Save / Boot | âœ“ | wave only | âœ— | âœ— |
-| ICON1.PMF generated | âœ“ | âœ— | GIF only | âœ— |
-| One clip â†’ ICON1 + SND0, budget fitted | âœ“ | âœ— | âœ— | âœ— |
-| POPS configs Â· LibCrypt | âœ“ Â· âœ“ | ? Â· âœ— | ? Â· âœ— | âœ“ Â· âœ“ |
-| CHD / archive input | âœ— | âœ“ | âœ— | CHD |
+| Native single binary | ✓ | .NET | Python + DLL | Python |
+| Animated XMB preview, Game / Save / Boot | ✓ | wave only | ✗ | ✗ |
+| ICON1.PMF generated | ✓ | ✗ | GIF only | ✗ |
+| One clip → ICON1 + SND0, budget fitted | ✓ | ✗ | ✗ | ✗ |
+| POPS configs · LibCrypt | ✓ · ✓ | ? · ✗ | ? · ✗ | ✓ · ✓ |
+| CHD / archive input | ✗ | ✓ | ✗ | CHD |
 
 The full matrix, with sources and the gaps still open: **[docs/COMPARISON.md](docs/COMPARISON.md)**.
 
-## â“ FAQ
+## ❓ FAQ
 
 <details>
 <summary><b>Has it been tested on real hardware?</b></summary>
@@ -333,7 +333,7 @@ folder: copy it under `PSP/GAME/`.
 Look at the disc's patch list (GUI, or `psx2psp patches disc.cue`). *Game fixes* is on by default
 and is the safe choice. *Unlock fps* and *60 Hz* make the emulated CPU work harder and are on by
 default only for games verified on hardware. For a PAL game, prefer the game's own *60 Hz* switch
-over the generic PALâ†’NTSC preset when it has one. Found a fix that works? Put it in your
+over the generic PAL→NTSC preset when it has one. Found a fix that works? Put it in your
 `patches.ini` and open an issue or a pull request.
 </details>
 
@@ -358,12 +358,12 @@ leaves more room for the picture.
 <details>
 <summary><b>Windows or macOS refuses to start the download.</b></summary>
 
-The binaries are not code-signed. On Windows choose *More info â†’ Run anyway*; on macOS run
+The binaries are not code-signed. On Windows choose *More info → Run anyway*; on macOS run
 `xattr -d com.apple.quarantine psx2psp-reborn-macos-aarch64` once. `SHA256SUMS.txt` in the release
 lets you check the file first.
 </details>
 
-## ðŸ”§ Troubleshooting
+## 🔧 Troubleshooting
 
 | Issue | Fix |
 |---|---|
@@ -373,12 +373,12 @@ lets you check the file first.
 | Clip fails right away | a tool is missing: `psx2psp tools`, or **Install missing** in the GUI |
 | No preview on an old GPU | the GUI needs a GPU that wgpu can drive; the CLI needs no GPU at all |
 
-## ðŸ™ Credits
+## 🙏 Credits
 
 - **[pop-fe](https://github.com/sahlberg/pop-fe)** by sahlberg and contributors (LGPL-2.1):
   the POPS configs, LibCrypt magic words and PPF fixes in `resources/popfe.ini`, with the community
   work it credits (among others The_Ho's POPS config research and krHACKen's LibCrypt patches).
-- **PSX2PSP v1.4.2** and the **Popstation GUI GameID Database** (SeattleMan): the generic PALâ†’NTSC
+- **PSX2PSP v1.4.2** and the **Popstation GUI GameID Database** (SeattleMan): the generic PAL→NTSC
   rules and the 10,109-serial title database.
 - **popstation / popstationr**, **[PSXPackager](https://github.com/RupertAvery/PSXPackager)** and
   pop-fe again, against which every byte of the format was cross-checked.
@@ -388,14 +388,14 @@ lets you check the file first.
 - **[iced](https://github.com/iced-rs/iced)** and **[wgpu](https://github.com/gfx-rs/wgpu)**, which
   draw every pixel of the GUI.
 
-## âš–ï¸ Licence
+## ⚖️ Licence
 
 The source code is dual-licensed under **[MIT](LICENSE-MIT)** or **[Apache-2.0](LICENSE-APACHE)**,
 at your option. Some files in `resources/` are not covered by that licence:
 
 - `resources/popfe.ini` is generated from pop-fe and keeps **pop-fe's LGPL-2.1** licence.
 - `resources/BASE.PBP` and `resources/DATA.PSP` are the PS1 Classic donor (from Sony's
-  *Hot Shots Golf 2* EBOOT), the same files other POPS tools ship; they are Â© Sony Interactive
+  *Hot Shots Golf 2* EBOOT), the same files other POPS tools ship; they are © Sony Interactive
   Entertainment.
 
 PlayStation, PSP, PS Vita and POPS are trademarks of Sony Interactive Entertainment. This project
