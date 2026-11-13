@@ -1,7 +1,7 @@
 # popsfs: full-screen PS1 games on PSP (ARK-4 / ARK-5)
 
-> **Status: version 2, not yet tested on a PSP.** Version 1 failed on a real PSP (ARK-5,
-> 2026-11-13): MediEvil and Abe's Exoddus showed vertical streaks and a split picture. It removed
+> **Status: version 2 works on a real PSP (ARK-5, 2026-11-13)**, tested with MediEvil and Abe's
+> Exoddus. Version 1 failed on the same games with vertical streaks and a split picture. It removed
 > the POPS code that adds the game's display start row to the texture base, so any game that
 > draws its picture from a row other than 0 sampled the wrong rows. Version 2 keeps that code.
 > It was checked offline against the real `pops_01g`..`pops_09g` code (4500 cases, see below).
