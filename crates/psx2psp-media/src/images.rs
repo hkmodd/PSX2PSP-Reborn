@@ -1,10 +1,11 @@
 //! XMB artwork: decode any common format, fit to the exact PSP slot size, re-encode as RGBA PNG.
 
-use image::codecs::png::{CompressionType, FilterType as PngFilter, PngEncoder};
-use image::imageops::{self, FilterType};
-use image::{ImageEncoder, RgbaImage};
+use std::io::Cursor;
 
-use crate::MediaError;
+use image::codecs::png::{CompressionType, FilterType as PngFilter, PngEncoder};
+use image::{DynamicImage, ImageDecoder, ImageEncoder, ImageReader, RgbaImage};
+
+use crate::{MediaError, framing};
 
 /// An XMB image slot with its native size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -55,21 +56,22 @@ pub struct SlotImage {
     pub png: Vec<u8>,
 }
 
+/// Fits `src` to `slot` with content-aware framing (see [`crate::framing`]).
 pub fn fit(slot: Slot, src: &RgbaImage) -> RgbaImage {
-    let (tw, th) = slot.size();
-    let (sw, sh) = src.dimensions();
-    if (sw, sh) == (tw, th) {
+    if src.dimensions() == slot.size() {
         return src.clone();
     }
-    let (sx, sy) = (tw as f64 / sw as f64, th as f64 / sh as f64);
-    let scale = if slot.fill() { sx.max(sy) } else { sx.min(sy) };
-    let (nw, nh) = (((sw as f64 * scale).round() as u32).max(1), ((sh as f64 * scale).round() as u32).max(1));
-    let scaled = imageops::resize(src, nw, nh, FilterType::Lanczos3);
-    let mut out = RgbaImage::new(tw, th);
-    let dx = (tw as i64 - nw as i64) / 2;
-    let dy = (th as i64 - nh as i64) / 2;
-    imageops::overlay(&mut out, &scaled, dx, dy);
-    out
+    framing::render(slot, src, &framing::plan(slot, src))
+}
+
+/// Decodes any supported format, upright (EXIF orientation applied), as RGBA.
+pub fn decode(bytes: &[u8]) -> Result<RgbaImage, MediaError> {
+    let err = |e: image::ImageError| MediaError::Image(e.to_string());
+    let mut decoder = ImageReader::new(Cursor::new(bytes)).with_guessed_format().map_err(|e| MediaError::Image(e.to_string()))?.into_decoder().map_err(err)?;
+    let orientation = decoder.orientation().map_err(err)?;
+    let mut img = DynamicImage::from_decoder(decoder).map_err(err)?;
+    img.apply_orientation(orientation);
+    Ok(img.to_rgba8())
 }
 
 pub fn encode_png(img: &RgbaImage) -> Result<Vec<u8>, MediaError> {
@@ -82,7 +84,7 @@ pub fn encode_png(img: &RgbaImage) -> Result<Vec<u8>, MediaError> {
 
 /// Decodes `bytes` (PNG/JPEG/BMP/GIF/WebP), fits it to `slot`, encodes the PNG.
 pub fn prepare(slot: Slot, bytes: &[u8]) -> Result<SlotImage, MediaError> {
-    let src = image::load_from_memory(bytes).map_err(|e| MediaError::Image(e.to_string()))?.to_rgba8();
+    let src = decode(bytes)?;
     let img = fit(slot, &src);
     let png = if src.dimensions() == slot.size() && bytes.starts_with(b"\x89PNG") {
         bytes.to_vec() // already slot-sized PNG: keep the author's exact bytes
@@ -102,12 +104,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn icon_is_letterboxed_background_is_cropped() {
+    fn flat_square_fills_every_slot_without_gaps() {
         let src = RgbaImage::from_pixel(1000, 1000, image::Rgba([255, 0, 0, 255]));
         let icon = fit(Slot::Icon0, &src);
         assert_eq!(icon.dimensions(), (144, 80));
-        assert_eq!(icon.get_pixel(0, 40)[3], 0, "letterbox is transparent");
-        assert_eq!(icon.get_pixel(72, 40)[0], 255);
+        assert!(icon.pixels().all(|p| *p == image::Rgba([255, 0, 0, 255])), "a flat picture continues its own colour");
 
         let bg = fit(Slot::Pic1, &src);
         assert_eq!(bg.dimensions(), (480, 272));

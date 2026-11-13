@@ -1,12 +1,14 @@
 //! # psx2psp-media
 //!
 //! * [`images`] — in-process XMB artwork pipeline (decode → fit → PNG), zero external deps.
+//! * [`framing`] — content-aware crop/pad of any picture into an XMB slot.
 //! * [`tools`]  — FFmpeg / ATRAC3 encoder / yt-dlp process adapters.
 //! * [`psmf`]   — native PSMF muxer/parser (ICON1.PMF).
 //! * [`clip`]   — file/URL → trimmed ICON1.PMF + SND0.AT3 pipeline.
 //! * [`provision`] — one-click install of the external tools into `<exe>/tools`.
 
 pub mod clip;
+pub mod framing;
 pub mod images;
 pub mod proc;
 pub mod provision;

@@ -23,6 +23,9 @@ USAGE:
   psx2psp patches <disc.cue|disc.bin> [--id <code>] [--ppf <file>]
                                      the patch database's entries for the game, with hits
   psx2psp clip    <video|audio|URL> [clip options] [-o <dir>]   → ICON1.PMF / SND0.AT3
+  psx2psp art     <image> [--slot icon0|pic0|pic1|boot] [-o <dir>]
+                                     frame any picture into the XMB slots (all by default)
+                                     as the converter would; prints the crop chosen
   psx2psp tools   [install]          show / download ffmpeg, yt-dlp, atracdenc into <exe>/tools
   psx2psp update  [--check]          replace this executable with the latest GitHub release
                                      (SHA-256 verified); --check only reports
@@ -105,6 +108,7 @@ fn main() -> ExitCode {
         Some("extract") if args.len() == 3 => cmd_extract(Path::new(&args[1]), Path::new(&args[2])),
         Some("info") if args.len() == 2 => cmd_info(Path::new(&args[1])),
         Some("clip") => cmd_clip(&args[1..]),
+        Some("art") => cmd_art(&args[1..]),
         Some("patches") => cmd_patches(&args[1..]),
         Some("tools") if args.len() == 1 => cmd_tools(false),
         Some("tools") if args.len() == 2 && args[1] == "install" => cmd_tools(true),
@@ -218,6 +222,54 @@ fn cmd_clip(args: &[String]) -> R {
             std::fs::write(&p, d)?;
             println!("{} ({} bytes)", p.display(), d.len());
         }
+    }
+    Ok(())
+}
+
+fn cmd_art(args: &[String]) -> R {
+    let mut it = args.iter();
+    let (mut src, mut out, mut slots) = (None, PathBuf::from("."), Slot::ALL.to_vec());
+    while let Some(a) = it.next() {
+        let mut val = || it.next().cloned().ok_or_else(|| format!("{a} needs a value"));
+        match a.as_str() {
+            "-o" | "--out" => out = PathBuf::from(val()?),
+            "--slot" => {
+                let v = val()?;
+                slots = vec![*Slot::ALL.iter().find(|s| s.label().eq_ignore_ascii_case(&v)).ok_or_else(|| format!("unknown slot {v}"))?];
+            }
+            s if s.starts_with("--") => return Err(format!("unknown flag {s}").into()),
+            s => src = Some(PathBuf::from(s)),
+        }
+    }
+    let src = src.ok_or("art needs an image")?;
+    let bytes = std::fs::read(&src).map_err(|e| format!("{}: {e}", src.display()))?;
+    let img = images::decode(&bytes)?;
+    std::fs::create_dir_all(&out)?;
+    let stem = src.file_stem().map_or("art".into(), |s| s.to_string_lossy().into_owned());
+    for slot in slots {
+        let t = std::time::Instant::now();
+        let f = psx2psp_engine::media::framing::plan(slot, &img);
+        let pic = psx2psp_engine::media::framing::render(slot, &img, &f);
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        let p = out.join(format!("{stem}.{}.png", slot.label()));
+        std::fs::write(&p, images::encode_png(&pic)?)?;
+        let (c, d) = (f.crop, f.dest);
+        println!(
+            "{:<5} crop {:.0},{:.0} {:.0}x{:.0} of {}x{} → {:.0},{:.0} {:.0}x{:.0}  fill {:?}  {ms:.1} ms  {}",
+            slot.label(),
+            c.x,
+            c.y,
+            c.w,
+            c.h,
+            img.width(),
+            img.height(),
+            d.x,
+            d.y,
+            d.w,
+            d.h,
+            f.fill,
+            p.display()
+        );
     }
     Ok(())
 }
