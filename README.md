@@ -68,14 +68,16 @@ icon itself, fits icon and music into the XMB's budget, and knows the fixes ~2,0
 3. **Drop a game in.** Drag a `.cue` (or `.bin`, `.img`, `.m3u`) onto the window. Title and
    product code are detected, and the game's fixes from the [patch database](#-the-patch-database)
    switch on by themselves.
-4. **Make it yours** (optional). Drop artwork, paste a YouTube link for an animated icon and its
-   music, flip between the **Game**, **Save** and **Boot** screens of the preview.
+4. **Make it yours** (optional). Drop artwork. For the animated icon and its music, pick
+   **From YouTube** (paste a link) or **From my files** (your own MP4 and MP3). Flip between the
+   **Game**, **Save** and **Boot** screens of the preview.
 5. **Build EBOOT.PBP**, then copy its folder to `PSP/GAME/` on the memory stick.
 
 > [!TIP]
 > Files dropped on the window are routed by name: `ICON0.png`, `PIC0.png`, `PIC1.png` and
 > `BOOT.png` (or `STARTDAT`) land in their slots, a `.ppf` attaches to the last disc, a `.pmf` loads
-> as ICON1, an `.at3` as SND0, and an existing `EBOOT.PBP` brings in its title, ID and artwork. The
+> as ICON1, an `.at3` as SND0, any other video or audio file becomes the video or music to convert,
+> and an existing `EBOOT.PBP` brings in its title, ID and artwork. The
 > same files can be passed on the command line: `psx2psp-reborn game.cue ICON0.png`.
 
 > [!IMPORTANT]
@@ -108,11 +110,19 @@ icon itself, fits icon and music into the XMB's budget, and knows the fixes ~2,0
   and `PIC1`/boot 480×272.
 - **Never blocks.** Probing, clips, downloads and builds run in background jobs with progress,
   cancel, a log panel and toasts.
+- **Smooth wheel scrolling**, and a soundtrack of its own: *Firmware Glitch* loops quietly under
+  the session and steps aside while your SND0 plays. One click on the note silences it; the volume
+  slider next to it is remembered.
 
-### 🎬 ICON1 and SND0 from YouTube, or from any video
+### 🎬 ICON1 and SND0 from YouTube, or from your own files
 
-Paste a YouTube link (or any URL yt-dlp understands), or pick a local video or audio file, set
-**From** and **To** in seconds or `m:ss`, and choose:
+The Media card asks one question first: **From YouTube** or **From my files**.
+
+- **From my files:** choose a video (MP4, MKV, WebM, MOV) for the animated icon and/or a song
+  (MP3, WAV, FLAC, M4A, or a video's sound) for the music, set **From** and **To**, press
+  **Convert**. Video and music can come from different files.
+- **From YouTube:** paste a link (or any URL yt-dlp understands), set **From** and **To** in
+  seconds or `m:ss`, and choose:
 
 | Mode | You get |
 |---|---|

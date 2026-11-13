@@ -1,5 +1,6 @@
 //! SND0 preview playback: the decoded SND0.AT3 loops on the default output device while the
 //! Game screen is shown, as on the XMB, and its position is the clock the ICON1 movie follows.
+//! Under it, the app's soundtrack loops quietly and steps aside while SND0 is audible.
 //!
 //! One cpal output stream lives on its own thread for the whole session (cpal streams are not
 //! `Send` on every backend). The callback never blocks: it swaps sounds only when the generation
@@ -7,12 +8,17 @@
 //! (headphones unplugged, default device changed) the thread rebuilds the stream.
 
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
+
+/// Soundtrack fade in/out and ducking time constant, seconds.
+const MUSIC_FADE: f64 = 0.25;
+/// Length of the crossfade that makes the soundtrack loop seamless, seconds.
+const LOOP_FADE: f64 = 1.5;
 
 /// Decoded SND0: interleaved stereo s16.
 pub struct Sound {
@@ -68,6 +74,12 @@ struct Shared {
     rebuild: AtomicBool,
     /// Output format, or why there is no output.
     status: Mutex<String>,
+    /// Soundtrack, read by the callback when `music_gen` changes.
+    music_next: Mutex<Option<Arc<Sound>>>,
+    music_gen: AtomicU64,
+    music_on: AtomicBool,
+    /// Linear soundtrack gain as f32 bits.
+    music_gain: AtomicU32,
 }
 
 /// Session-wide audio output.
@@ -115,6 +127,10 @@ impl Player {
             base: Instant::now(),
             rebuild: AtomicBool::new(false),
             status: Mutex::new("starting".into()),
+            music_next: Mutex::new(None),
+            music_gen: AtomicU64::new(0),
+            music_on: AtomicBool::new(false),
+            music_gain: AtomicU32::new(0),
         });
         let s = shared.clone();
         let spawned = std::thread::Builder::new().name("snd0-audio".into()).spawn(move || output_thread(&s));
@@ -145,6 +161,27 @@ impl Player {
 
     pub fn set_muted(&self, on: bool) {
         self.shared.muted.store(on, Ordering::Release);
+    }
+
+    /// Decodes the `mp3` soundtrack on a background thread; it loops once ready (if on).
+    pub fn load_music(&self, mp3: &'static [u8]) {
+        let s = self.shared.clone();
+        let _ = std::thread::Builder::new()
+            .name("soundtrack".into())
+            .spawn(move || {
+                if let Ok(sound) = decode_mp3(mp3) {
+                    *s.music_next.lock().unwrap() = Some(sound);
+                    s.music_gen.fetch_add(1, Ordering::AcqRel);
+                }
+            });
+    }
+
+    /// Soundtrack on/off and its linear gain; changes fade in about a quarter second.
+    pub fn set_music(&self, on: bool, gain: f32) {
+        self.shared
+            .music_gain
+            .store(gain.clamp(0.0, 1.0).to_bits(), Ordering::Release);
+        self.shared.music_on.store(on, Ordering::Release);
     }
 
     /// Output format ("48000 Hz · 2 ch") or the reason there is no audio.
@@ -200,6 +237,12 @@ fn build<T: SizedSample + FromSample<f32>>(device: &cpal::Device, config: &Strea
     let mut gen_seen = 0u64;
     // Position in source frames; reset on every generation change.
     let mut pos = 0f64;
+    let mut music: Option<Arc<Sound>> = None;
+    let mut music_seen = 0u64;
+    // The soundtrack keeps its place while silent, so it resumes where it faded out.
+    let mut mpos = 0f64;
+    let mut mgain = 0f32;
+    let fade = (1.0 - (-1.0 / (MUSIC_FADE * rate)).exp()) as f32;
     let data = move |out: &mut [T], info: &cpal::OutputCallbackInfo| {
         let g = shared.generation.load(Ordering::Acquire);
         if g != gen_seen {
@@ -210,37 +253,79 @@ fn build<T: SizedSample + FromSample<f32>>(device: &cpal::Device, config: &Strea
                 pos = 0.0;
             }
         }
+        let mg = shared.music_gen.load(Ordering::Acquire);
+        if mg != music_seen
+            && let Ok(next) = shared.music_next.try_lock()
+        {
+            music = next.clone();
+            music_seen = mg;
+            mpos = 0.0;
+        }
         let playing = shared.active.load(Ordering::Acquire) && gen_seen == g;
-        let gain = if shared.muted.load(Ordering::Acquire) { 0.0 } else { 1.0 };
-        let (Some(snd), true) = (sound.as_ref(), playing) else {
-            out.fill(T::from_sample(0.0f32));
-            return;
+        let snd = sound.as_ref().filter(|_| playing);
+        let gain = if shared.muted.load(Ordering::Acquire) {
+            0.0
+        } else {
+            1.0
         };
-        let ts = info.timestamp();
-        let latency = ts.playback.saturating_duration_since(ts.callback).as_secs_f64();
-        // Publish what is being heard now: buffer start minus the output latency.
-        let heard = pos / f64::from(snd.rate) - latency;
-        shared.pos.store(heard.to_bits(), Ordering::Release);
-        shared.stamp.store(shared.base.elapsed().as_nanos() as u64, Ordering::Release);
-        shared.pos_gen.store(g, Ordering::Release);
-        let step = f64::from(snd.rate) / rate;
+        if let Some(snd) = snd {
+            let ts = info.timestamp();
+            let latency = ts
+                .playback
+                .saturating_duration_since(ts.callback)
+                .as_secs_f64();
+            // Publish what is being heard now: buffer start minus the output latency.
+            let heard = pos / f64::from(snd.rate) - latency;
+            shared.pos.store(heard.to_bits(), Ordering::Release);
+            shared
+                .stamp
+                .store(shared.base.elapsed().as_nanos() as u64, Ordering::Release);
+            shared.pos_gen.store(g, Ordering::Release);
+        }
+        // The soundtrack steps aside while the SND0 preview is audible.
+        let target = if shared.music_on.load(Ordering::Acquire) && (snd.is_none() || gain == 0.0) {
+            f32::from_bits(shared.music_gain.load(Ordering::Acquire))
+        } else {
+            0.0
+        };
+        let step = snd.map_or(0.0, |s| f64::from(s.rate) / rate);
+        let mstep = music.as_ref().map_or(0.0, |m| f64::from(m.rate) / rate);
         for frame in out.chunks_mut(channels) {
-            let (l, r) = snd.at(pos);
-            pos += step;
+            let (mut l, mut r) = (0.0, 0.0);
+            if let Some(s) = snd {
+                (l, r) = s.at(pos);
+                (l, r) = (l * gain, r * gain);
+                pos += step;
+            }
+            mgain += (target - mgain) * fade;
+            if target == 0.0 && mgain < 1e-5 {
+                mgain = 0.0;
+            }
+            if let Some(m) = music.as_ref().filter(|_| mgain > 0.0) {
+                let (a, b) = m.at(mpos);
+                (l, r) = (l + a * mgain, r + b * mgain);
+                mpos += mstep;
+            }
+            let (l, r) = (l.clamp(-1.0, 1.0), r.clamp(-1.0, 1.0));
             match frame {
-                [m] => *m = T::from_sample((l + r) * 0.5 * gain),
+                [m] => *m = T::from_sample((l + r) * 0.5),
                 [a, b, rest @ ..] => {
-                    *a = T::from_sample(l * gain);
-                    *b = T::from_sample(r * gain);
+                    *a = T::from_sample(l);
+                    *b = T::from_sample(r);
                     rest.fill(T::from_sample(0.0f32));
                 }
                 [] => {}
             }
         }
-        // Keep the f64 position small (precision) without changing where the loop is.
-        let n = snd.frames() as f64;
-        if pos >= n * 64.0 {
-            pos -= n * 32.0;
+        // Keep the f64 positions small (precision) without changing where the loops are.
+        if let Some(s) = snd {
+            let n = s.frames() as f64;
+            if pos >= n * 64.0 {
+                pos -= n * 32.0;
+            }
+        }
+        if let Some(m) = &music {
+            mpos %= m.frames() as f64;
         }
     };
     let shared = s.clone();
@@ -251,9 +336,115 @@ fn build<T: SizedSample + FromSample<f32>>(device: &cpal::Device, config: &Strea
     device.build_output_stream(*config, data, err, None).map_err(|e| e.to_string())
 }
 
+/// Decodes an MP3 to stereo s16 and folds its tail into its head, so it loops without a seam.
+pub fn decode_mp3(mp3: &'static [u8]) -> Result<Arc<Sound>, String> {
+    use symphonia::core::audio::SampleBuffer;
+    use symphonia::core::errors::Error;
+    use symphonia::core::formats::FormatOptions;
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::probe::Hint;
+
+    let stream = MediaSourceStream::new(Box::new(std::io::Cursor::new(mp3)), Default::default());
+    let options = FormatOptions {
+        enable_gapless: true,
+        ..Default::default()
+    };
+    let probed = symphonia::default::get_probe()
+        .format(
+            Hint::new().with_extension("mp3"),
+            stream,
+            &options,
+            &Default::default(),
+        )
+        .map_err(|e| e.to_string())?;
+    let mut format = probed.format;
+    let track = format.default_track().ok_or("no audio track")?;
+    let (id, rate) = (
+        track.id,
+        track.codec_params.sample_rate.ok_or("no sample rate")?,
+    );
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &Default::default())
+        .map_err(|e| e.to_string())?;
+    let mut pcm = Vec::new();
+    loop {
+        let packet = match format.next_packet() {
+            Ok(p) => p,
+            Err(Error::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e.to_string()),
+        };
+        if packet.track_id() != id {
+            continue;
+        }
+        let decoded = match decoder.decode(&packet) {
+            Ok(d) => d,
+            Err(Error::DecodeError(_)) => continue, // one bad frame is skipped, as players do
+            Err(e) => return Err(e.to_string()),
+        };
+        let channels = decoded.spec().channels.count().max(1);
+        let mut buf = SampleBuffer::<i16>::new(decoded.capacity() as u64, *decoded.spec());
+        buf.copy_interleaved_ref(decoded);
+        for f in buf.samples().chunks_exact(channels) {
+            pcm.extend_from_slice(&[f[0], f[if channels > 1 { 1 } else { 0 }]]);
+        }
+    }
+    seamless(&mut pcm, (LOOP_FADE * f64::from(rate)) as usize);
+    if pcm.len() < 2 {
+        return Err("no audio".into());
+    }
+    Ok(Sound::new(rate, pcm))
+}
+
+/// Equal-power crossfade of the last `fade` frames into the first ones, then drops the tail:
+/// playback runs off the end straight into the blended head.
+fn seamless(pcm: &mut Vec<i16>, fade: usize) {
+    let n = pcm.len() / 2;
+    let x = fade.min(n / 4);
+    for i in 0..x {
+        let t = (i as f32 + 0.5) / x as f32 * std::f32::consts::FRAC_PI_2;
+        let (fin, fout) = (t.sin(), t.cos());
+        for c in 0..2 {
+            let (head, tail) = (
+                f32::from(pcm[i * 2 + c]),
+                f32::from(pcm[(n - x + i) * 2 + c]),
+            );
+            pcm[i * 2 + c] = (head * fin + tail * fout).round().clamp(-32768.0, 32767.0) as i16;
+        }
+    }
+    pcm.truncate((n - x) * 2);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loop_seam_is_continuous() {
+        // A ramp has a hard jump from its end back to its start; after folding, the last frame
+        // flows into the first and the body is untouched.
+        let mut pcm: Vec<i16> = (0..1000)
+            .flat_map(|i| [i as i16 * 10, -(i as i16) * 10])
+            .collect();
+        seamless(&mut pcm, 100);
+        assert_eq!(pcm.len(), 900 * 2);
+        let (last, first) = (pcm[899 * 2], pcm[0]);
+        assert!(
+            (i32::from(first) - i32::from(last)).abs() <= 20,
+            "seam {last} → {first}"
+        );
+        assert_eq!(pcm[100 * 2], 1000, "past the fade the head is the original");
+        assert_eq!(pcm[500 * 2 + 1], -5000);
+    }
+
+    #[test]
+    fn soundtrack_decodes() {
+        let s = decode_mp3(include_bytes!("../../../resources/Firmware Glitch.mp3")).unwrap();
+        assert_eq!(s.rate, 48_000);
+        // 55.17 s minus the 1.5 s loop crossfade.
+        assert!((s.secs() - (55.17 - LOOP_FADE)).abs() < 0.1, "{s:?}");
+        let peak = s.pcm.iter().map(|v| v.unsigned_abs()).max().unwrap();
+        assert!(peak > 20_000, "real music, not silence: peak {peak}");
+    }
 
     #[test]
     fn interpolates_and_loops() {

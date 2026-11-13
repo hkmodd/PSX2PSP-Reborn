@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- PSX2PSP-Reborn app icon. Rasterized to icon.ico / icon.png by the psx2psp-app "icon" example. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#16244f"/>
+      <stop offset="0.55" stop-color="#0d1430"/>
+      <stop offset="1" stop-color="#1b1140"/>
+    </linearGradient>
+    <radialGradient id="halo" cx="0.5" cy="0.42" r="0.6">
+      <stop offset="0" stop-color="#3d7bff" stop-opacity="0.42"/>
+      <stop offset="1" stop-color="#3d7bff" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="wave" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#3d7bff" stop-opacity="0"/>
+      <stop offset="0.5" stop-color="#9fc0ff" stop-opacity="0.9"/>
+      <stop offset="1" stop-color="#9b6bff" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="rim" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.35"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0.04"/>
+    </linearGradient>
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="5" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <clipPath id="tile"><rect x="8" y="8" width="240" height="240" rx="56"/></clipPath>
+  </defs>
+
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="url(#bg)"/>
+  <g clip-path="url(#tile)">
+    <rect x="8" y="8" width="240" height="240" fill="url(#halo)"/>
+    <!-- XMB wave -->
+    <path d="M0 196 C 60 160, 110 236, 170 200 S 236 168, 256 184" fill="none" stroke="url(#wave)" stroke-width="5" opacity="0.75"/>
+    <path d="M0 214 C 70 186, 120 250, 180 214 S 240 192, 256 206" fill="none" stroke="url(#wave)" stroke-width="3" opacity="0.45"/>
+  </g>
+  <rect x="9.5" y="9.5" width="237" height="237" rx="54.5" fill="none" stroke="url(#rim)" stroke-width="3"/>
+
+  <g fill="none" stroke-width="14" stroke-linecap="round" stroke-linejoin="round" filter="url(#glow)">
+    <path d="M128 46 L152 88 L104 88 Z" stroke="#2fd58a"/>
+    <circle cx="186" cy="124" r="22" stroke="#ff4d6a"/>
+    <path d="M108 160 L148 200 M148 160 L108 200" stroke="#5b8fff"/>
+    <rect x="50" y="103" width="42" height="42" rx="4" stroke="#ff6fd8"/>
+  </g>
+</svg>

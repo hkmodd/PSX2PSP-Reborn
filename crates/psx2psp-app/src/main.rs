@@ -7,6 +7,8 @@
 mod audio;
 mod icons;
 mod project;
+mod smooth;
+mod soundtrack;
 mod style;
 mod win32;
 mod updater;
@@ -45,7 +47,8 @@ const WAVE: Color = iced::color!(0x2a55c8);
 
 const IMAGE_EXT: &[&str] = &["png", "jpg", "jpeg", "bmp", "gif", "webp"];
 const DISC_EXT: &[&str] = &["cue", "bin", "img", "m3u"];
-const MEDIA_EXT: &[&str] = &["mp4", "mkv", "webm", "mov", "avi", "m4v", "mp3", "wav", "flac", "ogg", "opus", "m4a", "aac"];
+const VIDEO_EXT: &[&str] = &["mp4", "mkv", "webm", "mov", "avi", "m4v"];
+const AUDIO_EXT: &[&str] = &["mp3", "wav", "flac", "ogg", "opus", "m4a", "aac"];
 /// Clip length when no end is given (capped at the source's length).
 const CLIP_DEFAULT_SECS: f64 = 30.0;
 /// Frames decoded for the animated ICON1 preview (30 s at 29.97 fps, ~41 MB of RGBA at 144×80).
@@ -67,6 +70,7 @@ fn main() -> iced::Result {
             size: Size::new(1320.0, 820.0),
             min_size: Some(Size::new(1000.0, 640.0)),
             exit_on_close_request: false,
+            icon: window::icon::from_file_data(include_bytes!("../assets/icon.png"), None).ok(),
             ..Default::default()
         })
         .antialiasing(true)
@@ -90,6 +94,8 @@ struct App {
     /// SND0 preview output; its position drives the ICON1 movie (lip-sync).
     audio: audio::Player,
     muted: bool,
+    /// The app's soundtrack (on/off, volume), mixed under the SND0 preview.
+    music: soundtrack::Music,
     clip: ClipForm,
     level: u32,
     output: Option<PathBuf>,
@@ -295,8 +301,48 @@ struct ClipOut {
     snd0: Option<Snd0>,
 }
 
-/// Clip editor: URL or file → `[start, end)` → ICON1.PMF and/or SND0.AT3.
+/// Where the XMB media comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+enum Origin {
+    /// A YouTube (any yt-dlp) link: one clip → ICON1 and/or SND0.
+    #[default]
+    Web,
+    /// The user's own files: a video → ICON1, music → SND0.
+    Files,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Track {
+    Video,
+    Music,
+}
+
+/// One of the user's own files and the part of it to convert.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct LocalTrack {
+    path: String,
+    start: String,
+    end: String,
+    /// Probed length in seconds.
+    len: Option<f64>,
+}
+
+impl LocalTrack {
+    fn is_set(&self) -> bool {
+        !self.path.trim().is_empty()
+    }
+
+    fn span(&self) -> Option<(f64, f64)> {
+        span(&self.start, &self.end, self.len)
+    }
+}
+
+/// Clip editor: URL → `[start, end)` → ICON1.PMF and/or SND0.AT3, or own files → each payload.
 struct ClipForm {
+    origin: Origin,
+    video: LocalTrack,
+    music: LocalTrack,
     source: String,
     start: String,
     end: String,
@@ -310,8 +356,56 @@ struct ClipForm {
 
 impl Default for ClipForm {
     fn default() -> Self {
-        Self { source: String::new(), start: String::new(), end: String::new(), mode: ClipMode::Both, kbps: 132, len: None, title: None, probed: false }
+        Self {
+            origin: Origin::Web,
+            video: LocalTrack::default(),
+            music: LocalTrack::default(),
+            source: String::new(),
+            start: String::new(),
+            end: String::new(),
+            mode: ClipMode::Both,
+            kbps: 132,
+            len: None,
+            title: None,
+            probed: false,
+        }
     }
+}
+
+impl ClipForm {
+    fn is_blank(&self) -> bool {
+        self.source.trim().is_empty() && !self.video.is_set() && !self.music.is_set()
+    }
+
+    fn track(&self, t: Track) -> &LocalTrack {
+        match t {
+            Track::Video => &self.video,
+            Track::Music => &self.music,
+        }
+    }
+
+    fn track_mut(&mut self, t: Track) -> &mut LocalTrack {
+        match t {
+            Track::Video => &mut self.video,
+            Track::Music => &mut self.music,
+        }
+    }
+}
+
+/// `[start, end)` in seconds: empty start = 0, empty end = start + 30 s (capped at the source).
+fn span(start: &str, end: &str, len: Option<f64>) -> Option<(f64, f64)> {
+    let start = if start.trim().is_empty() {
+        0.0
+    } else {
+        tools::parse_hms(start)?
+    };
+    let end = if end.trim().is_empty() {
+        let e = start + CLIP_DEFAULT_SECS;
+        len.map_or(e, |l| e.min(l))
+    } else {
+        tools::parse_hms(end)?
+    };
+    (end - start >= 1.0 && len.is_none_or(|l| start < l)).then_some((start, end))
 }
 
 #[derive(Debug, Clone)]
@@ -394,9 +488,15 @@ enum Message {
     ArtPicked(Slot, Option<PathBuf>),
     ArtLoaded(Slot, Result<Art, String>),
     ClearArt(Slot),
+    MediaOrigin(Origin),
+    PickTrack(Track),
+    TrackPicked(Track, Option<PathBuf>),
+    TrackProbed(Track, String, Result<(Option<f64>, Option<String>), String>),
+    TrackStart(Track, String),
+    TrackEnd(Track, String),
+    ClearTrack(Track),
+    MakeTracks,
     ClipSource(String),
-    PickClipSource,
-    ClipSourcePicked(Option<PathBuf>),
     ProbeClip,
     ClipProbed(String, Result<(Option<f64>, Option<String>), String>),
     ClipStart(String),
@@ -414,6 +514,10 @@ enum Message {
     Snd0Loaded(Result<Snd0, String>),
     ClearSnd0,
     ToggleMute,
+    ToggleMusic,
+    MusicVolume(u8),
+    /// The volume slider was released: remember the choice.
+    SaveMusic,
     InstallTools,
     Level(u32),
     PickOutput,
@@ -479,6 +583,7 @@ impl App {
             snd0: None,
             audio: audio::Player::new(),
             muted: false,
+            music: soundtrack::Music::default(),
             clip: ClipForm::default(),
             level: DEFAULT_LEVEL,
             output: None,
@@ -494,6 +599,7 @@ impl App {
             chrome: Chrome::new(),
         };
         app.audio.set_active(app.screen == Screen::Game);
+        app.music = soundtrack::Music::start(&app.audio);
         let detect = detect_tools_task();
         // A broken user patches.ini is left out; the built-in database still applies.
         let warn = loaded.error.map(|e| app.toast(Kind::Error, format!("{e} — your patches.ini is ignored")));
@@ -755,15 +861,36 @@ impl App {
                 }
                 self.clip.source = src;
             }
-            Message::PickClipSource => {
-                return Task::perform(pick_file("Clip source (video or audio)", "Audio / video", MEDIA_EXT), Message::ClipSourcePicked);
+            Message::MediaOrigin(o) => self.clip.origin = o,
+            Message::PickTrack(t) => return Self::pick_track(t),
+            Message::TrackPicked(t, Some(p)) => return self.set_track(t, p),
+            Message::TrackPicked(_, None) => {}
+            Message::TrackProbed(t, src, r) => {
+                if src != self.clip.track(t).path {
+                    return Task::none(); // replaced while probing
+                }
+                match r {
+                    Ok((len, _)) => {
+                        self.log(format!(
+                            "{}: {src} · {}",
+                            if t == Track::Video { "Video" } else { "Music" },
+                            len.map_or("length unknown".into(), tools::fmt_hms)
+                        ));
+                        self.clip.track_mut(t).len = len;
+                    }
+                    Err(e) => {
+                        *self.clip.track_mut(t) = LocalTrack::default();
+                        return self.toast(
+                            Kind::Error,
+                            format!("Can't read {}: {e}", file_name(Path::new(&src))),
+                        );
+                    }
+                }
             }
-            Message::ClipSourcePicked(Some(p)) => {
-                self.clip.source = p.display().to_string();
-                (self.clip.len, self.clip.title, self.clip.probed) = (None, None, false);
-                return self.probe_clip();
-            }
-            Message::ClipSourcePicked(None) => {}
+            Message::TrackStart(t, s) => self.clip.track_mut(t).start = s,
+            Message::TrackEnd(t, s) => self.clip.track_mut(t).end = s,
+            Message::ClearTrack(t) => *self.clip.track_mut(t) = LocalTrack::default(),
+            Message::MakeTracks => return self.make_tracks(),
             Message::ProbeClip => return self.probe_clip(),
             Message::ClipProbed(src, r) => {
                 if src != self.clip.source.trim() {
@@ -834,6 +961,17 @@ impl App {
                 self.muted = !self.muted;
                 self.audio.set_muted(self.muted);
             }
+            Message::ToggleMusic => {
+                self.music.on = !self.music.on;
+                self.music.apply(&self.audio);
+                self.music.save();
+            }
+            Message::MusicVolume(v) => {
+                // Moving the volume is a clear "I want to hear it".
+                (self.music.volume, self.music.on) = (v, v > 0);
+                self.music.apply(&self.audio);
+            }
+            Message::SaveMusic => self.music.save(),
             Message::InstallTools => return self.install_tools(),
             Message::Level(l) => self.level = l,
             Message::PickOutput => {
@@ -926,7 +1064,8 @@ impl App {
                     "pbp" => worker::blocking(move || import(p), Message::Imported),
                     "pmf" => Task::done(Message::Icon1Picked(Some(p))),
                     "at3" => Task::done(Message::Snd0Picked(Some(p))),
-                    e if MEDIA_EXT.contains(&e) => Task::done(Message::ClipSourcePicked(Some(p))),
+                    e if VIDEO_EXT.contains(&e) => self.set_track(Track::Video, p),
+                    e if AUDIO_EXT.contains(&e) => self.set_track(Track::Music, p),
                     "ppf" => match self.discs.last().map(|d| d.key) {
                         Some(key) => Task::done(Message::PpfPicked(key, Some(p))),
                         None => self.toast(Kind::Error, "Add a disc before dropping a PPF patch"),
@@ -1066,17 +1205,142 @@ impl App {
         (self.icon1.as_ref().map_or(0, |i| i.media.bytes.len()) + self.snd0.as_ref().map_or(0, |m| m.media.bytes.len())) as u64
     }
 
-    /// `[start, end)` in seconds: empty start = 0, empty end = start + 30 s (capped at the source).
+    /// The web clip's `[start, end)` ([`span`]).
     fn clip_span(&self) -> Option<(f64, f64)> {
-        let c = &self.clip;
-        let start = if c.start.trim().is_empty() { 0.0 } else { tools::parse_hms(&c.start)? };
-        let end = if c.end.trim().is_empty() {
-            let e = start + CLIP_DEFAULT_SECS;
-            c.len.map_or(e, |l| e.min(l))
-        } else {
-            tools::parse_hms(&c.end)?
+        span(&self.clip.start, &self.clip.end, self.clip.len)
+    }
+
+    fn pick_track(t: Track) -> Task<Message> {
+        let (title, name, ext): (&str, &str, Vec<&str>) = match t {
+            Track::Video => (
+                "Your video → ICON1.PMF",
+                "Video",
+                VIDEO_EXT.iter().copied().chain(["pmf"]).collect(),
+            ),
+            Track::Music => (
+                "Your music → SND0.AT3",
+                "Audio / video",
+                AUDIO_EXT
+                    .iter()
+                    .chain(VIDEO_EXT)
+                    .copied()
+                    .chain(["at3"])
+                    .collect(),
+            ),
         };
-        (end - start >= 1.0 && c.len.is_none_or(|l| start < l)).then_some((start, end))
+        Task::perform(pick_file(title, name, &ext), move |p| {
+            Message::TrackPicked(t, p)
+        })
+    }
+
+    /// A file for `t`: finished payloads load as they are, anything else is probed for its length.
+    fn set_track(&mut self, t: Track, p: PathBuf) -> Task<Message> {
+        let ext = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        match (t, ext.as_str()) {
+            (Track::Video, "pmf") => return Task::done(Message::Icon1Picked(Some(p))),
+            (_, "at3") => return Task::done(Message::Snd0Picked(Some(p))),
+            _ => {}
+        }
+        self.clip.origin = Origin::Files;
+        let src = p.display().to_string();
+        *self.clip.track_mut(t) = LocalTrack {
+            path: src.clone(),
+            ..LocalTrack::default()
+        };
+        let key = src.clone();
+        worker::blocking(
+            move || {
+                let tools = ClipTools::detect().map_err(|e| e.to_string())?;
+                clip::probe(&tools, &src).map_err(|e| e.to_string())
+            },
+            move |r| Message::TrackProbed(t, key.clone(), r),
+        )
+    }
+
+    /// Converts the user's files: music first (CBR), then the video fitted to what is left of
+    /// the 500 KB. A payload with no file chosen keeps its current share.
+    fn make_tracks(&mut self) -> Task<Message> {
+        // Ok(None) = no file chosen, Err = a file with invalid times.
+        let ready = |tr: &LocalTrack| match tr.is_set() {
+            false => Ok(None),
+            true => tr
+                .span()
+                .map(|(s, e)| Some((tr.path.trim().to_owned(), s, e)))
+                .ok_or(()),
+        };
+        let (Ok(video), Ok(music)) = (ready(&self.clip.video), ready(&self.clip.music)) else {
+            return self.toast(Kind::Error, "Clip times: seconds or m:ss, end at least 1 s after start and start inside the file");
+        };
+        if video.is_none() && music.is_none() {
+            return self.toast(Kind::Error, "Choose a video or some music first");
+        }
+        let kept_icon1 = self.icon1.as_ref().map_or(0, |i| i.media.bytes.len()) as u64;
+        let kept_snd0 = self.snd0.as_ref().map_or(0, |m| m.media.bytes.len()) as u64;
+        let kbps = self.clip.kbps;
+        let Some(cancel) = self.start_job(JOB_CLIP) else {
+            return self.toast(Kind::Error, "A job is already running");
+        };
+        let name = |(p, s, e): &(String, f64, f64)| {
+            format!(
+                "{} [{}–{}]",
+                file_name(Path::new(p)),
+                tools::fmt_hms(*s),
+                tools::fmt_hms(*e)
+            )
+        };
+        for (what, t) in [("ICON1.PMF", &video), ("SND0.AT3", &music)] {
+            if let Some(t) = t {
+                self.log(format!("{what} ← {}", name(t)));
+            }
+        }
+        worker::job(
+            cancel,
+            move |m| {
+                let mut out = ClipOut {
+                    icon1: None,
+                    snd0: None,
+                };
+                if let Some(t) = &music {
+                    let (kbps, budget) = match video {
+                        Some(_) => (
+                            clip::SHARED_KBPS,
+                            tools::SND0_BUDGET.saturating_sub(clip::MIN_ICON1),
+                        ),
+                        None => (kbps, tools::SND0_BUDGET.saturating_sub(kept_icon1)),
+                    };
+                    let req = ClipRequest {
+                        source: &t.0,
+                        start: t.1,
+                        end: t.2,
+                        mode: ClipMode::Snd0,
+                        snd0_kbps: kbps,
+                        budget,
+                    };
+                    out.snd0 = run_clip(&req, name(t), m)?.snd0;
+                }
+                if let Some(t) = &video {
+                    let used = out
+                        .snd0
+                        .as_ref()
+                        .map_or(kept_snd0, |a| a.media.bytes.len() as u64);
+                    let req = ClipRequest {
+                        source: &t.0,
+                        start: t.1,
+                        end: t.2,
+                        mode: ClipMode::Icon1,
+                        snd0_kbps: kbps,
+                        budget: tools::SND0_BUDGET.saturating_sub(used),
+                    };
+                    out.icon1 = run_clip(&req, name(t), m)?.icon1;
+                }
+                Ok(out)
+            },
+            Message::ClipJob,
+        )
     }
 
     fn probe_clip(&mut self) -> Task<Message> {
@@ -1412,9 +1676,31 @@ impl App {
     /// then the section cards.
     fn left_panel(&self) -> Element<'_, Message> {
         let banner = self.updater.banner().map(|b| b.map(Message::Update));
-        let panel = column![banner, self.brand(), project::view(self), self.game_card(), self.art_card(), self.media_card(), self.build_card()].spacing(14).padding(16);
-        let bar = scrollable::Scrollbar::new().width(6).scroller_width(6).margin(3).spacing(2);
-        container(scrollable(panel).direction(scrollable::Direction::Vertical(bar)).width(470).height(Fill)).style(style::panel).height(Fill).into()
+        let panel = column![
+            banner,
+            self.brand(),
+            project::view(self),
+            self.game_card(),
+            self.art_card(),
+            self.media_card(),
+            self.build_card()
+        ]
+        .spacing(14)
+        .padding(16);
+        let bar = scrollable::Scrollbar::new()
+            .width(6)
+            .scroller_width(6)
+            .margin(3)
+            .spacing(2);
+        container(smooth::smooth(
+            scrollable(panel)
+                .direction(scrollable::Direction::Vertical(bar))
+                .width(470)
+                .height(Fill),
+        ))
+        .style(style::panel)
+        .height(Fill)
+        .into()
     }
 
     /// Step completion: Game (discs probed with an ID, title set), Artwork (any image),
@@ -1789,11 +2075,343 @@ impl App {
                 }
             }
         };
+        let tab = |o: Origin, glyph: Icon, s: &'static str| {
+            let on = c.origin == o;
+            let ink = if on { Color::WHITE } else { style::MUTED };
+            button(
+                container(
+                    row![
+                        icons::icon(glyph, 14.0, ink),
+                        text(s).size(13).font(style::BOLD).color(ink)
+                    ]
+                    .spacing(7)
+                    .align_y(Alignment::Center),
+                )
+                .center_x(Fill),
+            )
+            .padding([9, 4])
+            .width(Fill)
+            .style(style::segment(on, accent))
+            .on_press(Message::MediaOrigin(o))
+        };
+        let origin = container(
+            row![
+                tab(Origin::Web, Icon::Link, "From YouTube"),
+                tab(Origin::Files, Icon::Folder, "From my files")
+            ]
+            .spacing(4),
+        )
+        .padding(4)
+        .style(style::segmented);
+        let body = match c.origin {
+            Origin::Web => self.web_body(),
+            Origin::Files => self.files_body(),
+        };
+        let used = self.media_bytes();
+        let over = used > tools::SND0_BUDGET;
+        let budget = column![
+            row![
+                caption("XMB MEDIA BUDGET"),
+                space().width(Fill),
+                text(format!(
+                    "{} / 500 KB used by ICON1 + SND0",
+                    used.div_ceil(1024)
+                ))
+                .size(12)
+                .color(if over { style::RED } else { style::MUTED }),
+            ]
+            .align_y(Alignment::Center),
+            progress_bar(
+                0.0..=tools::SND0_BUDGET as f32,
+                used.min(tools::SND0_BUDGET) as f32
+            )
+            .girth(6)
+            .style(style::meter(if over { style::RED } else { accent })),
+        ]
+        .spacing(7);
+        let icon1 = self.icon1.as_ref().map_or_else(
+            || "Animated icon · not set yet".into(),
+            |i| {
+                format!(
+                    "{} · {:.1} s · {} KB{}",
+                    i.media.source,
+                    i.secs,
+                    i.media.bytes.len().div_ceil(1024),
+                    if i.movie.is_some() {
+                        ""
+                    } else {
+                        " · no preview"
+                    }
+                )
+            },
+        );
+        let snd0 = self.snd0.as_ref().map_or_else(
+            || "XMB music · not set yet".into(),
+            |m| match &m.sound {
+                Some(s) => format!(
+                    "{} · {:.1} s · {} KB",
+                    m.media.source,
+                    s.secs(),
+                    m.media.bytes.len().div_ceil(1024)
+                ),
+                None => format!(
+                    "{} · {} KB · no preview",
+                    m.media.source,
+                    m.media.bytes.len().div_ceil(1024)
+                ),
+            },
+        );
+        column![
+            origin,
+            body,
+            space().height(2),
+            hairline(),
+            caption("READY FOR THE EBOOT"),
+            slot_row(
+                Icon::Video,
+                accent,
+                "ICON1.PMF",
+                icon1,
+                self.icon1.is_some(),
+                Message::PickIcon1,
+                (
+                    Icon::Close,
+                    "Remove",
+                    self.icon1.as_ref().map(|_| Message::ClearIcon1)
+                )
+            ),
+            slot_row(
+                Icon::Music,
+                accent,
+                "SND0.AT3",
+                snd0,
+                self.snd0.is_some(),
+                Message::PickSnd0,
+                (
+                    Icon::Close,
+                    "Remove",
+                    self.snd0.as_ref().map(|_| Message::ClearSnd0)
+                )
+            ),
+            budget,
+            tools,
+        ]
+        .spacing(9)
+        .into()
+    }
+
+    /// The big pink action button; shows progress while a clip job runs.
+    fn convert_button(&self, idle_text: String, on_press: Option<Message>) -> Element<'_, Message> {
+        let accent = style::PINK;
+        let cta = |ink: Color, s: String| {
+            container(
+                row![
+                    icons::icon(Icon::Sparkles, 17.0, ink),
+                    text(s).size(14).font(style::BOLD)
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center),
+            )
+            .center_x(Fill)
+        };
+        match self.job.as_ref().filter(|j| j.label == JOB_CLIP) {
+            Some(j) => button(cta(
+                Color::WHITE,
+                if j.progress > 0.0 {
+                    format!("Converting…  {:.0}%", j.progress * 100.0)
+                } else {
+                    "Converting…".into()
+                },
+            ))
+            .style(style::busy_button(accent)),
+            None => button(cta(
+                if on_press.is_some() {
+                    Color::WHITE
+                } else {
+                    style::MUTED
+                },
+                idle_text,
+            ))
+            .style(style::primary_button(accent, style::VIOLET))
+            .on_press_maybe(on_press),
+        }
+        .padding([12, 16])
+        .width(Fill)
+        .into()
+    }
+
+    /// ATRAC3 bitrate picker (SND0 on its own).
+    fn kbps_row(&self) -> Element<'_, Message> {
+        let accent = style::PINK;
+        row![
+            caption("ATRAC3"),
+            space().width(Fill),
+            container([66, 105, 132].into_iter().fold(row![].spacing(3), |r, k| {
+                r.push(
+                    button(text(format!("{k} kbps")).size(12))
+                        .padding([4, 10])
+                        .style(style::segment(self.clip.kbps == k, accent))
+                        .on_press(Message::ClipKbps(k)),
+                )
+            }))
+            .padding(3)
+            .style(style::segmented),
+        ]
+        .align_y(Alignment::Center)
+        .into()
+    }
+
+    /// Own files: a video → ICON1, music → SND0, each with its own span.
+    fn files_body(&self) -> Element<'_, Message> {
+        let (v, m) = (self.clip.video.is_set(), self.clip.music.is_set());
+        let note: Element<'_, Message> = match (v, m) {
+            (true, true) => label(format!(
+                "Music as {} kbps ATRAC3; the video gets the rest of the 500 KB",
+                clip::SHARED_KBPS
+            ))
+            .into(),
+            (false, true) => self.kbps_row(),
+            (true, false) => {
+                label("144×80 H.264 at 29.97 fps, bitrate fitted to the free budget").into()
+            }
+            (false, false) => label("Pick one or both, set the part to use, then convert.").into(),
+        };
+        let cta = match (v, m) {
+            (true, true) => "Convert video + music",
+            (true, false) => "Convert video → ICON1",
+            (false, true) => "Convert music → SND0",
+            (false, false) => "Convert",
+        };
+        let go = (self.job.is_none() && (v || m)).then_some(Message::MakeTracks);
+        column![
+            label("Your own video becomes the animated icon, your music the XMB soundtrack. Drop files here too."),
+            self.track_row(Track::Video),
+            self.track_row(Track::Music),
+            note,
+            self.convert_button(cta.into(), go),
+        ]
+        .spacing(9)
+        .into()
+    }
+
+    fn track_row(&self, t: Track) -> Element<'_, Message> {
+        let accent = style::PINK;
+        let tr = self.clip.track(t);
+        let (glyph, target, what, formats) = match t {
+            Track::Video => (
+                Icon::Video,
+                "ICON1",
+                "your video",
+                "MP4, MKV, WebM, MOV, PMF",
+            ),
+            Track::Music => (
+                Icon::Music,
+                "SND0",
+                "your music",
+                "MP3, WAV, FLAC, M4A, AT3",
+            ),
+        };
+        let arrow = row![text("→").size(13).color(style::MUTED), chip(target, accent)]
+            .spacing(6)
+            .align_y(Alignment::Center);
+        if !tr.is_set() {
+            let face = row![
+                badge(glyph, accent, 38.0),
+                column![
+                    text(format!("Choose {what}…")).size(14).font(style::BOLD),
+                    label(formats).wrapping(text::Wrapping::None)
+                ]
+                .spacing(3)
+                .width(Fill)
+                .clip(true),
+                arrow,
+            ]
+            .spacing(12)
+            .align_y(Alignment::Center);
+            return button(face)
+                .padding([12, 14])
+                .width(Fill)
+                .style(style::tile(accent, false))
+                .on_press(Message::PickTrack(t))
+                .into();
+        }
+        let span = tr.span();
+        let end_hint = span.map_or_else(|| "end".into(), |(_, e)| tools::fmt_hms(e));
+        let len = tr.len.map_or_else(
+            || "reading length…".into(),
+            |l| format!("{} long", tools::fmt_hms(l)),
+        );
+        container(
+            column![
+                row![
+                    badge(glyph, accent, 38.0),
+                    column![
+                        text(file_name(Path::new(tr.path.trim())))
+                            .size(13)
+                            .font(style::BOLD)
+                            .wrapping(text::Wrapping::None),
+                        label(len)
+                    ]
+                    .spacing(3)
+                    .width(Fill)
+                    .clip(true),
+                    arrow,
+                    hint(
+                        icon_button(Icon::Folder, accent, Some(Message::PickTrack(t))),
+                        "Choose another file".into()
+                    ),
+                    hint(
+                        icon_button(Icon::Close, style::RED, Some(Message::ClearTrack(t))),
+                        "Remove".into()
+                    ),
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center),
+                row![
+                    icons::icon(Icon::Clock, 14.0, style::MUTED),
+                    label("From"),
+                    text_input("0:00", &tr.start)
+                        .on_input(move |s| Message::TrackStart(t, s))
+                        .size(13)
+                        .padding([7, 10])
+                        .width(80)
+                        .style(style::input),
+                    label("to"),
+                    text_input(&end_hint, &tr.end)
+                        .on_input(move |s| Message::TrackEnd(t, s))
+                        .size(13)
+                        .padding([7, 10])
+                        .width(80)
+                        .style(style::input),
+                    space().width(Fill),
+                    chip(
+                        span.map_or_else(
+                            || "invalid span".into(),
+                            |(s, e)| format!("{:.1} s", e - s)
+                        ),
+                        if span.is_some() { accent } else { style::RED }
+                    ),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            ]
+            .spacing(10),
+        )
+        .padding([10, 12])
+        .style(style::well)
+        .into()
+    }
+
+    /// A YouTube (any yt-dlp) link: one clip → ICON1, SND0 or both.
+    fn web_body(&self) -> Element<'_, Message> {
+        let c = &self.clip;
+        let idle = self.job.is_none();
+        let accent = style::PINK;
         let source_info = if c.probed {
             let name = c.title.clone().unwrap_or_else(|| file_name(Path::new(c.source.trim())));
             label(format!("{name} · {}", c.len.map_or("length unknown".into(), tools::fmt_hms))).wrapping(text::Wrapping::None)
         } else {
-            label("Paste a YouTube (or any yt-dlp) link, browse or drop a video/audio file")
+            label("Paste a link and press Enter (or the magnifier) to read its title and length")
         };
         let span = self.clip_span();
         let end_hint = span.map_or_else(|| "end".into(), |(_, e)| tools::fmt_hms(e));
@@ -1813,69 +2431,39 @@ impl App {
             r.push(segment(row![glyphs, text(m.label()).size(12).font(style::BOLD).wrapping(text::Wrapping::None)].spacing(6).align_y(Alignment::Center).into(), on, Message::ClipMode(m)))
         });
         let audio: Element<'_, Message> = match c.mode {
-            ClipMode::Snd0 => row![
-                caption("ATRAC3"),
-                space().width(Fill),
-                container([66, 105, 132].into_iter().fold(row![].spacing(3), |r, k| {
-                    r.push(button(text(format!("{k} kbps")).size(12)).padding([4, 10]).style(style::segment(c.kbps == k, accent)).on_press(Message::ClipKbps(k)))
-                }))
-                .padding(3)
-                .style(style::segmented),
-            ]
-            .align_y(Alignment::Center)
+            ClipMode::Snd0 => self.kbps_row(),
+            ClipMode::Both => label(format!(
+                "SND0 at {} kbps; the video gets the rest of the 500 KB",
+                clip::SHARED_KBPS
+            ))
             .into(),
-            ClipMode::Both => label(format!("SND0 at {} kbps; the video gets the rest of the 500 KB", clip::SHARED_KBPS)).into(),
-            ClipMode::Icon1 => label("144×80 H.264 at 29.97 fps, bitrate fitted to the free budget").into(),
+            ClipMode::Icon1 => {
+                label("144×80 H.264 at 29.97 fps, bitrate fitted to the free budget").into()
+            }
         };
         let can_make = idle && !c.source.trim().is_empty() && span.is_some();
-        let cta = |ink: Color, s: String| container(row![icons::icon(Icon::Sparkles, 17.0, ink), text(s).size(14).font(style::BOLD)].spacing(10).align_y(Alignment::Center)).center_x(Fill);
-        let make = match self.job.as_ref().filter(|j| j.label == JOB_CLIP) {
-            Some(j) => button(cta(
-                Color::WHITE,
-                if j.progress > 0.0 { format!("Making {}…  {:.0}%", c.mode.label(), j.progress * 100.0) } else { format!("Making {}…", c.mode.label()) },
-            ))
-            .style(style::busy_button(accent)),
-            None => button(cta(if can_make { Color::WHITE } else { style::MUTED }, format!("Make {}", c.mode.label())))
-                .style(style::primary_button(accent, style::VIOLET))
-                .on_press_maybe(can_make.then_some(Message::MakeClip)),
-        }
-        .padding([12, 16])
-        .width(Fill);
-        let used = self.media_bytes();
-        let over = used > tools::SND0_BUDGET;
-        let budget = column![
-            row![
-                caption("XMB MEDIA BUDGET"),
-                space().width(Fill),
-                text(format!("{} / 500 KB used by ICON1 + SND0", used.div_ceil(1024))).size(12).color(if over { style::RED } else { style::MUTED }),
-            ]
-            .align_y(Alignment::Center),
-            progress_bar(0.0..=tools::SND0_BUDGET as f32, used.min(tools::SND0_BUDGET) as f32).girth(6).style(style::meter(if over { style::RED } else { accent })),
-        ]
-        .spacing(7);
-        let icon1 = self.icon1.as_ref().map_or_else(
-            || "Animated icon · make one above or browse a .pmf".into(),
-            |i| format!("{} · {:.1} s · {} KB{}", i.media.source, i.secs, i.media.bytes.len().div_ceil(1024), if i.movie.is_some() { "" } else { " · no preview" }),
-        );
-        let snd0 = self.snd0.as_ref().map_or_else(
-            || "XMB music · make one above or browse a .at3".into(),
-            |m| match &m.sound {
-                Some(s) => format!("{} · {:.1} s · {} KB", m.media.source, s.secs(), m.media.bytes.len().div_ceil(1024)),
-                None => format!("{} · {} KB · no preview", m.media.source, m.media.bytes.len().div_ceil(1024)),
-            },
+        let make = self.convert_button(
+            format!("Make {}", c.mode.label()),
+            can_make.then_some(Message::MakeClip),
         );
         column![
-            caption("CLIP SOURCE"),
+            label("Paste a YouTube link: one clip becomes the animated icon, the music, or both."),
             row![
-                text_input("https://youtu.be/…  or  a video / audio file", &c.source)
+                text_input("https://youtu.be/…", &c.source)
                     .on_input(Message::ClipSource)
                     .on_submit(Message::ProbeClip)
                     .size(13)
                     .padding([9, 12])
                     .width(Fill)
                     .style(style::input),
-                hint(icon_button(Icon::Folder, accent, Some(Message::PickClipSource)), "Browse a video / audio file".into()),
-                hint(icon_button(Icon::Search, accent, (!c.source.trim().is_empty()).then_some(Message::ProbeClip)), "Probe: read length and title".into()),
+                hint(
+                    icon_button(
+                        Icon::Search,
+                        accent,
+                        (!c.source.trim().is_empty()).then_some(Message::ProbeClip)
+                    ),
+                    "Read the video's title and length".into()
+                ),
             ]
             .spacing(6)
             .align_y(Alignment::Center),
@@ -1894,13 +2482,6 @@ impl App {
             container(modes).padding(4).style(style::segmented),
             audio,
             make,
-            space().height(2),
-            hairline(),
-            caption("PAYLOADS"),
-            slot_row(Icon::Video, accent, "ICON1.PMF", icon1, self.icon1.is_some(), Message::PickIcon1, (Icon::Close, "Remove", self.icon1.as_ref().map(|_| Message::ClearIcon1))),
-            slot_row(Icon::Music, accent, "SND0.AT3", snd0, self.snd0.is_some(), Message::PickSnd0, (Icon::Close, "Remove", self.snd0.as_ref().map(|_| Message::ClearSnd0))),
-            budget,
-            tools,
         ]
         .spacing(9)
         .into()
@@ -1950,9 +2531,42 @@ impl App {
         let tabs = Screen::ALL.iter().fold(row![].spacing(4), |r, &s| {
             r.push(button(text(s.label()).size(13)).padding([6, 18]).style(style::tab(self.screen == s)).on_press(Message::Screen(s)))
         });
+        let on = self.music.on;
+        let music = container(
+            row![
+                button(icons::icon(
+                    Icon::Music,
+                    14.0,
+                    if on { Color::WHITE } else { style::MUTED }
+                ))
+                .padding([6, 10])
+                .style(style::tab(on))
+                .on_press(Message::ToggleMusic),
+                slider(0..=100, self.music.volume, Message::MusicVolume)
+                    .on_release(Message::SaveMusic)
+                    .width(84)
+                    .style(style::slider(if on { style::BLUE } else { style::MUTED })),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
+        )
+        .padding([4, 12])
+        .style(style::well);
+        let music = hint(
+            music,
+            format!(
+                "Soundtrack “Firmware Glitch” — {}. It steps aside while the game's SND0 plays.",
+                if on {
+                    "click the note to turn it off"
+                } else {
+                    "off"
+                }
+            ),
+        );
         row![
             column![text("XMB preview").size(20).font(style::BOLD), label("How the EBOOT looks on the PSP")].spacing(2),
             space().width(Fill),
+            music,
             self.snd0.as_ref().filter(|s| s.sound.is_some()).map(|_| {
                 button(text(if self.muted { "Sound off" } else { "Sound on" }).size(13))
                     .padding([6, 14])

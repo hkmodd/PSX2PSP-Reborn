@@ -35,7 +35,9 @@ use psx2psp_engine::media::images::{self, Slot};
 use psx2psp_engine::{self as engine, patchdb};
 use serde::{Deserialize, Serialize};
 
-use crate::{App, Art, ClipForm, Disc, Icon1, Kind, Media, Message, Snd0, style, worker};
+use crate::{
+    App, Art, ClipForm, Disc, Icon1, Kind, LocalTrack, Media, Message, Origin, Snd0, style, worker,
+};
 
 /// Format version written into every `project.json`.
 pub const VERSION: u32 = 1;
@@ -103,6 +105,10 @@ impl DiscFile {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ClipFile {
+    /// "web" or "files".
+    pub origin: String,
+    pub video: LocalTrack,
+    pub music: LocalTrack,
     pub source: String,
     pub start: String,
     pub end: String,
@@ -122,6 +128,14 @@ impl Default for ClipFile {
 impl From<&ClipForm> for ClipFile {
     fn from(c: &ClipForm) -> Self {
         Self {
+            origin: if c.origin == Origin::Files {
+                "files"
+            } else {
+                "web"
+            }
+            .into(),
+            video: c.video.clone(),
+            music: c.music.clone(),
             source: c.source.clone(),
             start: c.start.clone(),
             end: c.end.clone(),
@@ -137,6 +151,13 @@ impl From<&ClipForm> for ClipFile {
 impl ClipFile {
     fn to_form(&self) -> ClipForm {
         ClipForm {
+            origin: if self.origin == "files" {
+                Origin::Files
+            } else {
+                Origin::Web
+            },
+            video: self.video.clone(),
+            music: self.music.clone(),
             source: self.source.clone(),
             start: self.start.clone(),
             end: self.end.clone(),
@@ -218,6 +239,8 @@ impl Project {
             && self.icon1.is_none()
             && self.snd0.is_none()
             && self.clip.source.trim().is_empty()
+            && !self.clip.video.is_set()
+            && !self.clip.music.is_set()
     }
 }
 
@@ -810,7 +833,21 @@ fn fingerprint(app: &App) -> u64 {
     app.icon1.as_ref().map(|i| media(&i.media)).hash(&mut h);
     app.snd0.as_ref().map(|s| media(&s.media)).hash(&mut h);
     let c = &app.clip;
-    (&c.source, &c.start, &c.end, mode_str(c.mode), c.kbps, c.len.map(f64::to_bits), &c.title, c.probed).hash(&mut h);
+    (
+        &c.source,
+        &c.start,
+        &c.end,
+        mode_str(c.mode),
+        c.kbps,
+        c.len.map(f64::to_bits),
+        &c.title,
+        c.probed,
+    )
+        .hash(&mut h);
+    c.origin.hash(&mut h);
+    for t in [&c.video, &c.music] {
+        (&t.path, &t.start, &t.end, t.len.map(f64::to_bits)).hash(&mut h);
+    }
     h.finish()
 }
 
@@ -835,7 +872,7 @@ fn is_blank(app: &App) -> bool {
         && app.art.iter().all(Option::is_none)
         && app.icon1.is_none()
         && app.snd0.is_none()
-        && app.clip.source.trim().is_empty()
+        && app.clip.is_blank()
 }
 
 /// Replaces the editable state with `p` (+ its decoded previews); probes the discs again.
@@ -1446,6 +1483,19 @@ mod tests {
             icon1: blob("Trailer [0:05-0:35].pmf", &[0x50, 0x53, 0x4d, 0x46, 0, 1, 2, 3]),
             snd0: blob("Trailer [0:05-0:35].at3", b"RIFF....WAVEfmt "),
             clip: ClipFile {
+                origin: "files".into(),
+                video: LocalTrack {
+                    path: dir.join("trailer.mp4").display().to_string(),
+                    start: "0:02".into(),
+                    end: String::new(),
+                    len: Some(95.25),
+                },
+                music: LocalTrack {
+                    path: dir.join("song.mp3").display().to_string(),
+                    start: "1:00".into(),
+                    end: "1:30".into(),
+                    len: None,
+                },
                 source: "https://youtu.be/xyz".into(),
                 start: "0:05".into(),
                 end: "0:35".into(),
