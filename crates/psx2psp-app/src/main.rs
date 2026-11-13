@@ -8,6 +8,7 @@ mod audio;
 mod icons;
 mod project;
 mod style;
+mod win32;
 mod updater;
 mod worker;
 mod xmb;
@@ -438,6 +439,8 @@ enum Message {
     SectionSize(usize, Size),
     Frame(Instant),
     DragHover(bool),
+    /// The main window exists: install the Win32 size cap (see `win32`).
+    WindowOpened(window::Id),
 }
 
 // ───────────────────────────────── dialogs ────────────────────────────────
@@ -509,7 +512,8 @@ impl App {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        let events = event::listen_with(|e, _, _| match e {
+        let events = event::listen_with(|e, _, id| match e {
+            iced::Event::Window(window::Event::Opened { .. }) => Some(Message::WindowOpened(id)),
             iced::Event::Window(window::Event::FileDropped(p)) => Some(Message::FileDropped(p)),
             iced::Event::Window(window::Event::FileHovered(_)) => Some(Message::DragHover(true)),
             iced::Event::Window(window::Event::FilesHoveredLeft) => Some(Message::DragHover(false)),
@@ -956,6 +960,7 @@ impl App {
             Message::SectionSize(i, s) => self.chrome.measured(i, s.height),
             Message::Frame(now) => self.chrome.now = now,
             Message::DragHover(on) => self.chrome.drag = on,
+            Message::WindowOpened(id) => return window::run(id, win32::guard_resize).discard(),
         }
         Task::none()
     }
