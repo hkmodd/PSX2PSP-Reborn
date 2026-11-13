@@ -5,6 +5,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod audio;
+mod gpu;
 mod icons;
 mod project;
 mod smooth;
@@ -59,6 +60,7 @@ const JOB_INSTALL: &str = "Install tools";
 const CANCELLED: &str = "cancelled";
 
 fn main() -> iced::Result {
+    gpu::pin_native_backend();
     iced::application(App::boot, project::update, App::view)
         .title(App::title)
         .theme(App::theme)
