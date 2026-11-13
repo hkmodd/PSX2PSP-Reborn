@@ -1,0 +1,53 @@
+# popshud
+
+Measurement overlay for PS1 games under POPS on a PSP with ARK-4 / ARK-5 (firmware 6.61).
+A diagnostic tool for tuning per-game settings, not part of the release.
+
+```
+FPS 30 EMU 100% CPU  85%
+```
+
+Refreshed every second in the top left corner of the picture:
+
+| Field | Meaning | Source |
+|---|---|---|
+| FPS | frames the game showed | changes of the GP1(05h) display start, sampled at each vblank |
+| EMU | emulated time over real time (100% = full speed) | POPS's emulated cycle count at the last emulated vblank, at 33.8688 MHz |
+| CPU | PSP CPU time outside the idle thread | `sceKernelReferSystemStatus` idle clock |
+
+How to read it:
+- EMU under 100 with CPU at 100: the PSP cannot keep up (slow motion). Cheaper CPU accounting
+  (the POPS cycle shift) or a lighter game path is the fix.
+- EMU at 100 and FPS under 60: the game itself, in emulated time, draws at that rate (frame cap
+  or emulated CPU too slow for the work per frame).
+- CPU well under 100: headroom left on the PSP.
+
+`---` means a value that could not be measured (counter reset, unknown clock unit). FPS counts
+buffer flips; a game that draws into a single buffer shows 0.
+
+## Install
+
+Copy `popshud.prx` to `ms0:/SEPLUGINS/` and add to `ms0:/SEPLUGINS/PLUGINS.TXT`:
+
+```
+ps1, ms0:/SEPLUGINS/popshud.prx, on
+```
+
+It works next to `popsfs` and with any EBOOT. Set it to `off` to remove the overlay.
+
+## How it works
+
+The start-module handler of systemctrl catches the `pops` module and keeps its gp. A kernel
+thread wakes at each vblank, reads two POPS globals (gp+0x360C emulated cycles, gp+0x3610
+display start; same offsets in pops_01g..09g) and draws the line into the frame buffer on
+screen. POPS itself is not modified.
+
+## Build and test
+
+```
+make                      # pspdev toolchain
+cl /W4 /WX /D_CRT_SECURE_NO_WARNINGS test_hud.c hud.c && test_hud .   # PC test of hud.c
+```
+
+`test_hud` checks the measurements on known windows and the text drawing in all four PSP pixel
+formats, and writes `hud_<format>.rgba` (480x272 RGBA) for a look.
