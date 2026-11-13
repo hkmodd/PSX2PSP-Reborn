@@ -10,6 +10,7 @@ use psx2psp_engine::media::clip::{self, Clip, ClipMode, ClipRequest, ClipTools};
 use psx2psp_engine::media::provision::{self, Tool};
 use psx2psp_engine::media::tools::{self, At3Encoder, Ffmpeg, Snd0Request};
 use psx2psp_engine::patchdb::{self, PatchDb};
+use psx2psp_engine::update;
 use psx2psp_engine::{Artwork, ConvertRequest, DEFAULT_LEVEL, DiscInput, convert, core::Monitor, extract, inspect, probe_disc};
 
 const USAGE: &str = "\
@@ -23,6 +24,8 @@ USAGE:
                                      the patch database's entries for the game, with hits
   psx2psp clip    <video|audio|URL> [clip options] [-o <dir>]   → ICON1.PMF / SND0.AT3
   psx2psp tools   [install]          show / download ffmpeg, yt-dlp, atracdenc into <exe>/tools
+  psx2psp update  [--check]          replace this executable with the latest GitHub release
+                                     (SHA-256 verified); --check only reports
 
 CONVERT OPTIONS:
   --donor <pbp>      custom PS1 Classic donor EBOOT (default: built-in BASE.PBP + DATA.PSP)
@@ -105,6 +108,8 @@ fn main() -> ExitCode {
         Some("patches") => cmd_patches(&args[1..]),
         Some("tools") if args.len() == 1 => cmd_tools(false),
         Some("tools") if args.len() == 2 && args[1] == "install" => cmd_tools(true),
+        Some("update") if args.len() == 1 => cmd_update(false),
+        Some("update") if args.len() == 2 && args[1] == "--check" => cmd_update(true),
         _ => {
             eprint!("{USAGE}");
             return ExitCode::from(2);
@@ -224,6 +229,33 @@ fn cmd_tools(install: bool) -> R {
             None => eprintln!("{}: no prebuilt binary for this platform — {}", t.exe(), t.manual_hint()),
         }
     }
+    Ok(())
+}
+
+fn cmd_update(check_only: bool) -> R {
+    update::cleanup_leftovers(update::Program::Cli, std::time::Duration::ZERO);
+    println!("psx2psp v{}", update::CURRENT);
+    let release = match update::check(update::Program::Cli) {
+        Ok(update::Check::UpToDate(latest)) => {
+            println!("Up to date (latest release: v{latest}).");
+            return Ok(());
+        }
+        Err(update::UpdateError::NoRelease) => {
+            println!("No release has been published yet.");
+            return Ok(());
+        }
+        Ok(update::Check::Available(r)) => r,
+        Err(e) => return Err(e.into()),
+    };
+    println!("v{} is available: {}", release.version, release.page);
+    if check_only {
+        return Ok(());
+    }
+    let exe = std::env::current_exe()?;
+    let dir = exe.parent().ok_or("the executable has no parent directory")?;
+    let file = update::download(&release, dir, &Cli { last: AtomicU64::new(u64::MAX) })?;
+    update::install(&file, &exe)?;
+    println!("\nUpdated to v{} ({}).", release.version, exe.display());
     Ok(())
 }
 

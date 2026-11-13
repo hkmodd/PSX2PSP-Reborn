@@ -19,6 +19,7 @@ use psx2psp_patching::{PatternPatch, PpfPatch};
 pub mod gamedb;
 pub mod md5;
 pub mod patchdb;
+pub mod update;
 
 use patchdb::{Kind, Patch, PatchDb};
 

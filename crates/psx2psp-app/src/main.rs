@@ -6,6 +6,7 @@
 
 mod audio;
 mod style;
+mod updater;
 mod worker;
 mod xmb;
 
@@ -90,6 +91,7 @@ struct App {
     tools: Option<Tools>,
     /// Built-in patch database with the user's patches.ini merged on top.
     patches: PatchDb,
+    updater: updater::Updater,
 }
 
 struct Disc {
@@ -418,6 +420,7 @@ enum Message {
     ToggleLog,
     Dismiss(u64),
     ToolsDetected(Result<Tools, String>),
+    Update(updater::Msg),
 }
 
 // ───────────────────────────────── dialogs ────────────────────────────────
@@ -443,6 +446,7 @@ fn file_name(p: &Path) -> String {
 impl App {
     fn boot() -> (Self, Task<Message>) {
         let loaded = patchdb::load();
+        let (updater, update_check) = updater::Updater::new();
         let mut app = Self {
             theme: style::theme(),
             title: String::new(),
@@ -465,6 +469,7 @@ impl App {
             toasts: Vec::new(),
             tools: None,
             patches: loaded.db,
+            updater,
         };
         app.audio.set_active(app.screen == Screen::Game);
         let detect = detect_tools_task();
@@ -472,7 +477,7 @@ impl App {
         let warn = loaded.error.map(|e| app.toast(Kind::Error, format!("{e} — your patches.ini is ignored")));
         // Paths on the command line ("Open with", drag onto the exe) behave like dropped files.
         let opened = std::env::args_os().skip(1).map(|a| Task::done(Message::FileDropped(PathBuf::from(a))));
-        (app, Task::batch(std::iter::once(detect).chain(warn).chain(opened)))
+        (app, Task::batch(std::iter::once(detect).chain(warn).chain(opened).chain([update_check.map(Message::Update)])))
     }
 
     fn title(&self) -> String {
@@ -919,6 +924,7 @@ impl App {
                     self.tools = Some(t);
                 }
             }
+            Message::Update(m) => return self.updater.update(m, self.job.is_some()).map(Message::Update),
         }
         Task::none()
     }
@@ -1271,7 +1277,7 @@ fn file_row<'a>(name: String, browse: Message, clear: Option<Message>) -> Elemen
 
 impl App {
     fn view(&self) -> Element<'_, Message> {
-        let sidebar = scrollable(column![self.game_card(), self.art_card(), self.media_card(), self.build_card()].spacing(14).padding(16))
+        let sidebar = scrollable(column![self.updater.banner().map(|b| b.map(Message::Update)), self.game_card(), self.art_card(), self.media_card(), self.build_card()].spacing(14).padding(16))
             .width(440)
             .height(Fill);
         let main = column![self.header(), self.preview(), self.footer()].spacing(14).padding(16).width(Fill);
@@ -1605,6 +1611,7 @@ impl App {
                     .style(style::tab(!self.muted))
                     .on_press(Message::ToggleMute)
             }),
+            self.updater.version_button().map(Message::Update),
             container(tabs).padding(4).style(style::well),
         ]
         .align_y(Alignment::Center)
