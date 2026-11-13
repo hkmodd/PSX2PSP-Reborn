@@ -2,8 +2,9 @@
 
 All integers are little-endian. Offsets are hexadecimal. Every layout below is the one the code
 emits (`crates/psx2psp-core/src/{pbp,sfo,psar}.rs`), cross-checked against PSXPackager,
-popstationr and pop-fe. Values marked *donor* are opaque Sony blobs copied at runtime from a
-user-supplied PS1 Classic EBOOT (`--donor BASE.PBP`) and never shipped.
+popstationr and pop-fe. Values marked *donor* are opaque Sony blobs copied from a PS1 Classic
+EBOOT: the built-in donor (`resources/BASE.PBP` + `resources/DATA.PSP`), or the CLI's
+`--donor <pbp>` override.
 
 ## 1. PBP container (`pbp.rs`)
 
