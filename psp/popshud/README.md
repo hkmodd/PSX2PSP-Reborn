@@ -39,7 +39,7 @@ Each start appends a few lines to `ms0:/SEPLUGINS/popshud.log`:
 
 ```
 start 4b4b4b4b 4b4b4b4b 4b4b0000 ...   how each function was found: 4b K kernel lib, 55 U user lib, 2d - missing
-pops modgp text size coregp             the pops module; coregp 0 = core state not found, FPS/EMU show dashes
+pops gp text size used                  the pops module and the gp used (00010000 if the module's was rejected)
 stats fps emu cpu <n>                   the first three one-second windows
 fb ret addr stride format               the frame buffer the line is drawn into
 ```
@@ -53,12 +53,12 @@ Like popsfs, the module imports systemctrl only: the kernel NIDs of 6.61 differ 
 pspsdk stubs, so the Sony functions are looked up at run time with `sctrlHENFindFunction`,
 in the kernel library first and then in the user library of the same module.
 
-The start-module handler of systemctrl catches the `pops` module. POPS's emulation core does
-not run with the module gp: its entry loads `$gp` with the address of the core's state block
-(`lui gp, 0x49F4` at text+0xc in pops_01g..09g), and the handler takes the address from that
-instruction. A kernel thread wakes at each vblank, reads two words of the block (+0x360C
-emulated cycles, +0x3610 display start; same offsets in all six) and draws the line into the
-frame buffer on screen. POPS itself is not modified.
+The start-module handler of systemctrl catches the `pops` module and keeps its gp. That gp is
+0x00010000, the Allegrex scratchpad, not an address in the module image: the module info
+holds it as is, and the POPS code that borrows `$gp` puts it back with `lui gp, 1`. A kernel
+thread wakes at each vblank, reads two POPS globals (gp+0x360C emulated cycles, gp+0x3610
+display start; same offsets in pops_01g..09g) and draws the line into the frame buffer on
+screen. POPS itself is not modified.
 
 POPS redraws the whole picture with the GE right after every vblank, so a line drawn at the
 vblank is erased before the screen shows it. The thread draws 12 ms after the vblank, at the

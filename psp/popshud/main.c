@@ -9,12 +9,12 @@
  * EMU under 100 with CPU at 100 means the PSP cannot keep up; FPS under 60 with EMU at 100
  * means the game itself, in emulated time, draws at that rate.
  *
- * Nothing in POPS is written. The two counters sit at fixed offsets in the state block of
- * POPS's emulation core, the same in pops_01g..09g of firmware 6.61 (written at 0x11920 in
- * 01g, 0x11930 in 02g/03g, 0x119c0 in 04g/07g/09g). The core does not run with the module gp:
- * its entry loads $gp with the block's address (`lui gp, 0x49F4` at text+0xc in all six), so
- * the address is taken from that instruction. A kernel thread reads the counters after each
- * vblank and, once POPS has drawn its picture of that frame, draws into the frame buffer.
+ * Nothing in POPS is written. The two counters are POPS globals at fixed offsets from its gp,
+ * the same in pops_01g..09g of firmware 6.61 (written at 0x11920 in 01g, 0x11930 in 02g/03g,
+ * 0x119c0 in 04g/07g/09g). That gp is not in the module image: it is 0x00010000, the
+ * Allegrex scratchpad (the module info holds it as is, and the code that borrows $gp puts it
+ * back with `lui gp, 1`). A kernel thread reads the counters after each vblank and, once POPS
+ * has drawn its picture of that frame, draws into the frame buffer on screen.
  *
  * The module imports systemctrl only, like popsfs. The kernel NIDs of firmware 6.61 are not
  * those of the pspsdk stubs, so every Sony function is looked up at run time: in the kernel
@@ -26,7 +26,7 @@
 #include <pspkernel.h>
 #include "hud.h"
 
-PSP_MODULE_INFO("PSX2PSP_PopsHud", 0x1007, 1, 3);
+PSP_MODULE_INFO("PSX2PSP_PopsHud", 0x1007, 1, 4);
 
 /* Only the fields read here; offsets as in ARK's common/include/module2.h. */
 typedef struct SceModule2 {
@@ -50,9 +50,8 @@ u32 sctrlHENFindFunction(const char *mod, const char *lib, u32 nid);
 #define GP_VBLANK_CYCLES 0x360C /* emulated cycle count at the last emulated vblank */
 #define GP_DISPLAY_START 0x3610 /* GP1(05h) display start: x (low half), y (high half) */
 
-#define LUI_GP 0x3C1C0000 /* lui $gp, imm */
-#define USER_RAM_LO 0x08800000
-#define USER_RAM_HI 0x0A000000
+#define SCRATCHPAD_LO 0x00010000
+#define SCRATCHPAD_HI 0x00014000
 
 /*
  * POPS redraws the whole picture with the GE on every frame, right after the vblank: its
@@ -166,31 +165,23 @@ static int is_pops(const char *name)
     return name[0] == 'p' && name[1] == 'o' && name[2] == 'p' && name[3] == 's' && name[4] == 0;
 }
 
-/*
- * The gp of the emulation core: the one `lui $gp` in the text of POPS, if it points into user
- * RAM. 0 if there is none or more than one.
- */
-static u32 core_gp(const u32 *text, u32 size)
+/* Whether both counters of a gp lie in [lo, hi). */
+static int holds(u32 gp, u32 lo, u32 hi)
 {
-    u32 i, gp = 0, ram;
-
-    for (i = 0; i < size / 4; i++)
-        if ((text[i] & 0xFFFF0000) == LUI_GP) {
-            if (gp)
-                return 0;
-            gp = text[i] << 16;
-        }
-    ram = gp & 0x1FFFFFFF;
-    return ram >= USER_RAM_LO && ram + GP_DISPLAY_START + 4 <= USER_RAM_HI ? gp : 0;
+    return gp >= lo && gp + GP_DISPLAY_START + 4 <= hi;
 }
 
 static int on_module_start(SceModule2 *mod)
 {
     if (is_pops(mod->modname)) {
-        seen_gp = mod->gp_value;
-        seen_text = mod->text_addr;
-        seen_size = mod->text_size;
-        pops_gp = core_gp((const u32 *)mod->text_addr, mod->text_size);
+        u32 gp = mod->gp_value, lo = mod->text_addr,
+            hi = lo + mod->text_size + mod->data_size + mod->bss_size;
+        seen_gp = gp;
+        seen_text = lo;
+        seen_size = hi - lo;
+        /* Otherwise the value POPS's own code restores, whatever the module info said. */
+        pops_gp = holds(gp, SCRATCHPAD_LO, SCRATCHPAD_HI) || holds(gp, lo, hi) ? gp
+                                                                               : SCRATCHPAD_LO;
         pops_seen = 1;
     }
     return previous ? previous(mod) : 0;
@@ -234,7 +225,7 @@ static int hud_thread(SceSize args, void *argp)
              found[8] << 24 | found[9] << 16, 0);
     while (!pops_seen)
         wait(100000);
-    log_line("pops modgp text size coregp", seen_gp, seen_text, seen_size, pops_gp);
+    log_line("pops gp text size used", seen_gp, seen_text, seen_size, pops_gp);
     t0 = now_us();
     cycles0 = pops_word(GP_VBLANK_CYCLES);
     idle0 = idle_us();
