@@ -166,6 +166,7 @@ impl ClipFile {
             len: self.len,
             title: self.title.clone(),
             probed: self.probed,
+            probe_cancel: Default::default(),
         }
     }
 }

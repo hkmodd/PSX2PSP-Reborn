@@ -180,7 +180,7 @@ impl ClipArgs {
     fn run(&self, work: &Path, budget: u64) -> Result<Clip, Box<dyn std::error::Error>> {
         let src = self.source.as_deref().ok_or("no clip source")?;
         let tools = ClipTools::detect()?;
-        let (len, title) = clip::probe(&tools, src)?;
+        let (len, title) = clip::probe(&tools, src, &())?;
         if let Some(t) = title {
             eprintln!("Source: {t}");
         }

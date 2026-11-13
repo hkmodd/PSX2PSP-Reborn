@@ -170,6 +170,17 @@ fn single_disc_roundtrip_is_bit_exact() {
     assert!(h[psar::POPS_CONFIG_AT..0x800].iter().all(|&b| b == 0), "no config ⇒ zeros");
     assert_eq!(u32::from_le_bytes(h[0xBFC..0xC00].try_into().unwrap()), ISO_DATA as u32);
     assert_eq!(&h[0x800..0x80A], &[0x41, 0, 0xA0, 0, 0, 0, 0, 0x01, 0x20, 0]);
+
+    // A bogus p1 into the disc data, ahead of a huge PSAR tail: refused, not read into memory.
+    let psar_at = psar_at as usize;
+    let mut bad = raw.clone();
+    bad[psar_at + 0x0C..psar_at + 0x10].copy_from_slice(&(ISO_DATA as u32).to_le_bytes());
+    let err = Donor::from_pbp(&mut PbpFile::open(Cursor::new(bad.clone())).unwrap()).unwrap_err().to_string();
+    assert!(err.contains("no STARTDAT"), "{err}");
+    bad[psar_at + ISO_DATA as usize..][..8].copy_from_slice(b"STARTDAT");
+    bad.resize(bad.len() + (17 << 20), 0);
+    let err = Donor::from_pbp(&mut PbpFile::open(Cursor::new(bad)).unwrap()).unwrap_err().to_string();
+    assert!(err.contains("STARTDAT section of"), "{err}");
 }
 
 struct Xor;

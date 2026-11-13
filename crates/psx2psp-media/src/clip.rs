@@ -100,13 +100,13 @@ pub fn is_url(s: &str) -> bool {
     s.starts_with("https://") || s.starts_with("http://")
 }
 
-/// Source length in seconds (and a title for URLs).
-pub fn probe(tools: &ClipTools, source: &str) -> Result<(Option<f64>, Option<String>), MediaError> {
+/// Source length in seconds (and a title for URLs). Cancellable through `mon`.
+pub fn probe(tools: &ClipTools, source: &str, mon: &dyn Monitor) -> Result<(Option<f64>, Option<String>), MediaError> {
     if is_url(source) {
-        let i = tools.yt_dlp.as_ref().ok_or(MediaError::Missing("yt-dlp"))?.info(source.trim())?;
+        let i = tools.yt_dlp.as_ref().ok_or(MediaError::Missing("yt-dlp"))?.info(source.trim(), mon)?;
         Ok((i.duration, Some(i.title)))
     } else {
-        Ok((Some(tools.ffmpeg.duration(Path::new(source))?), None))
+        Ok((Some(tools.ffmpeg.duration(Path::new(source), mon)?), None))
     }
 }
 
@@ -310,7 +310,7 @@ mod tests {
         ])
         .unwrap();
         let tools = ClipTools { ffmpeg: ff.clone(), at3: None, yt_dlp: None };
-        assert!((probe(&tools, src.to_str().unwrap()).unwrap().0.unwrap() - 6.0).abs() < 0.1);
+        assert!((probe(&tools, src.to_str().unwrap(), &()).unwrap().0.unwrap() - 6.0).abs() < 0.1);
 
         let budget = 120 * 1024;
         let req = ClipRequest { source: src.to_str().unwrap(), start: 1.0, end: 5.0, mode: ClipMode::Icon1, snd0_kbps: 132, budget };

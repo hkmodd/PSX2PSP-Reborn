@@ -39,3 +39,10 @@ pub trait Monitor: Sync {
 }
 
 impl Monitor for () {}
+
+/// A bare cancel flag: no progress, no log.
+impl Monitor for std::sync::atomic::AtomicBool {
+    fn cancelled(&self) -> bool {
+        self.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}

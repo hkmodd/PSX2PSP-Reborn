@@ -362,6 +362,13 @@ impl Drop for PartFile {
     }
 }
 
+/// `std::fs::write` through a [`PartFile`]: a failed write never leaves a truncated `path`.
+fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
+    let part = PartFile::new(path);
+    std::fs::write(&part.part, data).map_err(psx2psp_core::Error::io_path(&part.part))?;
+    part.commit(path)
+}
+
 /// Hits per rule of each of `ps` over the whole image (one read), with the `base` PPFs applied
 /// first, in order; nothing is written.
 fn dry_run(img: &DiscImage, base: &[&PpfPatch], ps: &[PatternPatch]) -> Result<Vec<Vec<usize>>> {
@@ -773,27 +780,40 @@ pub fn inspect(path: &Path) -> Result<PbpSummary> {
 }
 
 /// ExtractPbp: EBOOT.PBP → `<id>.bin`/`.cue` per disc + every embedded asset.
+///
+/// Never overwrites: if any file it would write already exists in `out_dir`, nothing is written.
+/// Every file goes through a `.part` file, so a failure or cancel leaves no truncated output.
 pub fn extract(path: &Path, out_dir: &Path, monitor: &dyn Monitor) -> Result<Vec<PathBuf>> {
     let f = File::open(path).map_err(psx2psp_core::Error::io_path(path))?;
     let mut pbp = PbpFile::open(BufReader::with_capacity(1 << 20, f))?;
-    std::fs::create_dir_all(out_dir).map_err(psx2psp_core::Error::io_path(out_dir))?;
-    let mut produced = Vec::new();
+    let mut assets = Vec::new();
     for s in Section::ALL {
         if s == Section::DataPsar {
             continue;
         }
         let data = pbp.read(s)?;
         if !data.is_empty() {
-            let p = out_dir.join(s.file_name());
-            std::fs::write(&p, &data).map_err(psx2psp_core::Error::io_path(&p))?;
-            produced.push(p);
+            assets.push((out_dir.join(s.file_name()), data));
         }
     }
     let psar_at = pbp.range(Section::DataPsar).start;
     let discs = psar::read_discs(pbp.inner_mut(), psar_at)?;
     let multi = discs.len() > 1;
-    for (i, d) in discs.iter().enumerate() {
-        let stem = if multi { format!("{} (Disc {})", d.disc_id, i + 1) } else { d.disc_id.clone() };
+    let stems: Vec<String> =
+        discs.iter().enumerate().map(|(i, d)| if multi { format!("{} (Disc {})", d.disc_id, i + 1) } else { d.disc_id.clone() }).collect();
+
+    let targets = assets.iter().map(|(p, _)| p.clone()).chain(stems.iter().flat_map(|s| ["bin", "cue"].map(|e| out_dir.join(format!("{s}.{e}")))));
+    if let Some(p) = targets.into_iter().find(|p| p.exists()) {
+        return Err(EngineError::Input(format!("{} already exists: extract into an empty folder, or move it away first", p.display())));
+    }
+
+    std::fs::create_dir_all(out_dir).map_err(psx2psp_core::Error::io_path(out_dir))?;
+    let mut produced = Vec::new();
+    for (p, data) in assets {
+        write_atomic(&p, &data)?;
+        produced.push(p);
+    }
+    for ((i, d), stem) in discs.iter().enumerate().zip(&stems) {
         let bin = out_dir.join(format!("{stem}.bin"));
         let part = PartFile::new(&bin);
         let mut w = BufWriter::with_capacity(8 << 20, File::create(&part.part).map_err(psx2psp_core::Error::io_path(&part.part))?);
@@ -803,7 +823,7 @@ pub fn extract(path: &Path, out_dir: &Path, monitor: &dyn Monitor) -> Result<Vec
         drop(w);
         part.commit(&bin)?;
         let cue = out_dir.join(format!("{stem}.cue"));
-        std::fs::write(&cue, psar::toc_to_cue(&format!("{stem}.bin"), &d.tracks())).map_err(psx2psp_core::Error::io_path(&cue))?;
+        write_atomic(&cue, psar::toc_to_cue(&format!("{stem}.bin"), &d.tracks()).as_bytes())?;
         produced.push(bin);
         produced.push(cue);
     }
@@ -1044,6 +1064,12 @@ mod tests {
         assert_eq!(&out[theirs..theirs + 6], &raw[theirs..theirs + 6], "other dump's fix skipped");
         let diff = out[..raw.len()].iter().zip(&raw).filter(|(a, b)| a != b).count();
         assert_eq!(diff, 4, "only this dump's PPF bytes change");
+
+        // A second extract into the same folder refuses before writing anything.
+        let again = extract(&output, &t.path().join("x"), &()).unwrap_err().to_string();
+        assert!(again.contains("already exists"), "{again}");
+        assert_eq!(std::fs::read(t.path().join("x").join("SCPS99998.bin")).unwrap(), out);
+        assert!(std::fs::read_dir(t.path().join("x")).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().ends_with(".part")));
     }
 
     /// The real-PSP hang of every patched Sheep Dog build: its loader checks two CRC words in each

@@ -7,6 +7,7 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::time::Duration;
 
 use psx2psp_core::Monitor;
 
@@ -16,15 +17,18 @@ use crate::proc::run_watched;
 /// Max combined size of ICON1.PMF + SND0.AT3 accepted by the XMB.
 pub const SND0_BUDGET: u64 = 500 * 1024;
 
+#[cfg(windows)]
+pub(crate) const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// A tool that has printed nothing for this long while probing a file is considered hung.
+const PROBE_IDLE: Duration = Duration::from_secs(60);
+
+/// Piped, windowless command. Run it through [`crate::proc`], which owns its process tree.
 pub(crate) fn command(program: &Path) -> Command {
     let mut c = Command::new(program);
     c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        c.creation_flags(CREATE_NO_WINDOW);
-    }
+    std::os::windows::process::CommandExt::creation_flags(&mut c, CREATE_NO_WINDOW);
     c
 }
 
@@ -182,9 +186,7 @@ impl Ffmpeg {
 
     /// Whether this build includes libx264 (LGPL-only builds don't).
     pub fn has_x264(&self) -> bool {
-        command(&self.path)
-            .args(["-hide_banner", "-encoders"])
-            .output()
+        run_watched(&self.path, &["-hide_banner".as_ref(), "-encoders".as_ref()], &(), &mut |_| {}, Some(PROBE_IDLE))
             .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("libx264"))
     }
 
@@ -198,11 +200,9 @@ impl Ffmpeg {
     }
 
     /// Media duration in seconds, parsed from `ffmpeg -i` (no ffprobe needed).
-    pub fn duration(&self, input: &Path) -> Result<f64, MediaError> {
-        let out = command(&self.path)
-            .args(["-hide_banner".as_ref(), "-i".as_ref(), input.as_os_str()])
-            .output()
-            .map_err(|e| MediaError::Io(self.path.display().to_string(), e))?;
+    /// `ffmpeg -i` exits 1 (no output file), so the status is not checked. Cancellable through `mon`.
+    pub fn duration(&self, input: &Path, mon: &dyn Monitor) -> Result<f64, MediaError> {
+        let out = crate::proc::run_any(&self.path, &["-hide_banner".as_ref(), "-i".as_ref(), input.as_os_str()], mon, Some(PROBE_IDLE))?;
         let err = String::from_utf8_lossy(&out.stderr);
         err.lines()
             .find_map(|l| l.trim().strip_prefix("Duration: ").and_then(|r| parse_hms(r.split(',').next()?)))
@@ -287,11 +287,12 @@ impl YtDlp {
         a
     }
 
-    pub fn info(&self, url: &str) -> Result<RemoteInfo, MediaError> {
+    /// Title and length of `url`. Cancellable through `mon`.
+    pub fn info(&self, url: &str, mon: &dyn Monitor) -> Result<RemoteInfo, MediaError> {
         let mut args = Self::base_args(&Self::js_runtime());
         args.extend(["--no-warnings".into(), "--print".into(), "%(duration)s|%(title)s".into(), url.into()]);
         let args: Vec<&OsStr> = args.iter().map(|a| a.as_os_str()).collect();
-        let out = run_watched(&self.path, &args, &(), &mut |_| {}, Some(YTDLP_IDLE))?;
+        let out = run_watched(&self.path, &args, mon, &mut |_| {}, Some(YTDLP_IDLE))?;
         let line = String::from_utf8_lossy(&out.stdout).lines().last().unwrap_or_default().trim().to_string();
         let (d, t) = line.split_once('|').unwrap_or(("NA", &line));
         Ok(RemoteInfo { title: t.to_string(), duration: d.parse().ok() })

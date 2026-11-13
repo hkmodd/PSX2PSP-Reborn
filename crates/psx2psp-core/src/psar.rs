@@ -46,6 +46,9 @@ pub const POPS_CONFIG_MAX: usize = TOC_AT - POPS_CONFIG_AT;
 const SUBQ_PTR_AT: usize = 0x12D4;
 pub const SUBQ_ENTRY: usize = 12;
 const STARTDAT_HDR: usize = 0x50;
+/// Upper bound for a donor's STARTDAT (header, BOOT PNG and PGD trailer). Real ones are well
+/// under 1 MB; a bogus pointer would otherwise read the whole disc tail into memory.
+const STARTDAT_MAX: u64 = 16 << 20;
 const TITLEIMG_HDR: u64 = 0x400;
 const TITLEIMG_DISC_ALIGN: u64 = 0x8000;
 /// Blocks compressed per parallel batch (64 × 37.6 KB ≈ 2.4 MB in flight).
@@ -159,20 +162,28 @@ impl Donor {
             return Err(Error::format("donor PBP", "DATA.PSAR is not PSISOIMG/PSTITLEIMG (not a PS1 Classic)"));
         };
 
-        let sd_start = psar.start + p1;
-        if sd_start + STARTDAT_HDR as u64 > psar.end {
+        let sd_start = psar.start.saturating_add(p1);
+        if sd_start.saturating_add(STARTDAT_HDR as u64) > psar.end {
             return Err(Error::format("donor PBP", "STARTDAT offset out of range"));
         }
-        let mut sd = vec![0u8; (psar.end - sd_start) as usize];
+        // The magic is checked before the tail is read, and the tail is bounded.
+        let mut hdr = [0u8; STARTDAT_HDR];
         r.seek(SeekFrom::Start(sd_start))?;
-        r.read_exact(&mut sd)?;
-        if !sd.starts_with(b"STARTDAT") {
+        r.read_exact(&mut hdr)?;
+        if !hdr.starts_with(b"STARTDAT") {
             return Err(Error::format("donor PBP", "no STARTDAT section"));
         }
+        let len = psar.end - sd_start;
+        if len > STARTDAT_MAX {
+            return Err(Error::format("donor PBP", format!("STARTDAT section of {len} bytes (at most {STARTDAT_MAX} expected)")));
+        }
+        let mut sd = hdr.to_vec();
+        sd.resize(len as usize, 0);
+        r.read_exact(&mut sd[STARTDAT_HDR..])?;
         let hs = rd32(&sd, 0x10) as usize;
-        let png_len = rd32(&sd, 0x14) as usize;
-        let png = sd.get(hs..hs + png_len).ok_or_else(|| Error::format("donor PBP", "STARTDAT PNG truncated"))?;
-        let pgd = sd[hs + png_len..].to_vec();
+        let png_end = hs.saturating_add(rd32(&sd, 0x14) as usize);
+        let png = sd.get(hs..png_end).ok_or_else(|| Error::format("donor PBP", "STARTDAT PNG truncated"))?;
+        let pgd = sd[png_end..].to_vec();
         if !pgd.starts_with(b"\0PGD") {
             return Err(Error::format("donor PBP", "STARTDAT trailer is not a PGD block"));
         }
@@ -689,6 +700,10 @@ pub fn extract_disc<R: Read + Seek, W: Write>(
             written += n as u64;
         }
         monitor.progress(written, size);
+    }
+    // A truncated index would otherwise yield a short image without a word.
+    if written != size {
+        return Err(Error::format("PSISOIMG", format!("the block index covers {written} of {size} bytes")));
     }
     Ok(written)
 }

@@ -93,6 +93,10 @@ struct App {
     title_auto: bool,
     discs: Vec<Disc>,
     next_key: u64,
+    /// Picked/dropped files waiting for the resolve in flight; one resolve runs at a time, so two
+    /// files dropped together can never race into two entries.
+    disc_queue: Vec<PathBuf>,
+    resolving: bool,
     donor_boot: Option<Arc<Pixels>>,
     /// Indexed by `slot_ix` (ICON0, PIC0, PIC1, BOOT).
     art: [Option<Art>; 4],
@@ -411,6 +415,8 @@ struct ClipForm {
     len: Option<f64>,
     title: Option<String>,
     probed: bool,
+    /// Stops the URL probe in flight when the source changes or a new probe starts.
+    probe_cancel: Arc<AtomicBool>,
 }
 
 impl Default for ClipForm {
@@ -427,6 +433,7 @@ impl Default for ClipForm {
             len: None,
             title: None,
             probed: false,
+            probe_cancel: Arc::default(),
         }
     }
 }
@@ -523,11 +530,23 @@ fn slot_ix(s: Slot) -> usize {
 
 // ──────────────────────────────── messages ────────────────────────────────
 
+/// The disc list a background resolve worked out (see [`App::add_discs`]).
+#[derive(Debug, Clone)]
+struct DiscResolve {
+    /// The listed discs the resolve started from.
+    snapshot: Vec<PathBuf>,
+    discs: Vec<PathBuf>,
+    notes: Vec<String>,
+    /// `(cue, bin)`: a new CUE that takes over a BIN already listed.
+    upgrades: Vec<(PathBuf, PathBuf)>,
+}
+
 #[derive(Debug, Clone)]
 enum Message {
     Title(String),
     AddDiscs,
     DiscsPicked(Vec<PathBuf>),
+    DiscsResolved(Result<DiscResolve, String>),
     DiscProbed(u64, Result<DiscSummary, String>),
     RemoveDisc(u64),
     MoveDiscUp(u64),
@@ -650,6 +669,8 @@ impl App {
             title_auto: true,
             discs: Vec::new(),
             next_key: 1,
+            disc_queue: Vec::new(),
+            resolving: false,
             donor_boot: builtin_boot(),
             art: Default::default(),
             icon1: None,
@@ -736,20 +757,58 @@ impl App {
     }
 
     /// Merges picked/dropped files into the disc list: BIN+CUE are one disc, a lone BIN is upgraded
-    /// to its CUE, `.m3u` expands, duplicates collapse (see [`engine::resolve_discs`]). Synchronous on
-    /// purpose: it only reads a directory listing and a few KB of CUE text, and running it inline
-    /// means two files dropped together can never race into two entries.
+    /// to its CUE, `.m3u` expands, duplicates collapse (see [`engine::resolve_discs`]). The resolve
+    /// reads directory listings and CUE sheets, so it runs on a worker (a slow network share must
+    /// not freeze the window); files arriving meanwhile queue up for the next resolve, which then
+    /// sees this one's result.
     fn add_discs(&mut self, paths: Vec<PathBuf>) -> Task<Message> {
-        let existing: Vec<PathBuf> = self.discs.iter().map(|d| d.path.clone()).collect();
-        let plan = engine::resolve_discs(&existing, &paths);
-        for note in plan.notes {
+        self.disc_queue.extend(paths);
+        if self.resolving || self.disc_queue.is_empty() {
+            return Task::none();
+        }
+        self.resolving = true;
+        let added = std::mem::take(&mut self.disc_queue);
+        let snapshot: Vec<PathBuf> = self.discs.iter().map(|d| d.path.clone()).collect();
+        worker::blocking(
+            move || {
+                let plan = engine::resolve_discs(&snapshot, &added);
+                let upgrades = plan
+                    .discs
+                    .iter()
+                    .filter(|p| !snapshot.contains(p))
+                    .filter_map(|p| snapshot.iter().find(|b| engine::companion_cue(b).as_deref() == Some(p.as_path())).map(|b| (p.clone(), b.clone())))
+                    .collect();
+                Ok(DiscResolve { snapshot, discs: plan.discs, notes: plan.notes, upgrades })
+            },
+            Message::DiscsResolved,
+        )
+    }
+
+    /// Applies a finished resolve, then starts the next one if files queued up meanwhile.
+    fn discs_resolved(&mut self, r: Result<DiscResolve, String>) -> Task<Message> {
+        self.resolving = false;
+        let mut tasks = Vec::new();
+        match r {
+            Ok(r) => tasks.push(self.apply_discs(r)),
+            Err(e) => tasks.push(self.toast(Kind::Error, e)),
+        }
+        tasks.push(self.add_discs(Vec::new()));
+        Task::batch(tasks)
+    }
+
+    fn apply_discs(&mut self, r: DiscResolve) -> Task<Message> {
+        for note in r.notes {
             self.log(note);
         }
         let mut old = std::mem::take(&mut self.discs);
         let (mut tasks, mut dropped) = (Vec::new(), 0);
-        for path in plan.discs {
+        for path in r.discs {
             if let Some(i) = old.iter().position(|d| d.path == path) {
                 self.discs.push(old.remove(i));
+                continue;
+            }
+            // Removed by the user while the resolve ran: stays removed.
+            if r.snapshot.contains(&path) {
                 continue;
             }
             if self.discs.len() >= MAX_DISCS {
@@ -759,13 +818,16 @@ impl App {
             let key = self.next_key;
             self.next_key += 1;
             // A CUE replacing a BIN that was already listed inherits its PPF, typed ID and switches.
-            let disc = match old.iter().find(|d| engine::companion_cue(&d.path).as_deref() == Some(path.as_path())) {
+            let bin = r.upgrades.iter().find(|(cue, _)| *cue == path).map(|(_, bin)| bin);
+            let disc = match bin.and_then(|b| old.iter().find(|d| d.path == *b)) {
                 Some(d) => Disc { key, path: path.clone(), summary: None, error: None, id: d.id.clone(), ppf: d.ppf.clone(), patch_choice: d.patch_choice.clone(), seeded_for: d.seeded_for.clone(), scan: None, hits: None, ..*d },
                 None => Disc::new(key, path.clone()),
             };
             self.discs.push(disc);
             tasks.push(worker::blocking(move || engine::probe_disc(&path).map_err(|e| e.to_string()), move |r| Message::DiscProbed(key, r)));
         }
+        // Listed while the resolve ran (a project opened meanwhile): kept, after the plan.
+        self.discs.extend(old.into_iter().filter(|d| !r.snapshot.contains(&d.path)));
         if dropped > 0 {
             tasks.push(self.toast(Kind::Error, format!("A PBP holds at most {MAX_DISCS} discs; {dropped} ignored")));
         }
@@ -852,6 +914,7 @@ impl App {
                 });
             }
             Message::DiscsPicked(paths) => return self.add_discs(paths),
+            Message::DiscsResolved(r) => return self.discs_resolved(r),
             Message::DiscProbed(key, r) => {
                 let db = &self.patches;
                 let Some(d) = self.discs.iter_mut().find(|d| d.key == key) else { return Task::none() };
@@ -1076,6 +1139,7 @@ impl App {
             Message::ClipSource(src) => {
                 if src.trim() != self.clip.source.trim() {
                     (self.clip.len, self.clip.title, self.clip.probed) = (None, None, false);
+                    self.clip.probe_cancel.store(true, Ordering::Relaxed);
                 }
                 self.clip.source = src;
             }
@@ -1473,7 +1537,7 @@ impl App {
         worker::blocking(
             move || {
                 let tools = ClipTools::detect().map_err(|e| e.to_string())?;
-                clip::probe(&tools, &src).map_err(|e| e.to_string())
+                clip::probe(&tools, &src, &()).map_err(|e| e.to_string())
             },
             move |r| Message::TrackProbed(t, key.clone(), r),
         )
@@ -1567,10 +1631,13 @@ impl App {
             return Task::none();
         }
         let key = src.clone();
+        self.clip.probe_cancel.store(true, Ordering::Relaxed);
+        self.clip.probe_cancel = Arc::default();
+        let cancel = Arc::clone(&self.clip.probe_cancel);
         worker::blocking(
             move || {
                 let tools = ClipTools::detect().map_err(|e| e.to_string())?;
-                clip::probe(&tools, &src).map_err(|e| e.to_string())
+                clip::probe(&tools, &src, &*cancel).map_err(|e| e.to_string())
             },
             move |r| Message::ClipProbed(key.clone(), r),
         )
