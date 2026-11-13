@@ -24,3 +24,8 @@
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Local agent workspace (kept out of the public repo)
+/STATE.md
+/AGENTS.MD
+/.claude/
