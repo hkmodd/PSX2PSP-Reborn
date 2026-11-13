@@ -475,8 +475,10 @@ fn cmd_patches(args: &[String]) -> R {
     let game = l.db.game(&id);
     let built_as = if id == disc_id { String::new() } else { format!(" (built as {id})") };
     println!("{disc_id}{built_as}: {}", game.map_or("not in the patch database", |g| g.title.as_str()));
-    if let Some(magic) = l.db.libcrypt(&id) {
-        println!("  LibCrypt magic word 0x{magic:04X}: the EBOOT carries its subchannel table");
+    match (psx2psp_engine::core::subq::find_beside(&disc), l.db.libcrypt(&id)) {
+        (Some(f), _) => println!("  LibCrypt: the EBOOT carries the subchannel table of {}", f.display()),
+        (None, Some(magic)) => println!("  LibCrypt magic word 0x{magic:04X}: no .sbi beside the disc, table from the magic word"),
+        (None, None) => {}
     }
     // [on ]/[off] = what `convert` does without switches or --patch/--no-patch.
     let def = l.db.default_switches(&id);
@@ -510,7 +512,11 @@ fn cmd_info(p: &Path) -> R {
         println!("region   {}", d.region.label());
         println!("tracks   {} ({} audio)", d.tracks, d.audio_tracks);
         println!("size     {} bytes", d.size);
-        println!("md5      {} (track 1, raw)", psx2psp_engine::track1_md5(&psx2psp_engine::core::DiscImage::open(p)?)?);
+        let img = psx2psp_engine::core::DiscImage::open(p)?;
+        println!("md5      {} (track 1, raw)", psx2psp_engine::track1_md5(&img)?);
+        if let Some(r) = psx2psp_engine::core::subq::load_beside(p, &img.tracks)? {
+            println!("subq     {} ({} sectors, {} damaged)", r.path.display(), r.sectors, r.damaged);
+        }
         return Ok(());
     }
     let s = inspect(p)?;

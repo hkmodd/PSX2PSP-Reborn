@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use psx2psp_core::pbp::write_pbp;
 use psx2psp_core::psar::{self, PsarDisc};
+use psx2psp_core::subq;
 use psx2psp_core::{DiscImage, DiscSpec, Donor, ImagePatch, Monitor, PbpFile, PbpSections, PsarJob, PsarStats, Region, Section, Sfo};
 use psx2psp_patching::exe_crc::{self, SectorWrites};
 use psx2psp_patching::sector::{self, SECTOR};
@@ -603,6 +604,25 @@ fn exe_crc_for(img: &DiscImage, base: &[&PpfPatch], code: Vec<&PatternPatch>, n:
     Ok(Some(fix.writes))
 }
 
+/// The disc's LibCrypt subchannel table. A `.sbi`/`.lsd` beside the image is the dump of the
+/// real disc and wins: the magic word only says which bits are set, and some discs (MediEvil
+/// SCES-01494) damage other sectors than the 32 the magic-word model assumes.
+fn subchannels_for(d: &DiscInput, img: &DiscImage, magic: Option<u16>, n: usize, monitor: &dyn Monitor) -> Result<Option<Vec<u8>>> {
+    if let Some(r) = subq::load_beside(&d.path, &img.tracks)? {
+        let name = r.path.file_name().map_or_else(|| r.path.display().to_string(), |f| f.to_string_lossy().into_owned());
+        monitor.log(&format!("Disc {}: LibCrypt — subchannel table from {name} ({} sectors, {} damaged)", n + 1, r.sectors, r.damaged));
+        return Ok(Some(r.table));
+    }
+    Ok(magic.map(|magic| {
+        monitor.log(&format!(
+            "Disc {}: LibCrypt — subchannel table for magic word {magic:#06x}. No .sbi beside the disc: if the game \
+             freezes after it starts, put the redump .sbi next to the CUE and rebuild",
+            n + 1
+        ));
+        psar::libcrypt_subchannels(magic)
+    }))
+}
+
 /// ConvertIsoToPbp: discs (+patches, +media) → EBOOT.PBP.
 pub fn convert(req: &ConvertRequest, monitor: &dyn Monitor) -> Result<ConvertReport> {
     let t0 = Instant::now();
@@ -654,10 +674,7 @@ pub fn convert(req: &ConvertRequest, monitor: &dyn Monitor) -> Result<ConvertRep
         let base: Vec<&PpfPatch> = ppf.iter().collect();
         let pal = if d.pal_ntsc { pal_ntsc_for(&img, &base, &id, n, monitor)? } else { None };
         crcs.push(exe_crc_for(&img, &base, pal.iter().chain(&fix).collect(), n, monitor)?);
-        subqs.push(req.patches.libcrypt(&id).map(|magic| {
-            monitor.log(&format!("Disc {}: LibCrypt — subchannel table for magic word {magic:#06x}", n + 1));
-            psar::libcrypt_subchannels(magic)
-        }));
+        subqs.push(subchannels_for(d, &img, req.patches.libcrypt(&id), n, monitor)?);
         pals.push(pal);
         configs.push(config);
         fixes.push(fix);
@@ -1070,6 +1087,19 @@ mod tests {
         assert!(again.contains("already exists"), "{again}");
         assert_eq!(std::fs::read(t.path().join("x").join("SCPS99998.bin")).unwrap(), out);
         assert!(std::fs::read_dir(t.path().join("x")).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().ends_with(".part")));
+
+        // A redump .sbi beside the CUE is the real disc and wins over the magic word (MediEvil
+        // SCES-01494 damages one sector of some pairs plus a second set the model lacks).
+        std::fs::write(t.path().join("g.sbi"), b"SBI\0\x00\x02\x10\x01AAAAAAAAAA\x00\x02\x05\x01AAAAAAAAAA").unwrap();
+        let disc = DiscInput { path: cue.clone(), disc_id: Some("SCES-99998".into()), ..Default::default() };
+        let out2 = t.path().join("s").join("EBOOT.PBP");
+        convert(&ConvertRequest { discs: vec![disc], patches: db, title: "T".into(), output: out2.clone(), donor: None, artwork: Artwork::default(), level: 1 }, &()).unwrap();
+        let tracks = DiscImage::open(&cue).unwrap().tracks;
+        let expect = subq::load_beside(&cue, &tracks).unwrap().unwrap();
+        assert_eq!((expect.sectors, expect.damaged), (2, 2));
+        assert_eq!(inspect(&out2).unwrap().discs[0].subchannels, expect.table);
+        // LBA 155 (00:02:05) answers 154: rel 00:00:04, abs 00:02:04; sorted before LBA 160.
+        assert_eq!(&expect.table[12..24], &[5, 0, 0, 0, 1, 1, 0, 0, 4, 0, 2, 4]);
     }
 
     /// The real-PSP hang of every patched Sheep Dog build: its loader checks two CRC words in each

@@ -6,12 +6,14 @@
 //! * [`pbp`]  — EBOOT.PBP container
 //! * [`disc`] — BIN/CUE images, virtual pregaps, ISO9660 game-ID probe
 //! * [`psar`] — PSISOIMG / PSTITLEIMG streaming writer + extractor, TOC, donor blobs
+//! * [`subq`] — `.sbi` / `.lsd` subchannel replacements → the LibCrypt subchannel table
 
 pub mod disc;
 pub mod error;
 pub mod pbp;
 pub mod psar;
 pub mod sfo;
+pub mod subq;
 
 pub use disc::{DiscImage, DiscInfo, IsoFile, Region, Track, TrackKind};
 pub use error::{Error, Result};
