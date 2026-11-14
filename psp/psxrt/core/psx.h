@@ -222,6 +222,7 @@ typedef struct Gpu {
     /* per command kind (polygon, line, rectangle, copy, fill, other): count and microseconds;
      * fragments shaded and pixels tested. The host reads and clears them. */
     u32 n_kind[6], us_kind[6], frags, tested;
+    u32 flips; /* display area changes (GP1 0x05): the game's own frames; counts up, never cleared */
 } Gpu;
 
 /* A volume that is either fixed or sweeping (the voice volumes and the main volume). */

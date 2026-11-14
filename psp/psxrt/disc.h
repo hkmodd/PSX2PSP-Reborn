@@ -24,6 +24,9 @@ typedef struct DiscInfo {
     u32 images, code_base, code_size;
     CodeEntry *dir;
     u32 flags; /* DISC_PAL60 */
+    /* translated loops charge their PS1 cycles >> cpu_shift (patch database `cpu_shift`, as
+     * POPS config word 19): the game gets more CPU per frame */
+    u32 cpu_shift;
 } DiscInfo;
 
 /* DiscInfo.flags: a PAL picture runs at 60 vblanks a second (patch database `pal60`). */

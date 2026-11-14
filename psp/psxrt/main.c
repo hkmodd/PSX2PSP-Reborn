@@ -59,6 +59,7 @@ static char tty_line[COLS + 1];
 static int tty_len;
 static SceUID log_fd = -1;
 static int trace_bits; /* from psxrt.trace beside the EBOOT */
+static int cpu_override = -1; /* from psxrt.cpu beside the EBOOT */
 #define PAD_MAX 256
 typedef struct {
     u32 frame, buttons, frames;
@@ -150,6 +151,14 @@ static void open_log(const char *eboot)
         sceIoRead(fd, num, sizeof num - 1);
         sceIoClose(fd);
         trace_bits = (int)strtol(num, NULL, 10);
+    }
+    snprintf(slash + 1, sizeof path - (size_t)(slash + 1 - path), "psxrt.cpu");
+    fd = sceIoOpen(path, PSP_O_RDONLY, 0);
+    if (fd >= 0) { /* debugging: the CPU cycle shift, as a decimal number */
+        char num[16] = {0};
+        sceIoRead(fd, num, sizeof num - 1);
+        sceIoClose(fd);
+        cpu_override = (int)strtol(num, NULL, 10);
     }
     snprintf(slash + 1, sizeof path - (size_t)(slash + 1 - path), "psxrt.pad");
     fd = sceIoOpen(path, PSP_O_RDONLY, 0);
@@ -460,7 +469,7 @@ static void frame(void)
 {
     static u64 t0;
     static u64 c0;
-    static u32 f0, speed, fps;
+    static u32 f0, flips0, speed, fps, game_fps;
     static NativeStats n0;
     static u32 draw0, mdec0, spu0, rgb0;
     static char status[64];
@@ -472,8 +481,11 @@ static void frame(void)
         u64 us = t - t0;
         speed = (u32)((psx.cycles - c0) * 100000000ull / ((u64)PS1_HZ * us)); /* % of real time */
         fps = (u32)((u64)(frames - f0) * 1000000 / us);
-        t0 = t, c0 = psx.cycles, f0 = frames;
-        snprintf(status, sizeof status, "f %u pc %08X %u%% %u fps", (unsigned)frames, (unsigned)psx.cpu.pc, (unsigned)speed, (unsigned)fps);
+        game_fps = (u32)((u64)(psx.gpu.flips - flips0) * 1000000 / us);
+        t0 = t, c0 = psx.cycles, f0 = frames, flips0 = psx.gpu.flips;
+        /* "vbl": emulated vblanks a second; "fps": the game's own frames (display flips) */
+        snprintf(status, sizeof status, "f %u pc %08X %u%% %u vbl %u fps", (unsigned)frames, (unsigned)psx.cpu.pc, (unsigned)speed,
+                 (unsigned)fps, (unsigned)game_fps);
         if (log_fd >= 0) { /* the speed goes to the file only: the screen has its status line */
             char line[2048];
             int n = snprintf(line, sizeof line, "-- %s\n", status);
@@ -738,6 +750,10 @@ int main(int argc, char **argv)
         ge_init(&psx, (trace_bits >> 3) & 1);
     if (psx.gpu.renderer)
         say("GE renderer%s", (trace_bits & 8) ? ", compare mode" : "");
+    if (cpu_override >= 0) /* debugging: psxrt.cpu beside the EBOOT overrides the shift */
+        info.cpu_shift = (u32)cpu_override;
+    if (native && info.cpu_shift)
+        say("CPU: loops charge PS1 cycles >> %u", (unsigned)info.cpu_shift);
     if (native && (err = native_init(&psx, &info)) != NULL)
         halt(err);
     if (psx_boot(&psx) < 0)

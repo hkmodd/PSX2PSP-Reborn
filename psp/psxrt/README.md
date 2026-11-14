@@ -75,7 +75,8 @@ start of DATA.PSAR:
 | 0xB8 | 4 | host address of the code range |
 | 0xBC | 4 | size of the code range |
 | 0xC0 | 4 | flags: bit 0 PAL60 (a PAL picture at 60 vblanks a second: patch database `pal60` with the 60 Hz switch) |
-| 0xC4 | 12 | zero |
+| 0xC4 | 4 | CPU shift: translated loops charge their PS1 cycles >> this (at most 8; 0 = R3000A cost). The converter writes 0; a `psxrt.cpu` file beside the EBOOT (decimal) overrides it for measurements |
+| 0xC8 | 8 | zero |
 
 The index holds blocks + 1 offsets: block i is `index[i]..index[i+1]`. A block is raw deflate,
 or stored as is when deflate would not make it smaller (its length is then the raw length; only

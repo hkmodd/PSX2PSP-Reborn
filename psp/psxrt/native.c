@@ -96,6 +96,7 @@ typedef struct Image {
 static Image img[MAX_IMAGES];
 static int nimg;
 static u32 code_lo, code_hi;
+static u32 cpu_shift; /* DiscInfo.cpu_shift, at most 8 */
 static Psx *P;
 static u64 t_base, c_base;
 
@@ -301,7 +302,7 @@ static void charge(void)
     u32 b = ctx[C_BUDGET];
     if ((s32)b < -(s32)(FORCED / 2))
         b += FORCED;
-    P->cycles += (u32)((s32)BUDGET - (s32)b);
+    P->cycles += (u32)((s32)BUDGET - (s32)b) >> cpu_shift;
     ctx[C_BUDGET] = BUDGET;
 }
 
@@ -682,6 +683,7 @@ const char *native_init(Psx *psx, const DiscInfo *info)
         img[i] = (Image){e, text & (RAM_SIZE - 4), 0, 0, 0, ~0u};
     }
     nimg = (int)info->images;
+    cpu_shift = info->cpu_shift > 8 ? 8 : info->cpu_shift;
     P = psx;
     for (u32 i = 0; i < TABLE_WORDS; i++)
         table[i] = STUB_MISS;

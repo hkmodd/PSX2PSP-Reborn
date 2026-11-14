@@ -29,7 +29,8 @@ typedef struct {
     u32 sectors, block_sectors, index_offset, blocks;
     u32 dir_offset, images, code_base, code_size;
     u32 flags;
-    u32 pad[3];
+    u32 cpu_shift;
+    u32 pad[2];
 } Header;
 
 typedef struct {
@@ -96,6 +97,7 @@ const char *disc_open(const char *path, DiscInfo *info)
     info->code_base = h.code_base;
     info->code_size = h.code_size;
     info->flags = h.flags;
+    info->cpu_shift = h.cpu_shift;
     if (h.images) {
         u32 len = h.images * (u32)sizeof(CodeEntry);
         if (h.images > 256 || sizeof(CodeEntry) != 0x40)
