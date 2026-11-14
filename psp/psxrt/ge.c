@@ -2,9 +2,9 @@
  * psxrt: the GE renderer of the PS1 GPU, slices S4a-S4b of docs/recomp/S4.md.
  *
  * The core (core/gpu.c) decodes the commands and offers each primitive here first. Triangles,
- * rectangles and fills are drawn by the GE into its copy of PS1 VRAM (PSP VRAM 0x000000, 5551,
- * stride 1024); lines, copies, 15-bit textures and texture windows stay in software on RAM's
- * copy. The two copies are kept in step per 64x32 tile: `newer` marks tiles the GE drew since RAM
+ * rectangles, fills and copies are drawn by the GE into its copy of PS1 VRAM (PSP VRAM 0x000000,
+ * 5551, stride 1024); lines, overlapping copies, 15-bit textures and texture windows stay in
+ * software on RAM's copy. The two copies are kept in step per 64x32 tile: `newer` marks tiles the GE drew since RAM
  * last saw them, `read` brings all of VRAM back (one block transfer) before the CPU reads one of
  * those, `wrote` sends the CPU's pixels up as textured sprites. Textures come from RAM's copy:
  * 4/8-bit pages are copied into a cache of T4/T8 textures, CLUTs are converted into the list.
@@ -47,7 +47,7 @@ typedef struct {
 typedef struct {
     u32 tris, ttris, rects, trects, fills, lines, line_runs, sw_tex15, sw_texwin, sw_copy, pages, cluts;
     u32 readbacks, read_tiles, read_us, uploads, upload_px, flushes;
-    u32 copy_px, copy_from_ge; /* copies: pixels, and those whose source the GE drew */
+    u32 ge_copy, null_copy, copy_px, copy_from_ge; /* copies: on the GE, onto themselves, pixels, read from the GE */
 } GeStats;
 
 /* A 4/8-bit texture page as a 256x256 T4/T8 texture. */
@@ -332,13 +332,13 @@ static int pow2_log(s32 n)
     return l;
 }
 
-/* A piece of RAM's copy drawn as a 5551 sprite (the texture starts 16-byte aligned, at most 512
- * texels wide). Two passes: every pixel with bit 15 clear, then the pixels whose bit 15 is set
- * again, through the alpha test and the stencil. */
-static void upload_part(s32 x, s32 y, s32 w, s32 h)
+/* A piece of a blit (the texture starts 16-byte aligned, at most 512 texels wide). The written
+ * bit 15 is the stencil's: with `set` every pixel gets it; otherwise two passes, every pixel with
+ * it clear, then the pixels whose source has it set again, through the alpha test. */
+static void blit_part(u16 *src, s32 sx, s32 sy, s32 dx, s32 dy, s32 w, s32 h, int check, int set)
 {
-    s32 x8 = x & ~7, u0 = x - x8;
-    u16 *tex = ge.psx->gpu.vram + y * VRAM_W + x8;
+    s32 x8 = sx & ~7, u0 = sx - x8;
+    u16 *tex = src + sy * VRAM_W + x8;
     sceGuTexMode(GU_PSM_5551, 0, 0, 0);
     /* The oracle checks a texture in RAM for changes only when its address register changes, so
      * a second upload from the same place would draw the first one's pixels; a different address
@@ -347,23 +347,25 @@ static void upload_part(s32 x, s32 y, s32 w, s32 h)
     sceGuTexImage(0, 1 << pow2_log(u0 + w), 1 << pow2_log(h), VRAM_W, tex);
     sceGuTexFlush();
     UpVtx *v = (UpVtx *)sceGuGetMemory(2 * sizeof(UpVtx));
-    v[0] = (UpVtx){(u16)u0, 0, (s16)x, (s16)y, 0};
-    v[1] = (UpVtx){(u16)(u0 + w), (u16)h, (s16)(x + w), (s16)(y + h), 0};
-    scissor(x, y, x + w - 1, y + h - 1);
-    stencil(0, 0);
+    v[0] = (UpVtx){(u16)u0, 0, (s16)dx, (s16)dy, 0};
+    v[1] = (UpVtx){(u16)(u0 + w), (u16)h, (s16)(dx + w), (s16)(dy + h), 0};
+    scissor(dx, dy, dx + w - 1, dy + h - 1);
+    stencil(check, set);
     sceGuDrawArray(GU_SPRITES, GU_TEXTURE_16BIT | GU_VERTEX_16BIT | GU_TRANSFORM_2D, 2, 0, v);
-    stencil(0, 1);
+    if (set)
+        return;
+    stencil(check, 1);
     sceGuEnable(GU_ALPHA_TEST);
     sceGuDrawArray(GU_SPRITES, GU_TEXTURE_16BIT | GU_VERTEX_16BIT | GU_TRANSFORM_2D, 2, 0, v);
     sceGuDisable(GU_ALPHA_TEST);
 }
 
-/* A block transfer into the framebuffer would be exact on the PSP, but the oracle turns it into a
- * lossy redraw of the pixels; a textured sprite is exact on both. */
-static void upload(s32 x, s32 y, s32 w, s32 h)
+/* A rectangle of `src` (RAM's copy, or the GE's own) drawn exactly at dx,dy as 5551 sprites. A
+ * block transfer into the framebuffer would be exact on the PSP, but the oracle turns it into a
+ * lossy redraw of the pixels and does not carry one out between two places of this framebuffer;
+ * a textured sprite is exact on both. */
+static void blit(u16 *src, s32 sx, s32 sy, s32 dx, s32 dy, s32 w, s32 h, int check, int set)
 {
-    u16 *ram = ge.psx->gpu.vram;
-    sceKernelDcacheWritebackRange(ram + y * VRAM_W + x, (u32)((h - 1) * VRAM_W + w) * 2);
     tex_mode(0);
     blend(-1);
     dither(0);
@@ -371,14 +373,21 @@ static void upload(s32 x, s32 y, s32 w, s32 h)
     sceGuTexFilter(GU_NEAREST, GU_NEAREST);
     sceGuAlphaFunc(GU_GREATER, 0, 0xFF);
     sceGuEnable(GU_TEXTURE_2D);
-    for (s32 cx = x; cx < x + w;) {
-        s32 cw = x + w - cx, room = 512 - (cx & 7);
+    for (s32 cx = 0; cx < w;) {
+        s32 cw = w - cx, room = 512 - ((sx + cx) & 7);
         cw = cw > room ? room : cw;
-        upload_part(cx, y, cw, h);
+        blit_part(src, sx + cx, sy, dx + cx, dy, cw, h, check, set);
         cx += cw;
     }
     sceGuDisable(GU_TEXTURE_2D);
     ge.tex_sent = NULL, ge.texfn = -1, ge.a_func = -1;
+}
+
+static void upload(s32 x, s32 y, s32 w, s32 h)
+{
+    u16 *ram = ge.psx->gpu.vram;
+    sceKernelDcacheWritebackRange(ram + y * VRAM_W + x, (u32)((h - 1) * VRAM_W + w) * 2);
+    blit(ram, x, y, x, y, w, h, 0, 0);
     ge.s.uploads++, ge.s.upload_px += (u32)(w * h);
 }
 
@@ -876,21 +885,46 @@ static int rd_fill(void *self, s32 x, s32 y, s32 w, s32 h, u16 color)
     return DONE;
 }
 
-/* Copies stay in software: the oracle does not carry out a block transfer between two places of
- * this framebuffer (the destination keeps its old pixels). The source is rarely a place the GE
- * drew, so a copy costs an upload of the destination. */
+/* Whether the GE drew any tile of a rectangle since RAM last saw it. */
+static int newer(s32 x, s32 y, s32 w, s32 h)
+{
+    u16 c = span(x, w, VRAM_W, TILE_W), r = span(y, h, VRAM_H, TILE_H);
+    for (int ty = 0; ty < TILES_Y; ty++)
+        if ((r >> ty & 1) && (ge.newer[ty] & c))
+            return 1;
+    return 0;
+}
+
+/* A copy is done where the pixels it reads are current. When the GE drew them, it is a blit of
+ * the GE's copy into itself (that copy is never behind RAM's), and nothing is read back or sent
+ * up; in software it would cost a readback of all of VRAM. Otherwise it is done in RAM and its
+ * destination sent up: a blit there would leave the destination newer on the GE, and the next
+ * texture or copy read from it would bring all of VRAM back. Copies that wrap around VRAM, or
+ * whose source and destination overlap (the GE would read pixels it is writing), stay in
+ * software. Compare mode blits every copy, to check the blit. */
 static int rd_copy(void *self, s32 sx, s32 sy, s32 dx, s32 dy, s32 w, s32 h, int mask_check, u16 mask_set)
 {
-    (void)self, (void)dx, (void)dy, (void)mask_check, (void)mask_set;
-    ge.s.sw_copy++;
+    (void)self;
     ge.s.copy_px += (u32)(w * h);
-    u16 c = span(sx, w, VRAM_W, TILE_W), r = span(sy, h, VRAM_H, TILE_H);
-    for (int ty = 0; ty < TILES_Y; ty++)
-        if ((r >> ty & 1) && (ge.newer[ty] & c)) {
-            ge.s.copy_from_ge++;
-            break;
-        }
-    return GPU_SW;
+    /* A rectangle copied onto itself without setting bit 15 changes nothing (Sheep Dog copies 2x1
+     * pixels at 0,0 onto themselves every frame, as a wait for the GPU). */
+    if (sx == dx && sy == dy && !mask_set) {
+        ge.s.null_copy++;
+        return GPU_DRAWN;
+    }
+    int from_ge = newer(sx, sy, w, h) || (mask_check && newer(dx, dy, w, h));
+    ge.s.copy_from_ge += (u32)from_ge;
+    s32 ox = sx > dx ? sx - dx : dx - sx, oy = sy > dy ? sy - dy : dy - sy;
+    if ((!from_ge && !ge.compare) || sx + w > VRAM_W || dx + w > VRAM_W || sy + h > VRAM_H || dy + h > VRAM_H ||
+        (ox < w && oy < h)) {
+        ge.s.sw_copy++;
+        return GPU_SW;
+    }
+    begin();
+    blit((u16 *)VRAM_PTR, sx, sy, dx, dy, w, h, mask_check, mask_set != 0);
+    mark(dx, dy, dx + w - 1, dy + h - 1);
+    ge.s.ge_copy++;
+    return DONE;
 }
 
 /* ---- setup and log ---- */
@@ -973,12 +1007,12 @@ int ge_log(char *buf, int cap)
     const GeStats *s = &ge.s;
     int n = clampn(snprintf(buf, (size_t)cap,
                             "-- ge: tri %u+%u tex, rect %u+%u tex, fill %u, line %u (%u runs); sw tex15 %u texwin %u "
-                            "copy %u (%u kpx, %u from ge); pages %u cluts %u, readback %u (%u tiles, %u ms), upload %u "
+                            "copy %u+%u sw+%u null (%u kpx, %u from ge); pages %u cluts %u, readback %u (%u tiles, %u ms), upload %u "
                             "(%u kpx), flush %u\n",
                             (unsigned)s->tris, (unsigned)s->ttris, (unsigned)s->rects, (unsigned)s->trects,
                             (unsigned)s->fills, (unsigned)s->lines, (unsigned)s->line_runs, (unsigned)s->sw_tex15,
                             (unsigned)s->sw_texwin,
-                            (unsigned)s->sw_copy, (unsigned)(s->copy_px / 1000), (unsigned)s->copy_from_ge,
+                            (unsigned)s->ge_copy, (unsigned)s->sw_copy, (unsigned)s->null_copy, (unsigned)(s->copy_px / 1000), (unsigned)s->copy_from_ge,
                             (unsigned)s->pages, (unsigned)s->cluts, (unsigned)s->readbacks, (unsigned)s->read_tiles,
                             (unsigned)(s->read_us / 1000), (unsigned)s->uploads, (unsigned)(s->upload_px / 1000),
                             (unsigned)s->flushes),

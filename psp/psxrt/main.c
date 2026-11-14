@@ -60,6 +60,10 @@ static int tty_len;
 static SceUID log_fd = -1;
 static int trace_bits; /* from psxrt.trace beside the EBOOT */
 static int cpu_override = -1; /* from psxrt.cpu beside the EBOOT */
+/* psxrt.watch beside the EBOOT: PS1 RAM words logged once a second, last value and the sum of
+ * the values seen at each display flip (a per-frame variable summed over the game's frames) */
+#define WATCH_MAX 8
+static u32 watch_addr[WATCH_MAX], watch_sum[WATCH_MAX], watch_n, watch_flips;
 #define PAD_MAX 256
 typedef struct {
     u32 frame, buttons, frames;
@@ -159,6 +163,20 @@ static void open_log(const char *eboot)
         sceIoRead(fd, num, sizeof num - 1);
         sceIoClose(fd);
         cpu_override = (int)strtol(num, NULL, 10);
+    }
+    snprintf(slash + 1, sizeof path - (size_t)(slash + 1 - path), "psxrt.watch");
+    fd = sceIoOpen(path, PSP_O_RDONLY, 0);
+    if (fd >= 0) { /* debugging: hex addresses of PS1 RAM words */
+        char text[256] = {0};
+        sceIoRead(fd, text, sizeof text - 1);
+        sceIoClose(fd);
+        char *s = text, *e;
+        while (watch_n < WATCH_MAX) {
+            u32 a = (u32)strtoul(s, &e, 16);
+            if (e == s)
+                break;
+            watch_addr[watch_n++] = a, s = e;
+        }
     }
     snprintf(slash + 1, sizeof path - (size_t)(slash + 1 - path), "psxrt.pad");
     fd = sceIoOpen(path, PSP_O_RDONLY, 0);
@@ -464,6 +482,13 @@ static u32 frames;
 static int native;
 static u32 audio_drops, audio_gaps, audio_trims; /* per second; the audio ring below */
 
+static u32 watch_word(u32 a)
+{
+    u32 v;
+    memcpy(&v, psx.ram + (a & (RAM_SIZE - 4)), 4);
+    return v;
+}
+
 /* Pad, status line, picture; once per second the speed (and native counters) to the log. */
 static void frame(void)
 {
@@ -474,6 +499,11 @@ static void frame(void)
     static u32 draw0, mdec0, spu0, rgb0;
     static char status[64];
     psx.sio.buttons[0] = read_pad(frames);
+    if (watch_n && psx.gpu.flips != watch_flips) {
+        watch_flips = psx.gpu.flips;
+        for (u32 k = 0; k < watch_n; k++)
+            watch_sum[k] += watch_word(watch_addr[k]);
+    }
     u64 t = sceKernelGetSystemTimeWide();
     if (!t0)
         t0 = t, c0 = psx.cycles;
@@ -489,6 +519,15 @@ static void frame(void)
         if (log_fd >= 0) { /* the speed goes to the file only: the screen has its status line */
             char line[2048];
             int n = snprintf(line, sizeof line, "-- %s\n", status);
+            if (watch_n) {
+                n += snprintf(line + n, sizeof line - (size_t)n, "-- watch (last/flip sum):");
+                for (u32 k = 0; k < watch_n; k++) {
+                    n += snprintf(line + n, sizeof line - (size_t)n, " %08X %d/%d", (unsigned)watch_addr[k],
+                                  (int)watch_word(watch_addr[k]), (int)watch_sum[k]);
+                    watch_sum[k] = 0;
+                }
+                n += snprintf(line + n, sizeof line - (size_t)n, "\n");
+            }
             if (native) {
                 const NativeStats *s = &native_stats;
                 n += snprintf(line + n, sizeof line - (size_t)n, "-- native: %u calls, %u misses, %u steps, %u hashes, %u loads, %u poll skips\n",(unsigned)(s->calls - n0.calls),

@@ -22,7 +22,9 @@ the PC simulator `crates/psx2psp-sim` builds, so a fix lands on both):
 The overlay (debug screen over the picture) shows a status line (frame, PC, speed as % of the
 PS1's 33.8688 MHz, fps) and the last log lines, which L+R+SELECT toggles (off at start: the CPU
 draws them, which costs time every frame). Every line, plus a status
-line per second, goes to `psxrt.log` next to the EBOOT. HOME exits.
+line per second, goes to `psxrt.log` next to the EBOOT. HOME exits. A `psxrt.watch` file beside
+the EBOOT (up to 8 PS1 RAM addresses, hex) adds a line per second with each word's last value
+and its sum over the game's display flips, to follow a per-frame variable such as a time step.
 
 The heap is kept at 256 KB (`PSP_HEAP_SIZE_KB`) so it is taken from the bottom of the user
 partition and cannot grow over 0x09800000.
