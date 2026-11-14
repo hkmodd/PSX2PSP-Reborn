@@ -2802,6 +2802,7 @@ dependencies = [
  "psx2psp-core",
  "psx2psp-media",
  "psx2psp-patching",
+ "rayon",
  "serde",
  "serde_json",
  "sha2",

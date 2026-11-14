@@ -1,76 +1,260 @@
 /*
- * psxrt: the native runtime of PSX2PSP (recomp backend), slice S1.
+ * psxrt: the native runtime of PSX2PSP (recomp backend), slice S3.
  *
- * S1 proves, in user mode on a real PSP, what docs/recomp/S0.md chose for the memory layout:
- *   1. PSP RAM 0x09800000-0x09C00000 (4 MB: 2 MB PS1 RAM, 2 MB dispatch table) can be
- *      reserved, first with sceKernelAllocPartitionMemory(PSP_SMEM_Addr) on the user
- *      partition, then, if that is refused, by filling the free memory below it;
- *   2. the Allegrex scratchpad 0x00010000-0x00013FFF can be read and written;
- *   3. the converter's DATA.PSAR header reaches the runtime (the EBOOT path is argv[0]).
- * No game code runs yet. Everything is printed on screen; HOME exits.
+ * Boots the PS1 disc stored in DATA.PSAR of its own EBOOT (argv[0]) on the psxrt core, run by
+ * the interpreter (the translated code joins in S3 part 3b). The PS1 display area is shown with
+ * the GE as a scaled texture of PS1 VRAM; the guest's TTY and the core's diagnostics scroll at
+ * the bottom of the screen and go to psxrt.log next to the EBOOT. L+R+SELECT hides the text;
+ * HOME exits.
  *
- * The scratchpad test runs last: if user mode may not touch it, the access faults and the
- * PSP stops with the "testing" line as the last one on screen.
+ * Memory: PS1 RAM, scratchpad, translation context and dispatch table live at the fixed
+ * addresses of docs/recomp/S0.md (0x09800000-0x09C00FFF), reserved before anything else is
+ * allocated. VRAM, SPU RAM and the MDEC input are ordinary partition blocks.
  */
-#include <pspkernel.h>
+#include <pspctrl.h>
 #include <pspdebug.h>
 #include <pspdisplay.h>
+#include <pspgu.h>
+#include <pspiofilemgr.h>
+#include <pspkernel.h>
 #include <pspsysmem.h>
 #include <psputils.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include <string.h>
 
-PSP_MODULE_INFO("PSX2PSP_psxrt", PSP_MODULE_USER, 0, 1);
+#include "disc.h"
+#include "psx.h"
+
+PSP_MODULE_INFO("PSX2PSP_psxrt", PSP_MODULE_USER, 0, 3);
 PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU);
-/* A small heap, taken from the bottom of the user partition: the default one could grow
- * over 0x09800000. */
+/* A small heap, taken from the bottom of the user partition: the default one could grow over
+ * 0x09800000. Large buffers are partition blocks. */
 PSP_HEAP_SIZE_KB(256);
 
-#define printf pspDebugScreenPrintf
-
-#define PS1_BASE 0x09800000u
-#define PS1_SIZE 0x00400000u /* PS1 RAM (2 MB) + dispatch table (2 MB) */
-#define SPAD_BASE 0x00010000u
-#define SPAD_SIZE 0x00004000u
+#define FIXED_BASE 0x09800000u /* PS1 RAM (2 MB), then scratchpad 0x09A00000 */
+#define FIXED_SIZE 0x00401000u /* ... up to the end of the dispatch table, 0x09C01000 */
+#define SCRATCH_BASE 0x09A00000u
 #define USER_PARTITION 2
+#define MDEC_WORDS 0x10000 /* a whole compressed frame */
+#define PS1_HZ 33868800u
 
-/* DATA.PSAR of a native EBOOT, written by psx2psp-engine (convert_native). */
-#define PSAR_MAGIC "PSXRTDAT"
-#define PSAR_VERSION 1
-typedef struct {
-    char magic[8];
-    u32 version;
-    u32 header_len;
-    char disc_id[16];
-    char title[128];
-} PsarHeader;
+/* ---- text: a ring of lines, shown at the bottom and appended to psxrt.log ---- */
+#define LINES 64
+#define COLS 60
+#define SHOWN 12
+static char lines[LINES][COLS + 1];
+static int line_head; /* next line to write */
+static char tty_line[COLS + 1];
+static int tty_len;
+static SceUID log_fd = -1;
+static char log_buf[8192];
+static int log_len;
 
-#define GREEN 0xFF40FF40
-#define RED 0xFF4040FF
-#define WHITE 0xFFFFFFFF
-#define GREY 0xFFB0B0B0
-
-static int failures;
-
-/* Ends a result line with `ok_text` in green or `bad_text` in red. */
-static void mark(int ok, const char *ok_text, const char *bad_text)
+static void log_flush(void)
 {
-    pspDebugScreenSetTextColor(ok ? GREEN : RED);
-    printf("%s", ok ? ok_text : bad_text);
-    pspDebugScreenSetTextColor(WHITE);
-    printf("\n");
+    if (log_fd >= 0 && log_len)
+        sceIoWrite(log_fd, log_buf, log_len);
+    log_len = 0;
 }
 
-/* As mark(), and a red result counts as a failure of the slice. */
-static void verdict(int ok, const char *ok_text, const char *bad_text)
+static void push_line(const char *s)
 {
-    mark(ok, ok_text, bad_text);
-    if (!ok)
-        failures++;
+    int n = (int)strlen(s);
+    if (log_len + n + 1 > (int)sizeof log_buf)
+        log_flush();
+    if (n + 1 <= (int)sizeof log_buf) {
+        memcpy(log_buf + log_len, s, n);
+        log_len += n;
+        log_buf[log_len++] = '\n';
+    }
+    for (int at = 0; at == 0 || at < n; at += COLS) { /* long lines wrap on screen */
+        snprintf(lines[line_head], COLS + 1, "%s", s + at);
+        line_head = (line_head + 1) % LINES;
+    }
+}
+
+static void say(const char *fmt, ...)
+{
+    char line[256];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof line, fmt, ap);
+    va_end(ap);
+    push_line(line);
+}
+
+void disc_log(const char *line) { push_line(line); }
+
+static void host_log(void *user, const char *line)
+{
+    (void)user;
+    push_line(line);
+}
+
+static void host_tty(void *user, const char *s, int n)
+{
+    (void)user;
+    for (int i = 0; i < n; i++) {
+        char ch = s[i];
+        if (ch == '\n' || tty_len == COLS) {
+            tty_line[tty_len] = 0;
+            push_line(tty_line);
+            tty_len = 0;
+        }
+        if (ch != '\n' && ch != '\r')
+            tty_line[tty_len++] = ch >= 32 && ch < 127 ? ch : '?';
+    }
+}
+
+static void open_log(const char *eboot)
+{
+    char path[256];
+    snprintf(path, sizeof path, "%s", eboot);
+    char *slash = strrchr(path, '/');
+    if (!slash)
+        return;
+    snprintf(slash + 1, sizeof path - (size_t)(slash + 1 - path), "psxrt.log");
+    log_fd = sceIoOpen(path, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
+}
+
+/* ---- memory ---- */
+static void *palloc(const char *name, u32 size)
+{
+    SceUID uid = sceKernelAllocPartitionMemory(USER_PARTITION, name, PSP_SMEM_Low, size, NULL);
+    return uid < 0 ? NULL : sceKernelGetBlockHeadAddr(uid);
+}
+
+/* Reserves FIXED_BASE..+FIXED_SIZE: PSP_SMEM_Addr, or a filler block below it and then Low. */
+static int reserve_fixed(void)
+{
+    SceUID uid = sceKernelAllocPartitionMemory(USER_PARTITION, "psxrt fixed", PSP_SMEM_Addr, FIXED_SIZE, (void *)FIXED_BASE);
+    if (uid >= 0 && (u32)sceKernelGetBlockHeadAddr(uid) == FIXED_BASE)
+        return 1;
+    if (uid >= 0)
+        sceKernelFreePartitionMemory(uid);
+    SceUID probe = sceKernelAllocPartitionMemory(USER_PARTITION, "psxrt probe", PSP_SMEM_Low, 0x100, NULL);
+    u32 low = probe >= 0 ? (u32)sceKernelGetBlockHeadAddr(probe) : 0;
+    if (probe >= 0)
+        sceKernelFreePartitionMemory(probe);
+    SceUID filler = low && low < FIXED_BASE ? sceKernelAllocPartitionMemory(USER_PARTITION, "psxrt filler", PSP_SMEM_Low, FIXED_BASE - low, NULL) : -1;
+    uid = sceKernelAllocPartitionMemory(USER_PARTITION, "psxrt fixed", PSP_SMEM_Low, FIXED_SIZE, NULL);
+    if (filler >= 0)
+        sceKernelFreePartitionMemory(filler);
+    return uid >= 0 && (u32)sceKernelGetBlockHeadAddr(uid) == FIXED_BASE;
+}
+
+/* ---- screen ---- */
+static unsigned int __attribute__((aligned(16))) gu_list[0x4000];
+static void *draw_buf; /* relative to the start of the PSP's VRAM */
+static int show_text = 1;
+
+typedef struct {
+    u16 u, v;
+    s16 x, y, z;
+} Vertex;
+
+static void screen_init(void)
+{
+    sceGuInit();
+    sceGuStart(GU_DIRECT, gu_list);
+    sceGuDrawBuffer(GU_PSM_8888, (void *)0, 512);
+    sceGuDispBuffer(480, 272, (void *)0x88000, 512);
+    sceGuOffset(2048 - 240, 2048 - 136);
+    sceGuViewport(2048, 2048, 480, 272);
+    sceGuScissor(0, 0, 480, 272);
+    sceGuEnable(GU_SCISSOR_TEST);
+    sceGuDisable(GU_DEPTH_TEST);
+    sceGuFinish();
+    sceGuSync(0, 0);
+    sceDisplayWaitVblankStart();
+    sceGuDisplay(GU_TRUE);
+    draw_buf = (void *)0;
+}
+
+/* The PS1 display area, as a 5551 texture of PS1 VRAM (24-bit modes show raw until S4/S6). */
+static void draw_ps1(Psx *psx)
+{
+    const Gpu *g = &psx->gpu;
+    static const int widths[4] = {256, 320, 512, 640};
+    u32 st = g->stat;
+    int w = (st & 0x10000) ? 368 : widths[(st >> 17) & 3];
+    int h = g->vrange2 - g->vrange1;
+    if ((st & 0x80000) && (st & 0x400000))
+        h *= 2;
+    if (h <= 0 || h > 512)
+        h = psx->pal ? 256 : 240;
+    if (w > 512)
+        w = 512; /* GE texture limit; S4 draws natively */
+    if ((st & 0x800000) || g->disp_y + h > VRAM_H)
+        return; /* display off */
+    const u16 *src = g->vram + g->disp_y * VRAM_W + (g->disp_x & ~7);
+    sceKernelDcacheWritebackRange(src, (u32)h * VRAM_W * 2);
+    sceGuTexMode(GU_PSM_5551, 0, 0, 0);
+    sceGuTexImage(0, 512, 512, VRAM_W, src);
+    sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGB);
+    sceGuTexFilter(GU_LINEAR, GU_LINEAR);
+    sceGuTexFlush();
+    sceGuEnable(GU_TEXTURE_2D);
+    Vertex *v = (Vertex *)sceGuGetMemory(2 * sizeof(Vertex));
+    v[0] = (Vertex){0, 0, 0, 0, 0};
+    v[1] = (Vertex){(u16)w, (u16)h, 480, 272, 0};
+    sceGuDrawArray(GU_SPRITES, GU_TEXTURE_16BIT | GU_VERTEX_16BIT | GU_TRANSFORM_2D, 2, 0, v);
+    sceGuDisable(GU_TEXTURE_2D);
+}
+
+static void present(Psx *psx, const char *status)
+{
+    sceGuStart(GU_DIRECT, gu_list);
+    sceGuClearColor(0xFF000000);
+    sceGuClear(GU_COLOR_BUFFER_BIT);
+    if (psx)
+        draw_ps1(psx);
+    sceGuFinish();
+    sceGuSync(0, 0);
+    pspDebugScreenSetBase((u32 *)(0x44000000u + (u32)draw_buf));
+    pspDebugScreenSetXY(0, 0);
+    pspDebugScreenSetTextColor(0xFF40FFFF);
+    pspDebugScreenPrintf("%-60s", status);
+    if (show_text || !psx) {
+        int n = psx ? SHOWN : 32;
+        pspDebugScreenSetTextColor(0xFFFFFFFF);
+        for (int i = 0; i < n; i++) {
+            pspDebugScreenSetXY(0, 34 - n + i);
+            pspDebugScreenPrintf("%-60s", lines[(line_head - n + i + LINES) % LINES]);
+        }
+    }
+    draw_buf = sceGuSwapBuffers();
+}
+
+/* ---- pad: PSP bits equal PS1 bits except L/R (PSP 8/9, PS1 L1/R1 10/11); active low ---- */
+static u16 read_pad(void)
+{
+    static u32 prev;
+    SceCtrlData d;
+    sceCtrlPeekBufferPositive(&d, 1);
+    u32 b = d.Buttons, combo = PSP_CTRL_LTRIGGER | PSP_CTRL_RTRIGGER | PSP_CTRL_SELECT;
+    if ((b & combo) == combo && (prev & combo) != combo)
+        show_text = !show_text;
+    prev = b;
+    return (u16) ~((b & 0xF0F9u) | ((b >> 8) & 3u) << 10);
+}
+
+/* ---- the machine ---- */
+static Psx psx;
+static PsxHost host;
+static u32 frames;
+
+static void host_vblank(void *user)
+{
+    (void)user;
+    frames++;
 }
 
 static int exit_callback(int a, int b, void *c)
 {
     (void)a, (void)b, (void)c;
+    log_flush();
     sceKernelExitGame();
     return 0;
 }
@@ -84,143 +268,81 @@ static int callback_thread(SceSize args, void *argp)
     return 0;
 }
 
-static void setup_callbacks(void)
+static void halt(const char *why)
 {
-    int th = sceKernelCreateThread("psxrt callbacks", callback_thread, 0x11, 0x1000, PSP_THREAD_ATTR_USER, NULL);
-    if (th >= 0)
-        sceKernelStartThread(th, 0, NULL);
-}
-
-static void show_build(int argc, char **argv)
-{
-    unsigned fw = (unsigned)sceKernelDevkitVersion();
-    u32 here = (u32)&show_build;
-    printf("PSX2PSP native runtime (psxrt) - slice S1\n");
-    printf("build %s %s, gcc %s\n", __DATE__, __TIME__, __VERSION__);
-    printf("firmware %x.%02x, code at 0x%08X (%s mode)\n", fw >> 24, (fw >> 16) & 0xFF, (unsigned)here,
-           here < 0x80000000u ? "user" : "kernel");
-    printf("EBOOT %s\n", argc > 0 ? argv[0] : "(no argv[0])");
-}
-
-
-/* Reads the converter's header at the start of DATA.PSAR of our own EBOOT. */
-static void show_psar(int argc, char **argv)
-{
-    printf("DATA.PSAR: ");
-    if (argc < 1) {
-        verdict(0, "", "no EBOOT path");
-        return;
+    say("STOP: %s", why);
+    log_flush();
+    for (;;) {
+        present(NULL, "psxrt stopped - HOME exits");
+        sceDisplayWaitVblankStart();
     }
-    SceUID fd = sceIoOpen(argv[0], PSP_O_RDONLY, 0);
-    if (fd < 0) {
-        printf("open error 0x%08X ", (unsigned)fd);
-        verdict(0, "", "FAIL");
-        return;
-    }
-    u32 pbp[10];
-    PsarHeader h;
-    int ok = sceIoRead(fd, pbp, sizeof pbp) == (int)sizeof pbp && pbp[0] == 0x50425000u &&
-             sceIoLseek32(fd, (int)pbp[9], PSP_SEEK_SET) == (int)pbp[9] &&
-             sceIoRead(fd, &h, sizeof h) == (int)sizeof h && memcmp(h.magic, PSAR_MAGIC, 8) == 0 &&
-             h.version == PSAR_VERSION;
-    sceIoClose(fd);
-    if (ok) {
-        h.disc_id[sizeof h.disc_id - 1] = 0;
-        h.title[sizeof h.title - 1] = 0;
-        printf("%s \"%s\" ", h.disc_id, h.title);
-    }
-    verdict(ok, "OK", "no psxrt header");
-}
-
-static int block_at(SceUID uid)
-{
-    return uid >= 0 && (u32)sceKernelGetBlockHeadAddr(uid) == PS1_BASE;
-}
-
-static void show_block(SceUID uid)
-{
-    if (uid < 0)
-        printf("error 0x%08X ", (unsigned)uid);
-    else
-        printf("block at 0x%08X ", (unsigned)(u32)sceKernelGetBlockHeadAddr(uid));
-}
-
-/*
- * Reserves PS1_BASE..+PS1_SIZE. First as the S0 plan says (PSP_SMEM_Addr); if the firmware
- * refuses it or places the block elsewhere, by taking the free memory below PS1_BASE with a
- * filler block and then allocating from the bottom. The block stays allocated until exit.
- */
-static void reserve_ps1_ram(void)
-{
-    printf("\nPS1 RAM + dispatch 0x%08X-0x%08X (4 MB):\n", PS1_BASE, PS1_BASE + PS1_SIZE - 1);
-    printf("  free user memory: total %u KB, largest %u KB\n", (unsigned)(sceKernelTotalFreeMemSize() >> 10),
-           (unsigned)(sceKernelMaxFreeMemSize() >> 10));
-
-    SceUID uid = sceKernelAllocPartitionMemory(USER_PARTITION, "psxrt ps1", PSP_SMEM_Addr, PS1_SIZE, (void *)PS1_BASE);
-    printf("  Alloc(2, Addr): ");
-    show_block(uid);
-    if (block_at(uid)) {
-        verdict(1, "OK", "");
-        return;
-    }
-    mark(0, "", "refused");
-    if (uid >= 0)
-        sceKernelFreePartitionMemory(uid);
-
-    /* Fallback: fill the free memory below PS1_BASE, then allocate from the bottom. */
-    SceUID probe = sceKernelAllocPartitionMemory(USER_PARTITION, "psxrt probe", PSP_SMEM_Low, 0x100, NULL);
-    u32 low = probe >= 0 ? (u32)sceKernelGetBlockHeadAddr(probe) : 0;
-    if (probe >= 0)
-        sceKernelFreePartitionMemory(probe);
-    SceUID filler = -1;
-    if (low && low < PS1_BASE)
-        filler = sceKernelAllocPartitionMemory(USER_PARTITION, "psxrt filler", PSP_SMEM_Low, PS1_BASE - low, NULL);
-    uid = sceKernelAllocPartitionMemory(USER_PARTITION, "psxrt ps1", PSP_SMEM_Low, PS1_SIZE, NULL);
-    if (filler >= 0)
-        sceKernelFreePartitionMemory(filler);
-    printf("  filler 0x%08X- + Alloc(2, Low): ", (unsigned)low);
-    show_block(uid);
-    verdict(block_at(uid), "OK", "FAIL");
-}
-
-static int spad_word(u32 addr)
-{
-    volatile u32 *p = (volatile u32 *)addr;
-    u32 want = 0xA5C3F00Fu ^ addr;
-    u32 saved = *p;
-    *p = want;
-    sceKernelDcacheWritebackInvalidateRange((const void *)addr, 64);
-    u32 back = *p;
-    *p = saved;
-    sceKernelDcacheWritebackInvalidateRange((const void *)addr, 64);
-    printf("  0x%08X: wrote 0x%08X, read 0x%08X ", (unsigned)addr, (unsigned)want, (unsigned)back);
-    return back == want;
-}
-
-static void test_scratchpad(void)
-{
-    printf("\nScratchpad 0x%08X-0x%08X (16 KB):\n", SPAD_BASE, SPAD_BASE + SPAD_SIZE - 1);
-    pspDebugScreenSetTextColor(GREY);
-    printf("  testing (if the screen stops here: no user-mode access)\n");
-    pspDebugScreenSetTextColor(WHITE);
-    int ok = spad_word(SPAD_BASE);
-    verdict(ok, "OK", "FAIL");
-    ok = spad_word(SPAD_BASE + SPAD_SIZE - 4);
-    verdict(ok, "OK", "FAIL");
 }
 
 int main(int argc, char **argv)
 {
-    pspDebugScreenInit();
-    setup_callbacks();
-    show_build(argc, argv);
-    show_psar(argc, argv);
-    reserve_ps1_ram();
-    test_scratchpad();
-    printf("\n");
-    verdict(failures == 0, "S1 PASS", "S1 FAIL");
-    printf("Press HOME to exit.\n");
-    for (;;)
-        sceDisplayWaitVblankStart();
+    int fixed = reserve_fixed(); /* before any other allocation */
+    int th = sceKernelCreateThread("psxrt callbacks", callback_thread, 0x11, 0x1000, PSP_THREAD_ATTR_USER, NULL);
+    if (th >= 0)
+        sceKernelStartThread(th, 0, NULL);
+    pspDebugScreenInitEx((void *)0x44000000, PSP_DISPLAY_PIXEL_FORMAT_8888, 0);
+    screen_init();
+    sceCtrlSetSamplingCycle(0);
+    sceCtrlSetSamplingMode(PSP_CTRL_MODE_DIGITAL);
+    const char *eboot = argc > 0 ? argv[0] : "";
+    open_log(eboot);
+    say("PSX2PSP native runtime (psxrt) - S3, built %s %s", __DATE__, __TIME__);
+    say("EBOOT %s", eboot);
+    if (!fixed)
+        halt("0x09800000-0x09C00FFF is not free");
+
+    DiscInfo info;
+    const char *err = disc_open(eboot, &info);
+    if (err)
+        halt(err);
+    say("disc %s \"%s\": %u sectors, %u blocks", info.disc_id, info.title, (unsigned)info.sectors, (unsigned)info.blocks);
+
+    u16 *vram = palloc("psxrt vram", VRAM_W * VRAM_H * 2 + 0x10000); /* + slack for texture reads */
+    u8 *spu_ram = palloc("psxrt spu", 512 * 1024);
+    u32 *mdec_in = palloc("psxrt mdec", MDEC_WORDS * 4);
+    if (!vram || !spu_ram || !mdec_in)
+        halt("out of memory");
+    host.read_sector = disc_read_sector;
+    host.disc_end = 150 + info.sectors;
+    host.tty = host_tty;
+    host.log = host_log;
+    host.vblank = host_vblank;
+    psx_init(&psx, &host, (u8 *)FIXED_BASE, (u8 *)SCRATCH_BASE, vram, spu_ram, mdec_in, MDEC_WORDS);
+    if (psx_boot(&psx) < 0)
+        halt("cannot boot the disc (SYSTEM.CNF / boot EXE)");
+    present(&psx, "booting");
+    log_flush();
+
+    u64 t0 = sceKernelGetSystemTimeWide(), c0 = psx.cycles;
+    u32 speed = 0, fps = 0, f0 = 0;
+    char status[64];
+    for (;;) {
+        u32 f = frames;
+        while (frames == f && !psx.exiting)
+            cpu_run(&psx, psx.cycles + 4096);
+        if (psx.exiting)
+            halt(psx.exiting == 2 ? "the interpreter hit a fatal error" : "the game exited");
+        psx.sio.buttons[0] = read_pad();
+        u64 t = sceKernelGetSystemTimeWide();
+        if (t - t0 >= 1000000) {
+            u64 us = t - t0;
+            speed = (u32)((psx.cycles - c0) * 100000000ull / ((u64)PS1_HZ * us)); /* % of real time */
+            fps = (u32)((u64)(frames - f0) * 1000000 / us);
+            t0 = t, c0 = psx.cycles, f0 = frames;
+            snprintf(status, sizeof status, "f %u pc %08X %u%% %u fps", (unsigned)frames, (unsigned)psx.cpu.pc, (unsigned)speed, (unsigned)fps);
+            if (log_fd >= 0) { /* the speed goes to the file only: the screen has its status line */
+                char line[80];
+                int n = snprintf(line, sizeof line, "-- %s\n", status);
+                log_flush();
+                sceIoWrite(log_fd, line, n);
+            }
+        }
+        snprintf(status, sizeof status, "f %u pc %08X %u%% %u fps", (unsigned)frames, (unsigned)psx.cpu.pc, (unsigned)speed, (unsigned)fps);
+        present(&psx, status);
+    }
     return 0;
 }

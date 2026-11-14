@@ -803,15 +803,24 @@ pub fn convert(req: &ConvertRequest, monitor: &dyn Monitor) -> Result<ConvertRep
 
 /// The native runtime (`psp/psxrt`, prebuilt user-mode PRX): DATA.PSP of a native EBOOT.
 pub const NATIVE_RUNTIME: &[u8] = include_bytes!("../../../resources/psxrt.prx");
-/// Start of a native EBOOT's DATA.PSAR, read by psxrt (`PsarHeader` in `psp/psxrt/main.c`).
+/// DATA.PSAR of a native EBOOT, read by psxrt (`psp/psxrt/disc.c`). Little endian, offsets from
+/// the start of DATA.PSAR:
+/// - the header, [`NATIVE_PSAR_HEADER_LEN`] bytes ([`native_psar_header`]);
+/// - `blocks + 1` u32 offsets: block i spans `index[i]..index[i + 1]`;
+/// - the blocks. Block i holds the image's raw 2352-byte sectors from `16 * i` (sector 0 is
+///   00:02:00, LBA 150), fewer in the last one; it is raw deflate, or the sectors as they are when
+///   deflate would not be smaller (its length is then that of the raw data).
 pub const NATIVE_PSAR_MAGIC: [u8; 8] = *b"PSXRTDAT";
-pub const NATIVE_PSAR_VERSION: u32 = 1;
-/// magic 8, version 4, header length 4, disc ID 16, title 128.
-pub const NATIVE_PSAR_HEADER_LEN: usize = 0xA0;
+pub const NATIVE_PSAR_VERSION: u32 = 2;
+/// magic 8, version 4, header length 4, disc ID 16, title 128, disc sectors 4, sectors per block
+/// 4, index offset 4, block count 4.
+pub const NATIVE_PSAR_HEADER_LEN: usize = 0xB0;
+/// Raw sectors per block of a native DATA.PSAR (as PSISOIMG: 0x9300 bytes).
+pub const NATIVE_BLOCK_SECTORS: u32 = 16;
 
-/// DATA.PSAR of a native EBOOT; for now only its header. Little endian; disc ID and title are
-/// NUL-padded and cut (on a char boundary) to leave room for their NUL.
-pub fn native_psar_header(disc_id: &str, title: &str) -> Vec<u8> {
+/// Header of a native DATA.PSAR; the index follows it. Disc ID and title are NUL-padded and cut
+/// (on a char boundary) to leave room for their NUL.
+pub fn native_psar_header(disc_id: &str, title: &str, disc_sectors: u32) -> Vec<u8> {
     fn field(out: &mut Vec<u8>, s: &str, len: usize) {
         let mut end = s.len().min(len - 1);
         while !s.is_char_boundary(end) {
@@ -826,8 +835,70 @@ pub fn native_psar_header(disc_id: &str, title: &str) -> Vec<u8> {
     h.extend_from_slice(&(NATIVE_PSAR_HEADER_LEN as u32).to_le_bytes());
     field(&mut h, disc_id, 16);
     field(&mut h, title, 128);
+    let blocks = disc_sectors.div_ceil(NATIVE_BLOCK_SECTORS);
+    for v in [disc_sectors, NATIVE_BLOCK_SECTORS, NATIVE_PSAR_HEADER_LEN as u32, blocks] {
+        h.extend_from_slice(&v.to_le_bytes());
+    }
     debug_assert_eq!(h.len(), NATIVE_PSAR_HEADER_LEN);
     h
+}
+
+/// Writes a native DATA.PSAR at `psar` (where `w` stands): header, index, and the disc's blocks
+/// deflated at `level` in parallel.
+fn write_native_psar<W: Write + Seek>(
+    w: &mut W,
+    psar: u64,
+    img: &DiscImage,
+    disc_id: &str,
+    title: &str,
+    level: u8,
+    monitor: &dyn Monitor,
+) -> psx2psp_core::Result<PsarStats> {
+    use rayon::prelude::*;
+    const BATCH: usize = 64;
+    let block_len = NATIVE_BLOCK_SECTORS as usize * SECTOR;
+    let total = img.size_bytes();
+    let blocks = img.sectors().div_ceil(NATIVE_BLOCK_SECTORS) as usize;
+    let offset = |pos: u64| u32::try_from(pos).map_err(|_| psx2psp_core::Error::Unsupported("disc data exceeds 4 GiB".into()));
+
+    w.write_all(&native_psar_header(disc_id, title, img.sectors()))?;
+    let index_at = w.stream_position()?;
+    w.write_all(&vec![0u8; (blocks + 1) * 4])?;
+    let mut pos = index_at + (blocks as u64 + 1) * 4 - psar;
+    let mut index = Vec::with_capacity((blocks + 1) * 4);
+    let mut rd = img.reader();
+    let mut batch = vec![0u8; BATCH * block_len];
+    let mut stats = PsarStats::default();
+    for first in (0..blocks).step_by(BATCH) {
+        if monitor.cancelled() {
+            return Err(psx2psp_core::Error::Cancelled);
+        }
+        let len = (total - (first * block_len) as u64).min(batch.len() as u64) as usize;
+        let buf = &mut batch[..len];
+        rd.read_exact(buf)?;
+        let out: Vec<Vec<u8>> = buf
+            .par_chunks(block_len)
+            .map(|raw| {
+                let z = miniz_oxide::deflate::compress_to_vec(raw, level);
+                if z.len() < raw.len() { z } else { raw.to_vec() }
+            })
+            .collect();
+        for data in &out {
+            index.extend_from_slice(&offset(pos)?.to_le_bytes());
+            w.write_all(data)?;
+            pos += data.len() as u64;
+        }
+        stats.blocks += out.len() as u64;
+        stats.raw_bytes += len as u64;
+        monitor.progress(stats.raw_bytes, total);
+    }
+    index.extend_from_slice(&offset(pos)?.to_le_bytes());
+    stats.stored_bytes = pos;
+    let end = w.stream_position()?;
+    w.seek(SeekFrom::Start(index_at))?;
+    w.write_all(&index)?;
+    w.seek(SeekFrom::Start(end))?;
+    Ok(stats)
 }
 
 /// PARAM.SFO of a native EBOOT: a PSP game (category `MG`, what the pspsdk's mksfo writes),
@@ -846,8 +917,8 @@ pub fn native_sfo(title: &str, disc_id: &str) -> Sfo {
 }
 
 /// Output mode Native (recomp backend, `docs/recomp/PLAN.md`): an EBOOT that runs the native
-/// runtime instead of POPS. Same title, ID and artwork as [`convert`]; the disc is only read for
-/// its ID (slice S1: the runtime runs no game code yet). One disc; patches, donor and boot
+/// runtime instead of POPS. Same title, ID and artwork as [`convert`]; DATA.PSAR carries the
+/// whole disc for the runtime's CD ([`NATIVE_PSAR_MAGIC`]). One disc; patches, donor and boot
 /// picture do not apply.
 pub fn convert_native(req: &ConvertRequest, monitor: &dyn Monitor) -> Result<ConvertReport> {
     let t0 = Instant::now();
@@ -879,13 +950,18 @@ pub fn convert_native(req: &ConvertRequest, monitor: &dyn Monitor) -> Result<Con
     let part = PartFile::new(&req.output);
     let file = File::create(&part.part).map_err(psx2psp_core::Error::io_path(&part.part))?;
     let mut w = BufWriter::new(file);
-    write_pbp(&mut w, &sections, 0x10, |w, _| Ok(w.write_all(&native_psar_header(&disc_id, &req.title))?))?;
+    let level = req.level.clamp(*LEVELS.start(), *LEVELS.end()) as u8;
+    let mut stats = PsarStats::default();
+    write_pbp(&mut w, &sections, 0x10, |w, psar| {
+        stats = write_native_psar(w, psar, &img, &disc_id, &req.title, level, monitor)?;
+        Ok(())
+    })?;
     let file = w.into_inner().map_err(|e| EngineError::from(e.into_error()))?;
     file.sync_all()?;
     let file_size = file.metadata()?.len();
     drop(file);
     part.commit(&req.output)?;
-    let report = ConvertReport { output: req.output.clone(), disc_ids: vec![disc_id], stats: PsarStats::default(), file_size, elapsed: t0.elapsed() };
+    let report = ConvertReport { output: req.output.clone(), disc_ids: vec![disc_id], stats, file_size, elapsed: t0.elapsed() };
     monitor.log(&format!("Done: {} ({} B, native)", report.output.display(), file_size));
     Ok(report)
 }
@@ -1360,7 +1436,15 @@ mod tests {
     #[test]
     fn native_eboot_is_an_mg_game_running_the_runtime() {
         let t = tempfile::tempdir().unwrap();
-        let raw: Vec<u8> = (0..20u32).flat_map(|lba| patching::sector::build_mode2_form1(lba, &[0; 2048])).collect();
+        // 40 sectors = blocks of 16, 16 and 8; the second one is noise, which deflate cannot shrink.
+        let mut raw: Vec<u8> = (0..40u32).flat_map(|lba| patching::sector::build_mode2_form1(lba, &[lba as u8; 2048])).collect();
+        let mut x = 0x1234_5678u32;
+        for b in &mut raw[16 * SECTOR..32 * SECTOR] {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            *b = x as u8;
+        }
         std::fs::write(t.path().join("g.bin"), &raw).unwrap();
         let cue = touch(t.path(), "g.cue", "FILE \"g.bin\" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n");
         let output = t.path().join("NATIVE").join("EBOOT.PBP");
@@ -1397,11 +1481,31 @@ mod tests {
 
         let psar = pbp.read(Section::DataPsar).unwrap();
         assert_eq!(pbp.range(Section::DataPsar).start % 0x10, 0);
-        assert_eq!(psar, native_psar_header("SLES02895", "Sheep Dog 'n' Wolf"));
-        assert_eq!(psar.len(), NATIVE_PSAR_HEADER_LEN);
-        assert_eq!(psar[..12], *b"PSXRTDAT\x01\0\0\0");
+        let head = native_psar_header("SLES02895", "Sheep Dog 'n' Wolf", 40);
+        assert_eq!(psar[..NATIVE_PSAR_HEADER_LEN], head);
+        assert_eq!(psar[..12], *b"PSXRTDAT\x02\0\0\0");
         assert_eq!(&psar[0x10..0x1A], b"SLES02895\0");
         assert_eq!(&psar[0x20..0x33], b"Sheep Dog 'n' Wolf\0");
+        let word = |at: usize| u32::from_le_bytes(psar[at..at + 4].try_into().unwrap()) as usize;
+        assert_eq!([word(0xA0), word(0xA4), word(0xA8), word(0xAC)], [40, 16, 0xB0, 3]);
+
+        // The index bounds every block; each one gives back its sectors, the noise stored as is.
+        let index: Vec<usize> = (0..4).map(|i| word(0xB0 + 4 * i)).collect();
+        assert_eq!(index[0], 0xB0 + 16);
+        assert_eq!(index[3], psar.len());
+        let mut back = Vec::new();
+        for (i, span) in index.windows(2).enumerate() {
+            let data = &psar[span[0]..span[1]];
+            let len = (40 - 16 * i).min(16) * SECTOR;
+            if data.len() == len {
+                assert_eq!(i, 1, "only the noise is stored");
+                back.extend_from_slice(data);
+            } else {
+                back.extend(miniz_oxide::inflate::decompress_to_vec(data).unwrap());
+            }
+        }
+        assert_eq!(back, raw);
+        assert_eq!((rep.stats.blocks, rep.stats.raw_bytes, rep.stats.stored_bytes), (3, raw.len() as u64, psar.len() as u64));
 
         let two = ConvertRequest { discs: vec![req.discs[0].clone(), req.discs[0].clone()], ..req };
         assert!(convert_native(&two, &()).is_err(), "one disc only");
@@ -1409,11 +1513,11 @@ mod tests {
 
     #[test]
     fn native_psar_header_cuts_long_fields() {
-        let h = native_psar_header("ABCDEFGHIJKLMNOPQRS", &"é".repeat(100));
+        let h = native_psar_header("ABCDEFGHIJKLMNOPQRS", &"é".repeat(100), 0);
         assert_eq!(h.len(), NATIVE_PSAR_HEADER_LEN);
         assert_eq!(&h[0x10..0x20], b"ABCDEFGHIJKLMNO\0");
         // 63 two-byte chars fit in 127 bytes; the rest of the field is NUL.
         assert_eq!(std::str::from_utf8(&h[0x20..0x20 + 126]).unwrap(), "é".repeat(63));
-        assert!(h[0x20 + 126..].iter().all(|&b| b == 0));
+        assert!(h[0x20 + 126..0xA0].iter().all(|&b| b == 0));
     }
 }

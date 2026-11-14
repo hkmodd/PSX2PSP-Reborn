@@ -20,6 +20,7 @@ psx2psp-patching.workspace = true
 psx2psp-media.workspace = true
 thiserror.workspace = true
 miniz_oxide.workspace = true
+rayon.workspace = true
 # Self-update (update.rs): pure-Rust HTTPS (rustls + ring, Mozilla roots built in), no OpenSSL/curl.
 ureq = { version = "3.5", default-features = false, features = ["rustls"] }
 sha2 = "0.10"
