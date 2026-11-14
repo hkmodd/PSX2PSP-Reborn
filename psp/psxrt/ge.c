@@ -1343,6 +1343,20 @@ static void ring_bench(Psx *psx)
     }
     sceKernelDcacheWritebackInvalidateRange(fl.ring_c, fl.ring_bytes);
     psx_log(psx, "ge: 64 KB of vertices in %u us uncached, %u us cached and written back", (unsigned)t[0], (unsigned)t[1]);
+    /* the profile's own cost (each timed call adds one clock read) and a data cache miss: 512
+     * reads of PS1 RAM 4 KB apart, after the cache was emptied of it */
+    u32 t0 = sceKernelGetSystemTimeLow();
+    for (int i = 0; i < 256; i++)
+        sceKernelGetSystemTimeLow();
+    u32 clk = sceKernelGetSystemTimeLow() - t0, sum = 0;
+    sceKernelDcacheWritebackInvalidateRange(psx->ram, 2 * 1024 * 1024);
+    volatile const u32 *ram = (const u32 *)psx->ram;
+    t0 = sceKernelGetSystemTimeLow();
+    for (u32 i = 0; i < 512; i++)
+        sum += ram[i * 1024 + (i & 15) * 4];
+    u32 miss = sceKernelGetSystemTimeLow() - t0;
+    psx_log(psx, "cpu: clock read %u ns, cache miss %u ns (%u)", (unsigned)(clk * 1000 / 256), (unsigned)(miss * 1000 / 512),
+            (unsigned)(sum & 1));
 }
 
 void ge_init(Psx *psx, int compare)

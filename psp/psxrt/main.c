@@ -59,6 +59,7 @@ static int line_head; /* next line to write */
 static char tty_line[COLS + 1];
 static int tty_len;
 static SceUID log_fd = -1;
+static char log_path[256]; /* reopened to append: only a close updates the size on the stick */
 static int trace_bits; /* from psxrt.trace beside the EBOOT */
 static int cpu_override = -1; /* from psxrt.cpu beside the EBOOT */
 /* psxrt.watch beside the EBOOT: PS1 RAM words logged once a second, last value and the sum of
@@ -98,6 +99,17 @@ static void log_flush(void)
     if (log_fd >= 0 && log_len)
         sceIoWrite(log_fd, log_buf, log_len);
     log_len = 0;
+}
+
+/* The stick's directory gets the file's size only when it is closed: a game switched off or hung
+ * would leave an empty log. Closed and reopened every second for the first 20, then every 5th. */
+static void log_keep(void)
+{
+    static u32 n;
+    if (log_fd < 0 || (n++ >= 20 && n % 5))
+        return;
+    sceIoClose(log_fd);
+    log_fd = sceIoOpen(log_path, PSP_O_WRONLY | PSP_O_APPEND, 0777);
 }
 
 static void push_line(const char *s)
@@ -158,6 +170,7 @@ static void open_log(const char *eboot)
         return;
     snprintf(slash + 1, sizeof path - (size_t)(slash + 1 - path), "psxrt.log");
     log_fd = sceIoOpen(path, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
+    snprintf(log_path, sizeof log_path, "%s", path);
     snprintf(slash + 1, sizeof path - (size_t)(slash + 1 - path), "psxrt.trace");
     SceUID fd = sceIoOpen(path, PSP_O_RDONLY, 0);
     if (fd >= 0) { /* debugging: the core's trace bits (psx.h), as a decimal number */
@@ -753,6 +766,7 @@ static void frame(void)
                               (unsigned)(bench.present / k), (unsigned)(bench.sleep / k));
             log_flush();
             sceIoWrite(log_fd, line, n);
+            log_keep();
             if (bench_secs && bench_n > BENCH_SKIP && k >= bench_secs)
                 halt("bench done");
         }
@@ -1042,6 +1056,7 @@ int main(int argc, char **argv)
         halt("cannot boot the disc (SYSTEM.CNF / boot EXE)");
     present(&psx, "booting");
     log_flush();
+    log_keep();
     if (native)
         native_run(resume);
 
