@@ -127,6 +127,10 @@ pub struct Game {
     /// Lowest deflate level the game loads at on a real PSP (`min_level`): the converter raises
     /// a lower one. See [`psx2psp_core::psar::LEVELS`].
     pub min_level: Option<u32>,
+    /// `pal60 = yes`: the game keeps time with a timer, not by counting vblanks, so the native
+    /// runtime's "60 Hz" gives its PAL picture 60 vblanks a second instead of applying its `60hz`
+    /// patches (an NTSC branch that shows 240 lines of 256-line PAL art).
+    pub pal60: Option<bool>,
     pub origin: Origin,
 }
 
@@ -430,10 +434,18 @@ impl Section<'_> {
                 _ => return Err(self.err(l, format!("min_level `{v}`: a deflate level is 1..=9"))),
             },
         };
+        let pal60 = match self.take("pal60") {
+            None => None,
+            Some((v, l)) => match v.to_ascii_lowercase().as_str() {
+                "yes" => Some(true),
+                "no" => Some(false),
+                _ => return Err(self.err(l, format!("pal60 `{v}`: yes or no"))),
+            },
+        };
         let mut text = |k: &str| self.take(k).map(|v| v.0).unwrap_or_default();
         let (title, source, note) = (text("title"), text("source"), text("note"));
         self.finish()?;
-        Ok(Game { ids, title, config, source, note, switches, libcrypt, pops_id, min_level, origin })
+        Ok(Game { ids, title, config, source, note, switches, libcrypt, pops_id, min_level, pal60, origin })
     }
 
     fn patch(mut self, origin: Origin) -> Result<Patch, ParseError> {
@@ -606,6 +618,11 @@ impl PatchDb {
         self.game_field(id, |g| g.min_level)
     }
 
+    /// Whether the native runtime runs `id` at 60 Hz as PAL60 ([`Game::pal60`]).
+    pub fn pal60(&self, id: &str) -> bool {
+        self.game_field(id, |g| g.pal60).unwrap_or(false)
+    }
+
     /// LibCrypt magic word of `id`, if it is protected.
     pub fn libcrypt(&self, id: &str) -> Option<u16> {
         self.game_field(id, |g| g.libcrypt)
@@ -693,7 +710,7 @@ const USER_HEADER: &str = "\
 ;   [patch ID…|*]  name, kind (fix|fps|60hz|other), search + replace [+ align] or ppf (hex),
 ;                  [default], [md5], [note]
 ;   [game ID…]     title, config (POPS config, hex), source, [default (fix fps 60hz)],
-;                  [libcrypt], [pops_id], [min_level (1-9)], note
+;                  [libcrypt], [pops_id], [min_level (1-9)], [pal60 (yes|no)], note
 ; Entries here win over the built-in ones: patches by name, games by ID.
 ";
 
@@ -832,6 +849,8 @@ pub(crate) mod tests {
         }
         assert_eq!((db.libcrypt("SCES-01494"), db.game("SCES-01494").map(|g| g.title.as_str())), (Some(0xAAA6), Some("MediEvil")));
         assert_eq!(db.min_level("SLES-02895"), None);
+        // Sheep Dog keeps its PAL picture at 60 Hz in the native runtime; MediEvil does not.
+        assert_eq!((db.pal60("SLES_028.95"), db.pal60("SLUS-01369"), db.pal60("SCES-00311")), (true, true, false));
         // Terracon: built as SCPS02836, which carries the config and pop-fe's PPF fix.
         assert_eq!(popfe.pops_id("SCES-02836"), "SCPS02836");
         assert_eq!(popfe.pops_id("SCPS02836"), "SCPS02836");
@@ -949,6 +968,9 @@ pub(crate) mod tests {
         let merged = base.with_user(PatchDb::parse("[game sles_123.45]\nmin_level = 9\n", Origin::User).unwrap());
         assert_eq!((merged.min_level("SLES12345"), merged.config_game("SLES12345").and_then(|g| g.config.clone())), (Some(9), Some(vec![1, 2])));
         assert_eq!((base.min_level("SLES12345"), merged.min_level("SLES12346")), (None, None));
+        // A user `pal60 = no` turns the built-in one off; one without it keeps it.
+        let sheep = |ini: &str| PatchDb::builtin().with_user(PatchDb::parse(ini, Origin::User).unwrap()).pal60("SLES02895");
+        assert_eq!((sheep("[game SLES02895]\npal60 = NO\n"), sheep("[game SLES02895]\nmin_level = 9\n")), (false, true));
 
         for (bad, line, what) in [
             ("name = x\n", 1, "before any"),
@@ -972,6 +994,7 @@ pub(crate) mod tests {
             ("[game X]\nmin_level = 0\n", 2, "1..=9"),
             ("[game X]\nmin_level = 10\n", 2, "1..=9"),
             ("[game X]\nmin_level = five\n", 2, "1..=9"),
+            ("[game X]\npal60 = on\n", 2, "yes or no"),
         ] {
             let e = PatchDb::parse(bad, Origin::User).unwrap_err();
             assert_eq!(e.line, line, "{bad:?}: {e}");

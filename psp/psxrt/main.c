@@ -304,11 +304,7 @@ static int display_size(const Psx *psx, int *w, int *h)
     static const int widths[4] = {256, 320, 512, 640};
     u32 st = g->stat;
     *w = (st & 0x10000) ? 368 : widths[(st >> 17) & 3];
-    *h = g->vrange2 - g->vrange1;
-    if ((st & 0x80000) && (st & 0x400000))
-        *h *= 2;
-    if (*h <= 0 || *h > 512)
-        *h = psx->pal ? 256 : 240;
+    *h = gpu_display_height(psx);
     if (*w > 512)
         *w = 512; /* GE texture limit */
     return !(st & 0x800000) && g->disp_y + *h <= VRAM_H;
@@ -735,6 +731,9 @@ int main(int argc, char **argv)
     host.card_dirty = host_card_dirty;
     psx_init(&psx, &host, (u8 *)FIXED_BASE, (u8 *)SCRATCH_BASE, vram, spu_ram, mdec_in, MDEC_WORDS);
     psx.trace = trace_bits;
+    psx.pal60 = !!(info.flags & DISC_PAL60);
+    if (psx.pal60)
+        say("PAL60: a PAL picture at 60 Hz");
     if (!(trace_bits & 16)) /* bit 4: everything in software, for A/B runs */
         ge_init(&psx, (trace_bits >> 3) & 1);
     if (psx.gpu.renderer)

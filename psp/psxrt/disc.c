@@ -14,8 +14,8 @@
 #include <zlib.h>
 
 #define MAGIC "PSXRTDAT"
-#define VERSION 3
-#define HEADER_LEN 0xC0
+#define VERSION 4
+#define HEADER_LEN 0xD0
 #define BLOCK_SECTORS 16
 #define RAW 2352
 #define BLOCK_LEN (BLOCK_SECTORS * RAW)
@@ -28,6 +28,8 @@ typedef struct {
     char title[128];
     u32 sectors, block_sectors, index_offset, blocks;
     u32 dir_offset, images, code_base, code_size;
+    u32 flags;
+    u32 pad[3];
 } Header;
 
 typedef struct {
@@ -93,6 +95,7 @@ const char *disc_open(const char *path, DiscInfo *info)
     info->dir = NULL;
     info->code_base = h.code_base;
     info->code_size = h.code_size;
+    info->flags = h.flags;
     if (h.images) {
         u32 len = h.images * (u32)sizeof(CodeEntry);
         if (h.images > 256 || sizeof(CodeEntry) != 0x40)

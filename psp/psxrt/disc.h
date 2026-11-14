@@ -23,7 +23,11 @@ typedef struct DiscInfo {
     /* translated code: `images` entries, run from code_base..+code_size; none for 0 */
     u32 images, code_base, code_size;
     CodeEntry *dir;
+    u32 flags; /* DISC_PAL60 */
 } DiscInfo;
+
+/* DiscInfo.flags: a PAL picture runs at 60 vblanks a second (patch database `pal60`). */
+#define DISC_PAL60 1u
 
 /* Opens the EBOOT at `path` and checks its DATA.PSAR. NULL, or what is wrong. */
 const char *disc_open(const char *path, DiscInfo *info);

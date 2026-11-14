@@ -56,7 +56,8 @@ CONVERT OPTIONS:
                      9 is ~0.1% smaller in about the same time). Games that hang on a real PSP below
                      some level are raised to it (patch database min_level, e.g. MediEvil)
   --native           experimental: a native EBOOT (category MG) that runs the psxrt runtime
-                     instead of POPS; one disc, same title/ID/artwork, no disc patches
+                     instead of POPS; one disc, same title/ID/artwork and disc patches (no
+                     POPS config)
   --clip <src>       video/audio file or YouTube URL → ICON1.PMF + SND0.AT3 (see CLIP OPTIONS)
 
 CLIP OPTIONS:
@@ -464,7 +465,7 @@ fn load_patches() -> PatchDb {
 /// The PsyQ library functions recognised in each executable of a disc (native mode's view).
 fn cmd_libs(disc: &Path) -> R {
     let img = psx2psp_engine::core::DiscImage::open(disc)?;
-    let exes = psx2psp_engine::disc_executables(&img);
+    let exes = psx2psp_engine::disc_executables(&img, &[]);
     for (name, exe, hits) in psx2psp_engine::native_code::library_functions(&exes) {
         let unsure = hits.iter().filter(|h| !h.rivals.is_empty()).count();
         println!("{name}: text {:#010x}+{:#x}, {} library functions ({unsure} ambiguous)", exe.text_addr, exe.text.len(), hits.len());

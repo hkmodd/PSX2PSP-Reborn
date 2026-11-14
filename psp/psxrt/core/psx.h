@@ -354,6 +354,7 @@ struct Psx {
     u64 next_vblank;
     u64 frame_cycles;
     int pal;
+    int pal60; /* PAL video at 60 Hz: PAL lines and hblank rate, NTSC frame length */
     u32 io_ram_size, io_cache_ctrl;
     u32 exp_regs[16];
     const PsxHost *host;
@@ -381,6 +382,7 @@ void psx_log(Psx *psx, const char *fmt, ...);
 void psx_schedule(Psx *psx, u64 due);
 void psx_set_region(Psx *psx, int pal);
 u32 psx_line_cycles(const Psx *psx);
+void psx_video_mode(Psx *psx); /* after a GPUSTAT video mode change: the frame length */
 
 /* mem.c */
 u32 psx_read(Psx *psx, u32 addr, int size);
@@ -475,6 +477,7 @@ void gpu_gp0(Psx *psx, u32 v);
 u32 gpu_gp0_pixels(Psx *psx, const u32 *w, u32 n);
 void gpu_gp1(Psx *psx, u32 v);
 void gpu_vblank(Psx *psx);
+int gpu_display_height(const Psx *psx);
 
 /* spu.c */
 u16 spu_read(Psx *psx, u32 addr);

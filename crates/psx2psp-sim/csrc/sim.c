@@ -105,11 +105,7 @@ void sim_display(const Sim *s, int *out)
     static const int widths[4] = {256, 320, 512, 640};
     u32 st = g->stat;
     int w = (st & 0x10000) ? 368 : widths[(st >> 17) & 3];
-    int h = g->vrange2 - g->vrange1;
-    if ((st & 0x80000) && (st & 0x400000))
-        h *= 2;
-    if (h <= 0 || h > 512)
-        h = s->psx.pal ? 256 : 240;
+    int h = gpu_display_height(&s->psx);
     out[0] = g->disp_x, out[1] = g->disp_y, out[2] = w, out[3] = h;
     out[4] = (st >> 21) & 1;
     out[5] = !(st & 0x800000);

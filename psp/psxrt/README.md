@@ -54,7 +54,7 @@ dispatch table (one word per PS1 RAM word) with MISS.
 The log has a line per second with host calls, misses, interpreted instructions and executables
 loaded.
 
-## DATA.PSAR (version 3)
+## DATA.PSAR (version 4)
 
 Little endian, written by `write_native_psar` in `crates/psx2psp-engine`; offsets are from the
 start of DATA.PSAR:
@@ -62,18 +62,20 @@ start of DATA.PSAR:
 | Offset | Size | Field |
 |---|---|---|
 | 0x00 | 8 | `PSXRTDAT` |
-| 0x08 | 4 | version (3) |
-| 0x0C | 4 | header length (0xC0) |
+| 0x08 | 4 | version (4) |
+| 0x0C | 4 | header length (0xD0) |
 | 0x10 | 16 | disc ID, NUL padded (`SLES02895`) |
 | 0x20 | 128 | title, UTF-8, NUL padded |
 | 0xA0 | 4 | raw sectors of the disc image (2352 bytes each; sector 0 is LBA 150) |
 | 0xA4 | 4 | sectors per block (16) |
-| 0xA8 | 4 | offset of the block index (0xC0) |
+| 0xA8 | 4 | offset of the block index (0xD0) |
 | 0xAC | 4 | blocks = ceil(sectors / 16) |
 | 0xB0 | 4 | offset of the code directory (0: no translated code) |
 | 0xB4 | 4 | entries in the code directory |
 | 0xB8 | 4 | host address of the code range |
 | 0xBC | 4 | size of the code range |
+| 0xC0 | 4 | flags: bit 0 PAL60 (a PAL picture at 60 vblanks a second: patch database `pal60` with the 60 Hz switch) |
+| 0xC4 | 12 | zero |
 
 The index holds blocks + 1 offsets: block i is `index[i]..index[i+1]`. A block is raw deflate,
 or stored as is when deflate would not make it smaller (its length is then the raw length; only

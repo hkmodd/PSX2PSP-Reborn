@@ -666,11 +666,25 @@ static void reset(Psx *psx)
     g->clip_x2 = 1023, g->clip_y2 = 511;
 }
 
+/* Lines of VRAM the display shows: the game's vertical range, doubled when interlaced. Buffer
+ * spacing says nothing about it (Sheep Dog draws 240-line NTSC frames 256 lines apart). */
+int gpu_display_height(const Psx *psx)
+{
+    const Gpu *g = &psx->gpu;
+    u32 st = g->stat;
+    int h = g->vrange2 - g->vrange1;
+    if ((st & 0x80000) && (st & 0x400000))
+        h *= 2;
+    if (h <= 0 || h > 512)
+        h = (st & 0x100000) ? 256 : 240;
+    return h;
+}
+
 void gpu_gp1(Psx *psx, u32 v)
 {
     Gpu *g = &psx->gpu;
     switch (v >> 24) {
-    case 0x00: xfer_abort(psx), reset(psx); break;
+    case 0x00: xfer_abort(psx), reset(psx), psx_video_mode(psx); break;
     case 0x01: xfer_abort(psx), g->ncmd = 0; break;
     case 0x02: g->stat &= ~(1u << 24); break;
     case 0x03:
@@ -684,14 +698,25 @@ void gpu_gp1(Psx *psx, u32 v)
     case 0x05: {
         int x = (int)(v & 0x3FE), y = (int)((v >> 10) & 0x1FF);
         if ((psx->trace & 32) && (g->disp_x != x || g->disp_y != y))
-            psx_log(psx, "gpu: flip"); /* the game's own frame rate: flips per vblank */
+            psx_log(psx, "gpu: flip %d,%d", x, y); /* the game's own frame rate: flips per vblank */
         g->disp_x = x, g->disp_y = y;
         break;
     }
-    case 0x06: g->hrange1 = v & 0xFFF, g->hrange2 = (v >> 12) & 0xFFF; break;
-    case 0x07: g->vrange1 = v & 0x3FF, g->vrange2 = (v >> 10) & 0x3FF; break;
+    case 0x06:
+        if ((psx->trace & 32) && (g->hrange1 != (int)(v & 0xFFF) || g->hrange2 != (int)((v >> 12) & 0xFFF)))
+            psx_log(psx, "gpu: hrange %03X-%03X", v & 0xFFF, (v >> 12) & 0xFFF);
+        g->hrange1 = v & 0xFFF, g->hrange2 = (v >> 12) & 0xFFF;
+        break;
+    case 0x07:
+        if ((psx->trace & 32) && (g->vrange1 != (int)(v & 0x3FF) || g->vrange2 != (int)((v >> 10) & 0x3FF)))
+            psx_log(psx, "gpu: vrange %03X-%03X", v & 0x3FF, (v >> 10) & 0x3FF);
+        g->vrange1 = v & 0x3FF, g->vrange2 = (v >> 10) & 0x3FF;
+        break;
     case 0x08:
+        if (psx->trace & 32)
+            psx_log(psx, "gpu: mode %02X", v & 0xFF);
         g->stat = (g->stat & ~0x7F4000u) | ((v & 0x3F) << 17) | ((v & 0x40) << 10) | ((v & 0x80) << 7);
+        psx_video_mode(psx);
         break;
     case 0x10:
         switch (v & 7) {

@@ -815,13 +815,17 @@ pub const NATIVE_RUNTIME: &[u8] = include_bytes!("../../../resources/psxrt.prx")
 ///   slice, each deflated or stored the same way, then a directory of
 ///   [`NATIVE_CODE_ENTRY_LEN`]-byte entries ([`native_code_entry`]). None without code.
 pub const NATIVE_PSAR_MAGIC: [u8; 8] = *b"PSXRTDAT";
-pub const NATIVE_PSAR_VERSION: u32 = 3;
+pub const NATIVE_PSAR_VERSION: u32 = 4;
 /// magic 8, version 4, header length 4, disc ID 16, title 128, disc sectors 4, sectors per block
 /// 4, index offset 4, block count 4, code directory offset 4, code images 4, host address of the
-/// code 4, code size 4 (the last four written once the code is).
-pub const NATIVE_PSAR_HEADER_LEN: usize = 0xC0;
+/// code 4, code size 4 (these four written once the code is), flags 4 ([`NATIVE_FLAG_PAL60`]).
+pub const NATIVE_PSAR_HEADER_LEN: usize = 0xD0;
 /// Offset of the code fields in the header.
 const NATIVE_PSAR_CODE_FIELDS: u64 = 0xB0;
+/// Offset of the flags in the header.
+const NATIVE_PSAR_FLAGS: usize = 0xC0;
+/// Flag: a PAL picture runs at 60 vblanks a second (patch database `pal60`, "60 Hz" switch on).
+pub const NATIVE_FLAG_PAL60: u32 = 1;
 /// Bytes per entry of the code directory.
 pub const NATIVE_CODE_ENTRY_LEN: usize = 0x40;
 /// Raw sectors per block of a native DATA.PSAR (as PSISOIMG: 0x9300 bytes).
@@ -829,7 +833,7 @@ pub const NATIVE_BLOCK_SECTORS: u32 = 16;
 
 /// Header of a native DATA.PSAR; the index follows it. Disc ID and title are NUL-padded and cut
 /// (on a char boundary) to leave room for their NUL.
-pub fn native_psar_header(disc_id: &str, title: &str, disc_sectors: u32) -> Vec<u8> {
+pub fn native_psar_header(disc_id: &str, title: &str, disc_sectors: u32, flags: u32) -> Vec<u8> {
     fn field(out: &mut Vec<u8>, s: &str, len: usize) {
         let mut end = s.len().min(len - 1);
         while !s.is_char_boundary(end) {
@@ -849,6 +853,7 @@ pub fn native_psar_header(disc_id: &str, title: &str, disc_sectors: u32) -> Vec<
         h.extend_from_slice(&v.to_le_bytes());
     }
     h.resize(NATIVE_PSAR_HEADER_LEN, 0);
+    h[NATIVE_PSAR_FLAGS..NATIVE_PSAR_FLAGS + 4].copy_from_slice(&flags.to_le_bytes());
     h
 }
 
@@ -870,9 +875,9 @@ pub fn native_code_entry(img: &native_code::CodeImage, code: (u32, u32), table: 
     e
 }
 
-/// The PS-X executables of a disc's ISO9660 filesystem (file name, bytes); none when it has no
-/// readable filesystem.
-pub fn disc_executables(img: &DiscImage) -> Vec<(String, Vec<u8>)> {
+/// The PS-X executables of a disc's ISO9660 filesystem (file name, bytes) as they are after
+/// `patches`, applied per sector in stream order; none when it has no readable filesystem.
+pub fn disc_executables(img: &DiscImage, patches: &[&dyn ImagePatch]) -> Vec<(String, Vec<u8>)> {
     let Ok(files) = img.iso_files() else { return Vec::new() };
     let mut rd = img.reader();
     let mut out = Vec::new();
@@ -880,22 +885,40 @@ pub fn disc_executables(img: &DiscImage) -> Vec<(String, Vec<u8>)> {
         if !img.read_file(&mut rd, f, 8).is_ok_and(|h| h == b"PS-X EXE") {
             continue;
         }
-        if let Ok(bytes) = img.read_file(&mut rd, f, f.size) {
+        if let Ok(bytes) = read_patched_file(img, &mut rd, f, patches) {
             out.push((f.path.rsplit('/').next().unwrap_or(&f.path).to_string(), bytes));
         }
     }
     out
 }
 
+/// An ISO9660 file of Mode 1 or Mode 2 Form 1 sectors, with `patches` applied to each sector.
+fn read_patched_file(img: &DiscImage, rd: &mut psx2psp_core::disc::DiscReader, f: &psx2psp_core::IsoFile, patches: &[&dyn ImagePatch]) -> psx2psp_core::Result<Vec<u8>> {
+    let len = f.size as usize;
+    let mut out = Vec::with_capacity(len.next_multiple_of(2048));
+    let mut s = [0u8; SECTOR];
+    for i in 0..len.div_ceil(2048) as u32 {
+        let lba = f.lba.saturating_add(i);
+        img.read_sector(rd, lba, &mut s)?;
+        patches.iter().for_each(|p| p.apply(u64::from(lba) * SECTOR as u64, &mut s));
+        let at = if s[15] == 1 { 16 } else { 24 };
+        out.extend_from_slice(&s[at..at + 2048]);
+    }
+    out.truncate(len);
+    Ok(out)
+}
+
 /// Writes a native DATA.PSAR at `psar` (where `w` stands): header, index, the disc's blocks
-/// deflated at `level` in parallel, and the translated code.
+/// with `patches` applied and deflated at `level` in parallel, and the translated code.
 #[allow(clippy::too_many_arguments)]
 fn write_native_psar<W: Write + Seek>(
     w: &mut W,
     psar: u64,
     img: &DiscImage,
+    patches: &[&dyn ImagePatch],
     disc_id: &str,
     title: &str,
+    flags: u32,
     level: u8,
     code: &native_code::CodePack,
     monitor: &dyn Monitor,
@@ -907,7 +930,7 @@ fn write_native_psar<W: Write + Seek>(
     let blocks = img.sectors().div_ceil(NATIVE_BLOCK_SECTORS) as usize;
     let offset = |pos: u64| u32::try_from(pos).map_err(|_| psx2psp_core::Error::Unsupported("disc data exceeds 4 GiB".into()));
 
-    w.write_all(&native_psar_header(disc_id, title, img.sectors()))?;
+    w.write_all(&native_psar_header(disc_id, title, img.sectors(), flags))?;
     let index_at = w.stream_position()?;
     w.write_all(&vec![0u8; (blocks + 1) * 4])?;
     let mut pos = index_at + (blocks as u64 + 1) * 4 - psar;
@@ -922,6 +945,8 @@ fn write_native_psar<W: Write + Seek>(
         let len = (total - (first * block_len) as u64).min(batch.len() as u64) as usize;
         let buf = &mut batch[..len];
         rd.read_exact(buf)?;
+        let at = (first * block_len) as u64;
+        patches.iter().for_each(|p| p.apply(at, buf));
         let out: Vec<Vec<u8>> = buf
             .par_chunks(block_len)
             .map(|raw| {
@@ -1005,7 +1030,40 @@ pub fn convert_native(req: &ConvertRequest, monitor: &dyn Monitor) -> Result<Con
         _ => img.probe().disc_id.ok_or_else(|| EngineError::Input("no SYSTEM.CNF game ID found — enter it manually".into()))?,
     };
     monitor.log(&format!("Native: {} — ID {disc_id}, runtime psxrt {} B", d.path.display(), NATIVE_RUNTIME.len()));
-    let exes = disc_executables(&img);
+    // The disc patches of POPS mode, in the same order: PPFs, PAL→NTSC, the title's code
+    // patches, the loader CRCs. They change the disc the runtime reads and the executables the
+    // translator sees, so the translations match the patched code in RAM.
+    let id = req.patches.pops_id(&disc_id);
+    let user_ppf = match &d.ppf {
+        Some(p) => {
+            let patch = load_ppf(&img, p, 0)?;
+            monitor.log(&format!("Disc 1: {}", patch.describe()));
+            Some(patch)
+        }
+        None => None,
+    };
+    // A `pal60` game keeps its PAL picture: the runtime gives it 60 Hz in place of its 60hz patches.
+    let pal60 = d.ntsc_60hz && req.patches.pal60(&id);
+    let fixes_input = DiscInput { ntsc_60hz: d.ntsc_60hz && !pal60, ..d.clone() };
+    if pal60 {
+        monitor.log(&format!("Native: {id} runs its PAL picture at 60 Hz (PAL60), its 60hz patches stay off"));
+    }
+    let TitleFixes { config, ppfs: mut ppf, patterns: fix } = title_fixes_for(&fixes_input, &req.patches, &img, user_ppf.as_ref(), &id, 0, monitor)?;
+    if config.is_some() {
+        monitor.log("Native: the POPS config does not apply to the native runtime");
+    }
+    ppf.extend(user_ppf);
+    let base: Vec<&PpfPatch> = ppf.iter().collect();
+    let pal = if d.pal_ntsc { pal_ntsc_for(&img, &base, &id, 0, monitor)? } else { None };
+    let crc = exe_crc_for(&img, &base, pal.iter().chain(&fix).collect(), 0, monitor)?;
+    let patches: Vec<&dyn ImagePatch> = ppf
+        .iter()
+        .map(|p| p as &dyn ImagePatch)
+        .chain(pal.iter().map(|p| p as &dyn ImagePatch))
+        .chain(fix.iter().map(|p| p as &dyn ImagePatch))
+        .chain(crc.iter().map(|p| p as &dyn ImagePatch))
+        .collect();
+    let exes = disc_executables(&img, &patches);
     let found = exes.len();
     let code = native_code::build(exes).map_err(EngineError::Input)?;
     for (name, why) in &code.skipped {
@@ -1037,7 +1095,8 @@ pub fn convert_native(req: &ConvertRequest, monitor: &dyn Monitor) -> Result<Con
     let level = req.level.clamp(*LEVELS.start(), *LEVELS.end()) as u8;
     let mut stats = PsarStats::default();
     write_pbp(&mut w, &sections, 0x10, |w, psar| {
-        stats = write_native_psar(w, psar, &img, &disc_id, &req.title, level, &code, monitor)?;
+        let flags = if pal60 { NATIVE_FLAG_PAL60 } else { 0 };
+        stats = write_native_psar(w, psar, &img, &patches, &disc_id, &req.title, flags, level, &code, monitor)?;
         Ok(())
     })?;
     let file = w.into_inner().map_err(|e| EngineError::from(e.into_error()))?;
@@ -1565,18 +1624,19 @@ mod tests {
 
         let psar = pbp.read(Section::DataPsar).unwrap();
         assert_eq!(pbp.range(Section::DataPsar).start % 0x10, 0);
-        let head = native_psar_header("SLES02895", "Sheep Dog 'n' Wolf", 40);
+        let head = native_psar_header("SLES02895", "Sheep Dog 'n' Wolf", 40, 0);
         assert_eq!(psar[..NATIVE_PSAR_HEADER_LEN], head);
-        assert_eq!(psar[..12], *b"PSXRTDAT\x03\0\0\0");
+        assert_eq!(psar[..16], *b"PSXRTDAT\x04\0\0\0\xD0\0\0\0");
         assert_eq!(&psar[0x10..0x1A], b"SLES02895\0");
         assert_eq!(&psar[0x20..0x33], b"Sheep Dog 'n' Wolf\0");
         let word = |at: usize| u32::from_le_bytes(psar[at..at + 4].try_into().unwrap()) as usize;
-        assert_eq!([word(0xA0), word(0xA4), word(0xA8), word(0xAC)], [40, 16, 0xC0, 3]);
+        assert_eq!([word(0xA0), word(0xA4), word(0xA8), word(0xAC)], [40, 16, 0xD0, 3]);
         assert_eq!([word(0xB0), word(0xB4), word(0xB8), word(0xBC)], [0; 4], "no filesystem, no code");
+        assert_eq!(word(0xC0), 0, "no flags");
 
         // The index bounds every block; each one gives back its sectors, the noise stored as is.
-        let index: Vec<usize> = (0..4).map(|i| word(0xC0 + 4 * i)).collect();
-        assert_eq!(index[0], 0xC0 + 16);
+        let index: Vec<usize> = (0..4).map(|i| word(0xD0 + 4 * i)).collect();
+        assert_eq!(index[0], 0xD0 + 16);
         assert_eq!(index[3], psar.len());
         let mut back = Vec::new();
         for (i, span) in index.windows(2).enumerate() {
@@ -1592,13 +1652,25 @@ mod tests {
         assert_eq!(back, raw);
         assert_eq!((rep.stats.blocks, rep.stats.raw_bytes, rep.stats.stored_bytes), (3, raw.len() as u64, psar.len() as u64));
 
+        // PAL60: a `pal60` game with the 60 Hz switch on gets the flag; the switch alone does not.
+        let pal60 = PatchDb::parse("[game SLES-02895]\npal60 = yes\n", patchdb::Origin::User).unwrap();
+        let flags = |patches: &PatchDb, ntsc_60hz: bool| {
+            let disc = DiscInput { ntsc_60hz, ..req.discs[0].clone() };
+            let r = ConvertRequest { discs: vec![disc], patches: patches.clone(), title: req.title.clone(), output: output.clone(), donor: None, artwork: Artwork::default(), level: 1 };
+            convert_native(&r, &()).unwrap();
+            let psar = PbpFile::open(File::open(&output).unwrap()).unwrap().read(Section::DataPsar).unwrap();
+            u32::from_le_bytes(psar[0xC0..0xC4].try_into().unwrap())
+        };
+        assert_eq!([flags(&pal60, true), flags(&pal60, false), flags(&PatchDb::default(), true)], [NATIVE_FLAG_PAL60, 0, 0]);
+
         let two = ConvertRequest { discs: vec![req.discs[0].clone(), req.discs[0].clone()], ..req };
         assert!(convert_native(&two, &()).is_err(), "one disc only");
     }
 
     #[test]
     fn native_psar_header_cuts_long_fields() {
-        let h = native_psar_header("ABCDEFGHIJKLMNOPQRS", &"é".repeat(100), 0);
+        let h = native_psar_header("ABCDEFGHIJKLMNOPQRS", &"é".repeat(100), 0, NATIVE_FLAG_PAL60);
+        assert_eq!(h[0xC0..0xC4], NATIVE_FLAG_PAL60.to_le_bytes());
         assert_eq!(h.len(), NATIVE_PSAR_HEADER_LEN);
         assert_eq!(&h[0x10..0x20], b"ABCDEFGHIJKLMNO\0");
         // 63 two-byte chars fit in 127 bytes; the rest of the field is NUL.

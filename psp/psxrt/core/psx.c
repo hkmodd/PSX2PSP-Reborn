@@ -7,13 +7,26 @@
 
 #define K_BOOT_HDR 0x8000F800u /* exec struct of the boot EXE */
 
-static u32 line_cycles(const Psx *psx) { return psx->pal ? 2168 : 2153; }
-static u32 lines(const Psx *psx) { return psx->pal ? 314 : 263; }
+/* Video timing follows the GPU's video mode (GP1(08h) bit 3, GPUSTAT bit 20), as on the
+ * hardware: a PAL console shows a game that selects NTSC at 60 Hz. psx->pal is the console. */
+static int video_pal(const Psx *psx) { return (psx->gpu.stat >> 20) & 1; }
+static u32 line_cycles(const Psx *psx) { return video_pal(psx) ? 2168 : 2153; }
+static u32 lines(const Psx *psx) { return video_pal(psx) && !psx->pal60 ? 314 : 263; }
 
+void psx_video_mode(Psx *psx)
+{
+    u64 f = (u64)line_cycles(psx) * lines(psx);
+    if (psx->frame_cycles && f != psx->frame_cycles)
+        psx_log(psx, "video mode %s", video_pal(psx) ? psx->pal60 ? "PAL60" : "PAL" : "NTSC");
+    psx->frame_cycles = f;
+}
+
+/* The console's region; its BIOS leaves the GPU in the matching video mode. */
 void psx_set_region(Psx *psx, int pal)
 {
     psx->pal = pal;
-    psx->frame_cycles = (u64)line_cycles(psx) * lines(psx);
+    psx->gpu.stat = (psx->gpu.stat & ~(1u << 20)) | (u32)!!pal << 20;
+    psx_video_mode(psx);
 }
 
 u32 psx_line_cycles(const Psx *psx) { return line_cycles(psx); }
