@@ -22,6 +22,8 @@
 #define EVCB_SIZE 0x1Cu
 #define K_ENTRIES 0x80006800u /* kernel chain entries, 16 bytes each */
 #define K_STACK 0x8000DF00u   /* stack for chain functions */
+#define K_DCB 0x80007000u     /* device control blocks, 0x50 bytes each; names after them */
+#define DCB_SIZE 0x50u
 
 /* magic BIOS ROM addresses, see bios_rom_entry() */
 #define M_RCNT_V(n) (0xBFC0FF20u + (n) * 8)
@@ -1048,6 +1050,24 @@ void bios_init(Psx *psx)
     w32(psx, 0x80000120u, K_EVCB);
     w32(psx, 0x80000124u, MAX_EVENTS * EVCB_SIZE);
     g_memset(psx, K_EXCB, 0, 0x800);
+    /* Devices: libapi's firstfile looks its device up here by name before calling B(42) (and
+     * points the entry's firstfile at its own fix, unused: the HLE answers B(42) itself). */
+    static const struct { const char *name; u32 flags, sector; } dev[] = {
+        {"cdrom", 0x14, 0x800}, {"bu", 0x14, 0x80}, {"tty", 0x01, 0x01}};
+    u32 n_dev = sizeof dev / sizeof *dev, name = K_DCB + n_dev * DCB_SIZE;
+    g_memset(psx, K_DCB, 0, n_dev * DCB_SIZE + 0x20);
+    for (u32 i = 0; i < n_dev; i++) {
+        u32 e = K_DCB + i * DCB_SIZE;
+        w32(psx, e + 0, name), w32(psx, e + 4, dev[i].flags), w32(psx, e + 8, dev[i].sector);
+        for (const char *s = dev[i].name;; s++, name++) {
+            psx_write(psx, name, (u8)*s, 1);
+            if (!*s)
+                break;
+        }
+        name++;
+    }
+    w32(psx, 0x80000150u, K_DCB);
+    w32(psx, 0x80000154u, n_dev * DCB_SIZE);
     w32(psx, K_PCB, K_TCB);
     w32(psx, K_TCB, 0x4000); /* TCB 0 in use */
     /* jumps at the call vectors, for code that reads them */

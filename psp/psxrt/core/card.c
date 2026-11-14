@@ -171,6 +171,7 @@ static int f_open(Psx *psx, const char *path, u32 mode)
             psx->bios.fd[i].async = (mode & O_ASYNC) != 0;
             fd = i;
         }
+    psx_log(psx, "card open %s mode %X: fd %d", path, mode, (int)fd);
     G[R_V0] = (u32)fd;
     return 1;
 }
@@ -268,6 +269,8 @@ int card_call(Psx *psx, u32 vector, u32 fn)
     }
     if (vector != 0xB0)
         return 0;
+    if (fn == 0x41 || fn == 0x45) /* format, erase: rare */
+        psx_log(psx, "card B(%X) %X", fn, a0);
     switch (fn) {
     case 0x41: { /* format("bu00:") */
         char path[8] = {0};

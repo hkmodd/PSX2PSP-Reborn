@@ -168,10 +168,13 @@ static void open_log(const char *eboot)
         sceIoRead(fd, text, sizeof text - 1);
         sceIoClose(fd);
         for (char *s = text, *e; shot_n < (int)(sizeof shot_at / sizeof *shot_at); s = e) {
-            u32 f = (u32)strtoul(s, &e, 10);
-            if (e == s)
+            while (*s == ' ' || *s == '\n' || *s == '\r')
+                s++;
+            u32 ram = *s == 'r'; /* "r123": the PS1 RAM at frame 123 */
+            u32 f = (u32)strtoul(s + ram, &e, 10);
+            if (e == s + ram)
                 break;
-            shot_at[shot_n++] = f;
+            shot_at[shot_n++] = f | ram << 31;
         }
     }
     slash[1] = 0;
@@ -351,6 +354,19 @@ static void shot(Psx *psx, u32 frame_no)
     say("shot %s (%dx%d%s)", path, w, h, deep ? ", 24-bit" : "");
 }
 
+/* Debugging: the 2 MB of PS1 RAM, ramNNNNN.bin beside the EBOOT. */
+static void ram_dump(Psx *psx, u32 frame_no)
+{
+    char path[300];
+    snprintf(path, sizeof path, "%sram%05u.bin", base_dir, (unsigned)frame_no);
+    SceUID fd = sceIoOpen(path, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
+    if (fd < 0)
+        return;
+    sceIoWrite(fd, psx->ram, RAM_SIZE);
+    sceIoClose(fd);
+    say("ram %s", path);
+}
+
 static void present(Psx *psx, const char *status)
 {
     int w, h;
@@ -527,8 +543,8 @@ static void host_vblank(void *user)
     if (card_changed && frames - card_changed >= 30) /* a save writes many sectors in a row */
         card_save();
     for (int i = 0; i < shot_n; i++)
-        if (shot_at[i] == frames)
-            shot(&psx, frames);
+        if ((shot_at[i] & 0x7FFFFFFFu) == frames)
+            (shot_at[i] >> 31 ? ram_dump : shot)(&psx, frames);
     if (native)
         frame();
 }
