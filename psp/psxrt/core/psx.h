@@ -469,9 +469,9 @@ u8 cd_read(Psx *psx, int reg);
 void cd_write(Psx *psx, int reg, u8 v);
 void cd_update(Psx *psx);
 u32 cd_dma_word(Psx *psx);
-/* The next 44100 Hz stereo sample of the CD audio (XA), through the CD volume matrix; 0 when
+/* The next n 44100 Hz stereo samples of the CD audio (XA), through the CD volume matrix; 0 where
  * nothing is queued. */
-void cd_audio(Psx *psx, s32 *l, s32 *r);
+void cd_audio(Psx *psx, s32 *l, s32 *r, int n);
 
 /* gpu.c */
 void gpu_init(Psx *psx);
@@ -497,6 +497,42 @@ void spu_write(Psx *psx, u32 addr, u16 v);
 void spu_dma_write(Psx *psx, u32 v);
 u32 spu_dma_read(Psx *psx);
 void spu_run(Psx *psx);
+
+/* Voices played by a mixer of the host's (the PSP's sceSasCore on the Media Engine). Mode 0: the
+ * SPU mixes every voice; 1: the host may take voices at key on; 2: the host takes them and the
+ * SPU mixes them too, for comparison (spu_hw_energy). voice(voice, ev, pending) is called at a
+ * key on (SPU_HW_ON: it returns 1 if the host plays the voice; the SPU then keeps the voice's
+ * state without decoding or mixing it), at a key off of a voice the host plays (SPU_HW_OFF) and
+ * when the SPU takes such a voice back (SPU_HW_BACK); tick(pending) runs before every chunk the
+ * SPU mixes while the host plays a voice. `pending`: samples the SPU made that have not reached
+ * PsxHost.audio yet, so the event is at that sample of the stream. Not in PsxHost: Psx keeps its
+ * size, and snapshots their layout. */
+enum { SPU_HW_OFF, SPU_HW_ON, SPU_HW_BACK };
+/* Why a voice cannot be played elsewhere: its output modulates the next voice or is modulated,
+ * it plays noise, it feeds the active reverb, or its loop is not a plain VAG loop. */
+enum { SPU_FIT, SPU_UNFIT_PMON, SPU_UNFIT_NOISE, SPU_UNFIT_REVERB, SPU_UNFIT_LOOP, SPU_UNFIT_N };
+/* At SPU_HW_ON: what the voice plays, as a VAG would hold it. Bytes start..start+size of SPU
+ * RAM, the last block ending it (loop 0) or looping back (loop 1) to the last block before it
+ * with the loop-start flag, or to start. The flags of SPU RAM must be read as spu_hw_flag gives
+ * them. adopted: the voice was taken mid-play, so its envelope is in spu_hw_volume and the
+ * host's own envelope must stay at full level. */
+typedef struct SpuHwVoice {
+    u32 start, size, end, target;
+    int loop, unfit, adopted;
+} SpuHwVoice;
+const SpuHwVoice *spu_hw_voice(int voice);
+/* The VAG flag byte of the block whose PS1 flag byte is f: 0 plain, 3 loop end, 6 loop start. */
+static inline u8 spu_hw_flag(u8 f) { return (u8)(0x36063000u >> ((f & 7) * 4) & 15); }
+void spu_hw_mode(int mode, int (*voice)(int voice, int ev, int pending), void (*tick)(int pending));
+u32 spu_hw_voices(void);
+/* The volume a host-played voice has now, after the main volume and the mute bit: -7FFF..7FFF. */
+s32 spu_hw_volume(const Spu *s, int voice, int side);
+/* The 1 KB pages of SPU RAM written by transfers since the last call: 512 bits, then cleared.
+ * Returns 0 when none was. */
+int spu_hw_dirty(u32 pages[16]);
+/* Mode 2: the sum of squares of the host-played voices' mix as the SPU makes it (after the main
+ * volume), left and right, since the last call; *n gets the samples. */
+void spu_hw_energy(u64 e[2], u32 *n);
 
 /* sio.c */
 u32 sio_read(Psx *psx, u32 addr, int size);

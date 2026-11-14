@@ -466,19 +466,22 @@ static void xa_sector(Psx *psx, const u8 *raw)
     }
 }
 
-void cd_audio(Psx *psx, s32 *l, s32 *r)
+void cd_audio(Psx *psx, s32 *l, s32 *r, int n)
 {
     Cdrom *cd = &psx->cd;
-    if (cd->xa_rd == cd->xa_wr) {
-        *l = *r = 0;
-        return;
+    u32 have = cd->xa_wr - cd->xa_rd, k = 0, m = have < (u32)n ? have : (u32)n;
+    if (cd->muted) { /* the samples are used up all the same */
+        cd->xa_rd += m;
+    } else {
+        const s32 v0 = cd->vol[0], v1 = cd->vol[1], v2 = cd->vol[2], v3 = cd->vol[3];
+        for (u32 rd = cd->xa_rd; k < m; k++, rd++) {
+            u32 i = rd % CD_XA_FIFO;
+            s32 a = cd->xa_fifo[2 * i], b = cd->xa_fifo[2 * i + 1];
+            l[k] = clamp16((a * v0 + b * v2) >> 7); /* LL, RL: 0x80 is 100% */
+            r[k] = clamp16((a * v1 + b * v3) >> 7); /* LR, RR */
+        }
+        cd->xa_rd += m;
     }
-    u32 i = cd->xa_rd++ % CD_XA_FIFO;
-    s32 a = cd->xa_fifo[2 * i], b = cd->xa_fifo[2 * i + 1];
-    if (cd->muted) {
-        *l = *r = 0;
-        return;
-    }
-    *l = clamp16((a * cd->vol[0] + b * cd->vol[2]) >> 7); /* LL, RL: 0x80 is 100% */
-    *r = clamp16((a * cd->vol[1] + b * cd->vol[3]) >> 7); /* LR, RR */
+    for (k = cd->muted ? 0 : m; k < (u32)n; k++)
+        l[k] = r[k] = 0;
 }

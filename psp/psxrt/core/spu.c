@@ -124,6 +124,99 @@ typedef s16 ram16;
 static s32 rd16(const u8 *ram, u32 a) { return *(const ram16 *)(ram + a); }
 static void wr16(u8 *ram, u32 a, s32 v) { *(ram16 *)(ram + a) = (s16)v; }
 
+/* The host's mixer (spu_hw_mode): the voices it plays. The SPU still walks their blocks and
+ * envelopes, so ENDX, the envelope levels, the repeat address and the IRQ address are the
+ * hardware's; it only leaves out decoding and mixing them (mode 1). */
+static int hw_mode;
+static int (*hw_voice)(int voice, int ev, int pending);
+static void (*hw_tick)(int pending);
+static u32 hw;              /* voices the host plays */
+static u32 hw_env;          /* of those, the ones taken mid-play: their envelope is in the volume */
+static u32 hw_tried;        /* voices offered mid-play since their key on */
+static int hw_at;           /* the sample of the chunk a voice is at, for events from block_end */
+static SpuHwVoice hw_v[24];
+static u32 hw_dirty[16];    /* 1 KB pages written by transfers */
+static u64 hw_e[2], hw_en; /* mode 2: what the SPU's own mix of those voices sums to */
+
+void spu_hw_mode(int mode, int (*voice)(int voice, int ev, int pending), void (*tick)(int pending))
+{
+    hw_mode = voice ? mode : 0;
+    hw_voice = voice, hw_tick = tick;
+    hw = hw_env = hw_tried = 0;
+    memset(hw_dirty, 0xFF, sizeof hw_dirty); /* the host's copy starts from all of SPU RAM */
+}
+
+u32 spu_hw_voices(void) { return hw; }
+
+const SpuHwVoice *spu_hw_voice(int voice) { return &hw_v[voice]; }
+
+/* Whether the SPU decodes voice i's blocks: not when only the host's mixer plays it. */
+static int decodes(int i) { return !(hw >> i & 1) || hw_mode == 2; }
+
+/* What keeps voice i on the SPU whatever it plays (SPU_FIT: nothing). */
+static int unfit(const Spu *s, int i)
+{
+    u32 bit = 1u << i;
+    u32 pmon = (G(0x1F801D90) | (u32)G(0x1F801D92) << 16) & ~1u; /* voice 0 is not modulated */
+    if ((pmon | pmon >> 1) & bit)
+        return SPU_UNFIT_PMON;
+    if ((G(0x1F801D94) | (u32)G(0x1F801D96) << 16) & bit)
+        return SPU_UNFIT_NOISE;
+    if (((G(0x1F801D98) | (u32)G(0x1F801D9A) << 16) & bit) && ((s->ctrl & 0x80) || G(0x1F801D84) || G(0x1F801D86)))
+        return SPU_UNFIT_REVERB;
+    return SPU_FIT;
+}
+
+/* Voice i, starting at block `start` now, as a VAG (SpuHwVoice); or why it cannot be one. */
+static int fit(const Spu *s, int i, u32 start, SpuHwVoice *h)
+{
+    const SpuVoice *v = &s->v[i];
+    int why = unfit(s, i);
+    if (why != SPU_FIT)
+        return why;
+    /* up to the first block with the loop-end flag: where the SPU's repeat address will be
+     * there (the last loop-start flag on the way, unless the address was written), and where
+     * the VAG player loops (the last block before it that it sees as a loop start) */
+    u32 a = start, l_spu = ~0u, l_vag = ~0u;
+    u8 f;
+    for (;;) {
+        f = s->ram[a + 1];
+        if (f & 4) {
+            l_spu = a;
+            if (!(f & 1))
+                l_vag = a;
+        }
+        if (f & 1)
+            break;
+        if ((a += 16) >= 0x80000) /* the SPU would wrap to 0 */
+            return SPU_UNFIT_LOOP;
+    }
+    h->start = start, h->end = a + 16, h->size = a + 16 - start;
+    h->loop = (f & 2) != 0;
+    h->target = start;
+    if (h->loop) {
+        u32 t_spu = v->ignore_loop || l_spu == ~0u ? v->repeat : l_spu;
+        if (t_spu != (l_vag == ~0u ? start : l_vag))
+            return SPU_UNFIT_LOOP;
+        h->target = t_spu;
+    }
+    return SPU_FIT;
+}
+
+int spu_hw_dirty(u32 pages[16])
+{
+    u32 any = 0;
+    for (int k = 0; k < 16; k++)
+        any |= pages[k] = hw_dirty[k], hw_dirty[k] = 0;
+    return any != 0;
+}
+
+void spu_hw_energy(u64 e[2], u32 *n)
+{
+    e[0] = hw_e[0], e[1] = hw_e[1], *n = (u32)hw_en;
+    hw_e[0] = hw_e[1] = hw_en = 0;
+}
+
 static void irq(Psx *psx)
 {
     Spu *s = &psx->spu;
@@ -158,6 +251,24 @@ static inline s32 volume(u16 reg, SpuSweep *w)
         w->level = env_step(w->level, reg >> 14 & 1, dec, reg >> 2 & 31, dec ? st - 8 : 7 - st, &w->wait);
     }
     return (reg & 0x1000) ? -w->level : w->level;
+}
+
+/* The level volume() last gave, without a step. */
+static s32 volume_now(u16 reg, const SpuSweep *w)
+{
+    if (!(reg & 0x8000))
+        return (s16)(reg << 1);
+    return (reg & 0x1000) ? -w->level : w->level;
+}
+
+s32 spu_hw_volume(const Spu *s, int voice, int side)
+{
+    if ((s->ctrl & 0xC000) != 0xC000) /* SPU off, or muted */
+        return 0;
+    s32 v = volume_now(VR(voice, side), &s->v[voice].vol[side]);
+    if (hw_env >> voice & 1)
+        v = v * s->v[voice].env >> 15;
+    return v * volume_now(G(0x1F801D80 + 2 * side), &s->main[side]) >> 15;
 }
 
 static void set_volume(SpuSweep *w, u16 reg)
@@ -196,18 +307,22 @@ static void adsr(Spu *s, SpuVoice *v, int i)
     }
 }
 
-/* Entering the block at v->addr: its loop-start flag, the IRQ address, and (for a voice that
- * sounds) its 28 samples. */
-static void block(Psx *psx, SpuVoice *v, int decode)
+/* A sustain envelope whose steps leave its level as it is (at 0x7FFF going up, at 0 going down)
+ * stays there until a key off or an ADSR write: the samples between its steps, or 0 if it moves. */
+static s32 env_still(const Spu *s, const SpuVoice *v, int i)
 {
-    Spu *s = &psx->spu;
+    if (v->phase != SPU_SUSTAIN)
+        return 0;
+    u16 a2 = VR(i, 5);
+    int dec = a2 >> 14 & 1, st = a2 >> 6 & 3;
+    s32 p;
+    return env_step(v->env, a2 >> 15, dec, a2 >> 8 & 31, dec ? st - 8 : 7 - st, &p) == v->env ? p : 0;
+}
+
+/* The 28 samples of the block at v->addr, after the last three of the previous one. */
+static void decode(const Spu *s, SpuVoice *v)
+{
     const u8 *b = s->ram + v->addr;
-    if ((b[1] & 4) && !v->ignore_loop)
-        v->repeat = v->addr;
-    if ((s->ctrl & 0x40) && s->irq_addr - v->addr < 16)
-        irq(psx);
-    if (!decode)
-        return;
     memcpy(v->buf, v->buf + 28, 3 * sizeof v->buf[0]);
     int shift = b[0] & 15, f = b[0] >> 4 & 7;
     if (shift > 12)
@@ -224,6 +339,51 @@ static void block(Psx *psx, SpuVoice *v, int decode)
     v->hist[0] = (s16)h0, v->hist[1] = (s16)h1;
 }
 
+/* Entering the block at v->addr: its loop-start flag, the IRQ address, and (for a voice that
+ * the SPU sounds) its samples. */
+static void block(Psx *psx, SpuVoice *v, int dec)
+{
+    Spu *s = &psx->spu;
+    const u8 *b = s->ram + v->addr;
+    if ((b[1] & 4) && !v->ignore_loop)
+        v->repeat = v->addr;
+    if ((s->ctrl & 0x40) && s->irq_addr - v->addr < 16)
+        irq(psx);
+    if (dec)
+        decode(s, v);
+}
+
+/* The host stops playing voice i, `at` samples into the chunk; with `resume` the SPU sounds it
+ * again from its current block (the ADPCM history starts over: the host had it). */
+static void hw_release(Psx *psx, int i, int at, int resume)
+{
+    u32 bit = 1u << i;
+    if (!(hw & bit))
+        return;
+    hw &= ~bit, hw_env &= ~bit;
+    hw_voice(i, SPU_HW_BACK, psx->spu.nout + at);
+    SpuVoice *v = &psx->spu.v[i];
+    if (resume && hw_mode == 1 && v->phase != SPU_OFF) {
+        v->hist[0] = v->hist[1] = 0;
+        memset(v->buf, 0, sizeof v->buf);
+        decode(&psx->spu, v);
+    }
+}
+
+/* A voice that loops back while the SPU sounds it: offered to the host once per key on, the
+ * loop being where a VAG player can start it. */
+static void adopt(Psx *psx, int i)
+{
+    Spu *s = &psx->spu;
+    u32 bit = 1u << i;
+    hw_tried |= bit;
+    SpuHwVoice *h = &hw_v[i];
+    h->unfit = fit(s, i, s->v[i].addr, h);
+    h->adopted = 1;
+    if (hw_voice(i, SPU_HW_ON, s->nout + hw_at))
+        hw |= bit, hw_env |= bit;
+}
+
 /* Leaving the block at v->addr: its loop-end flag (ENDX, jump to the repeat address, and without
  * the repeat flag the voice goes silent), then the next block. */
 static void block_end(Psx *psx, SpuVoice *v, int i)
@@ -236,19 +396,23 @@ static void block_end(Psx *psx, SpuVoice *v, int i)
         u32 non = G(0x1F801D94) | (u32)G(0x1F801D96) << 16;
         if (!(f & 2) && !(non >> i & 1))
             v->phase = SPU_OFF, v->env = 0;
+        else if (hw_mode && v->phase == SPU_SUSTAIN && !((hw | hw_tried) >> i & 1))
+            adopt(psx, i);
     } else {
         v->addr = (v->addr + 16) & 0x7FFF0;
     }
-    block(psx, v, v->phase != SPU_OFF);
+    block(psx, v, v->phase != SPU_OFF && decodes(i));
 }
 
 static void key_on(Psx *psx, int i)
 {
     Spu *s = &psx->spu;
     SpuVoice *v = &s->v[i];
+    u32 bit = 1u << i;
     if (psx->trace & 32)
         psx_log(psx, "spu: kon %d addr %05X pitch %04X vol %04X/%04X adsr %04X%04X main %04X/%04X ctrl %04X", i,
                 (unsigned)VR(i, 3) << 3, VR(i, 2), VR(i, 0), VR(i, 1), VR(i, 4), VR(i, 5), G(0x1F801D80), G(0x1F801D82), s->ctrl);
+    hw_release(psx, i, 0, 0);
     v->addr = ((u32)VR(i, 3) << 3) & 0x7FFF0;
     v->counter = 0;
     v->env = 0, v->env_wait = 0;
@@ -256,15 +420,26 @@ static void key_on(Psx *psx, int i)
     v->ignore_loop = 0;
     v->hist[0] = v->hist[1] = 0;
     memset(v->buf, 0, sizeof v->buf);
-    s->endx &= ~(1u << i);
-    block(psx, v, 1);
+    s->endx &= ~bit;
+    hw_tried &= ~bit;
+    if (hw_mode) {
+        SpuHwVoice *h = &hw_v[i];
+        h->unfit = fit(s, i, v->addr, h);
+        h->adopted = 0;
+        if (hw_voice(i, SPU_HW_ON, s->nout))
+            hw |= bit;
+    }
+    block(psx, v, decodes(i));
 }
 
-static void key_off(Spu *s, int i)
+static void key_off(Psx *psx, int i)
 {
-    SpuVoice *v = &s->v[i];
-    if (v->phase != SPU_OFF)
-        v->phase = SPU_RELEASE, v->env_wait = 0;
+    SpuVoice *v = &psx->spu.v[i];
+    if (v->phase == SPU_OFF)
+        return;
+    v->phase = SPU_RELEASE, v->env_wait = 0;
+    if ((hw & ~hw_env) >> i & 1) /* a voice taken mid-play releases through its volume */
+        hw_voice(i, SPU_HW_OFF, psx->spu.nout);
 }
 
 /* A silent voice still walks its blocks: ENDX, the repeat address and the IRQ address stay as
@@ -272,11 +447,69 @@ static void key_off(Spu *s, int i)
 static void skip(Psx *psx, SpuVoice *v, int i, int n, u32 pitch)
 {
     u32 c = v->counter + (pitch > 0x3FFF ? 0x4000 : pitch) * (u32)n;
-    while (c >= 28u << 12) {
-        c -= 28u << 12;
+    u32 left = c / (28u << 12), done = 0;
+    v->counter = c % (28u << 12);
+    /* Within the call SPU RAM and the registers stay as they are, so once a loop end brings the
+     * voice back to where an earlier one did (address and repeat address alike) the walk repeats
+     * itself: ENDX, the loop starts and the IRQ (held until acknowledged) do nothing new. Whole
+     * laps go at once. */
+    u32 a0 = 1, r0 = 0, at0 = 0; /* after the last loop end: a block address is never odd */
+    while (left) {
+        u8 f = psx->spu.ram[v->addr + 1];
         block_end(psx, v, i);
+        left--, done++;
+        if ((f & 1) && left) {
+            if (v->addr == a0 && v->repeat == r0) {
+                left %= done - at0;
+                a0 = 1;
+            } else {
+                a0 = v->addr, r0 = v->repeat, at0 = done;
+            }
+        }
     }
-    v->counter = c;
+}
+
+/* Voice i over n samples from sample k of the chunk while the host plays it: the pitch counter,
+ * the blocks, the envelope and the volume sweeps go on as in voice(), without a sample made.
+ * Stretches with no envelope change, sweep or block end go in one step: a still envelope's
+ * counter goes on modulo its steps. */
+static void shadow(Psx *psx, int i, int k, int n)
+{
+    Spu *s = &psx->spu;
+    SpuVoice *v = &s->v[i];
+    u32 pitch = VR(i, 2), step = pitch > 0x3FFF ? 0x4000 : pitch;
+    u16 vl = VR(i, 0), vr = VR(i, 1);
+    int sweep = (vl | vr) & 0x8000;
+    s32 still = env_still(s, v, i);
+    while (v->phase != SPU_OFF && k < n) {
+        int m = sweep ? 0 : n - k;
+        if (!still && m > v->env_wait - 1)
+            m = v->env_wait - 1; /* below 1 when a step is due now: no stretch, m stays so */
+        if (m > 0 && step && (u32)m > ((28u << 12) - 1 - v->counter) / step)
+            m = (int)(((28u << 12) - 1 - v->counter) / step);
+        if (m > 0) {
+            s32 w = v->env_wait > 1 ? v->env_wait : 1; /* the samples to its next step */
+            v->env_wait = m < w ? w - m : still - (m - w) % still;
+            v->counter += step * (u32)m, k += m;
+            continue;
+        }
+        if (--v->env_wait <= 0)
+            adsr(s, v, i);
+        if (vl & 0x8000)
+            volume(vl, &v->vol[0]);
+        if (vr & 0x8000)
+            volume(vr, &v->vol[1]);
+        u32 c = v->counter + step;
+        k++;
+        if (c >= 28u << 12) {
+            v->counter = c - (28u << 12);
+            block_end(psx, v, i);
+        } else {
+            v->counter = c;
+        }
+    }
+    if (k < n)
+        skip(psx, v, i, n - k, pitch);
 }
 
 /* Voice i over n samples: out[] gets its level (the next voice's modulation), the mixes its
@@ -291,6 +524,7 @@ static void voice(Psx *psx, int i, int n, const s16 *mod, s16 *out, int need_out
     int is_noise = ((G(0x1F801D94) | (u32)G(0x1F801D96) << 16) & bit) != 0;
     int rev = ((G(0x1F801D98) | (u32)G(0x1F801D9A) << 16) & bit) != 0;
     u16 vl = VR(i, 0), vr = VR(i, 1);
+    s32 still = env_still(s, v, i);
     int k = 0;
     while (v->phase != SPU_OFF && k < n) {
         u32 c = v->counter;
@@ -302,8 +536,12 @@ static void voice(Psx *psx, int i, int n, const s16 *mod, s16 *out, int need_out
             const s16 *b = v->buf + (c >> 12);
             x = (gauss[0xFF - g] * b[0] >> 15) + (gauss[0x1FF - g] * b[1] >> 15) + (gauss[0x100 + g] * b[2] >> 15) + (gauss[g] * b[3] >> 15);
         }
-        if (--v->env_wait <= 0)
-            adsr(s, v, i);
+        if (--v->env_wait <= 0) {
+            if (still) /* the step adsr() would make */
+                v->env_wait = still;
+            else
+                adsr(s, v, i);
+        }
         x = clamp16(x * v->env >> 15);
         out[k] = (s16)x;
         s32 l = x * volume(vl, &v->vol[0]) >> 15, r = x * volume(vr, &v->vol[1]) >> 15;
@@ -317,7 +555,14 @@ static void voice(Psx *psx, int i, int n, const s16 *mod, s16 *out, int need_out
         k++;
         if (c >= 28u << 12) {
             v->counter = c - (28u << 12);
+            hw_at = k;
             block_end(psx, v, i);
+            if (hw_mode == 1 && (hw & bit)) { /* the host took it at its loop */
+                if (need_out)
+                    memset(out + k, 0, (size_t)(n - k) * sizeof *out);
+                shadow(psx, i, k, n);
+                return;
+            }
         } else {
             v->counter = c;
         }
@@ -379,11 +624,25 @@ static s32 rv_apf(Spu *s, const Rv *w, s32 x, int m, int d, int vol)
     return clamp16((x * g >> 15) + t);
 }
 
-static void reverb(Spu *s, s32 inl, s32 inr)
+/* Whether the reverb only reads zeros over a chunk: it writes nothing and its work area, clear of
+ * the capture buffers the chunk writes, holds zeros (looked at when it is at most 1 KB, so the
+ * look costs less than the steps it saves). */
+static int rev_silent(const Spu *s)
+{
+    u32 a = (u32)G(0x1F801DA2) * 8;
+    if ((s->ctrl & 0x80) || a < 0x1000 || a < 0x80000 - 0x400)
+        return 0;
+    u32 w = 0;
+    for (; a < 0x80000 && !w; a += 4)
+        memcpy(&w, s->ram + a, 4);
+    return !w;
+}
+
+static void reverb(Spu *s, s32 inl, s32 inr, int silent)
 {
     u32 base = (u32)G(0x1F801DA2) * 4;
     s16 lout = (s16)G(0x1F801D84), rout = (s16)G(0x1F801D86);
-    if (!(s->ctrl & 0x80) && !lout && !rout) { /* nothing written, nothing heard */
+    if (silent || (!(s->ctrl & 0x80) && !lout && !rout)) { /* nothing written, nothing heard */
         s->rev_out[0] = s->rev_out[1] = 0;
     } else {
         const Rv rv = {s->ram, (s32)base, 0x40000 - (s32)base, (s32)s->rev_cur - (s32)base, (s->ctrl & 0x80) != 0}, *w = &rv;
@@ -439,47 +698,101 @@ static void render(Psx *psx, int n)
             noise[k] = (s16)s->noise;
         }
     }
+    if (hw) {
+        /* a voice the host plays that has come to need what only the SPU does goes back to it */
+        for (int i = 0; i < 24; i++)
+            if ((hw >> i & 1) && unfit(s, i) != SPU_FIT)
+                hw_release(psx, i, 0, 1);
+        if (hw && hw_tick)
+            hw_tick(s->nout);
+    }
+    static s32 hl[SPU_CHUNK], hr[SPU_CHUNK]; /* mode 2: the host's voices as the SPU mixes them */
+    int both = hw_mode == 2 && hw;
+    if (both)
+        memset(hl, 0, bytes), memset(hr, 0, bytes);
     s16 *mod = va, *out = vb; /* voice 0 has no modulation: its mod is not read */
     for (int i = 0; i < 24; i++) {
         /* a voice's output is read as the next one's modulation, and voices 1 and 3 are captured */
         int need_out = i == 1 || i == 3 || (pmon >> (i + 1) & 1);
-        voice(psx, i, n, mod, out, need_out, noise, dl, dr, rl, rr);
+        if (hw >> i & 1) {
+            if (hw_mode == 1) {
+                if (need_out) /* capture of a voice the host plays: silence */
+                    memset(out, 0, (size_t)n * sizeof *out);
+                shadow(psx, i, 0, n);
+            } else {
+                voice(psx, i, n, mod, out, need_out, noise, hl, hr, rl, rr);
+            }
+            if (s->v[i].phase == SPU_OFF)
+                hw_release(psx, i, n, 0);
+        } else {
+            voice(psx, i, n, mod, out, need_out, noise, dl, dr, rl, rr);
+        }
         if (i == 1 || i == 3)
             memcpy(i == 1 ? cap1 : cap3, out, (size_t)n * sizeof *out);
         s16 *t = mod;
         mod = out, out = t;
     }
+    if (both) {
+        s32 m0 = (s->ctrl & 0xC000) == 0xC000 ? volume_now(G(0x1F801D80), &s->main[0]) : 0;
+        s32 m1 = (s->ctrl & 0xC000) == 0xC000 ? volume_now(G(0x1F801D82), &s->main[1]) : 0;
+        for (int k = 0; k < n; k++) {
+            s32 l = clamp16(hl[k]) * m0 >> 15, r = clamp16(hr[k]) * m1 >> 15;
+            hw_e[0] += (u64)((s64)l * l), hw_e[1] += (u64)((s64)r * r);
+            dl[k] += hl[k], dr[k] += hr[k];
+        }
+    }
+    if (hw_mode == 2) /* the energy is over all of the time, as the host's */
+        hw_en += (u32)n;
     s32 cdl = (s16)G(0x1F801DB0), cdr = (s16)G(0x1F801DB2);
     u16 ml = G(0x1F801D80), mr = G(0x1F801D82);
+    int rev_quiet = rev_silent(s);
+    /* Nothing in the loop writes the registers, and its stores to SPU RAM (u8, so they may alias
+     * anything) would otherwise make every field of s be loaded again each sample: the state it
+     * carries lives in locals and goes back to s where something else reads it. */
+    const u16 ctrl = s->ctrl;
+    const int cd_in = ctrl & 1, cd_rev = (ctrl & 5) == 5, unmuted = (ctrl & 0x4000) != 0;
+    const u32 irq_c = (ctrl & 0x40) && s->irq_addr < 0x1000 ? (s->irq_addr & 0x3FF) : ~0u;
+    u8 *const ram = s->ram;
+    s16 *const o = s->out;
+    const int cap = (int)(sizeof s->out / sizeof s->out[0] / 2);
+    u32 capture = s->capture;
+    int nout = s->nout, odd = s->rev_odd;
+    s32 ril = s->rev_in[0], rir = s->rev_in[1];
+    static s32 xl[SPU_CHUNK], xr[SPU_CHUNK]; /* nothing in the loop touches the CD's queue */
+    cd_audio(psx, xl, xr, n);
     for (int k = 0; k < n; k++) {
-        s32 cl, cr;
-        cd_audio(psx, &cl, &cr);
-        u32 c = s->capture * 2;
-        wr16(s->ram, c, cl), wr16(s->ram, 0x400 + c, cr), wr16(s->ram, 0x800 + c, cap1[k]), wr16(s->ram, 0xC00 + c, cap3[k]);
-        if ((s->ctrl & 0x40) && s->irq_addr < 0x1000 && (s->irq_addr & 0x3FF) == c)
+        s32 cl = xl[k], cr = xr[k];
+        u32 c = capture * 2;
+        wr16(ram, c, cl), wr16(ram, 0x400 + c, cr), wr16(ram, 0x800 + c, cap1[k]), wr16(ram, 0xC00 + c, cap3[k]);
+        if (c == irq_c)
             irq(psx);
-        s->capture = (s->capture + 1) & 0x1FF;
+        capture = (capture + 1) & 0x1FF;
         s32 l = dl[k], r = dr[k], vl = any_rev ? rl[k] : 0, vr = any_rev ? rr[k] : 0;
-        if (s->ctrl & 1) {
+        if (cd_in) {
             cl = cl * cdl >> 15, cr = cr * cdr >> 15;
             l += cl, r += cr;
-            if (s->ctrl & 4)
+            if (cd_rev)
                 vl += cl, vr += cr;
         }
-        s->rev_in[0] += vl, s->rev_in[1] += vr;
-        if (!(s->rev_odd ^= 1)) {
-            reverb(s, clamp16(s->rev_in[0] >> 1), clamp16(s->rev_in[1] >> 1));
-            s->rev_in[0] = s->rev_in[1] = 0;
+        ril += vl, rir += vr;
+        if (!(odd ^= 1)) {
+            reverb(s, clamp16(ril >> 1), clamp16(rir >> 1), rev_quiet);
+            ril = rir = 0;
         }
         l = clamp16(l + s->rev_out[0]) * volume(ml, &s->main[0]) >> 15;
         r = clamp16(r + s->rev_out[1]) * volume(mr, &s->main[1]) >> 15;
-        if (!(s->ctrl & 0x4000)) /* not unmuted */
+        if (!unmuted)
             l = r = 0;
-        s->out[2 * s->nout] = (s16)l, s->out[2 * s->nout + 1] = (s16)r;
-        if (++s->nout == (int)(sizeof s->out / sizeof s->out[0] / 2))
+        o[2 * nout] = (s16)l, o[2 * nout + 1] = (s16)r;
+        if (++nout == cap) {
+            s->nout = nout;
             flush(psx);
+            nout = 0;
+        }
     }
-    s->stat = (u16)((s->stat & ~0x800u) | (s->capture >= 0x100) << 11);
+    s->capture = capture, s->nout = nout, s->rev_odd = odd;
+    s->rev_in[0] = ril, s->rev_in[1] = rir;
+    s->stat = (u16)((s->stat & ~0x800u) | (capture >= 0x100) << 11);
 }
 
 /* Runs the SPU up to the CPU's time. */
@@ -507,8 +820,10 @@ static void sync(Psx *psx)
         static u64 next;
         if (s->last >= next) {
             next = s->last + (u64)CYCLES_PER_SAMPLE * 44100;
-            psx_log(psx, "spu: ctrl %04X main %04X/%04X cd %04X/%04X rev %04X/%04X endx %06X", s->ctrl, G(0x1F801D80), G(0x1F801D82),
-                    G(0x1F801DB0), G(0x1F801DB2), G(0x1F801D84), G(0x1F801D86), (unsigned)s->endx);
+            psx_log(psx, "spu: ctrl %04X main %04X/%04X cd %04X/%04X rev %04X/%04X endx %06X pmon %06X non %06X eon %06X apf1 %04X base %04X hw %06X",
+                    s->ctrl, G(0x1F801D80), G(0x1F801D82), G(0x1F801DB0), G(0x1F801DB2), G(0x1F801D84), G(0x1F801D86), (unsigned)s->endx,
+                    G(0x1F801D90) | (unsigned)G(0x1F801D92) << 16, G(0x1F801D94) | (unsigned)G(0x1F801D96) << 16,
+                    G(0x1F801D98) | (unsigned)G(0x1F801D9A) << 16, G(0x1F801DC0), G(0x1F801DA2), (unsigned)hw);
             for (int i = 0; i < 24; i++)
                 if (s->v[i].phase != SPU_OFF)
                     psx_log(psx, "spu:  v%d ph %d env %04X vol %04X/%04X pitch %04X addr %05X rep %05X", i, s->v[i].phase,
@@ -554,6 +869,11 @@ static void transfer(Psx *psx, u16 v)
 {
     Spu *s = &psx->spu;
     u32 a = s->xfer_addr & 0x7FFFE;
+    if (hw && !(a & 15) && s->ram[a + 1] != (u8)(v >> 8)) /* a new flag byte: the VAG the host plays may differ */
+        for (int i = 0; i < 24; i++)
+            if ((hw >> i & 1) && a >= hw_v[i].start && a < hw_v[i].end)
+                hw_release(psx, i, 0, 1);
+    hw_dirty[a >> 15] |= 1u << (a >> 10 & 31);
     wr16(s->ram, a, v);
     if ((s->ctrl & 0x40) && a == s->irq_addr)
         irq(psx);
@@ -571,10 +891,14 @@ void spu_write(Psx *psx, u32 addr, u16 v)
         case 0x0: set_volume(&vc->vol[0], v); break;
         case 0x2: set_volume(&vc->vol[1], v); break;
         case 0xC: vc->env = v & 0x7FFF; break;
-        case 0xE:
+        case 0xE: {
+            int i = (int)(off >> 4);
             vc->repeat = ((u32)v << 3) & 0x7FFF0;
             vc->ignore_loop = vc->phase != SPU_OFF;
+            if ((hw >> i & 1) && hw_v[i].loop && vc->repeat != hw_v[i].target) /* not where the host loops */
+                hw_release(psx, i, 0, 1);
             break;
+        }
         }
         return;
     }
@@ -593,7 +917,7 @@ void spu_write(Psx *psx, u32 addr, u16 v)
         sync(psx);
         for (int i = 0; i < 16; i++)
             if (v >> i & 1)
-                key_off(s, i + (addr == 0x1F801D8E) * 16);
+                key_off(psx, i + (addr == 0x1F801D8E) * 16);
         break;
     case 0x1F801DA2: s->rev_cur = (u32)v * 4; break;
     case 0x1F801DA4: s->irq_addr = (u32)v << 3; break;

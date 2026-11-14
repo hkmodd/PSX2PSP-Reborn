@@ -35,6 +35,7 @@
 #include "ge.h"
 #include "native.h"
 #include "psx.h"
+#include "sas.h"
 #include "snap.h"
 
 PSP_MODULE_INFO("PSX2PSP_psxrt", PSP_MODULE_USER, 0, 3);
@@ -62,6 +63,10 @@ static SceUID log_fd = -1;
 static char log_path[256]; /* reopened to append: only a close updates the size on the stick */
 static int trace_bits; /* from psxrt.trace beside the EBOOT */
 static int cpu_override = -1; /* from psxrt.cpu beside the EBOOT */
+/* psxrt.spu beside the EBOOT: "cpu" (0) the SPU mixes every voice; "both" (2) sceSasCore plays
+ * its voices beside the SPU, for the level comparison; otherwise (1) sceSasCore plays them */
+static int spu_mode = 1;
+static volatile int sas_on; /* spu_mode, once sceSasCore runs */
 /* psxrt.watch beside the EBOOT: PS1 RAM words logged once a second, last value and the sum of
  * the values seen at each display flip (a per-frame variable summed over the game's frames) */
 #define WATCH_MAX 8
@@ -89,7 +94,7 @@ static int log_len;
 #define BENCH_SKIP 2
 static u32 bench_secs, bench_n;
 static struct {
-    u32 speed, vbl, fps, interp, io, draw, spu, timer, dma2, update, present, sleep;
+    u32 speed, vbl, fps, interp, io, draw, spu, timer, dma2, update, present, sleep, sas;
 } bench;
 
 static void halt(const char *why) __attribute__((noreturn));
@@ -189,6 +194,14 @@ static void open_log(const char *eboot)
         sceIoRead(fd, num, sizeof num - 1);
         sceIoClose(fd);
         cpu_override = (int)strtol(num, NULL, 10);
+    }
+    snprintf(slash + 1, sizeof path - (size_t)(slash + 1 - path), "psxrt.spu");
+    fd = sceIoOpen(path, PSP_O_RDONLY, 0);
+    if (fd >= 0) {
+        char word[16] = {0};
+        sceIoRead(fd, word, sizeof word - 1);
+        sceIoClose(fd);
+        spu_mode = !strncmp(word, "cpu", 3) ? 0 : !strncmp(word, "both", 4) ? 2 : 1;
     }
     snprintf(slash + 1, sizeof path - (size_t)(slash + 1 - path), "psxrt.bench");
     fd = sceIoOpen(path, PSP_O_RDONLY, 0);
@@ -787,17 +800,23 @@ static void frame(void)
                                       ms_of(d->us_run[ch]), ms_of(d->words[ch]));
                 n += snprintf(line + n, sizeof line - (size_t)n, "\n");
                 memset(d->n_run, 0, sizeof d->n_run), memset(d->us_run, 0, sizeof d->us_run), memset(d->words, 0, sizeof d->words);
+                if (sas_on) {
+                    u32 us;
+                    n += sas_log(line + n, (int)sizeof line - n, &us);
+                    if (bench_secs && bench_n > BENCH_SKIP)
+                        bench.sas += us / 1000;
+                }
             }
             n += ge_log(line + n, (int)sizeof line - n);
             u32 k = bench_n - BENCH_SKIP;
             if (bench_secs && bench_n > BENCH_SKIP && k >= bench_secs)
                 n += snprintf(line + n, sizeof line - (size_t)n,
                               "-- bench %u s at frame %u: speed %u%% vbl %u fps %u.%u | ms/s interp %u io %u (draw %u spu %u timer %u)"
-                              " dma2 %u update %u present %u sleep %u\n",
+                              " dma2 %u update %u present %u sleep %u | sas thread %u\n",
                               (unsigned)k, (unsigned)frames, (unsigned)(bench.speed / k), (unsigned)(bench.vbl / k), (unsigned)(bench.fps / k),
                               (unsigned)(bench.fps * 10 / k % 10), (unsigned)(bench.interp / k), (unsigned)(bench.io / k), (unsigned)(bench.draw / k),
                               (unsigned)(bench.spu / k), (unsigned)(bench.timer / k), (unsigned)(bench.dma2 / k), (unsigned)(bench.update / k),
-                              (unsigned)(bench.present / k), (unsigned)(bench.sleep / k));
+                              (unsigned)(bench.present / k), (unsigned)(bench.sleep / k), (unsigned)(bench.sas / k));
             log_flush();
             sceIoWrite(log_fd, line, n);
             log_keep();
@@ -826,8 +845,13 @@ static u32 host_usec(void *user)
  * consumer trims it, when it runs dry the channel gets silence. ---- */
 #define AUDIO_RING 16384 /* stereo samples, a power of two */
 #define AUDIO_BLOCK 1024 /* samples per hardware output, a multiple of 64 */
-static s16 audio_ring[AUDIO_RING * 2];
+static s16 audio_ring[AUDIO_RING * 2] __attribute__((aligned(64))); /* sceSasCore mixes into its grains */
 static volatile u32 audio_rd, audio_wr;
+
+/* sceSasCore (sas.c): the SPU's events at the stream's sample they belong to */
+static int host_spu_voice(int voice, int ev, int pending) { return sas_voice(voice, ev, audio_wr + (u32)pending); }
+
+static void host_spu_tick(int pending) { sas_tick(audio_wr + (u32)pending); }
 
 static void host_audio(void *user, const s16 *samples, int frames)
 {
@@ -859,7 +883,13 @@ static int audio_thread(SceSize args, void *argp)
     s32 avg = target; /* the fill, smoothed over ~16 blocks */
     u32 pos = 0;      /* 16.16: the fraction of a sample past rd */
     for (;;) {
-        u32 rd = audio_rd, fill = audio_wr - rd;
+        u32 top = audio_wr; /* with sceSasCore playing voices: up to where it has mixed them in */
+        if (sas_on) {
+            u32 mixed = sas_mix(audio_ring, AUDIO_RING, top);
+            if (sas_on == 1)
+                top = mixed;
+        }
+        u32 rd = audio_rd, fill = top - rd;
         if (fill > 8 * AUDIO_BLOCK) /* more than ~190 ms behind: catch up to ~70 ms */
             rd += fill - (u32)target, fill = (u32)target, avg = target, audio_trims++;
         avg += ((s32)fill - avg) / 16;
@@ -1056,6 +1086,16 @@ int main(int argc, char **argv)
     host.card_dirty = host_card_dirty;
     psx_init(&psx, &host, (u8 *)FIXED_BASE, (u8 *)SCRATCH_BASE, vram, spu_ram, mdec_in, MDEC_WORDS);
     psx.trace = trace_bits;
+    if (spu_mode) { /* before the SPU makes a sample: the stream's sample 0 is sceSasCore's */
+        const char *why = sas_init(&psx, spu_mode, palloc);
+        if (why) {
+            say("sceSasCore: %s; the SPU mixes every voice", why);
+        } else {
+            spu_hw_mode(spu_mode, host_spu_voice, host_spu_tick); /* every page dirty: the first voice brings all of SPU RAM */
+            sas_on = spu_mode;
+            say("sceSasCore plays the SPU's voices%s", spu_mode == 2 ? " beside it (comparison)" : "");
+        }
+    }
     psx.pal60 = !!(disc_info.flags & DISC_PAL60);
     if (psx.pal60)
         say("PAL60: a PAL picture at 60 Hz");

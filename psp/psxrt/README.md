@@ -66,12 +66,38 @@ Files beside the EBOOT drive the runtime for development (`docs/recomp/S9.md`):
 | `psxrt.bench` | seconds to measure after `BENCH_SKIP` (2); then one `-- bench` line (speed, vblanks, fps, ms/s by kind) and a stop |
 | `psxrt.shots` | frame numbers to save as `shotNNNNN.bmp`; `rNNN` saves a RAM dump instead |
 | `psxrt.pad` | `frame buttons frames` lines: scripted presses |
+| `psxrt.spu` | `cpu`: the SPU mixes every voice; `both`: sceSasCore mixes its voices into a buffer nobody hears, beside the SPU, and the `-- sas` line compares the levels; anything else or no file: sceSasCore plays them (the default, S17) |
 
 Recipes (`crates/psx2psp-recomp/src/hooks.rs`) are library code found by its exact words and
 served by the runtime (`native.c`, "recipes") instead of its translation: libpad's
 `_padChkRC2wait` and the /ACK wait of `_padSioRW2`, which spin on root counter 2, become one
 host call that reads the same registers, gives the same results and lets PS1 time jump to the
 expiry. The log's `hooks` counts them.
+
+## sceSasCore (S17)
+
+`sas.c` plays the SPU's ADPCM voices with sceSasCore, which the PSP runs on the Media Engine
+(`docs/recomp/S17.md`). The core offers each voice at its key on, and a sustained voice once more
+when it loops back. The voice is taken if the PSP's VAG player can play it: no pitch modulation,
+noise or reverb on it, and a loop the player can follow. A taken voice still walks in the SPU
+without being decoded, so ENDX, IRQs, envelope levels and volume sweeps stay exact. The voice
+goes back to the SPU when the guest asks for something only the SPU does.
+
+- The player reads a mirror of SPU RAM. Its flag bytes are rewritten for the VAG player.
+- Pages the guest writes reach the mirror at the same sample of the stream.
+- Commands carry the stream sample they belong to, and the audio thread applies them at the
+  nearest 256-sample grain.
+- If the sascore module does not load, the SPU mixes everything, as with `psxrt.spu` `cpu`.
+
+The log's `-- sas` line counts, per second:
+
+- voices taken, adopted, given back and refused (by reason);
+- commands and lost commands;
+- page copies;
+- sceSasCore errors;
+- grains and their time.
+
+In `both` mode it also gives the RMS of both mixes.
 
 ## DATA.PSAR (version 4)
 
