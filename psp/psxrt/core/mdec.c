@@ -26,21 +26,33 @@ static int halfword(Mdec *m, u16 *h)
     return 1;
 }
 
+/* Two matrix passes. A coefficient is within +-0x400 and a scale entry within +-0x8000, so a
+ * first-pass sum stays below 2^28: exact in 32 bits, and the second pass is 32x32->64 multiply-adds
+ * (one MADD each on the PSP). Columns of zero coefficients, most of them in a video, are skipped:
+ * their first-pass results are zero. */
 static void idct(const Mdec *m, s16 *blk)
 {
-    s64 tmp[64];
-    for (int x = 0; x < 8; x++)
+    s32 tmp[64];
+    int cols[8], nc = 0;
+    for (int x = 0; x < 8; x++) {
+        int any = 0;
+        for (int u = 0; u < 8; u++)
+            any |= blk[u * 8 + x];
+        if (!any)
+            continue;
+        cols[nc++] = x;
         for (int y = 0; y < 8; y++) {
-            s64 sum = 0;
+            s32 sum = 0;
             for (int u = 0; u < 8; u++)
-                sum += (s64)blk[u * 8 + x] * m->scale[u * 8 + y];
+                sum += blk[u * 8 + x] * m->scale[u * 8 + y];
             tmp[x + y * 8] = sum;
         }
+    }
     for (int x = 0; x < 8; x++)
         for (int y = 0; y < 8; y++) {
             s64 sum = 0;
-            for (int u = 0; u < 8; u++)
-                sum += tmp[u + y * 8] * m->scale[u * 8 + x];
+            for (int i = 0; i < nc; i++)
+                sum += (s64)tmp[cols[i] + y * 8] * m->scale[cols[i] * 8 + x];
             s32 v = (s32)((sum >> 32) + ((sum >> 31) & 1));
             v = (s32)((u32)v << 23) >> 23; /* 9-bit result */
             blk[x + y * 8] = (s16)(v < -128 ? -128 : v > 127 ? 127 : v);

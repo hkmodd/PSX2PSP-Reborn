@@ -382,7 +382,21 @@ static int xfer_pixel(Psx *psx, u16 *io, int write)
     return 0;
 }
 
+static void draw(Psx *psx);
+
 static void execute(Psx *psx)
+{
+    const PsxHost *h = psx->host;
+    if (!h->usec) {
+        draw(psx);
+        return;
+    }
+    u32 t = h->usec(h->user);
+    draw(psx);
+    psx->gpu.us_draw += h->usec(h->user) - t;
+}
+
+static void draw(Psx *psx)
 {
     Gpu *g = &psx->gpu;
     u32 *c = g->cmd, cmd = c[0] >> 24;

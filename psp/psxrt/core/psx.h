@@ -63,6 +63,8 @@ typedef struct PsxHost {
     /* Memory card file of slot 0/1: 128 KB, read at init, written back on change. */
     u8 *card[2];
     void (*card_dirty)(void *user, int slot);
+    /* Optional microsecond clock for profiling (Gpu.us_draw); NULL: not measured. */
+    u32 (*usec)(void *user);
 } PsxHost;
 
 /* ---- CPU state, shared by the interpreter and the translated code's context ---- */
@@ -174,6 +176,7 @@ typedef struct Gpu {
     u64 frame;
     /* host renderer hook: called before a draw that reads VRAM the host may hold */
     void *renderer;
+    u32 us_draw; /* microseconds spent drawing, when PsxHost.usec is set */
 } Gpu;
 
 typedef struct SpuVoice {

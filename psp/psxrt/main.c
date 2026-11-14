@@ -290,6 +290,7 @@ static void frame(void)
     static u64 c0;
     static u32 f0, speed, fps;
     static NativeStats n0;
+    static u32 draw0;
     static char status[64];
     psx.sio.buttons[0] = read_pad();
     u64 t = sceKernelGetSystemTimeWide();
@@ -309,11 +310,12 @@ static void frame(void)
                 n += snprintf(line + n, sizeof line - (size_t)n, "-- native: %u calls, %u misses, %u steps, %u hashes, %u loads\n",(unsigned)(s->calls - n0.calls),
                               (unsigned)(s->misses - n0.misses), (unsigned)(s->steps - n0.steps), (unsigned)(s->hashes - n0.hashes),
                               (unsigned)s->loads);
-                n += snprintf(line + n, sizeof line - (size_t)n, "-- ms: interp %u io %u update %u present %u sleep %u\n",
+                n += snprintf(line + n, sizeof line - (size_t)n, "-- ms: interp %u io %u (draw %u) update %u present %u sleep %u\n",
                               (unsigned)((s->us_interp - n0.us_interp) / 1000), (unsigned)((s->us_io - n0.us_io) / 1000),
+                              (unsigned)((psx.gpu.us_draw - draw0) / 1000),
                               (unsigned)((s->us_update - n0.us_update) / 1000), (unsigned)((s->us_present - n0.us_present) / 1000),
                               (unsigned)((s->us_sleep - n0.us_sleep) / 1000));
-                n0 = *s;
+                n0 = *s, draw0 = psx.gpu.us_draw;
             }
             log_flush();
             sceIoWrite(log_fd, line, n);
@@ -324,6 +326,12 @@ static void frame(void)
     u32 tp = sceKernelGetSystemTimeLow();
     present(&psx, status);
     native_stats.us_present += sceKernelGetSystemTimeLow() - tp;
+}
+
+static u32 host_usec(void *user)
+{
+    (void)user;
+    return sceKernelGetSystemTimeLow();
 }
 
 static void host_vblank(void *user)
@@ -406,6 +414,7 @@ int main(int argc, char **argv)
     host.tty = host_tty;
     host.log = host_log;
     host.vblank = host_vblank;
+    host.usec = host_usec;
     psx_init(&psx, &host, (u8 *)FIXED_BASE, (u8 *)SCRATCH_BASE, vram, spu_ram, mdec_in, MDEC_WORDS);
     psx.trace = trace_bits;
     if (native && (err = native_init(&psx, &info)) != NULL)
