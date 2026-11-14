@@ -104,7 +104,19 @@ static void put_rgb(Mdec *m, int x, int y, s32 r, s32 g, s32 b)
     }
 }
 
-static void macroblock(Mdec *m)
+static void decode(Mdec *m);
+
+/* Decodes the next macroblock into `out`, timed when the host has a clock. */
+static void macroblock(Psx *psx)
+{
+    const PsxHost *h = psx->host;
+    u32 t = h->usec ? h->usec(h->user) : 0;
+    decode(&psx->mdec);
+    if (h->usec)
+        psx->mdec.us_decode += h->usec(h->user) - t;
+}
+
+static void decode(Mdec *m)
 {
     m->nout = m->rout = 0;
     if (m->depth >= 2) {
@@ -160,7 +172,7 @@ u32 mdec_read(Psx *psx, int reg)
     if (!reg)
         return mdec_dma_out(psx);
     if (m->rout >= m->nout && more_input(m) && !m->words_left)
-        macroblock(m);
+        macroblock(psx);
     int out = m->rout < m->nout;
     u32 s = 0;
     if (!out)
@@ -186,7 +198,7 @@ u32 mdec_dma_out(Psx *psx)
 {
     Mdec *m = &psx->mdec;
     if (m->rout >= m->nout && more_input(m) && !m->words_left)
-        macroblock(m);
+        macroblock(psx);
     return m->rout < m->nout ? m->out[m->rout++] : 0;
 }
 

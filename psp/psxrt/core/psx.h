@@ -159,7 +159,8 @@ typedef struct Gpu {
     int polyline;
     /* VRAM transfer in progress */
     int xfer; /* 0 none, 1 CPU->VRAM, 2 VRAM->CPU */
-    int xx, xy, xw, xh, xi;
+    int xx, xy, xw, xh;
+    int xi, xr; /* next pixel: column and row in the rectangle */
     /* draw state */
     u32 texpage;
     int tex_flip_x, tex_flip_y;
@@ -238,6 +239,7 @@ typedef struct Mdec {
     int block; /* block being decoded, for the status register */
     u32 out[192]; /* one decoded macroblock */
     int nout, rout;
+    u32 us_decode; /* microseconds spent decoding, when PsxHost.usec is set */
 } Mdec;
 
 /* ---- BIOS (HLE) ---- */

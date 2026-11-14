@@ -188,17 +188,30 @@ static void screen_init(void)
 
 /* 24-bit display modes (MDEC movies) are converted to this 8888 texture, 512x512. */
 static u32 *rgb24_tex;
+static u32 us_rgb24; /* time spent converting, for the log */
 
 static const void *convert24(const Gpu *g, int w, int h)
 {
-    const u32 wrap = VRAM_W * 2 - 1;
+    u32 t = sceKernelGetSystemTimeLow();
+    const u32 wrap = VRAM_W * 2 - 1, b0 = (u32)g->disp_x * 2;
+    /* whole words when the line starts on one and does not wrap: 4 pixels in 3 words */
+    u32 fast = (b0 & 3) == 0 && b0 + 3u * (u32)w <= VRAM_W * 2 ? (u32)w & ~3u : 0;
     for (int y = 0; y < h; y++) {
         const u8 *row = (const u8 *)g->vram + (u32)((g->disp_y + y) & (VRAM_H - 1)) * VRAM_W * 2;
         u32 *o = rgb24_tex + y * 512;
-        for (u32 x = 0, b = (u32)g->disp_x * 2; x < (u32)w; x++, b += 3)
+        const u32 *s = (const u32 *)(row + b0);
+        for (u32 x = 0; x < fast; x += 4, s += 3) {
+            u32 a = s[0], b = s[1], c = s[2];
+            o[x] = 0xFF000000u | a;
+            o[x + 1] = 0xFF000000u | a >> 24 | b << 8;
+            o[x + 2] = 0xFF000000u | b >> 16 | c << 16;
+            o[x + 3] = 0xFF000000u | c >> 8;
+        }
+        for (u32 x = fast, b = b0 + 3 * fast; x < (u32)w; x++, b += 3)
             o[x] = 0xFF000000u | (u32)row[(b + 2) & wrap] << 16 | (u32)row[(b + 1) & wrap] << 8 | row[b & wrap];
     }
     sceKernelDcacheWritebackRange(rgb24_tex, (u32)h * 512 * 4);
+    us_rgb24 += sceKernelGetSystemTimeLow() - t;
     return rgb24_tex;
 }
 
@@ -290,7 +303,7 @@ static void frame(void)
     static u64 c0;
     static u32 f0, speed, fps;
     static NativeStats n0;
-    static u32 draw0;
+    static u32 draw0, mdec0, rgb0;
     static char status[64];
     psx.sio.buttons[0] = read_pad();
     u64 t = sceKernelGetSystemTimeWide();
@@ -310,12 +323,13 @@ static void frame(void)
                 n += snprintf(line + n, sizeof line - (size_t)n, "-- native: %u calls, %u misses, %u steps, %u hashes, %u loads\n",(unsigned)(s->calls - n0.calls),
                               (unsigned)(s->misses - n0.misses), (unsigned)(s->steps - n0.steps), (unsigned)(s->hashes - n0.hashes),
                               (unsigned)s->loads);
-                n += snprintf(line + n, sizeof line - (size_t)n, "-- ms: interp %u io %u (draw %u) update %u present %u sleep %u\n",
+                n += snprintf(line + n, sizeof line - (size_t)n,
+                              "-- ms: interp %u io %u (draw %u mdec %u) update %u present %u (rgb24 %u) sleep %u\n",
                               (unsigned)((s->us_interp - n0.us_interp) / 1000), (unsigned)((s->us_io - n0.us_io) / 1000),
-                              (unsigned)((psx.gpu.us_draw - draw0) / 1000),
+                              (unsigned)((psx.gpu.us_draw - draw0) / 1000), (unsigned)((psx.mdec.us_decode - mdec0) / 1000),
                               (unsigned)((s->us_update - n0.us_update) / 1000), (unsigned)((s->us_present - n0.us_present) / 1000),
-                              (unsigned)((s->us_sleep - n0.us_sleep) / 1000));
-                n0 = *s, draw0 = psx.gpu.us_draw;
+                              (unsigned)((us_rgb24 - rgb0) / 1000), (unsigned)((s->us_sleep - n0.us_sleep) / 1000));
+                n0 = *s, draw0 = psx.gpu.us_draw, mdec0 = psx.mdec.us_decode, rgb0 = us_rgb24;
             }
             log_flush();
             sceIoWrite(log_fd, line, n);

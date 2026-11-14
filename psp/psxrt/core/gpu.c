@@ -361,25 +361,26 @@ static void xfer_start(Psx *psx, const u32 *c, int dir)
     Gpu *g = &psx->gpu;
     g->xx = c[1] & 0x3FF, g->xy = (c[1] >> 16) & 0x1FF;
     g->xw = ((c[2] - 1) & 0x3FF) + 1, g->xh = (((c[2] >> 16) - 1) & 0x1FF) + 1;
-    g->xi = 0;
+    g->xi = g->xr = 0;
     g->xfer = dir;
 }
 
 static int xfer_pixel(Psx *psx, u16 *io, int write)
 {
     Gpu *g = &psx->gpu;
-    int x = g->xx + g->xi % g->xw, y = g->xy + g->xi / g->xw;
-    u16 *d = &VRAM(x, y);
+    u16 *d = &VRAM(g->xx + g->xi, g->xy + g->xr);
     if (write) {
         if (!(g->mask_check && (*d & 0x8000)))
             *d = *io | (g->mask_set ? 0x8000 : 0);
     } else
         *io = *d;
-    if (++g->xi >= g->xw * g->xh) {
-        g->xfer = 0;
-        return 1;
-    }
-    return 0;
+    if (++g->xi < g->xw)
+        return 0;
+    g->xi = 0;
+    if (++g->xr < g->xh)
+        return 0;
+    g->xfer = 0;
+    return 1;
 }
 
 static void draw(Psx *psx);

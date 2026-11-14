@@ -4,16 +4,19 @@
  */
 #include "psx.h"
 
+#include <string.h>
+
+/* Word access to PS1 RAM; both hosts (PSP, PC) are little endian like the PS1. */
 static u32 rd(Psx *psx, u32 a)
 {
-    const u8 *p = psx->ram + (a & (RAM_SIZE - 4));
-    return p[0] | p[1] << 8 | p[2] << 16 | (u32)p[3] << 24;
+    u32 v;
+    memcpy(&v, psx->ram + (a & (RAM_SIZE - 4)), 4);
+    return v;
 }
 
 static void wr(Psx *psx, u32 a, u32 v)
 {
-    u8 *p = psx->ram + (a & (RAM_SIZE - 4));
-    p[0] = (u8)v, p[1] = (u8)(v >> 8), p[2] = (u8)(v >> 16), p[3] = (u8)(v >> 24);
+    memcpy(psx->ram + (a & (RAM_SIZE - 4)), &v, 4);
 }
 
 static void update_master(Psx *psx, int raise)
