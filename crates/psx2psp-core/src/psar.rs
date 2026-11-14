@@ -325,7 +325,7 @@ pub struct PsarJob<'a> {
     pub discs: Vec<DiscSpec<'a>>,
     /// Game title for the PSTITLEIMG header (multi-disc).
     pub title: String,
-    /// Deflate level, clamped to 1..=9 (raw blocks never load on fw 6.61: see `compress_block`).
+    /// Deflate level, clamped to [`LEVELS`] (raw blocks never load on fw 6.61: see `compress_block`).
     pub level: u32,
     pub boot_png: &'a [u8],
     pub donor: &'a Donor,
@@ -503,6 +503,15 @@ fn pad16<W: Write + Seek>(w: &mut W) -> Result<()> {
     Ok(())
 }
 
+/// Deflate levels that load on real hardware. Every block is inflated by the PSP kernel's
+/// `sceKernelDeflateDecompress` (ARK popcorn hooks POPS's scePopsMan 0x0090B2C8 import onto it),
+/// not by POPS. Level 1 broke MediEvil (SCES-01494) on a real PSP (ARK-5): the same disc, art and
+/// LibCrypt table hang after the last FMV at level 1 and reach gameplay at level 5 (A/B builds
+/// T19G/T19A, 2026-11-14). Both decode bit-exact with zlib and use the same deflate features, so
+/// the fault is inside the kernel inflate, which cannot be run off the device: levels below the
+/// proven ones are not offered. Builds at 5 and 9 are proven on the PSP.
+pub const LEVELS: std::ops::RangeInclusive<u32> = 5..=9;
+
 /// Writes DATA.PSAR starting at absolute position `psar` (the writer must be positioned there).
 pub fn write_psar<W: Write + Seek>(w: &mut W, psar: u64, job: &PsarJob<'_>, monitor: &dyn Monitor) -> Result<PsarStats> {
     if job.discs.is_empty() || job.discs.len() > MAX_DISCS {
@@ -517,7 +526,7 @@ pub fn write_psar<W: Write + Seek>(w: &mut W, psar: u64, job: &PsarJob<'_>, moni
             return Err(Error::format("subchannel table", format!("not a whole number of {SUBQ_ENTRY}-byte entries")));
         }
     }
-    let level = Compression::new(job.level.clamp(1, 9));
+    let level = Compression::new(job.level.clamp(*LEVELS.start(), *LEVELS.end()));
     let total: u64 = job.discs.iter().map(|d| d.image.size_bytes()).sum();
     let png_trailer = (STARTDAT_HDR + job.boot_png.len()) as u32;
     let mut all = PsarStats::default();

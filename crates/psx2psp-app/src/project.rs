@@ -501,7 +501,7 @@ pub fn load(dir: &Path) -> Result<(Project, Vec<String>), String> {
         }
         discs.push(d);
     }
-    let p = Project { name: f.name, title: f.title, title_auto: f.title_auto, discs, art, icon1, snd0, clip: f.clip, output: f.output, level: f.level.clamp(1, 9) };
+    let p = Project { name: f.name, title: f.title, title_auto: f.title_auto, discs, art, icon1, snd0, clip: f.clip, output: f.output, level: f.level.clamp(*engine::LEVELS.start(), *engine::LEVELS.end()) };
     Ok((p, warn))
 }
 
@@ -1524,6 +1524,19 @@ mod tests {
         assert_eq!(json["version"], VERSION);
         // Four media files + project.json, nothing else.
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 5);
+    }
+
+    #[test]
+    fn saved_level_below_the_safe_range_loads_as_five() {
+        // Projects saved at level 1 made EBOOTs that hang MediEvil on a real PSP.
+        let t = tempfile::tempdir().unwrap();
+        let mut p = sample(t.path());
+        let dir = t.path().join("slot");
+        for (saved, loaded) in [(1, 5), (4, 5), (5, 5), (9, 9), (12, 9)] {
+            p.level = saved;
+            save(&dir, &p, u64::from(saved)).unwrap();
+            assert_eq!(load(&dir).unwrap().0.level, loaded, "saved at {saved}");
+        }
     }
 
     #[test]

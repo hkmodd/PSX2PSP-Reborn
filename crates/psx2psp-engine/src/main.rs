@@ -51,7 +51,8 @@ CONVERT OPTIONS:
   --icon1 <pmf>      ready-made ICON1.PMF
   --snd0 <audio>     any audio/video → SND0.AT3 (needs ffmpeg + at3tool/atracdenc)
   --snd0-start <s>   start offset in seconds (default 0)
-  --level <1-9>      deflate level (default 5; 9 is ~0.1% smaller and twice as slow)
+  --level <5-9>      deflate level (default 5; 9 is ~0.1% smaller and twice as slow; lower
+                     levels hang games on real PSPs)
   --native           experimental: a native EBOOT (category MG) that runs the psxrt runtime
                      instead of POPS; one disc, same title/ID/artwork, no disc patches
   --clip <src>       video/audio file or YouTube URL → ICON1.PMF + SND0.AT3 (see CLIP OPTIONS)
@@ -359,7 +360,12 @@ fn cmd_convert(args: &[String]) -> R {
             "--icon1" => icon1 = Some(PathBuf::from(val()?)),
             "--snd0" => snd0 = Some(PathBuf::from(val()?)),
             "--snd0-start" => snd0_start = val()?.parse()?,
-            "--level" => level = val()?.parse()?,
+            "--level" => {
+                level = val()?.parse()?;
+                if !psx2psp_engine::LEVELS.contains(&level) {
+                    return Err(format!("--level {level}: use 5..=9 (levels 1-4 hang games on real PSPs)").into());
+                }
+            }
             "--native" => native = true,
             "--pal-ntsc" => pal_ntsc = true,
             "--no-title-fixes" => title_fixes = Some(false),

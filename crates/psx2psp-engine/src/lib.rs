@@ -226,8 +226,9 @@ pub const PSAR_ALIGN: u64 = 0x10000;
 /// Default deflate level, as PSXPackager. Measured over 0x9300 blocks of a real disc: 5 is
 /// within 0.1% of 9's size at half the compression time, and inflate time (the PSP's cost)
 /// does not depend on the level. Level 0 (stored) is not offered: such EBOOTs are reported
-/// not to boot under POPS.
+/// not to boot under POPS. Levels 1-4 are not offered either: see [`LEVELS`].
 pub const DEFAULT_LEVEL: u32 = 5;
+pub use psx2psp_core::psar::LEVELS;
 
 #[derive(Debug, Clone, Default)]
 pub struct DiscInput {
@@ -754,7 +755,7 @@ pub fn convert(req: &ConvertRequest, monitor: &dyn Monitor) -> Result<ConvertRep
     let file = File::create(&part.part).map_err(psx2psp_core::Error::io_path(&part.part))?;
     let mut w = BufWriter::with_capacity(8 << 20, file);
     let mut stats = PsarStats::default();
-    monitor.log(&format!("Compressing {} disc(s) at level {} on {} threads", images.len(), req.level.clamp(1, 9), std::thread::available_parallelism().map_or(1, |n| n.get())));
+    monitor.log(&format!("Compressing {} disc(s) at level {} on {} threads", images.len(), req.level.clamp(*LEVELS.start(), *LEVELS.end()), std::thread::available_parallelism().map_or(1, |n| n.get())));
     write_pbp(&mut w, &sections, PSAR_ALIGN, |w, base| {
         stats = psar::write_psar(w, base, &job, monitor)?;
         Ok(())
@@ -1024,6 +1025,39 @@ mod tests {
         let out = default_output(Path::new("D:/games"), "SLUS00594");
         assert_eq!(out, Path::new("D:/games/SLUS00594/EBOOT.PBP"));
         assert_eq!(work_dir(&out).parent(), Some(Path::new("D:/games/SLUS00594")));
+    }
+
+    #[test]
+    fn levels_below_five_compress_as_five() {
+        // Level 1 EBOOTs hang MediEvil on a real PSP (kernel inflate); 5 and 9 are proven.
+        use patching::sector::build_mode2_form1;
+        let t = tempfile::tempdir().unwrap();
+        let mut x = 0x9e37_79b9_u32;
+        let mut raw = Vec::new();
+        for lba in 0..64u32 {
+            // Small-alphabet noise: levels 1 and 5 give different deflate streams.
+            let user: Vec<u8> = (0..2048).map(|_| { x ^= x << 13; x ^= x >> 17; x ^= x << 5; b"abcdefgh"[(x >> 29) as usize] }).collect();
+            raw.extend_from_slice(&build_mode2_form1(lba, user.as_slice().try_into().unwrap()));
+        }
+        std::fs::write(t.path().join("g.bin"), &raw).unwrap();
+        let cue = touch(t.path(), "g.cue", "FILE \"g.bin\" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n");
+        let build = |level: u32| {
+            let output = t.path().join(level.to_string()).join("EBOOT.PBP");
+            let disc = DiscInput { path: cue.clone(), disc_id: Some("SLES00001".into()), ..Default::default() };
+            convert(&ConvertRequest { discs: vec![disc], patches: PatchDb::default(), title: "T".into(), output: output.clone(), donor: None, artwork: Artwork::default(), level }, &()).unwrap();
+            std::fs::read(output).unwrap()
+        };
+        let deflate = |l: u32| {
+            use std::io::Write as _;
+            let mut e = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::new(l));
+            e.write_all(&raw[..0x9300]).unwrap();
+            e.finish().unwrap()
+        };
+        assert_ne!(deflate(1), deflate(5), "the sample must tell level 1 from 5");
+        let five = build(5);
+        assert_eq!(build(1), five);
+        assert_eq!(build(4), five);
+        assert_eq!(*LEVELS.start(), 5);
     }
 
     /// 40-sector PAL disc with the Y Fix #2 sequence in sector 30 (plus Graphic Fix #2 when
