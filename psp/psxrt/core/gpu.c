@@ -9,20 +9,35 @@
 
 #define VRAM(x, y) psx->gpu.vram[((y) & 511) * VRAM_W + ((x) & 1023)]
 
-typedef struct {
-    s32 x, y;
-    s32 r, g, b;
-    s32 u, v;
-} Vtx;
+typedef GpuVtx Vtx;
+typedef GpuPrim Prim;
 
-typedef struct {
-    int textured, raw, semi, gouraud;
-    u32 clut_x, clut_y;
-    u32 tpx, tpy, depth, abr;
-    u32 tw_and_u, tw_or_u, tw_and_v, tw_or_v; /* texture window, from E2 */
-    int mask_check;
-    u16 mask_set;
-} Prim;
+/* With a host renderer, the software path brings the renderer's pixels into `vram` before it
+ * reads them and hands back what it wrote (inclusive corners). */
+static void sw_read(Psx *psx, s32 x0, s32 y0, s32 x1, s32 y1)
+{
+    const GpuRenderer *r = psx->gpu.renderer;
+    if (r)
+        r->read(r->self, x0, y0, x1 - x0 + 1, y1 - y0 + 1);
+}
+
+static void sw_wrote(Psx *psx, s32 x0, s32 y0, s32 x1, s32 y1)
+{
+    const GpuRenderer *r = psx->gpu.renderer;
+    if (r)
+        r->wrote(r->self, x0, y0, x1 - x0 + 1, y1 - y0 + 1);
+}
+
+/* The texture page and CLUT a textured primitive reads. */
+static void sw_read_texture(Psx *psx, const Prim *p)
+{
+    if (!p->textured)
+        return;
+    s32 w = p->depth == 0 ? 64 : p->depth == 1 ? 128 : 256;
+    sw_read(psx, (s32)p->tpx, (s32)p->tpy, (s32)p->tpx + w - 1, (s32)p->tpy + 255);
+    if (p->depth < 2)
+        sw_read(psx, (s32)p->clut_x, (s32)p->clut_y, (s32)p->clut_x + (p->depth ? 255 : 15), (s32)p->clut_y);
+}
 
 /* The per-pixel path is inlined into the loops that walk the pixels. */
 #ifdef _MSC_VER
@@ -83,6 +98,7 @@ static void prim_from(Psx *psx, Prim *p, u32 cmd, u32 clut, u32 tp)
     p->tw_and_v = 0xFF & ~(u32)(g->tw_mask_y * 8), p->tw_or_v = (u32)(g->tw_off_y & g->tw_mask_y) * 8;
     p->mask_check = g->mask_check;
     p->mask_set = g->mask_set ? 0x8000 : 0;
+    p->gouraud = p->dither = 0;
 }
 
 PIXEL u16 texel(Psx *psx, const Prim *p, u32 u, u32 v)
@@ -178,12 +194,20 @@ static void triangle(Psx *psx, const Prim *p, Vtx v0, Vtx v1, Vtx v2)
     }
     if (maxx - minx > 1023 || maxy - miny > 511)
         return;
+    const GpuRenderer *rd = g->renderer;
+    int how = rd ? rd->triangle(rd->self, p, &v0, &v1, &v2) : GPU_SW;
+    if (how == GPU_DRAWN)
+        return;
     if (minx < g->clip_x1) minx = g->clip_x1;
     if (miny < g->clip_y1) miny = g->clip_y1;
     if (maxx > g->clip_x2) maxx = g->clip_x2;
     if (maxy > g->clip_y2) maxy = g->clip_y2;
     if (minx > maxx || miny > maxy)
         return;
+    if (how == GPU_SW) {
+        sw_read_texture(psx, p);
+        sw_read(psx, minx, miny, maxx, maxy);
+    }
     /* attribute planes: a(x,y) = a0 + dadx*(x-x0) + dady*(y-y0), 16.16 */
     s32 a0[5] = {v0.r, v0.g, v0.b, v0.u, v0.v}, a1[5] = {v1.r, v1.g, v1.b, v1.u, v1.v}, a2[5] = {v2.r, v2.g, v2.b, v2.u, v2.v};
     s64 dx[5], dy[5];
@@ -193,7 +217,7 @@ static void triangle(Psx *psx, const Prim *p, Vtx v0, Vtx v1, Vtx v2)
         dy[k] = ((d2 * (v1.x - v0.x) - d1 * (v2.x - v0.x)) << 16) / area;
     }
     int b0 = top_left(&v1, &v2) ? 0 : 1, b1 = top_left(&v2, &v0) ? 0 : 1, b2 = top_left(&v0, &v1) ? 0 : 1;
-    int dith = (g->stat & 0x200) && (p->gouraud || (p->textured && !p->raw));
+    int dith = p->dither;
     /* Edge functions step by constants; the bounding box is at most 1024x512, so they fit in 32
      * bits. A row of a triangle is one span: the x where all three edges pass, found by division
      * instead of testing every pixel of the box. */
@@ -239,13 +263,26 @@ static void triangle(Psx *psx, const Prim *p, Vtx v0, Vtx v1, Vtx v2)
         for (int k = 0; k < 5; k++)
             ar[k] += dy[k];
     }
+    if (how == GPU_SW)
+        sw_wrote(psx, minx, miny, maxx, maxy);
 }
 
 static void rect(Psx *psx, const Prim *p, s32 x0, s32 y0, s32 w, s32 h, s32 r, s32 gg, s32 b, s32 u0, s32 v0)
 {
     Gpu *g = &psx->gpu;
+    const GpuRenderer *rd = g->renderer;
+    Vtx c = {x0, y0, r, gg, b, u0, v0};
+    int how = rd ? rd->rect(rd->self, p, x0, y0, w, h, &c, g->tex_flip_x, g->tex_flip_y) : GPU_SW;
+    if (how == GPU_DRAWN)
+        return;
     s32 xa = g->clip_x1 - x0, xb = g->clip_x2 - x0 + 1, ya = g->clip_y1 - y0, yb = g->clip_y2 - y0 + 1;
     xa = xa < 0 ? 0 : xa, ya = ya < 0 ? 0 : ya, xb = xb > w ? w : xb, yb = yb > h ? h : yb;
+    if (xa >= xb || ya >= yb)
+        return;
+    if (how == GPU_SW) {
+        sw_read_texture(psx, p);
+        sw_read(psx, x0 + xa, y0 + ya, x0 + xb - 1, y0 + yb - 1);
+    }
     for (s32 y = ya; y < yb; y++) {
         s32 py = y0 + y;
         for (s32 x = xa; x < xb; x++) {
@@ -254,6 +291,8 @@ static void rect(Psx *psx, const Prim *p, s32 x0, s32 y0, s32 w, s32 h, s32 r, s
             fragment(psx, p, px, py, r, gg, b, u, v, 0);
         }
     }
+    if (how == GPU_SW)
+        sw_wrote(psx, x0 + xa, y0 + ya, x0 + xb - 1, y0 + yb - 1);
 }
 
 static void line(Psx *psx, const Prim *p, Vtx a, Vtx b)
@@ -263,8 +302,19 @@ static void line(Psx *psx, const Prim *p, Vtx a, Vtx b)
     s32 adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
     if (adx > 1023 || ady > 511)
         return;
+    const GpuRenderer *rd = g->renderer;
+    int how = rd ? rd->line(rd->self, p, &a, &b) : GPU_SW;
+    if (how == GPU_DRAWN)
+        return;
+    s32 x0 = a.x < b.x ? a.x : b.x, x1 = a.x < b.x ? b.x : a.x, y0 = a.y < b.y ? a.y : b.y, y1 = a.y < b.y ? b.y : a.y;
+    x0 = x0 < g->clip_x1 ? g->clip_x1 : x0, y0 = y0 < g->clip_y1 ? g->clip_y1 : y0;
+    x1 = x1 > g->clip_x2 ? g->clip_x2 : x1, y1 = y1 > g->clip_y2 ? g->clip_y2 : y1;
+    if (x0 > x1 || y0 > y1)
+        return;
+    if (how == GPU_SW)
+        sw_read(psx, x0, y0, x1, y1);
     s32 n = adx > ady ? adx : ady;
-    int dith = (g->stat & 0x200) && p->gouraud;
+    int dith = p->dither;
     for (s32 i = 0; i <= n; i++) {
         s32 x = a.x + (n ? (dx * i + (dx >= 0 ? n / 2 : -n / 2)) / n : 0);
         s32 y = a.y + (n ? (dy * i + (dy >= 0 ? n / 2 : -n / 2)) / n : 0);
@@ -273,6 +323,8 @@ static void line(Psx *psx, const Prim *p, Vtx a, Vtx b)
         s32 r = a.r + (n ? (b.r - a.r) * i / n : 0), gg = a.g + (n ? (b.g - a.g) * i / n : 0), bb = a.b + (n ? (b.b - a.b) * i / n : 0);
         plot(psx, p, x, y, r, gg, bb, dith, p->semi, 0);
     }
+    if (how == GPU_SW)
+        sw_wrote(psx, x0, y0, x1, y1);
 }
 
 static void vtx_pos(Psx *psx, Vtx *v, u32 w)
@@ -315,6 +367,7 @@ static void draw_polygon(Psx *psx, const u32 *c)
     Prim p;
     prim_from(psx, &p, cmd, clut, tp);
     p.gouraud = gour;
+    p.dither = (psx->gpu.stat & 0x200) && (gour || (tex && !p.raw));
     if (tex && p.raw)
         for (int i = 0; i < n; i++)
             v[i].r = v[i].g = v[i].b = 0x80;
@@ -343,7 +396,6 @@ static void draw_rect(Psx *psx, const u32 *c)
     else
         w = h = size == 1 ? 1 : size == 2 ? 8 : 16;
     prim_from(psx, &p, cmd, clut, psx->gpu.texpage);
-    p.gouraud = 0;
     if (tex && p.raw)
         v.r = v.g = v.b = 0x80;
     rect(psx, &p, v.x, v.y, w, h, v.r, v.g, v.b, u, vv);
@@ -357,7 +409,8 @@ static void draw_line(Psx *psx, const u32 *c, int n)
     prim_from(psx, &p, cmd, 0, psx->gpu.texpage);
     p.textured = 0;
     p.gouraud = gour;
-    Vtx prev, cur;
+    p.dither = (psx->gpu.stat & 0x200) && gour;
+    Vtx prev = {0}, cur = {0};
     int k = 0;
     vtx_col(&prev, c[k++]);
     vtx_pos(psx, &prev, c[k++]);
@@ -380,9 +433,17 @@ static void fill(Psx *psx, const u32 *c)
     u16 px = (u16)(((col >> 3) & 31) | ((col >> 11) & 31) << 5 | ((col >> 19) & 31) << 10);
     s32 x0 = c[1] & 0x3F0, y0 = (c[1] >> 16) & 0x1FF;
     s32 w = ((c[2] & 0x3FF) + 0xF) & ~0xF, h = (c[2] >> 16) & 0x1FF;
+    if (!w || !h)
+        return;
+    const GpuRenderer *rd = psx->gpu.renderer;
+    int how = rd ? rd->fill(rd->self, x0, y0, w, h, px) : GPU_SW;
+    if (how == GPU_DRAWN)
+        return;
     for (s32 y = 0; y < h; y++)
         for (s32 x = 0; x < w; x++)
             VRAM(x0 + x, y0 + y) = px;
+    if (how == GPU_SW)
+        sw_wrote(psx, x0, y0, x0 + w - 1, y0 + h - 1);
 }
 
 static void copy(Psx *psx, const u32 *c)
@@ -390,6 +451,15 @@ static void copy(Psx *psx, const u32 *c)
     Gpu *g = &psx->gpu;
     s32 sx = c[1] & 0x3FF, sy = (c[1] >> 16) & 0x1FF, dx = c[2] & 0x3FF, dy = (c[2] >> 16) & 0x1FF;
     s32 w = ((c[3] - 1) & 0x3FF) + 1, h = (((c[3] >> 16) - 1) & 0x1FF) + 1;
+    const GpuRenderer *rd = g->renderer;
+    int how = rd ? rd->copy(rd->self, sx, sy, dx, dy, w, h, g->mask_check, g->mask_set ? 0x8000 : 0) : GPU_SW;
+    if (how == GPU_DRAWN)
+        return;
+    if (how == GPU_SW) {
+        sw_read(psx, sx, sy, sx + w - 1, sy + h - 1);
+        if (g->mask_check)
+            sw_read(psx, dx, dy, dx + w - 1, dy + h - 1);
+    }
     for (s32 y = 0; y < h; y++)
         for (s32 x = 0; x < w; x++) {
             u16 s = VRAM(sx + x, sy + y);
@@ -398,6 +468,8 @@ static void copy(Psx *psx, const u32 *c)
                 continue;
             *d = s | (g->mask_set ? 0x8000 : 0);
         }
+    if (how == GPU_SW)
+        sw_wrote(psx, dx, dy, dx + w - 1, dy + h - 1);
 }
 
 static void xfer_start(Psx *psx, const u32 *c, int dir)
@@ -407,6 +479,22 @@ static void xfer_start(Psx *psx, const u32 *c, int dir)
     g->xw = ((c[2] - 1) & 0x3FF) + 1, g->xh = (((c[2] >> 16) - 1) & 0x1FF) + 1;
     g->xi = g->xr = 0;
     g->xfer = dir;
+    /* reading VRAM, or writing it under the mask bits: the renderer's pixels first */
+    if (dir == 2 || g->mask_check)
+        sw_read(psx, g->xx, g->xy, g->xx + g->xw - 1, g->xy + g->xh - 1);
+}
+
+/* A CPU->VRAM transfer cut short (GP1 00/01): hands the renderer the pixels written so far. */
+static void xfer_abort(Psx *psx)
+{
+    Gpu *g = &psx->gpu;
+    if (g->xfer == 1) {
+        if (g->xr)
+            sw_wrote(psx, g->xx, g->xy, g->xx + g->xw - 1, g->xy + g->xr - 1);
+        if (g->xi)
+            sw_wrote(psx, g->xx, g->xy + g->xr, g->xx + g->xi - 1, g->xy + g->xr);
+    }
+    g->xfer = 0;
 }
 
 static int xfer_pixel(Psx *psx, u16 *io, int write)
@@ -423,6 +511,8 @@ static int xfer_pixel(Psx *psx, u16 *io, int write)
     g->xi = 0;
     if (++g->xr < g->xh)
         return 0;
+    if (write)
+        sw_wrote(psx, g->xx, g->xy, g->xx + g->xw - 1, g->xy + g->xh - 1);
     g->xfer = 0;
     return 1;
 }
@@ -518,7 +608,7 @@ static void reset(Psx *psx)
 {
     Gpu *g = &psx->gpu;
     u16 *vram = g->vram;
-    void *r = g->renderer;
+    const GpuRenderer *r = g->renderer;
     memset(g, 0, sizeof *g);
     g->vram = vram;
     g->renderer = r;
@@ -533,8 +623,8 @@ void gpu_gp1(Psx *psx, u32 v)
 {
     Gpu *g = &psx->gpu;
     switch (v >> 24) {
-    case 0x00: reset(psx); break;
-    case 0x01: g->ncmd = 0, g->xfer = 0; break;
+    case 0x00: xfer_abort(psx), reset(psx); break;
+    case 0x01: xfer_abort(psx), g->ncmd = 0; break;
     case 0x02: g->stat &= ~(1u << 24); break;
     case 0x03:
         g->stat = (g->stat & ~(1u << 23)) | ((v & 1) << 23);

@@ -1,11 +1,12 @@
 /*
- * psxrt: the native runtime of PSX2PSP (recomp backend), slice S3.
+ * psxrt: the native runtime of PSX2PSP (recomp backend), slice S4.
  *
  * Boots the PS1 disc stored in DATA.PSAR of its own EBOOT (argv[0]) on the psxrt core. With
  * translated executables in DATA.PSAR the guest runs as native code (native.c), the interpreter
  * filling in; a frame is then shown at every emulated vblank. Without, the interpreter runs
- * everything and a frame is shown per vblank from the main loop. The PS1 display area is shown with
- * the GE as a scaled texture of PS1 VRAM; the guest's TTY and the core's diagnostics scroll at
+ * everything and a frame is shown per vblank from the main loop. The GE draws what it can of the
+ * PS1 GPU's work (ge.c); the PS1 display area is shown as a scaled texture of the GE's copy of PS1
+ * VRAM; the guest's TTY and the core's diagnostics scroll at
  * the bottom of the screen and go to psxrt.log next to the EBOOT. L+R+SELECT hides the text;
  * HOME exits.
  *
@@ -28,6 +29,7 @@
 #include <string.h>
 
 #include "disc.h"
+#include "ge.h"
 #include "native.h"
 #include "psx.h"
 
@@ -158,8 +160,7 @@ static int reserve_fixed(void)
     return uid >= 0 && (u32)sceKernelGetBlockHeadAddr(uid) == FIXED_BASE;
 }
 
-/* ---- screen ---- */
-static unsigned int __attribute__((aligned(16))) gu_list[0x4000];
+/* ---- screen: PSP VRAM holds the GE's PS1 VRAM and two 565 display buffers (ge.h) ---- */
 static void *draw_buf; /* relative to the start of the PSP's VRAM */
 static int show_text; /* the log lines over the picture: drawn by the CPU, so off at start */
 
@@ -171,19 +172,18 @@ typedef struct {
 static void screen_init(void)
 {
     sceGuInit();
-    sceGuStart(GU_DIRECT, gu_list);
-    sceGuDrawBuffer(GU_PSM_8888, (void *)0, 512);
-    sceGuDispBuffer(480, 272, (void *)0x88000, 512);
+    ge_open();
+    sceGuDrawBuffer(GU_PSM_5650, (void *)GE_DISP_B, 512);
+    sceGuDispBuffer(480, 272, (void *)GE_DISP_A, 512);
     sceGuOffset(2048 - 240, 2048 - 136);
     sceGuViewport(2048, 2048, 480, 272);
-    sceGuScissor(0, 0, 480, 272);
     sceGuEnable(GU_SCISSOR_TEST);
+    sceGuScissor(0, 0, 480, 272);
     sceGuDisable(GU_DEPTH_TEST);
-    sceGuFinish();
-    sceGuSync(0, 0);
+    ge_sync();
     sceDisplayWaitVblankStart();
     sceGuDisplay(GU_TRUE);
-    draw_buf = (void *)0;
+    draw_buf = (void *)GE_DISP_B;
 }
 
 /* 24-bit display modes (MDEC movies) are converted to this 8888 texture, 512x512. */
@@ -215,32 +215,44 @@ static const void *convert24(const Gpu *g, int w, int h)
     return rgb24_tex;
 }
 
-/* The PS1 display area: a 5551 texture of PS1 VRAM, or a converted copy in 24-bit modes. */
-static void draw_ps1(Psx *psx)
+/* The PS1 display area: w x h pixels, 0 when the display is off. */
+static int display_size(const Psx *psx, int *w, int *h)
 {
     const Gpu *g = &psx->gpu;
     static const int widths[4] = {256, 320, 512, 640};
     u32 st = g->stat;
-    int w = (st & 0x10000) ? 368 : widths[(st >> 17) & 3];
-    int h = g->vrange2 - g->vrange1;
+    *w = (st & 0x10000) ? 368 : widths[(st >> 17) & 3];
+    *h = g->vrange2 - g->vrange1;
     if ((st & 0x80000) && (st & 0x400000))
-        h *= 2;
-    if (h <= 0 || h > 512)
-        h = psx->pal ? 256 : 240;
-    if (w > 512)
-        w = 512; /* GE texture limit; S4 draws natively */
-    if ((st & 0x800000) || g->disp_y + h > VRAM_H)
-        return; /* display off */
-    if ((st & 0x200000) && rgb24_tex) {
-        if (h > 512)
-            h = 512;
+        *h *= 2;
+    if (*h <= 0 || *h > 512)
+        *h = psx->pal ? 256 : 240;
+    if (*w > 512)
+        *w = 512; /* GE texture limit */
+    return !(st & 0x800000) && g->disp_y + *h <= VRAM_H;
+}
+
+static int display_24bit(const Psx *psx) { return (psx->gpu.stat & 0x200000) && rgb24_tex; }
+
+/* The PS1 display area: a 5551 texture of the GE's PS1 VRAM, or a converted copy in 24-bit modes
+ * (present() has brought the GE's pixels into RAM). */
+static void draw_ps1(Psx *psx)
+{
+    const Gpu *g = &psx->gpu;
+    int w, h;
+    if (!display_size(psx, &w, &h))
+        return;
+    if (display_24bit(psx)) {
         sceGuTexMode(GU_PSM_8888, 0, 0, 0);
         sceGuTexImage(0, 512, 512, 512, convert24(g, w, h));
-    } else {
+    } else if (!g->renderer) {
         const u16 *src = g->vram + g->disp_y * VRAM_W + (g->disp_x & ~7);
         sceKernelDcacheWritebackRange(src, (u32)h * VRAM_W * 2);
         sceGuTexMode(GU_PSM_5551, 0, 0, 0);
         sceGuTexImage(0, 512, 512, VRAM_W, src);
+    } else {
+        sceGuTexMode(GU_PSM_5551, 0, 0, 0);
+        sceGuTexImage(0, 512, 512, VRAM_W, (void *)(0x04000000u + GE_PS1_VRAM + ((u32)g->disp_y * VRAM_W + (g->disp_x & ~7u)) * 2));
     }
     sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGB);
     sceGuTexFilter(GU_LINEAR, GU_LINEAR);
@@ -255,13 +267,22 @@ static void draw_ps1(Psx *psx)
 
 static void present(Psx *psx, const char *status)
 {
-    sceGuStart(GU_DIRECT, gu_list);
+    int w, h;
+    if (psx && psx->gpu.renderer && display_24bit(psx) && display_size(psx, &w, &h))
+        ge_read(psx->gpu.disp_x, psx->gpu.disp_y, (w * 3 + 1) / 2 + 1, h);
+    if (psx && psx->gpu.renderer)
+        ge_touch();
+    ge_open();
+    sceGuDrawBufferList(GU_PSM_5650, draw_buf, 512);
+    sceGuScissor(0, 0, 480, 272);
+    sceGuDisable(GU_STENCIL_TEST);
+    sceGuDisable(GU_BLEND);
+    sceGuDisable(GU_DITHER);
     sceGuClearColor(0xFF000000);
     sceGuClear(GU_COLOR_BUFFER_BIT);
     if (psx)
         draw_ps1(psx);
-    sceGuFinish();
-    sceGuSync(0, 0);
+    ge_sync();
     pspDebugScreenSetBase((u32 *)(0x44000000u + (u32)draw_buf));
     pspDebugScreenSetXY(0, 0);
     pspDebugScreenSetTextColor(0xFF40FFFF);
@@ -316,7 +337,7 @@ static void frame(void)
         t0 = t, c0 = psx.cycles, f0 = frames;
         snprintf(status, sizeof status, "f %u pc %08X %u%% %u fps", (unsigned)frames, (unsigned)psx.cpu.pc, (unsigned)speed, (unsigned)fps);
         if (log_fd >= 0) { /* the speed goes to the file only: the screen has its status line */
-            char line[1024];
+            char line[2048];
             int n = snprintf(line, sizeof line, "-- %s\n", status);
             if (native) {
                 const NativeStats *s = &native_stats;
@@ -346,6 +367,7 @@ static void frame(void)
                               (unsigned)g->frags, (unsigned)g->tested);
                 memset(g->n_kind, 0, sizeof g->n_kind), memset(g->us_kind, 0, sizeof g->us_kind), g->frags = g->tested = 0;
             }
+            n += ge_log(line + n, (int)sizeof line - n);
             log_flush();
             sceIoWrite(log_fd, line, n);
         }
@@ -407,13 +429,13 @@ int main(int argc, char **argv)
     int th = sceKernelCreateThread("psxrt callbacks", callback_thread, 0x11, 0x1000, PSP_THREAD_ATTR_USER, NULL);
     if (th >= 0)
         sceKernelStartThread(th, 0, NULL);
-    pspDebugScreenInitEx((void *)0x44000000, PSP_DISPLAY_PIXEL_FORMAT_8888, 0);
+    pspDebugScreenInitEx((void *)(0x44000000u + GE_DISP_A), PSP_DISPLAY_PIXEL_FORMAT_565, 0);
     screen_init();
     sceCtrlSetSamplingCycle(0);
     sceCtrlSetSamplingMode(PSP_CTRL_MODE_DIGITAL);
     const char *eboot = argc > 0 ? argv[0] : "";
     open_log(eboot);
-    say("PSX2PSP native runtime (psxrt) - S3, built %s %s", __DATE__, __TIME__);
+    say("PSX2PSP native runtime (psxrt) - S4, built %s %s", __DATE__, __TIME__);
     say("EBOOT %s", eboot);
     if (!fixed)
         halt("0x09800000-0x09C00FFF is not free");
@@ -446,6 +468,10 @@ int main(int argc, char **argv)
     host.usec = host_usec;
     psx_init(&psx, &host, (u8 *)FIXED_BASE, (u8 *)SCRATCH_BASE, vram, spu_ram, mdec_in, MDEC_WORDS);
     psx.trace = trace_bits;
+    if (!(trace_bits & 16)) /* bit 4: everything in software, for A/B runs */
+        ge_init(&psx, (trace_bits >> 3) & 1);
+    if (psx.gpu.renderer)
+        say("GE renderer%s", (trace_bits & 8) ? ", compare mode" : "");
     if (native && (err = native_init(&psx, &info)) != NULL)
         halt(err);
     if (psx_boot(&psx) < 0)

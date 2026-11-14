@@ -149,6 +149,41 @@ typedef struct Cdrom {
 } Cdrom;
 
 #define GPU_FIFO 16
+
+/* A primitive as the rasterizer sees it: vertices after the drawing offset (colours 0-255,
+ * 0x80 for raw textures), and the draw state it was issued with. */
+typedef struct GpuVtx {
+    s32 x, y;
+    s32 r, g, b;
+    s32 u, v;
+} GpuVtx;
+
+typedef struct GpuPrim {
+    int textured, raw, semi, gouraud, dither;
+    u32 clut_x, clut_y;
+    u32 tpx, tpy, depth, abr;
+    u32 tw_and_u, tw_or_u, tw_and_v, tw_or_v; /* texture window, from E2 */
+    int mask_check;
+    u16 mask_set;
+} GpuPrim;
+
+/* A host renderer (the PSP's GE) drawing into its own copy of VRAM. `Gpu.vram` stays the copy
+ * the core reads and writes: transfers, and whatever the renderer leaves to the software
+ * rasterizer, which then asks for the pixels it reads and reports the ones it wrote. Each draw
+ * returns GPU_SW (not drawn: the core draws it), GPU_DRAWN, or GPU_BOTH (drawn, and the core
+ * draws it too without syncing: comparing the two). Rectangles may wrap around VRAM. */
+enum { GPU_SW, GPU_DRAWN, GPU_BOTH };
+typedef struct GpuRenderer {
+    void *self;
+    int (*triangle)(void *self, const GpuPrim *p, const GpuVtx *v0, const GpuVtx *v1, const GpuVtx *v2);
+    int (*rect)(void *self, const GpuPrim *p, s32 x, s32 y, s32 w, s32 h, const GpuVtx *c, int flip_x, int flip_y);
+    int (*line)(void *self, const GpuPrim *p, const GpuVtx *a, const GpuVtx *b);
+    int (*fill)(void *self, s32 x, s32 y, s32 w, s32 h, u16 color);
+    int (*copy)(void *self, s32 sx, s32 sy, s32 dx, s32 dy, s32 w, s32 h, int mask_check, u16 mask_set);
+    void (*read)(void *self, s32 x, s32 y, s32 w, s32 h);  /* about to read `vram` there */
+    void (*wrote)(void *self, s32 x, s32 y, s32 w, s32 h); /* wrote `vram` there */
+} GpuRenderer;
+
 typedef struct Gpu {
     u16 *vram; /* VRAM_W * VRAM_H */
     u32 stat;
@@ -175,8 +210,7 @@ typedef struct Gpu {
     int disp_enabled;
     int dma_dir;
     u64 frame;
-    /* host renderer hook: called before a draw that reads VRAM the host may hold */
-    void *renderer;
+    const GpuRenderer *renderer; /* NULL: software only */
     u32 us_draw; /* microseconds spent drawing, when PsxHost.usec is set */
     /* per command kind (polygon, line, rectangle, copy, fill, other): count and microseconds;
      * fragments shaded and pixels tested. The host reads and clears them. */
