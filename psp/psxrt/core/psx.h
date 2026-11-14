@@ -189,6 +189,10 @@ typedef struct GpuRenderer {
     int (*copy)(void *self, s32 sx, s32 sy, s32 dx, s32 dy, s32 w, s32 h, int mask_check, u16 mask_set);
     void (*read)(void *self, s32 x, s32 y, s32 w, s32 h);  /* about to read `vram` there */
     void (*wrote)(void *self, s32 x, s32 y, s32 w, s32 h); /* wrote `vram` there */
+    /* Optional: a whole polygon command (GP0 20-3F) as its words, offered before the core decodes
+     * it, with the texpage of a textured one already set. -1: not handled (the core goes on as
+     * without it); GPU_DRAWN; GPU_BOTH: drawn, and the core draws its triangles as well. */
+    int (*poly)(void *self, const u32 *c);
 } GpuRenderer;
 
 typedef struct Gpu {
@@ -475,6 +479,8 @@ u32 gpu_read(Psx *psx, int reg);
 void gpu_gp0(Psx *psx, u32 v);
 /* GP0 words of a DMA packet, in PS1 RAM (word aligned) */
 void gpu_gp0_packet(Psx *psx, const u32 *w, u32 n);
+/* A primitive's fields from its command byte, CLUT and texpage, and the GPU's state */
+void gpu_prim_from(Psx *psx, GpuPrim *p, u32 cmd, u32 clut, u32 tp);
 /* GP0 words while a CPU->VRAM transfer is in progress, a row at a time: the words used (it
  * stops where the transfer ends; a lone last pixel uses its whole word) */
 u32 gpu_gp0_pixels(Psx *psx, const u32 *w, u32 n);

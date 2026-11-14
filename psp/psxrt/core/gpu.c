@@ -82,7 +82,7 @@ static void set_texpage(Psx *psx, u32 tp)
     g->stat = (g->stat & ~0x87FFu) | (tp & 0x7FF) | ((tp & 0x800) << 4);
 }
 
-static void prim_from(Psx *psx, Prim *p, u32 cmd, u32 clut, u32 tp)
+void gpu_prim_from(Psx *psx, GpuPrim *p, u32 cmd, u32 clut, u32 tp)
 {
     p->textured = (cmd >> 2) & 1 && !(cmd >= 0x40 && cmd < 0x60);
     p->raw = cmd & 1;
@@ -343,6 +343,12 @@ static void draw_polygon(Psx *psx, const u32 *c)
 {
     u32 cmd = c[0] >> 24;
     int quad = (cmd >> 3) & 1, tex = (cmd >> 2) & 1, gour = (cmd >> 4) & 1, n = quad ? 4 : 3;
+    const GpuRenderer *rd = psx->gpu.renderer;
+    if (tex) /* the second vertex's texpage, as the loop below sets it */
+        set_texpage(psx, (psx->gpu.texpage & ~0x1FFu) | (c[gour ? 5 : 4] >> 16 & 0x1FF));
+    int fast = rd && rd->poly ? rd->poly(rd->self, c) : -1;
+    if (fast == GPU_DRAWN)
+        return;
     Vtx v[4];
     u32 clut = 0, tp = psx->gpu.texpage;
     int k = 0;
@@ -366,15 +372,14 @@ static void draw_polygon(Psx *psx, const u32 *c)
             v[i].u = v[i].v = 0;
     }
     Prim p;
-    prim_from(psx, &p, cmd, clut, tp);
+    gpu_prim_from(psx, &p, cmd, clut, tp);
     p.gouraud = gour;
     p.dither = (psx->gpu.stat & 0x200) && (gour || (tex && !p.raw));
     if (tex && p.raw)
         for (int i = 0; i < n; i++)
             v[i].r = v[i].g = v[i].b = 0x80;
-    const GpuRenderer *rd = psx->gpu.renderer;
-    int drawn = 0;
-    if (quad && rd && rd->quad) {
+    int drawn = fast == GPU_BOTH; /* compare mode: the renderer drew it, the core draws it too */
+    if (!drawn && quad && rd && rd->quad) {
         s32 minx = v[0].x, maxx = v[0].x, miny = v[0].y, maxy = v[0].y;
         for (int i = 1; i < 4; i++) {
             minx = v[i].x < minx ? v[i].x : minx, maxx = v[i].x > maxx ? v[i].x : maxx;
@@ -411,7 +416,7 @@ static void draw_rect(Psx *psx, const u32 *c)
         w = c[k] & 0x3FF, h = (c[k] >> 16) & 0x1FF;
     else
         w = h = size == 1 ? 1 : size == 2 ? 8 : 16;
-    prim_from(psx, &p, cmd, clut, psx->gpu.texpage);
+    gpu_prim_from(psx, &p, cmd, clut, psx->gpu.texpage);
     if (tex && p.raw)
         v.r = v.g = v.b = 0x80;
     rect(psx, &p, v.x, v.y, w, h, v.r, v.g, v.b, u, vv);
@@ -422,7 +427,7 @@ static void draw_line(Psx *psx, const u32 *c, int n)
     u32 cmd = c[0] >> 24;
     int gour = (cmd >> 4) & 1;
     Prim p;
-    prim_from(psx, &p, cmd, 0, psx->gpu.texpage);
+    gpu_prim_from(psx, &p, cmd, 0, psx->gpu.texpage);
     p.textured = 0;
     p.gouraud = gour;
     p.dither = (psx->gpu.stat & 0x200) && gour;

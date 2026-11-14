@@ -49,6 +49,7 @@ typedef struct {
     u32 readbacks, read_tiles, read_us, uploads, upload_px, flushes;
     u32 ge_copy, null_copy, copy_px, copy_from_ge; /* copies: on the GE, onto themselves, pixels, read from the GE */
     u32 bind_tex, bind_clut, kicks, rd_checks;     /* textures and CLUTs sent, stall moves, readback checks */
+    u32 fast, fast_setups, fast_hits;              /* polygons through the fast lane; its state changes, found cached */
 } GeStats;
 
 /* A 4/8-bit texture page as a 256x256 T4/T8 texture. */
@@ -101,6 +102,27 @@ static struct {
     GeStats s;
 } ge;
 
+/* The polygon fast lane (rd_poly): while a polygon command has the key of the one before (its
+ * command bits, texpage, CLUT, mask bits and drawing area, with no tile changed or newly drawn
+ * under its texture), the GE is still in that polygon's state, and the polygon is its vertices in
+ * a ring plus a few words of list. Anything else that writes the list clears `valid` (begin). */
+#define RING_MAX (512 * 1024)
+static struct {
+    int valid;
+    u32 k0, k1, a0, a1; /* command bits, texpage and mask bits; CLUT; drawing area */
+    u32 epoch, nver;    /* ge.epoch and, for a textured key, ge.nver when it was set */
+    int flags;          /* prim_begin's for the key; 0: it draws nothing */
+    int two;            /* two passes, each after its words of state */
+    s32 x1, y1, x2, y2; /* the drawing area within VRAM */
+    u32 base;           /* BASE as the lane last sent it; ~0: unknown */
+    int n1, n2;
+    const u32 *pass1, *pass2; /* the key's cache entry's */
+    int dirty;          /* a cached block set the GE's state: ge's copy of it is stale */
+    u8 *ring;           /* vertices, through the uncached mirror; NULL: no lane */
+    u32 ring_bytes, ring_off;
+} fl;
+static u32 fl_arena_off; /* words of the arena (below) used by the open list's blocks */
+
 /* The PS1 dither matrix, row = y & 3, column = x & 3; the GE adds it to 8-bit colours before
  * they are cut to 5 bits, as the PS1 does. */
 static const ScePspIMatrix4 ps1_dither = {{-4, 0, -3, 1}, {2, -2, 3, -1}, {-3, 1, -4, 0}, {3, -1, 2, -2}};
@@ -124,6 +146,7 @@ void ge_open(void)
         list_open = 1;
     }
     state_valid = 0;
+    fl.valid = 0;
 }
 
 /* Lets the GE run what is written so far, once STALL_STEP more bytes are there. */
@@ -145,8 +168,10 @@ void ge_sync(void)
         sceGuSync(0, 0);
         list_open = 0;
         ge.syncs++;
+        fl_arena_off = 0; /* the GE is done with its blocks */
     }
     state_valid = 0;
+    fl.valid = 0, fl.ring_off = 0; /* the GE is done with the ring */
 }
 
 /* The state every renderer list starts from; the rest is sent as primitives need it. */
@@ -178,9 +203,21 @@ static void base_state(void)
     state_valid = 1;
 }
 
+/* ge's copy of the GE state, all unknown: what follows sends all of it. */
+static void fl_forget(void)
+{
+    ge.sc_x1 = -1;
+    ge.st_check = ge.st_set = ge.blend = ge.dither = -2;
+    ge.tex_sent = ge.clut_sent = NULL;
+    ge.texfn = -1, ge.tex_on = -1, ge.a_func = -1;
+}
+
 /* Before renderer commands: a list with room, in the renderer's state. */
 static void begin(void)
 {
+    fl.valid = 0;
+    if (fl.dirty)
+        fl_forget(), fl.dirty = 0;
     if (list_open) {
         if (sceGuCheckList() > LIST_BYTES - LIST_SLACK) {
             ge_sync();
@@ -953,13 +990,267 @@ static int rd_copy(void *self, s32 sx, s32 sy, s32 dx, s32 dy, s32 w, s32 h, int
     return DONE;
 }
 
+/* ---- the polygon fast lane ---- */
+
+/* pspgu's display list (guInternal.h): both pointers through the uncached mirror. */
+typedef struct {
+    unsigned int *start, *current;
+    int parent_context;
+} GuListHead;
+extern GuListHead *gu_list;
+
+/* A key's state as a block of GE words, sent from unknown so that they alone set it, with what
+ * prim_begin found for it. The blocks live in an arena the GE calls into, written while a list is
+ * open and kept until it has run (the CLUTs they load live in that list too): a key seen again in
+ * the same list, with no tile changed or, under its page and CLUT, turned newer, is a CALL. */
+#define FL_BITS 7
+#define FL_WORDS 48
+#define FL_ARENA (64 * 1024)
+typedef struct {
+    u32 k0, k1, a0, a1, syncs, epoch, nver;
+    int flags, two, n1, n2, slot;
+    u32 use; /* fl_uses when last found */
+    u32 call[2]; /* BASE and CALL of its block */
+    u32 pass1[8], pass2[8];
+} FlEntry;
+static FlEntry fl_cache[1 << FL_BITS];
+static u32 fl_uses;
+static u32 __attribute__((aligned(64))) fl_arena[FL_ARENA / 4];
+#define FL_ARENA_UNCACHED ((unsigned int *)((u32)fl_arena | 0x40000000u))
+
+/* A tile under a texpage's page or a CLUT is newer on the GE (prim_begin would read back). */
+static int fl_newer(u32 tp, u32 clut)
+{
+    int d = tp >> 7 & 3;
+    return newer((s32)(tp & 0xF) * 64, (s32)(tp >> 4 & 1) * 256, d ? 128 : 64, 256) ||
+           newer((s32)(clut & 0x3F) * 16, (s32)(clut >> 6 & 0x1FF), d ? 256 : 16, 1);
+}
+
+/* A pass's state, sent from unknown so that its words alone set it, and kept. */
+static void fl_capture(u32 *dst, int *n, int func, int ref, int mode, int check, int set)
+{
+    unsigned int *s = gu_list->current;
+    ge.a_func = -1, ge.blend = -2, ge.st_check = ge.st_set = -2;
+    alpha(func, ref);
+    blend(mode);
+    stencil(check, set);
+    *n = (int)(gu_list->current - s);
+    for (int i = 0; i < *n; i++)
+        dst[i] = s[i];
+}
+
+/* A new key: its state words, as polygon() and tex_draw() would send them, into a block of the
+ * arena when it has room (else into the list, and the entry is used this once). */
+static void fl_miss(FlEntry *e, u32 cmd, u32 clut, s32 x1, s32 y1, s32 x2, s32 y2)
+{
+    const Gpu *g = &ge.psx->gpu;
+    GpuPrim p;
+    int gour = cmd >> 4 & 1;
+    gpu_prim_from(ge.psx, &p, cmd, clut, g->texpage);
+    p.gouraud = gour;
+    p.dither = (g->stat & 0x200) && (gour || (p.textured && !p.raw));
+    int flags = prim_begin(&p);
+    e->k0 = fl.k0, e->k1 = fl.k1, e->a0 = fl.a0, e->a1 = fl.a1;
+    e->flags = flags, e->two = 0, e->slot = -1;
+    if (flags) {
+        const u8 *pg = ge.tex_sent;
+        const u32 *cl = ge.clut_sent;
+        unsigned int *l = gu_list->current;
+        int arena = fl_arena_off + FL_WORDS + 16 <= FL_ARENA / 4;
+        if (arena)
+            gu_list->current = FL_ARENA_UNCACHED + fl_arena_off;
+        unsigned int *s = gu_list->current;
+        fl_forget();
+        if (p.textured) {
+            bind(&p, pg, cl);
+            e->slot = (int)((pg - ge.pages[0].data) / PAGE_BYTES);
+        }
+        prim_state(&p, x1, y1, x2, y2);
+        if (!p.textured)
+            tex_mode(0);
+        else {
+            int semi = p.semi ? (int)p.abr : -1, set = p.mask_set != 0;
+            tex_mode(1);
+            if (flags == 1 || flags == 2 || (semi < 0 && set)) {
+                alpha(GU_GREATER, 0);
+                blend(flags == 2 ? semi : -1);
+                stencil(p.mask_check, flags == 1 ? set : 1);
+            } else {
+                unsigned int *m = gu_list->current; /* the lane sends these before each pass */
+                fl_capture(e->pass1, &e->n1, GU_EQUAL, 0xFF, -1, p.mask_check, set);
+                fl_capture(e->pass2, &e->n2, GU_EQUAL, 0x80, semi, p.mask_check, 1);
+                gu_list->current = m;
+                ge.a_func = -1, ge.blend = -2, ge.st_check = ge.st_set = -2;
+                e->two = 1;
+            }
+        }
+        sceGuSendCommandi(0x12, p.textured ? TEX_VTX : GE_VTX); /* VTYPE */
+        if (arena) {
+            sceGuSendCommandi(0x0B, 0); /* RET */
+            fl_arena_off += (u32)(gu_list->current - s);
+            e->call[0] = 0x10000000u | ((u32)s >> 8 & 0xF0000);
+            e->call[1] = 0x0A000000u | ((u32)s & 0xFFFFFF);
+            l[0] = e->call[0], l[1] = e->call[1];
+            gu_list->current = l + 2;
+        } else
+            e->k0 = ~0u, e->call[0] = 0; /* used this once, never found */
+    }
+    e->syncs = ge.syncs, e->epoch = ge.epoch, e->nver = ge.nver; /* prim_begin may have run the list */
+}
+
+/* The key in fl.k0-a1 changed: the GE gets its state, from the cache when it holds. */
+static void fl_setup(u32 cmd, u32 clut)
+{
+    s32 x1, y1, x2, y2;
+    int flags = 0;
+    /* two ways per set, the one used longer ago replaced */
+    u32 h = (fl.k0 ^ fl.k1 * 0x9E3779B1u ^ fl.a0 * 0x85EBCA6Bu ^ fl.a1) * 0xC2B2AE35u;
+    FlEntry *e = &fl_cache[(h ^ h >> 15) >> (32 - FL_BITS) & ~1u];
+    if (e->k0 != fl.k0 || e->k1 != fl.k1 || e->a0 != fl.a0 || e->a1 != fl.a1) {
+        FlEntry *o = e + 1;
+        if ((o->k0 == fl.k0 && o->k1 == fl.k1 && o->a0 == fl.a0 && o->a1 == fl.a1) || o->use < e->use)
+            e = o;
+    }
+    e->use = ++fl_uses;
+    if (area(&x1, &y1, &x2, &y2)) {
+        begin(); /* first: running the list ends its blocks */
+        if (e->k0 == fl.k0 && e->k1 == fl.k1 && e->a0 == fl.a0 && e->a1 == fl.a1 && e->syncs == ge.syncs &&
+            e->epoch == ge.epoch && (e->nver == ge.nver || !(fl.k0 & 1) || !fl_newer(ge.psx->gpu.texpage, clut))) {
+            e->nver = ge.nver;
+            if (e->flags) {
+                unsigned int *l = gu_list->current;
+                l[0] = e->call[0], l[1] = e->call[1];
+                gu_list->current = l + 2;
+                fl.dirty = 1;
+                if (e->slot >= 0)
+                    ge.pages[e->slot].age = ++ge.ages;
+            }
+            ge.s.fast_hits++;
+        } else
+            fl_miss(e, cmd, clut, x1, y1, x2, y2);
+        flags = e->flags;
+    }
+    fl.flags = flags;
+    fl.two = flags && e->two, fl.n1 = e->n1, fl.n2 = e->n2, fl.pass1 = e->pass1, fl.pass2 = e->pass2;
+    fl.x1 = x1, fl.y1 = y1, fl.x2 = x2, fl.y2 = y2;
+    fl.base = flags && e->call[0] ? e->call[0] & 0xF0000 : ~0u; /* the block's CALL set it last */
+    fl.epoch = ge.epoch, fl.nver = ge.nver;
+    fl.valid = 1;
+    ge.s.fast_setups++;
+}
+
+/* A polygon command (GP0 20-3F) straight from its words, when it lies inside VRAM (no clipping
+ * at the origin) and the GE can sample its texture; -1 otherwise. Each vertex is written once
+ * into the ring; the list gets BASE when it moves, VADDR and PRIM, per pass. */
+static int rd_poly(void *self, const u32 *c)
+{
+    (void)self;
+    const Gpu *g = &ge.psx->gpu;
+    u32 cmd = c[0] >> 24;
+    int quad = cmd >> 3 & 1, tex = cmd >> 2 & 1, gour = cmd >> 4 & 1, n = quad ? 4 : 3;
+    if (tex && ((g->texpage >> 7 & 3) >= 2 || g->tw_mask_x || g->tw_mask_y || !ge.npages))
+        return -1;
+    s32 x[4], y[4];
+    u32 col[4], uv[4];
+    u32 cl = c[0] & 0xFFFFFF;
+    int k = 1;
+    for (int i = 0; i < n; i++) {
+        if (gour && i)
+            cl = c[k++] & 0xFFFFFF;
+        u32 w = c[k++];
+        x[i] = ((s32)(w << 21) >> 21) + g->off_x;
+        y[i] = ((s32)(w << 5) >> 21) + g->off_y;
+        col[i] = cl;
+        uv[i] = tex ? c[k++] : 0;
+    }
+    s32 minx = x[0], maxx = x[0], miny = y[0], maxy = y[0];
+    for (int i = 1; i < n; i++) {
+        minx = x[i] < minx ? x[i] : minx, maxx = x[i] > maxx ? x[i] : maxx;
+        miny = y[i] < miny ? y[i] : miny, maxy = y[i] > maxy ? y[i] : maxy;
+    }
+    if ((minx | miny) < 0 || maxx > VRAM_W - 1 || maxy > VRAM_H - 1)
+        return -1;
+    if (!quad && (x[1] - x[0]) * (y[2] - y[0]) == (x[2] - x[0]) * (y[1] - y[0]))
+        return -1; /* no area: the core draws nothing */
+    u32 vsz = tex ? sizeof(TexVtx) : sizeof(GeVtx);
+    if (fl.ring_off + (u32)n * vsz > fl.ring_bytes) {
+        ge_sync();
+        ge.s.flushes++;
+    } else if (fl.valid && (u32)((u8 *)gu_list->current - (u8 *)gu_list->start) > LIST_BYTES - LIST_SLACK)
+        fl.valid = 0; /* fl_setup's begin() runs the list */
+    /* only what changes the GE state: flat and Gouraud polygons, triangles and quads share it,
+     * and the dither bit counts only where fl_setup's prim_state would dither */
+    int raw = tex && (cmd & 1), semi = cmd >> 1 & 1;
+    u32 dith = (g->texpage >> 9 & 1) && (gour || tex) && !raw;
+    u32 tp = (tex ? g->texpage & 0x19F : 0) | (semi ? g->texpage & 0x60 : 0);
+    u32 k0 = (u32)tex | (u32)raw << 1 | (u32)semi << 2 | dith << 3 | tp << 8 | (u32)(g->mask_check != 0) << 20 |
+             (u32)(g->mask_set != 0) << 21;
+    u32 k1 = uv[0] >> 16;
+    u32 a0 = (u32)g->clip_x1 | (u32)g->clip_y1 << 16, a1 = (u32)g->clip_x2 | (u32)g->clip_y2 << 16;
+    if (!fl.valid || k0 != fl.k0 || k1 != fl.k1 || a0 != fl.a0 || a1 != fl.a1 || ge.epoch != fl.epoch) {
+        fl.k0 = k0, fl.k1 = k1, fl.a0 = a0, fl.a1 = a1;
+        fl_setup(cmd, k1);
+    } else if (tex && ge.nver != fl.nver) {
+        /* tiles turned newer: only those under the page or the CLUT need the readback */
+        if (fl_newer(g->texpage, k1))
+            fl_setup(cmd, k1);
+        else
+            fl.nver = ge.nver;
+    }
+    if (!fl.flags)
+        return DONE;
+    s32 bx1 = minx > fl.x1 ? minx : fl.x1, by1 = miny > fl.y1 ? miny : fl.y1;
+    s32 bx2 = maxx < fl.x2 ? maxx : fl.x2, by2 = maxy < fl.y2 ? maxy : fl.y2;
+    if (bx1 > bx2 || by1 > by2)
+        return DONE;
+    if (tex)
+        ge.s.ttris += (u32)n - 2;
+    else
+        ge.s.tris += (u32)n - 2;
+    ge.s.fast++;
+    mark(bx1, by1, bx2, by2);
+    /* +0.5 as in polygon() */
+    u8 *vp = fl.ring + fl.ring_off;
+    if (tex) {
+        TexVtx *o = (TexVtx *)vp;
+        for (int i = 0; i < n; i++) {
+            o[i].u = (float)(uv[i] & 0xFF) + 0.5f, o[i].v = (float)(uv[i] >> 8 & 0xFF) + 0.5f;
+            o[i].c = raw ? 0xFF808080u : 0xFF000000u | col[i];
+            o[i].x = (float)x[i] + 0.5f, o[i].y = (float)y[i] + 0.5f, o[i].z = 0;
+        }
+    } else {
+        GeVtx *o = (GeVtx *)vp;
+        for (int i = 0; i < n; i++) {
+            o[i].c = 0xFF000000u | col[i];
+            o[i].x = (float)x[i] + 0.5f, o[i].y = (float)y[i] + 0.5f, o[i].z = 0;
+        }
+    }
+    fl.ring_off += (u32)n * vsz;
+    u32 base = (u32)vp >> 8 & 0xF0000, va = 0x01000000u | ((u32)vp & 0xFFFFFF);
+    u32 pr = 0x04000000u | (u32)(quad ? GU_TRIANGLE_STRIP : GU_TRIANGLE_FAN) << 16 | (u32)n;
+    unsigned int *l = gu_list->current;
+    if (fl.two)
+        for (int i = 0; i < fl.n1; i++)
+            *l++ = fl.pass1[i];
+    if (base != fl.base)
+        *l++ = 0x10000000u | base, fl.base = base;
+    *l++ = va, *l++ = pr;
+    if (fl.two) {
+        for (int i = 0; i < fl.n2; i++)
+            *l++ = fl.pass2[i];
+        *l++ = va, *l++ = pr;
+    }
+    gu_list->current = l;
+    ge_kick();
+    return DONE;
+}
+
 /* ---- setup and log ---- */
 
 void ge_init(Psx *psx, int compare)
 {
     ge.psx = psx;
     ge.compare = compare;
-    ge.r = (GpuRenderer){&ge, rd_triangle, rd_quad, rd_rect, rd_line, rd_fill, rd_copy, rd_read, rd_wrote};
     if (compare) {
         SceUID uid = sceKernelAllocPartitionMemory(2, "psxrt ge compare", PSP_SMEM_Low, VRAM_W * VRAM_H * 2, NULL);
         ge.cmp = uid < 0 ? NULL : sceKernelGetBlockHeadAddr(uid);
@@ -974,8 +1265,20 @@ void ge_init(Psx *psx, int compare)
             ge.pages[i].data = b + i * PAGE_BYTES;
         ge.npages = n;
     }
+    for (u32 b = RING_MAX; b >= 64 * 1024 && !fl.ring; b /= 2) {
+        SceUID uid = sceKernelAllocPartitionMemory(2, "psxrt ge ring", PSP_SMEM_Low, b + 64, NULL);
+        if (uid < 0)
+            continue;
+        u8 *r = (u8 *)(((u32)sceKernelGetBlockHeadAddr(uid) + 63) & ~63u);
+        sceKernelDcacheWritebackInvalidateRange(r, b); /* written through the uncached mirror only */
+        fl.ring = (u8 *)((u32)r | 0x40000000u), fl.ring_bytes = b;
+    }
+    for (int i = 0; i < 1 << FL_BITS; i++)
+        fl_cache[i].k0 = ~0u; /* no key */
+    sceKernelDcacheWritebackInvalidateRange(fl_arena, sizeof fl_arena); /* written uncached from now on */
+    ge.r = (GpuRenderer){&ge, rd_triangle, rd_quad, rd_rect, rd_line, rd_fill, rd_copy, rd_read, rd_wrote, fl.ring ? rd_poly : NULL};
     ge.syncs = 1; /* no slot (used 0) is in the list */
-    psx_log(psx, "ge: %d texture page slots", ge.npages);
+    psx_log(psx, "ge: %d texture page slots, %u KB vertex ring", ge.npages, (unsigned)(fl.ring_bytes / 1024));
     rd_fill(&ge, 0, 0, VRAM_W, VRAM_H, 0); /* also makes the oracle create the framebuffer */
     ge_sync();
     newer_clear(); /* both copies are zero */
@@ -1034,7 +1337,7 @@ int ge_log(char *buf, int cap)
     int n = clampn(snprintf(buf, (size_t)cap,
                             "-- ge: tri %u+%u tex, rect %u+%u tex, fill %u, line %u (%u runs); sw tex15 %u texwin %u "
                             "copy %u+%u sw+%u null (%u kpx, %u from ge); pages %u cluts %u, readback %u (%u tiles, %u ms), upload %u "
-                            "(%u kpx), flush %u; bind %u tex %u clut, kick %u, rd check %u\n",
+                            "(%u kpx), flush %u; bind %u tex %u clut, kick %u, rd check %u; fast %u (%u setups, %u cached)\n",
                             (unsigned)s->tris, (unsigned)s->ttris, (unsigned)s->rects, (unsigned)s->trects,
                             (unsigned)s->fills, (unsigned)s->lines, (unsigned)s->line_runs, (unsigned)s->sw_tex15,
                             (unsigned)s->sw_texwin,
@@ -1042,7 +1345,7 @@ int ge_log(char *buf, int cap)
                             (unsigned)s->pages, (unsigned)s->cluts, (unsigned)s->readbacks, (unsigned)s->read_tiles,
                             (unsigned)(s->read_us / 1000), (unsigned)s->uploads, (unsigned)(s->upload_px / 1000),
                             (unsigned)s->flushes, (unsigned)s->bind_tex, (unsigned)s->bind_clut, (unsigned)s->kicks,
-                            (unsigned)s->rd_checks),
+                            (unsigned)s->rd_checks, (unsigned)s->fast, (unsigned)s->fast_setups, (unsigned)s->fast_hits),
                    cap);
     memset(&ge.s, 0, sizeof ge.s);
     if (ge.compare && n < cap - 1)
