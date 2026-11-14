@@ -2788,7 +2788,7 @@ dependencies = [
 name = "psx2psp-core"
 version = "0.1.0"
 dependencies = [
- "flate2",
+ "miniz_oxide 0.9.1",
  "rayon",
  "tempfile",
  "thiserror 2.0.21",
@@ -2798,7 +2798,7 @@ dependencies = [
 name = "psx2psp-engine"
 version = "0.1.0"
 dependencies = [
- "flate2",
+ "miniz_oxide 0.9.1",
  "psx2psp-core",
  "psx2psp-media",
  "psx2psp-patching",

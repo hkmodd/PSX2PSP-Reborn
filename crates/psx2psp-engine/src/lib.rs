@@ -57,11 +57,9 @@ pub fn builtin_base_pbp() -> &'static [u8] {
     PBP.get_or_init(|| inflate(include_bytes!(concat!(env!("OUT_DIR"), "/BASE.PBP.z"))))
 }
 
-/// Inflates a zlib resource compressed by `build.rs`.
+/// Inflates a built-in zlib resource (`build.rs` output or a `resources/*.z` file).
 pub(crate) fn inflate(z: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
-    flate2::read::ZlibDecoder::new(z).read_to_end(&mut out).expect("built-in resource is valid zlib");
-    out
+    miniz_oxide::inflate::decompress_to_vec_zlib(z).expect("built-in resource is valid zlib")
 }
 /// Built-in loader: the 19 002-byte ELF `DATA.PSP` that popstation/PSX2PSP and PSXPackager write
 /// in preference to the donor's own signed module.
@@ -965,12 +963,7 @@ mod tests {
             convert(&ConvertRequest { discs: vec![disc], patches: patches.clone(), title: "T".into(), output: output.clone(), donor: None, artwork: Artwork::default(), level }, &()).unwrap();
             std::fs::read(output).unwrap()
         };
-        let deflate = |l: u32| {
-            use std::io::Write as _;
-            let mut e = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::new(l));
-            e.write_all(&raw[..0x9300]).unwrap();
-            e.finish().unwrap()
-        };
+        let deflate = |l: u8| miniz_oxide::deflate::compress_to_vec(&raw[..0x9300], l);
         assert_ne!(deflate(1), deflate(5), "the sample must tell level 1 from 5");
         let none = PatchDb::default();
         let five = build(5, &none);

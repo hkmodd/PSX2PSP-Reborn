@@ -6,7 +6,6 @@
 //! like PSX2PSP's default `hideGameRegion=1`. Decompressed once, on first lookup (~5 ms).
 
 use std::collections::HashMap;
-use std::io::Read;
 use std::sync::OnceLock;
 
 static RAW: &[u8] = include_bytes!("../../../resources/gamedb.tsv.z");
@@ -23,8 +22,7 @@ pub struct GameEntry {
 fn db() -> &'static HashMap<String, GameEntry> {
     static DB: OnceLock<HashMap<String, GameEntry>> = OnceLock::new();
     DB.get_or_init(|| {
-        let mut text = String::new();
-        flate2::read::ZlibDecoder::new(RAW).read_to_string(&mut text).expect("embedded game DB is valid zlib UTF-8");
+        let text = String::from_utf8(crate::inflate(RAW)).expect("embedded game DB is UTF-8");
         text.lines()
             .filter_map(|l| {
                 let mut f = l.split('\t');

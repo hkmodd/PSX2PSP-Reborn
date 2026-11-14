@@ -20,9 +20,8 @@
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use flate2::Compression;
-use flate2::read::DeflateDecoder;
-use flate2::write::DeflateEncoder;
+use miniz_oxide::deflate::compress_to_vec;
+use miniz_oxide::inflate::decompress_to_vec_with_limit;
 use rayon::prelude::*;
 
 use crate::disc::{DiscImage, LEAD_IN_FRAMES, RAW_SECTOR, TrackKind};
@@ -369,13 +368,14 @@ fn read_full(r: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
 /// popsman `sceMeAudio_3771229c`, which returns 0 without reading once the compiled SDK version is
 /// above 3.02 (POPS 6.61 sets 6.06): the block never becomes valid and the game hangs on it. An
 /// incompressible block becomes deflate stored blocks instead (0x9300 + 5 bytes, never 0x9300).
-fn compress_block(block: &[u8], level: Compression) -> Vec<u8> {
-    let deflate = |l| {
-        let mut e = DeflateEncoder::new(Vec::with_capacity(BLOCK / 2), l);
-        e.write_all(block).and_then(|()| e.finish()).expect("deflate into a Vec cannot fail")
-    };
-    let v = deflate(level);
-    if v.len() < BLOCK { v } else { deflate(Compression::none()) }
+///
+/// The encoder is miniz_oxide, pinned in the workspace manifest: every EBOOT proven on a real PSP
+/// was built with it, and the kernel inflate is not provably stream-agnostic (see [`LEVELS`]).
+/// zlib-rs was measured on MediEvil's 14,934 blocks: 4x faster, but level 1 is 11% larger and
+/// level 5–9 never smaller than miniz, so the speed would buy an encoder the PSP has never seen.
+fn compress_block(block: &[u8], level: u8) -> Vec<u8> {
+    let v = compress_to_vec(block, level);
+    if v.len() < BLOCK { v } else { compress_to_vec(block, 0) }
 }
 
 struct DiscHeader<'a> {
@@ -429,7 +429,7 @@ pub type BlockIndex = Vec<(u32, u32)>;
 fn stream_disc<W: Write + Seek>(
     w: &mut W,
     spec: &DiscSpec<'_>,
-    level: Compression,
+    level: u8,
     monitor: &dyn Monitor,
     done_before: u64,
     total: u64,
@@ -511,6 +511,9 @@ fn pad16<W: Write + Seek>(w: &mut W) -> Result<()> {
 /// T19G/T19A, 2026-11-14), while Sheep, Dog 'n' Wolf plays at level 1. Both streams decode
 /// bit-exact with zlib, so the fault cannot be reproduced off the device: such games carry a
 /// minimum level in the patch database instead.
+///
+/// Lower levels are not faster with this encoder (measured on MediEvil, Crash 2 and Silent Hill:
+/// level 1 takes as long as 5 or 9) and only make the file 2–3% larger; 9 saves ~0.1% over 5.
 pub const LEVELS: std::ops::RangeInclusive<u32> = 1..=9;
 
 /// Writes DATA.PSAR starting at absolute position `psar` (the writer must be positioned there).
@@ -527,7 +530,7 @@ pub fn write_psar<W: Write + Seek>(w: &mut W, psar: u64, job: &PsarJob<'_>, moni
             return Err(Error::format("subchannel table", format!("not a whole number of {SUBQ_ENTRY}-byte entries")));
         }
     }
-    let level = Compression::new(job.level.clamp(*LEVELS.start(), *LEVELS.end()));
+    let level = job.level.clamp(*LEVELS.start(), *LEVELS.end()) as u8;
     let total: u64 = job.discs.iter().map(|d| d.image.size_bytes()).sum();
     let png_trailer = (STARTDAT_HDR + job.boot_png.len()) as u32;
     let mut all = PsarStats::default();
@@ -728,8 +731,7 @@ fn inflate(p: &[u8]) -> Result<Vec<u8>> {
     if p.len() == BLOCK {
         return Ok(p.to_vec());
     }
-    let mut v = Vec::with_capacity(BLOCK);
-    DeflateDecoder::new(p).read_to_end(&mut v)?;
+    let v = decompress_to_vec_with_limit(p, BLOCK).map_err(|e| Error::format("PSISOIMG", format!("block does not inflate: {e}")))?;
     if v.len() != BLOCK {
         return Err(Error::format("PSISOIMG", format!("block inflated to {} bytes", v.len())));
     }
@@ -744,13 +746,40 @@ mod tests {
     fn incompressible_block_is_never_stored_raw() {
         let mut x = 0x2545_f491_4f6c_dd1d_u64;
         let blk: Vec<u8> = (0..BLOCK).map(|_| { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x as u8 }).collect();
-        for level in [Compression::fast(), Compression::best()] {
+        for level in [1, 9] {
             let c = compress_block(&blk, level);
             assert!(c.len() > BLOCK && c.len() <= 0xFFFF, "len {:#x}", c.len());
             assert_eq!(inflate(&c).unwrap(), blk);
         }
-        let z = compress_block(&[0u8; BLOCK], Compression::fast());
+        let z = compress_block(&[0u8; BLOCK], 1);
         assert!(z.len() < BLOCK);
         assert_eq!(inflate(&z).unwrap(), vec![0u8; BLOCK]);
     }
+
+    /// The deflate streams are what the PSP kernel inflates, and only this encoder's output has been
+    /// proven on hardware. Any change here (encoder version, backend, settings) must fail loudly:
+    /// update the hashes only after the new streams have booted a real PSP.
+    #[test]
+    fn deflate_streams_are_pinned() {
+        // A sector-like block: a header, text-like runs, zero padding and noise, so every level
+        // takes a different path through the matcher and the Huffman builder.
+        let mut x = 0x9e37_79b9_7f4a_7c15_u64;
+        let blk: Vec<u8> = (0..BLOCK)
+            .map(|i| match (i / 0x930) % 4 {
+                0 => b"SONY COMPUTER ENTERTAINMENT INC. "[i % 33],
+                1 => 0,
+                2 => (i / 7) as u8,
+                _ => { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x >> 56) as u8 }
+            })
+            .collect();
+        // FNV-1a: tiny, dependency-free and enough to detect a different stream.
+        let fnv = |d: &[u8]| d.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
+        let got: Vec<(u8, usize, u64)> = [1, 5, 9].map(|l| { let c = compress_block(&blk, l); (l, c.len(), fnv(&c)) }).to_vec();
+        for &(l, ..) in &got {
+            assert_eq!(inflate(&compress_block(&blk, l)).unwrap(), blk);
+        }
+        assert_eq!(got, PINNED, "deflate output changed: re-validate on a real PSP before updating");
+    }
+    // miniz_oxide 0.9.1, identical to the flate2 1.1 (miniz backend) streams of every PSP-tested build.
+    const PINNED: [(u8, usize, u64); 3] = [(1, 11219, 0xd023_f018_aada_bf73), (5, 10234, 0x7e5d_f8a1_0ccd_df42), (9, 10242, 0xa493_9f3c_4c01_c0d9)];
 }
