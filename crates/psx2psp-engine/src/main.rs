@@ -11,7 +11,7 @@ use psx2psp_engine::media::provision::{self, Tool};
 use psx2psp_engine::media::tools::{self, At3Encoder, Ffmpeg, Snd0Request};
 use psx2psp_engine::patchdb::{self, PatchDb};
 use psx2psp_engine::update;
-use psx2psp_engine::{Artwork, ConvertRequest, DEFAULT_LEVEL, DiscInput, convert, core::Monitor, extract, inspect, probe_disc};
+use psx2psp_engine::{Artwork, ConvertRequest, DEFAULT_LEVEL, DiscInput, convert, convert_native, core::Monitor, extract, inspect, probe_disc};
 
 const USAGE: &str = "\
 psx2psp — PS1 → PSP/PS Vita (POPS) EBOOT.PBP builder
@@ -52,6 +52,8 @@ CONVERT OPTIONS:
   --snd0 <audio>     any audio/video → SND0.AT3 (needs ffmpeg + at3tool/atracdenc)
   --snd0-start <s>   start offset in seconds (default 0)
   --level <1-9>      deflate level (default 5; 9 is ~0.1% smaller and twice as slow)
+  --native           experimental: a native EBOOT (category MG) that runs the psxrt runtime
+                     instead of POPS; one disc, same title/ID/artwork, no disc patches
   --clip <src>       video/audio file or YouTube URL → ICON1.PMF + SND0.AT3 (see CLIP OPTIONS)
 
 CLIP OPTIONS:
@@ -334,6 +336,7 @@ fn cmd_convert(args: &[String]) -> R {
     let mut snd0_start = 0.0f64;
     let mut clip_args = ClipArgs::default();
     let mut level = DEFAULT_LEVEL;
+    let mut native = false;
     let mut discs: Vec<DiscInput> = Vec::new();
     let mut ppfs: Vec<(usize, PathBuf)> = Vec::new();
     // Switches the user did not set follow the game's defaults in the patch database.
@@ -357,6 +360,7 @@ fn cmd_convert(args: &[String]) -> R {
             "--snd0" => snd0 = Some(PathBuf::from(val()?)),
             "--snd0-start" => snd0_start = val()?.parse()?,
             "--level" => level = val()?.parse()?,
+            "--native" => native = true,
             "--pal-ntsc" => pal_ntsc = true,
             "--no-title-fixes" => title_fixes = Some(false),
             "--fps-unlock" => fps_unlock = Some(true),
@@ -432,7 +436,8 @@ fn cmd_convert(args: &[String]) -> R {
         snd0,
     };
     let req = ConvertRequest { discs, patches, title, output, donor, artwork, level };
-    let rep = convert(&req, &Cli { last: AtomicU64::new(u64::MAX) })?;
+    let cli = Cli { last: AtomicU64::new(u64::MAX) };
+    let rep = if native { convert_native(&req, &cli)? } else { convert(&req, &cli)? };
     println!("{}", rep.output.display());
     Ok(())
 }
