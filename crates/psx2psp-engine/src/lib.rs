@@ -226,7 +226,8 @@ pub const PSAR_ALIGN: u64 = 0x10000;
 /// Default deflate level, as PSXPackager. Measured over 0x9300 blocks of a real disc: 5 is
 /// within 0.1% of 9's size at half the compression time, and inflate time (the PSP's cost)
 /// does not depend on the level. Level 0 (stored) is not offered: such EBOOTs are reported
-/// not to boot under POPS. Levels 1-4 are not offered either: see [`LEVELS`].
+/// not to boot under POPS. Lower levels build faster and larger, and break some games on a
+/// real PSP: those carry a `min_level` in the patch database, which [`convert`] enforces.
 pub const DEFAULT_LEVEL: u32 = 5;
 pub use psx2psp_core::psar::LEVELS;
 
@@ -498,7 +499,7 @@ fn title_fixes_for(d: &DiscInput, db: &PatchDb, img: &DiscImage, ppf: Option<&Pp
         }
         monitor.log(&format!("Disc {disc}: POPS config from {} ({} B)", sidecar.display(), c.len()));
         Some(c)
-    } else if let Some(g) = db.game(id).filter(|g| g.config.is_some()) {
+    } else if let Some(g) = db.config_game(id) {
         let c = g.config.clone().expect("filtered");
         if patchdb::config_wanted(sw, &d.patch_choice) {
             monitor.log(&format!("Disc {disc}: POPS config for {id} — {} ({} B){}", g.source, c.len(), origin(g.origin)));
@@ -711,6 +712,16 @@ pub fn convert(req: &ConvertRequest, monitor: &dyn Monitor) -> Result<ConvertRep
         ppfs.push(ppf);
     }
 
+    // A game that hangs on a real PSP below some level (patch database `min_level`) raises the
+    // level of the whole PSAR.
+    let mut level = req.level.clamp(*LEVELS.start(), *LEVELS.end());
+    for (n, id) in ids.iter().enumerate() {
+        if let Some(min) = req.patches.min_level(id).filter(|&m| m > level) {
+            monitor.log(&format!("Disc {}: compression raised from level {level} to {min}: {id} hangs on a real PSP below level {min} (patch database)", n + 1));
+            level = min;
+        }
+    }
+
     let multi = images.len() > 1;
     let job = PsarJob {
         discs: (0..images.len())
@@ -732,7 +743,7 @@ pub fn convert(req: &ConvertRequest, monitor: &dyn Monitor) -> Result<ConvertRep
             })
             .collect(),
         title: req.title.clone(),
-        level: req.level,
+        level,
         boot_png: req.artwork.boot.as_deref().unwrap_or(&donor.boot_png),
         donor: &donor,
     };
@@ -755,7 +766,7 @@ pub fn convert(req: &ConvertRequest, monitor: &dyn Monitor) -> Result<ConvertRep
     let file = File::create(&part.part).map_err(psx2psp_core::Error::io_path(&part.part))?;
     let mut w = BufWriter::with_capacity(8 << 20, file);
     let mut stats = PsarStats::default();
-    monitor.log(&format!("Compressing {} disc(s) at level {} on {} threads", images.len(), req.level.clamp(*LEVELS.start(), *LEVELS.end()), std::thread::available_parallelism().map_or(1, |n| n.get())));
+    monitor.log(&format!("Compressing {} disc(s) at level {} on {} threads", images.len(), level, std::thread::available_parallelism().map_or(1, |n| n.get())));
     write_pbp(&mut w, &sections, PSAR_ALIGN, |w, base| {
         stats = psar::write_psar(w, base, &job, monitor)?;
         Ok(())
@@ -1028,8 +1039,9 @@ mod tests {
     }
 
     #[test]
-    fn levels_below_five_compress_as_five() {
-        // Level 1 EBOOTs hang MediEvil on a real PSP (kernel inflate); 5 and 9 are proven.
+    fn min_level_raises_the_level_for_that_game_only() {
+        // Level 1 EBOOTs hang MediEvil on a real PSP (kernel inflate): its `min_level = 5` must
+        // win over the level asked for, and leave other games and higher levels alone.
         use patching::sector::build_mode2_form1;
         let t = tempfile::tempdir().unwrap();
         let mut x = 0x9e37_79b9_u32;
@@ -1041,10 +1053,11 @@ mod tests {
         }
         std::fs::write(t.path().join("g.bin"), &raw).unwrap();
         let cue = touch(t.path(), "g.cue", "FILE \"g.bin\" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n");
-        let build = |level: u32| {
-            let output = t.path().join(level.to_string()).join("EBOOT.PBP");
+        let db = PatchDb::parse("[game SLES-00001]\nmin_level = 5\n", patchdb::Origin::User).unwrap();
+        let build = |level: u32, patches: &PatchDb| {
+            let output = t.path().join(format!("{level}-{}", patches.games.len())).join("EBOOT.PBP");
             let disc = DiscInput { path: cue.clone(), disc_id: Some("SLES00001".into()), ..Default::default() };
-            convert(&ConvertRequest { discs: vec![disc], patches: PatchDb::default(), title: "T".into(), output: output.clone(), donor: None, artwork: Artwork::default(), level }, &()).unwrap();
+            convert(&ConvertRequest { discs: vec![disc], patches: patches.clone(), title: "T".into(), output: output.clone(), donor: None, artwork: Artwork::default(), level }, &()).unwrap();
             std::fs::read(output).unwrap()
         };
         let deflate = |l: u32| {
@@ -1054,10 +1067,13 @@ mod tests {
             e.finish().unwrap()
         };
         assert_ne!(deflate(1), deflate(5), "the sample must tell level 1 from 5");
-        let five = build(5);
-        assert_eq!(build(1), five);
-        assert_eq!(build(4), five);
-        assert_eq!(*LEVELS.start(), 5);
+        let none = PatchDb::default();
+        let five = build(5, &none);
+        assert_ne!(build(1, &none), five, "without min_level, level 1 is honoured");
+        assert_eq!(build(1, &db), five);
+        assert_eq!(build(4, &db), five);
+        assert_eq!(build(9, &db), build(9, &none), "a minimum never lowers the level");
+        assert_eq!(LEVELS, 1..=9);
     }
 
     /// 40-sector PAL disc with the Y Fix #2 sequence in sector 30 (plus Graphic Fix #2 when

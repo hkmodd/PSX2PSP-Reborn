@@ -248,7 +248,7 @@ impl Disc {
 
     /// The database's POPS config for this game, if any.
     fn config<'a>(&self, db: &'a PatchDb) -> Option<&'a patchdb::Game> {
-        self.db_id(db).and_then(|id| db.game(&id)).filter(|g| g.config.is_some())
+        self.db_id(db).and_then(|id| db.config_game(&id))
     }
 
     /// The database's patches for this game, sorted by kind.
@@ -2861,7 +2861,16 @@ impl App {
     }
 
     fn build_card(&self) -> Element<'_, Message> {
-        let status = chip(format!("Level {}", self.level), style::GREEN);
+        // The engine raises the level to a game's `min_level` (games that hang on a PSP below it).
+        let floor = self.discs.iter().filter_map(|d| d.db_id(&self.patches).and_then(|id| self.patches.min_level(&id))).max();
+        let raised = floor.filter(|&m| m > self.level);
+        let status = chip(format!("Level {}", raised.unwrap_or(self.level)), if raised.is_some() { style::AMBER } else { style::GREEN });
+        let (note, accent) = match (raised, self.level) {
+            (Some(m), _) => (format!("raised to {m}: this game hangs on a PSP below it"), style::AMBER),
+            (None, ..=4) => ("faster build, larger file".to_owned(), style::MUTED),
+            (None, 5..=6) => ("recommended".to_owned(), style::GREEN),
+            (None, _) => ("slower, ~same size".to_owned(), style::MUTED),
+        };
         self.section(BUILD, status, || {
             let output = self.output_path().map_or_else(|| "<disc folder>/<GAME ID>/EBOOT.PBP".into(), |p| p.display().to_string());
             let reset = (Icon::Reset, "Back to the default location", self.output.as_ref().map(|_| Message::ResetOutput));
@@ -2873,13 +2882,7 @@ impl App {
                     icons::icon(Icon::Layers, 14.0, style::MUTED),
                     caption(format!("COMPRESSION  {}", self.level)),
                     space().width(Fill),
-                    chip(
-                        match self.level {
-                            ..=6 => "recommended",
-                            _ => "slower, ~same size",
-                        },
-                        if self.level <= 6 { style::GREEN } else { style::MUTED },
-                    ),
+                    chip(note, accent),
                 ]
                 .spacing(8)
                 .align_y(Alignment::Center),

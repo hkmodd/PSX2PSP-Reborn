@@ -81,8 +81,10 @@ Offsets are relative to the start of DATA.PSAR.
 
 The raw BIN (MODE2/2352 with audio tracks inline) is cut into **0x9300-byte blocks** (16 raw
 sectors), and the last block is zero-padded. Each block is raw deflate (no zlib header), at
-level 5–9 (default 5). Levels 1–4 are not offered: a level 1 build of MediEvil hangs on a real
-PSP where the same build at level 5 plays. `len == 0x9300` means a block stored verbatim, but
+level 1–9 (default 5). On ARK the blocks are inflated by the kernel's
+`sceKernelDeflateDecompress`, and that is not level-agnostic for every game: a level 1 build of
+MediEvil hangs on a real PSP where the same build at level 5 plays, though both inflate to the
+same disc with zlib. Such games carry `min_level` in the patch database. `len == 0x9300` means a block stored verbatim, but
 the writer never emits one, because POPS 6.61 does not load raw blocks. An incompressible block
 becomes deflate stored blocks instead (0x9305 bytes). The index can hold at most (0x100000 − 0x4000) / 32 = 32 256
 blocks, about 1.18 GB of raw image.

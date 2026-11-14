@@ -51,8 +51,9 @@ CONVERT OPTIONS:
   --icon1 <pmf>      ready-made ICON1.PMF
   --snd0 <audio>     any audio/video → SND0.AT3 (needs ffmpeg + at3tool/atracdenc)
   --snd0-start <s>   start offset in seconds (default 0)
-  --level <5-9>      deflate level (default 5; 9 is ~0.1% smaller and twice as slow; lower
-                     levels hang games on real PSPs)
+  --level <1-9>      deflate level (default 5, recommended; 1 builds faster and larger, 9 is
+                     ~0.1% smaller and twice as slow). Games that hang on a real PSP below
+                     some level are raised to it (patch database min_level, e.g. MediEvil)
   --native           experimental: a native EBOOT (category MG) that runs the psxrt runtime
                      instead of POPS; one disc, same title/ID/artwork, no disc patches
   --clip <src>       video/audio file or YouTube URL → ICON1.PMF + SND0.AT3 (see CLIP OPTIONS)
@@ -363,7 +364,7 @@ fn cmd_convert(args: &[String]) -> R {
             "--level" => {
                 level = val()?.parse()?;
                 if !psx2psp_engine::LEVELS.contains(&level) {
-                    return Err(format!("--level {level}: use 5..=9 (levels 1-4 hang games on real PSPs)").into());
+                    return Err(format!("--level {level}: use 1..=9").into());
                 }
             }
             "--native" => native = true,
@@ -502,7 +503,10 @@ fn cmd_patches(args: &[String]) -> R {
     // [on ]/[off] = what `convert` does without switches or --patch/--no-patch.
     let def = l.db.default_switches(&id);
     let mark = |on: bool| if on { "on " } else { "off" };
-    if let Some((g, c)) = game.and_then(|g| g.config.as_ref().map(|c| (g, c))) {
+    if let Some(m) = l.db.min_level(&id) {
+        println!("  Compression: level {m} or higher (lower levels hang this game on a real PSP; convert raises them)");
+    }
+    if let Some((g, c)) = l.db.config_game(&id).and_then(|g| g.config.as_ref().map(|c| (g, c))) {
         println!("  [{}] {:<40} fix   {} B, {}", mark(patchdb::config_wanted(def, &[])), patchdb::CONFIG, c.len(), g.source);
     }
     let hits = psx2psp_engine::scan_patches(&disc, ppf.as_deref(), &id, &l.db)?;
