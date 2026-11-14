@@ -15,7 +15,9 @@
 //!   runtime through a host call and continue after it.
 //! * Anything the translator does not model hands the guest over to the runtime's interpreter
 //!   ("resume"), which comes back to translated code through the dispatch table.
-//! * Loop back-edges poll [`ctx::IRQ`] first.
+//! * Loop back-edges charge the loop's estimated PS1 cycles to [`ctx::BUDGET`] first and enter
+//!   the runtime when it goes negative: the runtime advances the PS1 clock by what was spent
+//!   and serves interrupts (it also forces the budget negative to deliver one).
 //!
 //! Host call, five words: `sw ra,GPR31(k0); jal RT_CALL; nop; .word pc; .word insn`. The runtime
 //! saves the guest state to [`CTX`], services pending interrupts, executes `insn` as the guest
@@ -46,6 +48,8 @@ const K1R: u32 = 27;
 const RA: u32 = 31;
 const GUEST_K: u32 = (1 << K0R) | (1 << K1R);
 const NOP: u32 = 0;
+/// Upper bound of a loop's charge ([`Em::loop_cost`]): a long body is mostly skipped paths.
+const MAX_LOOP_COST: u32 = 1024;
 
 /// Why the runtime handles a guest instruction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -590,12 +594,30 @@ impl Em<'_> {
         c
     }
 
-    /// `lw k1,IRQ(k0); bne k1,zero,irq; nop` with the host call out of line.
-    fn poll(&mut self, pc: u32) {
+    /// PS1 cycles charged for one pass of the loop `t..=a` (`a` the back-edge): its words, plus
+    /// two per memory access for the R3000A's load and store stalls. An estimate: what matters is
+    /// that a counted wait loop (PsyQ's `VSync` timeout) lasts as long as on the PS1.
+    fn loop_cost(&self, t: u32, a: u32) -> u16 {
+        use Kind::*;
+        let mut cost = 0u32;
+        for w in (t..=a + 4).step_by(4).filter(|w| self.d.code.contains(w)) {
+            let mem = self.at(w).is_some_and(|(_, k)| {
+                matches!(k, Lb | Lh | Lwl | Lw | Lbu | Lhu | Lwr | Sb | Sh | Swl | Sw | Swr | Lwc2 | Swc2)
+            });
+            cost += if mem { 3 } else { 1 };
+        }
+        cost.clamp(1, MAX_LOOP_COST) as u16
+    }
+
+    /// `lw k1,BUDGET(k0); addiu k1,k1,-cost; bltz k1,irq; sw k1,BUDGET(k0)` with the host call
+    /// out of line.
+    fn poll(&mut self, pc: u32, cost: u16) {
         let (irq, back) = (self.label(), self.label());
-        self.out.push(lw(K1R, k0_off(layout::CTX + ctx::IRQ), K0R));
-        self.out.branch(bne(K1R, ZR), To::Label(irq), pc);
-        self.out.push(NOP);
+        let budget = k0_off(layout::CTX + ctx::BUDGET);
+        self.out.push(lw(K1R, budget, K0R));
+        self.out.push(addiu(K1R, K1R, cost.wrapping_neg()));
+        self.out.branch(bltz(K1R), To::Label(irq), pc);
+        self.out.push(sw(K1R, budget, K0R));
         self.out.def(back);
         let mut s = Code::default();
         s.def(irq);
@@ -724,7 +746,8 @@ impl Em<'_> {
                     return None;
                 }
                 if t <= a && link == 0 {
-                    self.poll(a);
+                    let cost = self.loop_cost(t, a);
+                    self.poll(a, cost);
                 }
                 if uncond {
                     if simple_slot.is_none() {

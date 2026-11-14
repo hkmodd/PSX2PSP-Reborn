@@ -2,7 +2,8 @@
  * psxrt: the PS1 disc, read from DATA.PSAR of the runtime's own EBOOT. The converter stores the
  * image as blocks of 16 raw sectors, each raw deflate or stored, behind an index of offsets
  * (README.md, "DATA.PSAR"). Two inflated blocks are kept: a CD reads sequentially, and a seek
- * back to the block before (file headers, XA interleave) does not inflate again.
+ * back to the block before (file headers, XA interleave) does not inflate again. After the
+ * blocks come the translated executables (native.c), read with disc_blob().
  */
 #include "disc.h"
 
@@ -13,8 +14,8 @@
 #include <zlib.h>
 
 #define MAGIC "PSXRTDAT"
-#define VERSION 2
-#define HEADER_LEN 0xB0
+#define VERSION 3
+#define HEADER_LEN 0xC0
 #define BLOCK_SECTORS 16
 #define RAW 2352
 #define BLOCK_LEN (BLOCK_SECTORS * RAW)
@@ -26,6 +27,7 @@ typedef struct {
     char disc_id[16];
     char title[128];
     u32 sectors, block_sectors, index_offset, blocks;
+    u32 dir_offset, images, code_base, code_size;
 } Header;
 
 typedef struct {
@@ -87,7 +89,41 @@ const char *disc_open(const char *path, DiscInfo *info)
     info->title[sizeof info->title - 1] = 0;
     info->sectors = h.sectors;
     info->blocks = h.blocks;
+    info->images = 0;
+    info->dir = NULL;
+    info->code_base = h.code_base;
+    info->code_size = h.code_size;
+    if (h.images) {
+        u32 len = h.images * (u32)sizeof(CodeEntry);
+        if (h.images > 256 || sizeof(CodeEntry) != 0x40)
+            return "DATA.PSAR code directory is damaged";
+        info->dir = alloc("psxrt code dir", len);
+        if (!info->dir || !read_at(h.dir_offset, info->dir, len))
+            return "cannot read the code directory";
+        info->images = h.images;
+    }
     return NULL;
+}
+
+int disc_blob(u32 off, u32 stored, void *dst, u32 raw_len)
+{
+    if (stored == raw_len)
+        return read_at(off, dst, raw_len) ? 0 : -1;
+    if (stored > raw_len || inflateReset(&zs) != Z_OK)
+        return -1;
+    zs.next_out = dst, zs.avail_out = raw_len;
+    int r = Z_OK;
+    for (u32 done = 0; done < stored;) {
+        u32 n = stored - done < BLOCK_LEN ? stored - done : BLOCK_LEN;
+        if (!read_at(off + done, zbuf, n))
+            return -1;
+        done += n;
+        zs.next_in = zbuf, zs.avail_in = n;
+        r = inflate(&zs, done == stored ? Z_FINISH : Z_NO_FLUSH);
+        if (r != Z_OK && r != Z_STREAM_END)
+            break;
+    }
+    return r == Z_STREAM_END && !zs.avail_out ? 0 : -1;
 }
 
 static void fail(u32 b, const char *what, int code)

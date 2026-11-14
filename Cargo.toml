@@ -23,6 +23,7 @@ psx2psp-core = { path = "crates/psx2psp-core" }
 psx2psp-patching = { path = "crates/psx2psp-patching" }
 psx2psp-media = { path = "crates/psx2psp-media" }
 psx2psp-engine = { path = "crates/psx2psp-engine" }
+psx2psp-recomp = { path = "crates/psx2psp-recomp" }
 
 thiserror = "2.0"
 # Exact pin: these deflate streams are what the PSP kernel inflates, and every EBOOT proven on

@@ -15,6 +15,8 @@ const BASE: u32 = 0x8001_0000;
 const CODE: u32 = 0x08A0_0000;
 const HI: u32 = layout::SCRATCH;
 const IO: u32 = 0x1F80_1000;
+/// Cycle budget the runtime side refills: no test loop exhausts it.
+const FULL_BUDGET: u32 = 0x4000_0000;
 
 const ZERO: u32 = 0;
 const AT: u32 = 1;
@@ -138,6 +140,7 @@ impl Machine {
         for (e, v) in t.table() {
             self.set_word(e, v);
         }
+        self.set_ctx(ctx::BUDGET, FULL_BUDGET);
     }
     fn word(&self, host: u32) -> u32 {
         let o = (host - HI) as usize;
@@ -402,8 +405,8 @@ fn run_psp(
                 run_ps1(m, &mut g, end, budget).map_err(|f| format!("interpreter stopped: {f:x?}"))?;
                 return Ok((g, log));
             }
-            if m.ctx(ctx::IRQ) != 0 {
-                m.set_ctx(ctx::IRQ, 0);
+            if (m.ctx(ctx::BUDGET) as i32) < 0 {
+                m.set_ctx(ctx::BUDGET, FULL_BUDGET);
                 log.polls += 1;
             }
             if word != NOP {
@@ -469,6 +472,11 @@ struct Run {
 /// Translates `words`, runs both sides from `BASE` (registers from `init`) to word `end` and
 /// compares them.
 fn check(words: &[u32], end: u32, init: impl Fn(&mut Cpu), irq: bool) -> Run {
+    check_budget(words, end, init, if irq { u32::MAX } else { FULL_BUDGET })
+}
+
+/// [`check`] starting with `budget` in [`ctx::BUDGET`].
+fn check_budget(words: &[u32], end: u32, init: impl Fn(&mut Cpu), budget: u32) -> Run {
     let x = exe(words);
     let d = Discovery::run(&x);
     let hz = Hazards::check(&x, &d);
@@ -481,9 +489,7 @@ fn check(words: &[u32], end: u32, init: impl Fn(&mut Cpu), irq: bool) -> Run {
     m2.table(&t);
     let end = End { guest: at(end), host: t.host(at(end)).unwrap(), code: CODE + 4 * t.words.len() as u32 };
     run_ps1(&mut m1, &mut c, end, 100_000).unwrap();
-    if irq {
-        m2.set_ctx(ctx::IRQ, 1);
-    }
+    m2.set_ctx(ctx::BUDGET, budget);
     let (g, log) = run_psp(&mut m2, &t, &start, end, 200_000).unwrap();
     if let Some(d) = differs(&c, &m1, &g, &m2, true, 0..0, &|_, _| false) {
         panic!("{d}");
@@ -653,6 +659,20 @@ fn calls_jumps_and_delay_slots() {
 fn pending_interrupt_is_served_at_a_back_edge() {
     let run = check(&control_program(), 41, |c| c.gpr[SP as usize] = 0x801F_FF00, true);
     assert_eq!(run.log.polls, 1);
+}
+
+#[test]
+fn back_edges_charge_the_loop_cost() {
+    let w = [
+        addiu(T0, ZERO, 100),     // 0
+        addiu(T0, T0, -1),        // 1  loop: 3 words, no memory access
+        b(5, T0, ZERO, 2, 1),     // 2  bne t0,zero,loop
+        NOP,                      // 3
+        NOP,                      // 4  end
+    ];
+    // 100 passes cost 300: a budget of 300 lasts, 299 runs out on the last pass.
+    assert_eq!(check_budget(&w, 4, |_| {}, 300).log.polls, 0);
+    assert_eq!(check_budget(&w, 4, |_| {}, 299).log.polls, 1);
 }
 
 #[test]

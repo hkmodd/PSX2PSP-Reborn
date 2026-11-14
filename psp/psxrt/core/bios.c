@@ -593,6 +593,8 @@ static int iso_load(Psx *psx, u32 lba, u32 size, u32 dst)
             for (u32 i = 0; i < n; i++)
                 w8(psx, dst + done + i, d[i]);
     }
+    if (psx->ram_loaded)
+        psx->ram_loaded(psx, dst, size);
     return (int)size;
 }
 

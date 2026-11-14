@@ -293,6 +293,9 @@ struct Psx {
     const PsxHost *host;
     /* Runs guest code at `addr` as a call: returns when it returns. Set by the backend. */
     void (*call)(Psx *psx, u32 addr);
+    /* Called once disc data has reached RAM (CD DMA, BIOS file loads): `len` bytes from `addr`.
+     * The PSP backend drops translations of the code it overwrote. NULL: nothing to do. */
+    void (*ram_loaded)(Psx *psx, u32 addr, u32 len);
     /* Set when control must leave the current guest context (exception, Exec, longjmp hook):
      * the backend resumes at cpu.pc with the registers in cpu. */
     int redirect;

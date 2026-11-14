@@ -350,6 +350,17 @@ impl DiscImage {
         Ok(raw[off..off + 2048].try_into().unwrap())
     }
 
+    /// The first `len` bytes (at most the file's size) of an ISO9660 file of this disc.
+    pub fn read_file(&self, reader: &mut DiscReader, file: &IsoFile, len: u32) -> Result<Vec<u8>> {
+        let len = len.min(file.size) as usize;
+        let mut out = Vec::with_capacity(len.next_multiple_of(2048));
+        for s in 0..len.div_ceil(2048) as u32 {
+            out.extend_from_slice(&self.read_user(reader, file.lba.saturating_add(s))?);
+        }
+        out.truncate(len);
+        Ok(out)
+    }
+
     /// Probes the ISO9660 filesystem for `SYSTEM.CNF` → BOOT executable → product code.
     pub fn probe(&self) -> DiscInfo {
         self.probe_inner().unwrap_or_default()

@@ -44,8 +44,10 @@ pub mod ctx {
     pub const TARGET: u32 = 0x88;
     /// Host address held across a delay slot that needs `k1`.
     pub const JUMP: u32 = 0x8C;
-    /// Nonzero when an interrupt is pending; polled at loop back-edges.
-    pub const IRQ: u32 = 0x90;
+    /// PS1 cycles left (signed) before translated code enters the runtime: each loop back-edge
+    /// subtracts its cost and makes a host call when the result is negative. The runtime refills
+    /// it, and sets it negative to have the next back-edge serve an interrupt.
+    pub const BUDGET: u32 = 0x90;
 }
 
 /// `addr` as a 16-bit offset from `k0`.

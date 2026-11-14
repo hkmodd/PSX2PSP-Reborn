@@ -34,6 +34,8 @@ void dma_done(Psx *psx, int ch)
     if (d->dicr & (1u << (16 + ch)))
         d->dicr |= 1u << (24 + ch);
     update_master(psx, 1);
+    if (psx->trace & 4)
+        psx_log(psx, "dma%d done dicr %08X stat %03X", ch, d->dicr, psx->i_stat);
 }
 
 static void dev_write(Psx *psx, int ch, u32 v)
@@ -84,8 +86,11 @@ static void run(Psx *psx, int ch)
             for (u32 i = 0; i < words; i++, addr = (addr + step) & 0x1FFFFC)
                 dev_write(psx, ch, rd(psx, addr));
         } else {
+            u32 start = addr;
             for (u32 i = 0; i < words; i++, addr = (addr + step) & 0x1FFFFC)
                 wr(psx, addr, dev_read(psx, ch));
+            if (ch == 3 && step == 4 && psx->ram_loaded)
+                psx->ram_loaded(psx, start, words * 4);
         }
         if (sync == 1) {
             c->madr = addr;
@@ -141,6 +146,8 @@ void dma_write(Psx *psx, u32 addr, u32 v)
         return;
     }
     if (addr == 0x1F8010F4) {
+        if (psx->trace & 4)
+            psx_log(psx, "dicr %08X <- %08X", d->dicr, v);
         d->dicr = (d->dicr & 0xFF000000u & ~(v & 0x7F000000u)) | (v & 0x00FF803Fu);
         update_master(psx, 0);
         return;

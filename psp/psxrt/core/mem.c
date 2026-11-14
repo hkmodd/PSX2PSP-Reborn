@@ -51,7 +51,10 @@ static void io_write(Psx *psx, u32 p, u32 v, int size)
             dma_write(psx, p, v);
         else { /* narrow writes: merge into the register */
             u32 a = p & ~3u, sh = 8 * (p & 3), m = (size == 1 ? 0xFFu : 0xFFFFu) << sh;
-            dma_write(psx, a, (dma_read(psx, a) & ~m) | ((v << sh) & m));
+            u32 old = dma_read(psx, a);
+            if (a == 0x1F8010F4) /* DICR flags are write-1-to-clear: only bytes written acknowledge */
+                old &= ~0x7F000000u;
+            dma_write(psx, a, (old & ~m) | ((v << sh) & m));
         }
         return;
     }
@@ -82,6 +85,8 @@ static void io_write(Psx *psx, u32 p, u32 v, int size)
     }
     switch (p & ~3u) {
     case 0x1F801070: /* I_STAT: writing 0 acknowledges */
+        if (psx->trace & 8)
+            psx_log(psx, "i_stat %03X &= %08X (%d) at %08X", psx->i_stat, v, size, psx->cpu.pc);
         psx->i_stat &= v | ~0x7FFu;
         psx->i_stat &= 0x7FF;
         return;
