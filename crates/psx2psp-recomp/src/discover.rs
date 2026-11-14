@@ -1,0 +1,400 @@
+//! Code discovery in a PS-X EXE: which words are instructions, where functions start, where
+//! register jumps go.
+//!
+//! Recursive descent from the entry point, then from every `addiu`/`addi sp,sp,-N` prologue the
+//! descent has not reached (walked back over the instructions that precede it in the same
+//! block), until nothing new is found. Register jumps are resolved where the code says where
+//! they go: compiler switch tables (`sltiu` bound, `sll 2`, `lui`+`addu`, `lw`, `jr`) and
+//! constants built with `lui`/`addiu`/`ori`. What stays unresolved (calls through pointers) goes
+//! through the run-time dispatch table.
+//!
+//! Every path stops at the first word that does not decode in canonical form: such a word is
+//! reported, never guessed.
+
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+
+use crate::exe::PsxExe;
+use crate::insn::{Insn, Isa, Kind, Uses, decode};
+
+const RA: usize = 31;
+const JR_RA: u32 = 0x03E0_0008;
+
+/// Where control goes after an instruction (its delay slot aside).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Flow {
+    Next,
+    /// Conditional branch: the target or the instruction after the delay slot.
+    Branch(u32),
+    /// Unconditional branch or `j`.
+    Goto(u32),
+    /// `jal`, `bal`, `bltzal`/`bgezal`: the callee, then the instruction after the delay slot.
+    Call(u32),
+    /// `jr ra`.
+    Return,
+    /// `jr` through any other register.
+    JumpReg,
+    /// `jalr`.
+    CallReg,
+}
+
+/// The flow of `i` (decoded as `k`) at `pc`.
+pub fn flow(i: Insn, k: Kind, pc: u32) -> Flow {
+    use Kind::*;
+    let bt = i.branch_target(pc);
+    match k {
+        Jr if i.rs() == RA => Flow::Return,
+        Jr => Flow::JumpReg,
+        Jalr => Flow::CallReg,
+        J => Flow::Goto(i.jump_target(pc)),
+        Jal => Flow::Call(i.jump_target(pc)),
+        Beq if i.rs() == i.rt() => Flow::Goto(bt),
+        Bgez if i.rs() == 0 => Flow::Goto(bt),
+        Bltzal | Bgezal => Flow::Call(bt),
+        Beq | Bne | Blez | Bgtz | Bltz | Bgez | Beql | Bnel | Blezl | Bgtzl => Flow::Branch(bt),
+        _ => Flow::Next,
+    }
+}
+
+/// Why a function was found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Origin {
+    Entry,
+    Call,
+    Prologue,
+}
+
+/// A `jr` through a register other than `ra`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JumpReg {
+    /// Switch table at `table`; `bounded` when its size comes from the `sltiu` guard.
+    Table { table: u32, targets: Vec<u32>, bounded: bool },
+    /// The register holds a constant (BIOS vectors 0xA0/0xB0/0xC0 among them).
+    Const(u32),
+    Unresolved(&'static str),
+}
+
+/// Why a path of the descent ended without a control transfer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeadEnd {
+    /// The path left the text.
+    Outside,
+    /// A word that does not decode in canonical R3000A form.
+    Invalid(u32),
+}
+
+/// The code of one executable as far as static analysis can see it.
+#[derive(Clone, Debug, Default)]
+pub struct Discovery {
+    /// Every reached instruction, delay slots included.
+    pub code: BTreeSet<u32>,
+    /// Delay slot -> its branch or jump.
+    pub delay_slots: BTreeMap<u32, u32>,
+    pub entries: BTreeMap<u32, Origin>,
+    /// Callee -> call sites (`jal`, `bal`, constant `jalr`); callees outside the text included.
+    pub calls: BTreeMap<u32, Vec<u32>>,
+    /// `jr` sites other than `jr ra`.
+    pub jumps: BTreeMap<u32, JumpReg>,
+    /// `jalr` sites and their target when constant.
+    pub indirect_calls: BTreeMap<u32, Option<u32>>,
+    /// Address where a path ended, and why.
+    pub dead_ends: BTreeMap<u32, DeadEnd>,
+    visited: HashSet<u32>,
+}
+
+/// One function: the instructions reachable from its entry without entering another function,
+/// and its `jr ra` sites.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Body {
+    pub insns: BTreeSet<u32>,
+    pub returns: Vec<u32>,
+}
+
+/// Instruction access over the text.
+#[derive(Clone, Copy)]
+pub(crate) struct Image<'a>(pub &'a PsxExe);
+
+impl Image<'_> {
+    /// The instruction at `a`, if inside the text and canonical.
+    pub(crate) fn at(self, a: u32) -> Option<(Insn, Kind)> {
+        let i = Insn(self.0.word(a)?);
+        let k = decode(i, Isa::R3000A);
+        (k != Kind::Invalid).then_some((i, k))
+    }
+
+    pub(crate) fn flow_at(self, a: u32) -> Option<Flow> {
+        self.at(a).map(|(i, k)| flow(i, k, a))
+    }
+
+    /// True if `a` is the delay slot of a transfer that does not continue at `a + 4`.
+    fn no_fall(self, a: u32) -> bool {
+        matches!(
+            self.flow_at(a.wrapping_sub(4)),
+            Some(Flow::Goto(_) | Flow::Call(_) | Flow::Return | Flow::JumpReg | Flow::CallReg)
+        )
+    }
+
+    /// The last instruction before `pc`, in the same straight-line block, that writes `reg`.
+    fn find_def(self, reg: usize, pc: u32) -> Option<u32> {
+        let mut a = pc.wrapping_sub(4);
+        for _ in 0..32 {
+            if !self.0.contains(a) || self.no_fall(a) {
+                return None;
+            }
+            let (i, k) = self.at(a)?;
+            if Uses::of(i, k).write & (1 << reg) != 0 {
+                return Some(a);
+            }
+            a = a.wrapping_sub(4);
+        }
+        None
+    }
+
+    /// The value of `reg` just before `pc`, if built by a `lui`/`addiu`/`ori` chain.
+    pub(crate) fn const_of(self, reg: usize, pc: u32) -> Option<u32> {
+        self.const_at(reg, pc, 0)
+    }
+
+    fn const_at(self, reg: usize, pc: u32, depth: u32) -> Option<u32> {
+        if reg == 0 {
+            return Some(0);
+        }
+        if depth > 4 {
+            return None;
+        }
+        let a = self.find_def(reg, pc)?;
+        let (i, k) = self.at(a)?;
+        match k {
+            Kind::Lui => Some(i.imm() << 16),
+            Kind::Addiu => Some(self.const_at(i.rs(), a, depth + 1)?.wrapping_add(i.simm())),
+            Kind::Ori => Some(self.const_at(i.rs(), a, depth + 1)? | i.imm()),
+            _ => None,
+        }
+    }
+
+    /// Resolves the `jr` at `pc` (not through `ra`).
+    fn jump_reg(self, pc: u32) -> JumpReg {
+        let rs = self.at(pc).map_or(0, |(i, _)| i.rs());
+        match self.switch_table(rs, pc) {
+            Ok(t) => t,
+            Err(why) => match self.const_of(rs, pc) {
+                Some(c) => JumpReg::Const(c),
+                None => JumpReg::Unresolved(why),
+            },
+        }
+    }
+
+    /// `sltiu at,idx,N / … / sll t,idx,2 / lui b,hi / addu b,b,t / lw r,lo(b) / jr r`.
+    fn switch_table(self, rs: usize, pc: u32) -> Result<JumpReg, &'static str> {
+        let d = self.find_def(rs, pc).ok_or("no definition of the jump register")?;
+        let (lw, k) = self.at(d).ok_or("bad definition")?;
+        if k != Kind::Lw {
+            return Err("jump register not loaded from memory");
+        }
+        let d2 = self.find_def(lw.rs(), d).ok_or("no definition of the load base")?;
+        let (add, k) = self.at(d2).ok_or("bad definition")?;
+        if k != Kind::Addu {
+            return Err("load base is not an addu");
+        }
+        let (mut base, mut index) = (None, None);
+        for r in [add.rs(), add.rt()] {
+            if base.is_none()
+                && let Some(c) = self.const_of(r, d2)
+            {
+                base = Some(c);
+                continue;
+            }
+            if let Some(s) = self.find_def(r, d2)
+                && let Some((sll, Kind::Sll)) = self.at(s)
+                && sll.sa() == 2
+            {
+                index = Some((sll.rt(), s));
+            }
+        }
+        let (Some(base), Some((idx, sll_at))) = (base, index) else {
+            return Err("addu operands are not table + index*4");
+        };
+        let table = base.wrapping_add(lw.simm());
+        if !self.0.contains(table) {
+            return Err("table outside the text");
+        }
+        let mut bound = None;
+        let mut a = sll_at.wrapping_sub(4);
+        for _ in 0..32 {
+            match self.at(a) {
+                Some((i, Kind::Sltiu)) if i.rs() == idx => {
+                    bound = Some(i.imm());
+                    break;
+                }
+                None if !self.0.contains(a) => break,
+                _ => {}
+            }
+            a = a.wrapping_sub(4);
+        }
+        let mut targets = Vec::new();
+        match bound {
+            Some(n) => {
+                for e in 0..n {
+                    match self.0.word(table.wrapping_add(4 * e)) {
+                        Some(t) => targets.push(t),
+                        None => break,
+                    }
+                }
+            }
+            None => {
+                for e in 0..512 {
+                    match self.0.word(table.wrapping_add(4 * e)) {
+                        Some(t) if self.at(t).is_some() => targets.push(t),
+                        _ => break,
+                    }
+                }
+            }
+        }
+        Ok(JumpReg::Table { table, targets, bounded: bound.is_some() })
+    }
+}
+
+impl Discovery {
+    /// Discovers the code of `exe`.
+    pub fn run(exe: &PsxExe) -> Self {
+        let img = Image(exe);
+        let mut d = Discovery::default();
+        d.entries.insert(exe.pc0, Origin::Entry);
+        d.explore(img, vec![exe.pc0]);
+        let mut tried = HashSet::new();
+        loop {
+            let mut changed = false;
+            for a in (exe.text_addr..exe.text_end()).step_by(4) {
+                let w = exe.word(a).unwrap_or(0);
+                let prologue = matches!(w >> 16, 0x27BD | 0x23BD) && w & 0x8000 != 0;
+                if !prologue || d.code.contains(&a) || !tried.insert(a) {
+                    continue;
+                }
+                let mut s = a;
+                for _ in 0..8 {
+                    let p = s.wrapping_sub(4);
+                    if !exe.contains(p) || d.code.contains(&p) || exe.word(p) == Some(0) {
+                        break;
+                    }
+                    if exe.word(p.wrapping_sub(4)) == Some(JR_RA) || img.flow_at(p) != Some(Flow::Next) {
+                        break;
+                    }
+                    s = p;
+                }
+                d.entries.entry(s).or_insert(Origin::Prologue);
+                d.explore(img, vec![s]);
+                changed = true;
+            }
+            if !changed {
+                break;
+            }
+        }
+        d.visited = HashSet::new();
+        d
+    }
+
+    fn explore(&mut self, img: Image, mut work: Vec<u32>) {
+        let exe = img.0;
+        while let Some(mut pc) = work.pop() {
+            loop {
+                if self.visited.contains(&pc) {
+                    break;
+                }
+                let Some((i, k)) = img.at(pc) else {
+                    let why = exe.word(pc).map_or(DeadEnd::Outside, DeadEnd::Invalid);
+                    self.dead_ends.insert(pc, why);
+                    break;
+                };
+                self.visited.insert(pc);
+                self.code.insert(pc);
+                let f = flow(i, k, pc);
+                if f == Flow::Next {
+                    pc = pc.wrapping_add(4);
+                    continue;
+                }
+                let slot = pc.wrapping_add(4);
+                let after = pc.wrapping_add(8);
+                if img.at(slot).is_some() {
+                    self.code.insert(slot);
+                    self.delay_slots.insert(slot, pc);
+                }
+                match f {
+                    Flow::Branch(t) => work.extend([t, after]),
+                    Flow::Goto(t) => work.push(t),
+                    Flow::Call(t) => {
+                        self.call(exe, t, pc, &mut work);
+                        work.push(after);
+                    }
+                    Flow::Return => {}
+                    Flow::JumpReg => {
+                        let j = img.jump_reg(pc);
+                        match &j {
+                            JumpReg::Table { targets, .. } => work.extend(targets),
+                            JumpReg::Const(c) if exe.contains(*c) => work.push(*c),
+                            _ => {}
+                        }
+                        self.jumps.insert(pc, j);
+                    }
+                    Flow::CallReg => {
+                        let c = img.const_of(i.rs(), pc);
+                        self.indirect_calls.insert(pc, c);
+                        if let Some(c) = c {
+                            self.call(exe, c, pc, &mut work);
+                        }
+                        work.push(after);
+                    }
+                    Flow::Next => unreachable!(),
+                }
+                break;
+            }
+        }
+    }
+
+    fn call(&mut self, exe: &PsxExe, target: u32, site: u32, work: &mut Vec<u32>) {
+        self.calls.entry(target).or_default().push(site);
+        if exe.contains(target) {
+            self.entries.entry(target).or_insert(Origin::Call);
+            work.push(target);
+        }
+    }
+
+    /// The body of the function at `entry`.
+    pub fn body(&self, exe: &PsxExe, entry: u32) -> Body {
+        let img = Image(exe);
+        let other = |t: u32| t != entry && self.entries.contains_key(&t);
+        let mut body = Body::default();
+        let mut seen = HashSet::new();
+        let mut work = vec![entry];
+        while let Some(mut pc) = work.pop() {
+            loop {
+                if !seen.insert(pc) {
+                    break;
+                }
+                let Some((i, k)) = img.at(pc) else { break };
+                body.insns.insert(pc);
+                let f = flow(i, k, pc);
+                if f == Flow::Next {
+                    pc = pc.wrapping_add(4);
+                    continue;
+                }
+                if img.at(pc.wrapping_add(4)).is_some() {
+                    body.insns.insert(pc.wrapping_add(4));
+                }
+                let after = pc.wrapping_add(8);
+                match f {
+                    Flow::Branch(t) => work.extend([t, after]),
+                    Flow::Goto(t) if exe.contains(t) && !other(t) => work.push(t),
+                    Flow::Call(_) | Flow::CallReg => work.push(after),
+                    Flow::Return => body.returns.push(pc),
+                    Flow::JumpReg => {
+                        if let Some(JumpReg::Table { targets, .. }) = self.jumps.get(&pc) {
+                            work.extend(targets.iter().filter(|&&t| exe.contains(t) && !other(t)));
+                        }
+                    }
+                    _ => {}
+                }
+                break;
+            }
+        }
+        body
+    }
+}

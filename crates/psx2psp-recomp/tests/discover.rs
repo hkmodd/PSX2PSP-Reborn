@@ -1,0 +1,190 @@
+//! Code discovery and the load-delay hazard check.
+
+use std::collections::BTreeMap;
+
+use psx2psp_recomp::{DeadEnd, Discovery, HazardKind, Hazards, JumpReg, Origin, PsxExe};
+
+const BASE: u32 = 0x8001_0000;
+const ZERO: u32 = 0;
+const AT: u32 = 1;
+const V0: u32 = 2;
+const V1: u32 = 3;
+const A0: u32 = 4;
+const A1: u32 = 5;
+const T0: u32 = 8;
+const T1: u32 = 9;
+const SP: u32 = 29;
+const RA: u32 = 31;
+const NOP: u32 = 0;
+
+const fn r(funct: u32, rs: u32, rt: u32, rd: u32, sa: u32) -> u32 {
+    (rs << 21) | (rt << 16) | (rd << 11) | (sa << 6) | funct
+}
+const fn i(op: u32, rs: u32, rt: u32, imm: u16) -> u32 {
+    (op << 26) | (rs << 21) | (rt << 16) | imm as u32
+}
+const fn at(n: u32) -> u32 {
+    BASE + 4 * n
+}
+const fn j(op: u32, n: u32) -> u32 {
+    (op << 26) | ((at(n) >> 2) & 0x03FF_FFFF)
+}
+
+/// A PS-X EXE whose text is `words` at `BASE`, entry at `BASE`.
+fn exe(words: &[u32]) -> PsxExe {
+    let mut f = vec![0u8; 0x800];
+    f[..8].copy_from_slice(b"PS-X EXE");
+    for (o, v) in [(0x10, BASE), (0x18, BASE), (0x1C, 4 * words.len() as u32)] {
+        f[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    f.extend(words.iter().flat_map(|w| w.to_le_bytes()));
+    PsxExe::parse(&f).unwrap()
+}
+
+/// `main` calls `f` and switches on `a1` through a two-entry table; a third function is only
+/// reachable through its prologue. Two load-delay hazards: a sequential one in `main` and one in
+/// the `jr ra` delay slot of `f`, read at the return site in `main`.
+fn program() -> PsxExe {
+    let mut w = vec![NOP; 39];
+    let code = [
+        i(9, SP, SP, (-8i16) as u16),     // 0  main: addiu sp,sp,-8
+        j(3, 17),                         // 1  jal f
+        NOP,                              // 2
+        r(0x21, A0, ZERO, A1, 0),         // 3  addu a1,a0,zero  <- reads f's delay-slot load
+        i(0x23, SP, V0, 0),               // 4  lw v0,0(sp)
+        r(0x21, V0, V0, V1, 0),           // 5  addu v1,v0,v0    <- reads it in the delay slot
+        i(0xB, A1, AT, 2),                // 6  sltiu at,a1,2
+        i(4, AT, ZERO, 7),                // 7  beq at,zero,15
+        r(0, 0, A1, T0, 2),               // 8  sll t0,a1,2
+        i(0xF, 0, T1, 0x8001),            // 9  lui t1,0x8001
+        r(0x21, T1, T0, T1, 0),           // 10 addu t1,t1,t0
+        i(0x23, T1, T0, 0x80),            // 11 lw t0,0x80(t1)
+        NOP,                              // 12
+        r(8, T0, 0, 0, 0),                // 13 jr t0
+        NOP,                              // 14
+        r(8, RA, 0, 0, 0),                // 15 jr ra
+        NOP,                              // 16
+        r(8, RA, 0, 0, 0),                // 17 f: jr ra
+        i(0x23, SP, A0, 0),               // 18 lw a0,0(sp)
+        j(2, 15),                         // 19 case 0: j 15
+        NOP,                              // 20
+        j(2, 15),                         // 21 case 1: j 15
+        NOP,                              // 22
+    ];
+    w[..code.len()].copy_from_slice(&code);
+    w[32] = at(19);
+    w[33] = at(21);
+    w[36] = i(9, SP, SP, (-16i16) as u16); // 36 g: addiu sp,sp,-16
+    w[37] = r(8, RA, 0, 0, 0); //              37 jr ra
+    w[38] = i(9, SP, SP, 16); //               38 addiu sp,sp,16
+    exe(&w)
+}
+
+#[test]
+fn discovery_finds_calls_switch_tables_and_prologues() {
+    let x = program();
+    let d = Discovery::run(&x);
+    let entries: Vec<_> = d.entries.iter().map(|(&a, &o)| (a, o)).collect();
+    assert_eq!(entries, [(at(0), Origin::Entry), (at(17), Origin::Call), (at(36), Origin::Prologue)]);
+    assert_eq!(d.calls[&at(17)], [at(1)]);
+    assert_eq!(
+        d.jumps[&at(13)],
+        JumpReg::Table { table: at(32), targets: vec![at(19), at(21)], bounded: true }
+    );
+    assert_eq!(d.delay_slots[&at(18)], at(17));
+    assert_eq!(d.delay_slots[&at(8)], at(7));
+    assert!(d.dead_ends.is_empty());
+    let code: Vec<u32> = (0..=22).chain(36..=38).map(at).collect();
+    assert_eq!(d.code.iter().copied().collect::<Vec<_>>(), code);
+
+    let main = d.body(&x, at(0));
+    assert_eq!(main.returns, [at(15)]);
+    assert_eq!(main.insns.len(), 21);
+    assert!(!main.insns.contains(&at(17)));
+    assert_eq!(d.body(&x, at(17)).returns, [at(17)]);
+}
+
+#[test]
+fn hazards_in_sequence_and_across_returns() {
+    let x = program();
+    let h = Hazards::check(&x, &Discovery::run(&x));
+    let want = BTreeMap::from([(at(4), HazardKind::Sequential), (at(18), HazardKind::ReturnSlot)]);
+    assert_eq!(h.sites, want);
+    assert_eq!((h.loads, h.merged_pairs, h.return_slot_no_caller), (3, 0, 0));
+}
+
+#[test]
+fn unknown_jumps_and_invalid_words_are_reported() {
+    let x = exe(&[
+        r(9, T0, 0, RA, 0),   // jalr t0 (t0 unknown)
+        i(0x23, SP, A0, 0),   // lw a0,0(sp) in its delay slot
+        i(0x22, SP, A0, 3),   // lwl a0,3(sp)
+        i(0x26, SP, A0, 0),   // lwr a0,0(sp): merges with the lwl
+        r(2, 1, A0, A0, 8),   // rotr (Allegrex), not a canonical R3000A srl
+    ]);
+    let d = Discovery::run(&x);
+    assert_eq!(d.indirect_calls[&at(0)], None);
+    assert_eq!(d.dead_ends[&at(4)], DeadEnd::Invalid(r(2, 1, A0, A0, 8)));
+    let h = Hazards::check(&x, &d);
+    assert_eq!(h.sites, BTreeMap::from([(at(1), HazardKind::UnknownSlot)]));
+    assert_eq!(h.merged_pairs, 1);
+}
+
+/// Runs discovery and the hazard check on real executables:
+/// `PSX2PSP_EXES=<dir> cargo test -p psx2psp-recomp --test discover -- --ignored --nocapture`.
+#[test]
+#[ignore = "needs PSX2PSP_EXES"]
+fn real_executables_have_no_hazards() {
+    let dir = std::env::var("PSX2PSP_EXES").expect("PSX2PSP_EXES");
+    let mut paths: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).collect();
+    paths.sort();
+    println!(
+        "exe | funcs (desc, prologue) | code bytes | code% | invalid stops | jt (bounded/unbounded) | \
+         jt entries | jr const | jr unresolved | jalr | jalr const | loads | lwl/lwr pairs | \
+         jr-ra slot no caller | hazards"
+    );
+    let (mut funcs, mut code, mut text, mut bad) = (0, 0, 0, 0);
+    for path in &paths {
+        let x = PsxExe::parse(&std::fs::read(path).unwrap()).unwrap();
+        let d = Discovery::run(&x);
+        let h = Hazards::check(&x, &d);
+        let prol = d.entries.values().filter(|&&o| o == Origin::Prologue).count();
+        let (mut jb, mut ju, mut je, mut jc, mut jn) = (0, 0, 0, 0, 0);
+        for j in d.jumps.values() {
+            match j {
+                JumpReg::Table { targets, bounded, .. } => {
+                    *if *bounded { &mut jb } else { &mut ju } += 1;
+                    je += targets.len();
+                }
+                JumpReg::Const(_) => jc += 1,
+                JumpReg::Unresolved(_) => jn += 1,
+            }
+        }
+        let invalid: Vec<_> = d.dead_ends.iter().filter(|(_, e)| matches!(e, DeadEnd::Invalid(_))).collect();
+        let jalr_const = d.indirect_calls.values().filter(|c| c.is_some()).count();
+        println!(
+            "{} | {} ({}, {prol}) | {} | {:.1} | {} | {jb}/{ju} | {je} | {jc} | {jn} | {} | {jalr_const} | {} | {} | {} | {:?}",
+            path.file_name().unwrap().to_string_lossy(),
+            d.entries.len(),
+            d.entries.len() - prol,
+            4 * d.code.len(),
+            400.0 * d.code.len() as f64 / x.text.len() as f64,
+            invalid.len(),
+            d.indirect_calls.len(),
+            h.loads,
+            h.merged_pairs,
+            h.return_slot_no_caller,
+            h.sites,
+        );
+        for (a, e) in invalid.iter().take(4) {
+            println!("   stop at {a:08x}: {e:x?}");
+        }
+        funcs += d.entries.len();
+        code += 4 * d.code.len();
+        text += x.text.len();
+        bad += h.sites.len();
+    }
+    println!("TOTAL funcs {funcs} code {code} text {text} {:.1}%", 100.0 * code as f64 / text as f64);
+    assert!(!paths.is_empty());
+    assert_eq!(bad, 0, "load-delay hazards found");
+}
