@@ -45,8 +45,9 @@ typedef struct {
 #define TEX_VTX (GU_TEXTURE_32BITF | GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_2D)
 
 typedef struct {
-    u32 tris, ttris, rects, trects, fills, sw_tex15, sw_texwin, sw_line, sw_copy, pages, cluts;
-    u32 readbacks, read_tiles, uploads, upload_px, flushes;
+    u32 tris, ttris, rects, trects, fills, lines, line_runs, sw_tex15, sw_texwin, sw_copy, pages, cluts;
+    u32 readbacks, read_tiles, read_us, uploads, upload_px, flushes;
+    u32 copy_px, copy_from_ge; /* copies: pixels, and those whose source the GE drew */
 } GeStats;
 
 /* A 4/8-bit texture page as a 256x256 T4/T8 texture. */
@@ -403,10 +404,12 @@ static void rd_read(void *self, s32 x, s32 y, s32 w, s32 h)
     if (!any)
         return;
     u16 *ram = ge.psx->gpu.vram;
+    u32 t0 = sceKernelGetSystemTimeLow();
     begin();
     sceKernelDcacheWritebackInvalidateRange(ram, VRAM_W * VRAM_H * 2);
     sceGuCopyImage(GU_PSM_5551, 0, 0, VRAM_W, VRAM_H, VRAM_W, VRAM_PTR, 0, 0, VRAM_W, ram);
     ge_sync();
+    ge.s.read_us += sceKernelGetSystemTimeLow() - t0;
     for (int ty = 0; ty < TILES_Y; ty++) {
         for (int tx = 0; tx < TILES_X; tx++)
             if (ge.newer[ty] >> tx & 1)
@@ -797,11 +800,53 @@ static int rd_rect(void *self, const GpuPrim *p, s32 x, s32 y, s32 w, s32 h, con
     return DONE;
 }
 
+/* The core's pixels (gpu.c line()), as sprites: a run of pixels of one colour along a row or a
+ * column is one sprite. The GE's own lines rasterize differently. */
 static int rd_line(void *self, const GpuPrim *p, const GpuVtx *a, const GpuVtx *b)
 {
-    (void)self, (void)p, (void)a, (void)b;
-    ge.s.sw_line++;
-    return GPU_SW;
+    (void)self;
+    s32 x1, y1, x2, y2;
+    if (!area(&x1, &y1, &x2, &y2))
+        return DONE;
+    s32 dx = b->x - a->x, dy = b->y - a->y, adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+    s32 n = adx > ady ? adx : ady;
+    static struct { s16 x0, y0, x1, y1; u32 c; } run[1025];
+    int nr = 0;
+    s32 bx1 = VRAM_W, by1 = VRAM_H, bx2 = -1, by2 = -1;
+    for (s32 i = 0; i <= n; i++) {
+        s32 x = a->x + (n ? (dx * i + (dx >= 0 ? n / 2 : -n / 2)) / n : 0);
+        s32 y = a->y + (n ? (dy * i + (dy >= 0 ? n / 2 : -n / 2)) / n : 0);
+        if (x < x1 || x > x2 || y < y1 || y > y2)
+            continue;
+        u32 c = abgr(a->r + (n ? (b->r - a->r) * i / n : 0), a->g + (n ? (b->g - a->g) * i / n : 0),
+                     a->b + (n ? (b->b - a->b) * i / n : 0));
+        bx1 = x < bx1 ? x : bx1, by1 = y < by1 ? y : by1, bx2 = x > bx2 ? x : bx2, by2 = y > by2 ? y : by2;
+        if (nr) {
+            typeof(run[0]) *r = &run[nr - 1];
+            int row = r->y0 == y && r->y1 == y && (x == r->x1 + 1 || x == r->x0 - 1);
+            int col = r->x0 == x && r->x1 == x && (y == r->y1 + 1 || y == r->y0 - 1);
+            if (r->c == c && (row || col)) {
+                r->x0 = x < r->x0 ? x : r->x0, r->x1 = x > r->x1 ? x : r->x1;
+                r->y0 = y < r->y0 ? y : r->y0, r->y1 = y > r->y1 ? y : r->y1;
+                continue;
+            }
+        }
+        run[nr++] = (typeof(run[0])){(s16)x, (s16)y, (s16)x, (s16)y, c};
+    }
+    if (!nr)
+        return DONE;
+    prim_begin(p);
+    prim_state(p, x1, y1, x2, y2);
+    mark(bx1, by1, bx2, by2);
+    tex_mode(0);
+    GeVtx *o = sceGuGetMemory((u32)nr * 2 * sizeof(GeVtx));
+    for (int i = 0; i < nr; i++) {
+        o[2 * i] = (GeVtx){run[i].c, (float)run[i].x0, (float)run[i].y0, 0};
+        o[2 * i + 1] = (GeVtx){run[i].c, (float)(run[i].x1 + 1), (float)(run[i].y1 + 1), 0};
+    }
+    sceGuDrawArray(GU_SPRITES, GE_VTX, 2 * nr, NULL, o);
+    ge.s.lines++, ge.s.line_runs += (u32)nr;
+    return DONE;
 }
 
 static void fill_piece(s32 x, s32 y, s32 w, s32 h)
@@ -830,8 +875,15 @@ static int rd_fill(void *self, s32 x, s32 y, s32 w, s32 h, u16 color)
  * drew, so a copy costs an upload of the destination. */
 static int rd_copy(void *self, s32 sx, s32 sy, s32 dx, s32 dy, s32 w, s32 h, int mask_check, u16 mask_set)
 {
-    (void)self, (void)sx, (void)sy, (void)dx, (void)dy, (void)w, (void)h, (void)mask_check, (void)mask_set;
+    (void)self, (void)dx, (void)dy, (void)mask_check, (void)mask_set;
     ge.s.sw_copy++;
+    ge.s.copy_px += (u32)(w * h);
+    u16 c = span(sx, w, VRAM_W, TILE_W), r = span(sy, h, VRAM_H, TILE_H);
+    for (int ty = 0; ty < TILES_Y; ty++)
+        if ((r >> ty & 1) && (ge.newer[ty] & c)) {
+            ge.s.copy_from_ge++;
+            break;
+        }
     return GPU_SW;
 }
 
@@ -914,12 +966,15 @@ int ge_log(char *buf, int cap)
 {
     const GeStats *s = &ge.s;
     int n = clampn(snprintf(buf, (size_t)cap,
-                            "-- ge: tri %u+%u tex, rect %u+%u tex, fill %u; sw tex15 %u texwin %u line %u copy %u; "
-                            "pages %u cluts %u, readback %u (%u tiles), upload %u (%u kpx), flush %u\n",
+                            "-- ge: tri %u+%u tex, rect %u+%u tex, fill %u, line %u (%u runs); sw tex15 %u texwin %u "
+                            "copy %u (%u kpx, %u from ge); pages %u cluts %u, readback %u (%u tiles, %u ms), upload %u "
+                            "(%u kpx), flush %u\n",
                             (unsigned)s->tris, (unsigned)s->ttris, (unsigned)s->rects, (unsigned)s->trects,
-                            (unsigned)s->fills, (unsigned)s->sw_tex15, (unsigned)s->sw_texwin, (unsigned)s->sw_line,
-                            (unsigned)s->sw_copy, (unsigned)s->pages, (unsigned)s->cluts, (unsigned)s->readbacks,
-                            (unsigned)s->read_tiles, (unsigned)s->uploads, (unsigned)(s->upload_px / 1000),
+                            (unsigned)s->fills, (unsigned)s->lines, (unsigned)s->line_runs, (unsigned)s->sw_tex15,
+                            (unsigned)s->sw_texwin,
+                            (unsigned)s->sw_copy, (unsigned)(s->copy_px / 1000), (unsigned)s->copy_from_ge,
+                            (unsigned)s->pages, (unsigned)s->cluts, (unsigned)s->readbacks, (unsigned)s->read_tiles,
+                            (unsigned)(s->read_us / 1000), (unsigned)s->uploads, (unsigned)(s->upload_px / 1000),
                             (unsigned)s->flushes),
                    cap);
     memset(&ge.s, 0, sizeof ge.s);
