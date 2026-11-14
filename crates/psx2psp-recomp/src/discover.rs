@@ -18,6 +18,34 @@ use crate::insn::{Insn, Isa, Kind, Uses, decode};
 
 const RA: usize = 31;
 const JR_RA: u32 = 0x03E0_0008;
+/// Instructions a leaf found after a return may run straight before its own `jr ra`.
+const LEAF_MAX: u32 = 64;
+
+/// `a` holds a non-zero word right after a `jr ra`, its delay slot and up to 3 zero words.
+fn after_return(exe: &PsxExe, a: u32) -> bool {
+    if exe.word(a).is_none_or(|w| w == 0) {
+        return false;
+    }
+    for pad in 0..4u32 {
+        let slot = a.wrapping_sub(4 * (pad + 1));
+        if exe.word(slot.wrapping_sub(4)) == Some(JR_RA) {
+            return true;
+        }
+        if exe.word(slot) != Some(0) {
+            return false;
+        }
+    }
+    false
+}
+
+/// From `a`, every word decodes up to a `jr ra` (and its delay slot) within [`LEAF_MAX`].
+fn leaf_shape(img: Image, a: u32) -> bool {
+    (0..LEAF_MAX).map(|n| a.wrapping_add(4 * n)).try_for_each(|p| match img.at(p) {
+        None => Err(false),
+        Some(_) if img.0.word(p) == Some(JR_RA) => Err(img.at(p.wrapping_add(4)).is_some()),
+        Some(_) => Ok(()),
+    }) == Err(true)
+}
 
 /// Where control goes after an instruction (its delay slot aside).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,6 +89,9 @@ pub enum Origin {
     Entry,
     Call,
     Prologue,
+    /// Straight after a `jr ra` and its delay slot (and any zero padding), with a clean decode
+    /// up to its own `jr ra`: a leaf reached only through a pointer built at run time.
+    AfterReturn,
 }
 
 /// A `jr` through a register other than `ra`.
@@ -266,7 +297,15 @@ impl Discovery {
             for a in (exe.text_addr..exe.text_end()).step_by(4) {
                 let w = exe.word(a).unwrap_or(0);
                 let prologue = matches!(w >> 16, 0x27BD | 0x23BD) && w & 0x8000 != 0;
-                if !prologue || d.code.contains(&a) || !tried.insert(a) {
+                if d.code.contains(&a) || !(prologue || after_return(exe, a)) || !tried.insert(a) {
+                    continue;
+                }
+                if !prologue {
+                    if leaf_shape(img, a) {
+                        d.entries.entry(a).or_insert(Origin::AfterReturn);
+                        d.explore(img, vec![a]);
+                        changed = true;
+                    }
                     continue;
                 }
                 let mut s = a;
