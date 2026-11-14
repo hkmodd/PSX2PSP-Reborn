@@ -26,6 +26,34 @@ Prior art is reused, not rediscovered. Licences decide how:
   else stays MIT OR Apache-2.0.
 - ps1-recomp (GPL-3.0): reference only, no code copied.
 
+No Sheep Dog recipe exists in any of the three (searched SLES-02895, SLUS-01142, "sheep").
+
+### What comes from where (map of 2026-11-14)
+
+| Component | Source | Licence | Notes |
+|---|---|---|---|
+| Function discovery | RecompOne `Analysis/FunctionDetector.cs`, `FunctionPipeline.cs` | MIT | Ours (S2 2/4) already matches S0; add their fixpoint passes (escaping branches, cross-image calls, constant pointers) when a game needs them |
+| Jump tables | RecompOne `Analysis/JumpTableAnalyzer.cs` | MIT | Register-state tracking; a table always keeps a dispatch default |
+| Untranslated code | psxrecomp three tiers (`dirty_ram_interp.c`, `psx_dispatch_impl`, call contract) as the model | NC | Reimplemented in C, not copied. Their tier 2 (DLL compiled at run time) is impossible on PSP |
+| Overlays | RecompOne `Dispatcher.LoadByLba`, `PSMemory.TrackWrite` | MIT | An overlay's table becomes active on load; overlapping ones are dropped |
+| Interrupt delivery | RecompOne `Hardware/Interrupts.cs` | MIT | Poll at back-edges; PSP vblank instead of a wall clock; SysEnqIntRP chains and IntrEnv handler |
+| Recipe schema | RecompOne `Config/ConfigLoader.cs` keys | MIT | Same fields, written as INI like `patches.ini` |
+| GTE | RecompOne `Hardware/Gte.cs` | MIT | Integer core 1:1 (22 commands, flags, UNR table); its float extras are the widescreen hook |
+| GPU packets -> GE | RecompOne `sdk/LibGpu` (DrawOTag walk) + `Gpu/GpuCommands.cs`; psxrecomp `gpu_sw_renderer.c` for accuracy | MIT / NC (reference) | Packet parser and OT walk ported; the GE backend is ours |
+| SPU, XA | RecompOne `Hardware/Spu.cs`, `XaAudio.cs` | MIT | Reverb cost on Allegrex to be measured |
+| MDEC | RecompOne `Hardware/Mdec.cs`, `LibPress` | MIT | Media Engine not used at first |
+| CD | RecompOne `sdk/LibCd*`, `Cdrom/CdController.cs` | MIT | libcd-level HLE preferred; controller for games that bypass it |
+| BIOS HLE | RecompOne `Bios/BiosA.cs`, `BiosB.cs`, `BiosC.cs` | MIT | BIOS threads become PSP threads |
+| PsyQ signatures | RecompOne `AutoConfigure/signatures/psyq.json`, `SdkMatcher.cs` | MIT | Runs in the converter, not on the PSP. ps1-recomp's Crash numbers: 61 of 174 matched functions were safe to replace |
+| Mod hooks | RecompOne `Modding/HookManager.cs` (idea) | MIT | A recipe entry replaces or wraps a function; widescreen and frame-rate patches go there |
+
+What we keep of our own, because the PSP needs it:
+- Direct Allegrex emission (all three donors emit C, C# or C++ and need a compiler).
+- The load-delay check of S2 2/4: none of the MIT/GPL donors models load delays; psxrecomp
+  does. Sites the checker finds are emitted with a temporary; Sheep Dog has none.
+- Dispatch miss: the runtime's interpreter runs the code, as in psxrecomp, instead of aborting
+  (ps1-recomp, RecompOne). Each miss is logged with its PC so the recipe can add the function.
+
 ## Architecture
 
 | Part | Where | What |
