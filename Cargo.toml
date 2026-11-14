@@ -7,6 +7,7 @@ members = [
     "crates/psx2psp-engine",
     "crates/psx2psp-app",
     "crates/psx2psp-recomp",
+    "crates/psx2psp-sim",
 ]
 
 [workspace.package]

@@ -1,0 +1,247 @@
+//! psx2psp-sim: runs a PS1 disc on the psxrt core's interpreter (the same C core the PSP runtime
+//! links), printing the guest's TTY and the core's log and saving the screen as PNG.
+//!
+//! ```text
+//! psx2psp-sim <disc.cue|disc.bin> [--frames N] [--every N] [--out DIR] [--press FRAME:BUTTON,...]
+//! ```
+//! Buttons: select start up right down left l2 r2 l1 r1 triangle circle cross square; each press
+//! holds for 6 frames.
+
+use std::ffi::{c_char, c_int, c_void};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+
+#[repr(C)]
+struct Sim {
+    _opaque: [u8; 0],
+}
+
+type ReadFn = extern "C" fn(*mut c_void, u32, *mut u8) -> c_int;
+type TextFn = extern "C" fn(*mut c_void, *const c_char, c_int);
+
+unsafe extern "C" {
+    fn sim_new(user: *mut c_void, rd: ReadFn, disc_end: u32, tty: TextFn, log: TextFn) -> *mut Sim;
+    fn sim_free(s: *mut Sim);
+    fn sim_boot(s: *mut Sim) -> c_int;
+    fn sim_frame(s: *mut Sim) -> c_int;
+    fn sim_vram(s: *const Sim) -> *const u16;
+    fn sim_pad(s: *mut Sim, buttons: u16);
+    fn sim_display(s: *const Sim, out: *mut c_int);
+    fn sim_status(s: *const Sim, out: *mut u32);
+    fn sim_trace(s: *mut Sim, flags: c_int);
+}
+
+struct Disc {
+    file: File,
+    sectors: u32,
+}
+
+const SECTOR: u64 = 2352;
+const PREGAP: u32 = 150;
+
+extern "C" fn read_sector(user: *mut c_void, lba: u32, raw: *mut u8) -> c_int {
+    // SAFETY: `user` is the `Disc` owned by `main` for the simulator's whole life, and `raw` points
+    // at a 2352-byte buffer the core owns.
+    let disc = unsafe { &mut *(user as *mut Disc) };
+    let buf = unsafe { std::slice::from_raw_parts_mut(raw, SECTOR as usize) };
+    if lba < PREGAP || lba - PREGAP >= disc.sectors {
+        return -1;
+    }
+    let ok = disc.file.seek(SeekFrom::Start(u64::from(lba - PREGAP) * SECTOR)).is_ok() && disc.file.read_exact(buf).is_ok();
+    if ok { 0 } else { -1 }
+}
+
+fn text<'a>(s: *const c_char, n: c_int) -> &'a [u8] {
+    // SAFETY: the core passes `n` valid bytes at `s`.
+    unsafe { std::slice::from_raw_parts(s as *const u8, n.max(0) as usize) }
+}
+
+extern "C" fn tty(_user: *mut c_void, s: *const c_char, n: c_int) {
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(text(s, n));
+    let _ = out.flush();
+}
+
+extern "C" fn log(_user: *mut c_void, s: *const c_char, n: c_int) {
+    println!("[psxrt] {}", String::from_utf8_lossy(text(s, n)));
+}
+
+fn bin_path(arg: &Path) -> Result<PathBuf, String> {
+    if !arg.extension().is_some_and(|e| e.eq_ignore_ascii_case("cue")) {
+        return Ok(arg.to_path_buf());
+    }
+    let cue = std::fs::read_to_string(arg).map_err(|e| format!("{}: {e}", arg.display()))?;
+    let name = cue
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("FILE ").and_then(|r| r.split('"').nth(1)))
+        .ok_or("cue sheet without a FILE line")?;
+    Ok(arg.with_file_name(name))
+}
+
+fn button(name: &str) -> Option<u16> {
+    const NAMES: [&str; 16] = [
+        "select", "l3", "r3", "start", "up", "right", "down", "left", "l2", "r2", "l1", "r1", "triangle", "circle", "cross", "square",
+    ];
+    NAMES.iter().position(|n| *n == name).map(|i| 1 << i)
+}
+
+struct Args {
+    disc: PathBuf,
+    frames: u32,
+    every: u32,
+    out: PathBuf,
+    presses: Vec<(u32, u16)>,
+}
+
+fn args() -> Result<Args, String> {
+    let mut it = std::env::args().skip(1);
+    let mut a = Args { disc: PathBuf::new(), frames: 600, every: 60, out: PathBuf::from("D:/Temp/PSX2PSP-Reborn/sim"), presses: Vec::new() };
+    let num = |v: Option<String>, what: &str| v.and_then(|s| s.parse::<u32>().ok()).ok_or(format!("{what} needs a number"));
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--frames" => a.frames = num(it.next(), "--frames")?,
+            "--every" => a.every = num(it.next(), "--every")?,
+            "--out" => a.out = PathBuf::from(it.next().ok_or("--out needs a directory")?),
+            "--press" => {
+                for p in it.next().ok_or("--press needs FRAME:BUTTON,...")?.split(',') {
+                    let (f, b) = p.split_once(':').ok_or(format!("bad press {p}"))?;
+                    let f = f.parse::<u32>().map_err(|_| format!("bad frame in {p}"))?;
+                    a.presses.push((f, button(b).ok_or(format!("unknown button {b}"))?));
+                }
+            }
+            _ if a.disc.as_os_str().is_empty() => a.disc = PathBuf::from(arg),
+            _ => return Err(format!("unexpected argument {arg}")),
+        }
+    }
+    if a.disc.as_os_str().is_empty() {
+        return Err("usage: psx2psp-sim <disc.cue|disc.bin> [--frames N] [--every N] [--out DIR] [--press FRAME:BUTTON,...]".into());
+    }
+    Ok(a)
+}
+
+/// The display area as RGB8, reading 15-bit or 24-bit VRAM.
+fn screen(vram: &[u16], d: &[c_int; 6]) -> image::RgbImage {
+    let (x0, y0, w, h, rgb24) = (d[0] as usize, d[1] as usize, d[2] as u32, d[3] as u32, d[4] != 0);
+    image::RgbImage::from_fn(w, h, |x, y| {
+        let row = (y0 + y as usize) & 511;
+        if rgb24 {
+            let byte = x0 * 2 + x as usize * 3;
+            let b = |i: usize| {
+                let px = vram[row * 1024 + ((i / 2) & 1023)];
+                if i & 1 == 1 { (px >> 8) as u8 } else { px as u8 }
+            };
+            image::Rgb([b(byte), b(byte + 1), b(byte + 2)])
+        } else {
+            let px = vram[row * 1024 + ((x0 + x as usize) & 1023)];
+            let c = |s: u16| (((px >> s) & 31) << 3 | ((px >> s) & 31) >> 2) as u8;
+            image::Rgb([c(0), c(5), c(10)])
+        }
+    })
+}
+
+fn vram_image(vram: &[u16]) -> image::RgbImage {
+    image::RgbImage::from_fn(1024, 512, |x, y| {
+        let px = vram[y as usize * 1024 + x as usize];
+        let c = |s: u16| (((px >> s) & 31) << 3) as u8;
+        image::Rgb([c(0), c(5), c(10)])
+    })
+}
+
+fn main() -> ExitCode {
+    let a = match args() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(2);
+        }
+    };
+    let bin = match bin_path(&a.disc) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(2);
+        }
+    };
+    let file = match File::open(&bin) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("{}: {e}", bin.display());
+            return ExitCode::from(2);
+        }
+    };
+    let sectors = (file.metadata().map(|m| m.len()).unwrap_or(0) / SECTOR) as u32;
+    if let Err(e) = std::fs::create_dir_all(&a.out) {
+        eprintln!("{}: {e}", a.out.display());
+        return ExitCode::from(2);
+    }
+    let mut disc = Box::new(Disc { file, sectors });
+    let user = &mut *disc as *mut Disc as *mut c_void;
+    // SAFETY: `disc` outlives the simulator, which is freed before main returns.
+    let sim = unsafe { sim_new(user, read_sector, sectors + PREGAP, tty, log) };
+    if sim.is_null() {
+        eprintln!("out of memory");
+        return ExitCode::FAILURE;
+    }
+    let started = std::time::Instant::now();
+    let mut code = ExitCode::SUCCESS;
+    // SAFETY: `sim` is valid until sim_free below; VRAM is 1024x512 halfwords.
+    unsafe {
+        // PSXRT_TRACE: bit 0 BIOS calls, bit 1 CD commands, bit 2 DMA.
+        let trace = std::env::var("PSXRT_TRACE").ok().and_then(|v| v.parse::<c_int>().ok()).unwrap_or(0);
+        sim_trace(sim, trace);
+        if sim_boot(sim) != 0 {
+            eprintln!("boot failed");
+            sim_free(sim);
+            return ExitCode::FAILURE;
+        }
+        let vram = std::slice::from_raw_parts(sim_vram(sim), 1024 * 512);
+        let mut held: Vec<(u32, u16)> = Vec::new();
+        for frame in 1..=a.frames {
+            for &(f, b) in &a.presses {
+                if f == frame {
+                    held.push((frame + 6, b));
+                }
+            }
+            held.retain(|&(until, _)| frame < until);
+            sim_pad(sim, !held.iter().fold(0u16, |m, &(_, b)| m | b));
+            let exit = sim_frame(sim);
+            let last = exit != 0 || frame == a.frames;
+            if (a.every != 0 && frame % a.every == 0) || last {
+                let mut d = [0 as c_int; 6];
+                sim_display(sim, d.as_mut_ptr());
+                let mut st = [0u32; 4];
+                sim_status(sim, st.as_mut_ptr());
+                let path = a.out.join(format!("frame{frame:05}.png"));
+                if let Err(e) = screen(vram, &d).save(&path) {
+                    eprintln!("{}: {e}", path.display());
+                }
+                println!(
+                    "[sim] frame {frame} pc {:08X} {} Mcycles imask {:03X} display {}x{} at {},{}{}{}",
+                    st[0],
+                    st[1],
+                    st[3],
+                    d[2],
+                    d[3],
+                    d[0],
+                    d[1],
+                    if d[4] != 0 { " 24-bit" } else { "" },
+                    if d[5] != 0 { "" } else { " (off)" }
+                );
+            }
+            if exit != 0 {
+                println!("[sim] guest stopped ({})", if exit == 1 { "exit" } else { "fatal" });
+                code = ExitCode::FAILURE;
+                break;
+            }
+        }
+        let path = a.out.join("vram.png");
+        if let Err(e) = vram_image(vram).save(&path) {
+            eprintln!("{}: {e}", path.display());
+        }
+        sim_free(sim);
+    }
+    println!("[sim] {:.1} s wall, output in {}", started.elapsed().as_secs_f64(), a.out.display());
+    code
+}
