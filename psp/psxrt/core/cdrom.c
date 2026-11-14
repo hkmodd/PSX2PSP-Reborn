@@ -424,6 +424,16 @@ static void xa_sector(Psx *psx, const u8 *raw)
             psx_log(psx, "cd: 8-bit XA-ADPCM not supported (coding %02X)", ci);
         return;
     }
+    if (psx->trace & 64) {
+        static u32 seen;
+        if (!(seen++ & 31)) {
+            const u16 *g = psx->spu.regs;
+            psx_log(psx, "xa: %u sectors, file %u chan %u coding %02X, fifo %u, muted %d, cd vol %u %u %u %u, spucnt %04X cdvol %04X/%04X main %04X/%04X",
+                    (unsigned)seen, raw[16], raw[17], ci, (unsigned)(cd->xa_wr - cd->xa_rd), cd->muted, cd->vol[0], cd->vol[1],
+                    cd->vol[2], cd->vol[3], psx->spu.ctrl, g[(0x1F801DB0 - 0x1F801C00) >> 1], g[(0x1F801DB2 - 0x1F801C00) >> 1],
+                    g[(0x1F801D80 - 0x1F801C00) >> 1], g[(0x1F801D82 - 0x1F801C00) >> 1]);
+        }
+    }
     static s16 pcm[2][4032];
     int n[2] = {0, 0};
     for (int g = 0; g < 18; g++) {

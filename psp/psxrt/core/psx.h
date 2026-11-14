@@ -366,7 +366,8 @@ struct Psx {
      * the backend resumes at cpu.pc with the registers in cpu. */
     int redirect;
     int exiting;
-    int trace; /* diagnostics: bit 0 BIOS calls, bit 1 CD commands, bit 2 DMA */
+    int trace; /* diagnostics: bit 0 BIOS calls, bit 1 CD commands, bit 2 DMA, bit 3 IRQ,
+                * bit 4 vblank, bit 5 SPU state and display flips, bit 6 XA sectors */
     char exe_name[64];
 };
 

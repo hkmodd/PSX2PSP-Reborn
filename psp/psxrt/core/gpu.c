@@ -681,7 +681,13 @@ void gpu_gp1(Psx *psx, u32 v)
         g->dma_dir = v & 3;
         g->stat = (g->stat & ~0x60000000u) | ((v & 3) << 29);
         break;
-    case 0x05: g->disp_x = v & 0x3FE, g->disp_y = (v >> 10) & 0x1FF; break;
+    case 0x05: {
+        int x = (int)(v & 0x3FE), y = (int)((v >> 10) & 0x1FF);
+        if ((psx->trace & 32) && (g->disp_x != x || g->disp_y != y))
+            psx_log(psx, "gpu: flip"); /* the game's own frame rate: flips per vblank */
+        g->disp_x = x, g->disp_y = y;
+        break;
+    }
     case 0x06: g->hrange1 = v & 0xFFF, g->hrange2 = (v >> 12) & 0xFFF; break;
     case 0x07: g->vrange1 = v & 0x3FF, g->vrange2 = (v >> 10) & 0x3FF; break;
     case 0x08:

@@ -240,6 +240,9 @@ static void key_on(Psx *psx, int i)
 {
     Spu *s = &psx->spu;
     SpuVoice *v = &s->v[i];
+    if (psx->trace & 32)
+        psx_log(psx, "spu: kon %d addr %05X pitch %04X vol %04X/%04X adsr %04X%04X main %04X/%04X ctrl %04X", i,
+                (unsigned)VR(i, 3) << 3, VR(i, 2), VR(i, 0), VR(i, 1), VR(i, 4), VR(i, 5), G(0x1F801D80), G(0x1F801D82), s->ctrl);
     v->addr = ((u32)VR(i, 3) << 3) & 0x7FFF0;
     v->counter = 0;
     v->env = 0, v->env_wait = 0;
@@ -475,6 +478,18 @@ static void sync(Psx *psx)
     }
     if (psx->host->usec)
         s->us_mix += psx->host->usec(psx->host->user) - t0;
+    if (psx->trace & 32) { /* once a second: the mixer state and every sounding voice */
+        static u64 next;
+        if (s->last >= next) {
+            next = s->last + (u64)CYCLES_PER_SAMPLE * 44100;
+            psx_log(psx, "spu: ctrl %04X main %04X/%04X cd %04X/%04X rev %04X/%04X endx %06X", s->ctrl, G(0x1F801D80), G(0x1F801D82),
+                    G(0x1F801DB0), G(0x1F801DB2), G(0x1F801D84), G(0x1F801D86), (unsigned)s->endx);
+            for (int i = 0; i < 24; i++)
+                if (s->v[i].phase != SPU_OFF)
+                    psx_log(psx, "spu:  v%d ph %d env %04X vol %04X/%04X pitch %04X addr %05X rep %05X", i, s->v[i].phase,
+                            (unsigned)s->v[i].env, VR(i, 0), VR(i, 1), VR(i, 2), (unsigned)s->v[i].addr, (unsigned)s->v[i].repeat);
+        }
+    }
 }
 
 static void status(Spu *s)
