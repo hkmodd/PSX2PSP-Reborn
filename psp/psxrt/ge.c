@@ -56,8 +56,13 @@ typedef struct {
 typedef struct {
     u32 key, stamp; /* key 0: empty; stamp: the page's tile generations, summed */
     u32 used, age;  /* used: the list (ge.syncs) that last drew with it */
+    u32 epoch;      /* ge.epoch when the stamp was last found current */
     u8 *data;
 } Page;
+
+/* Games switch CLUTs per model, and models are drawn interleaved in depth order. */
+#define CLUT_BITS 5
+#define CLUT_SLOTS (1 << CLUT_BITS)
 
 static unsigned int __attribute__((aligned(64))) list[LIST_BYTES / 4];
 static int list_open, state_valid;
@@ -88,7 +93,7 @@ static struct {
         u32 key, stamp, syncs, epoch;
         const u32 *ptr;
         int flags;
-    } clut; /* the last CLUT converted, in the list `syncs` */
+    } cluts[CLUT_SLOTS]; /* CLUTs converted into the list `syncs`, by a hash of their key */
     GeStats s;
 } ge;
 
@@ -507,11 +512,11 @@ static const u8 *page(const GpuPrim *p)
         s->used = ge.syncs, s->age = ++ge.ages;
         return s->data;
     }
-    u32 st = stamp((s32)p->tpx, (s32)p->tpy, hw, 256);
     s = NULL;
     for (int i = 0; i < ge.npages && !s; i++)
         if (ge.pages[i].key == key)
             s = &ge.pages[i];
+    u32 st = s && s->epoch == ge.epoch ? s->stamp : stamp((s32)p->tpx, (s32)p->tpy, hw, 256);
     if (!s || s->stamp != st) {
         if (!s) {
             s = &ge.pages[0];
@@ -540,7 +545,7 @@ static const u8 *page(const GpuPrim *p)
             ge.tex_sent = NULL;
         ge.s.pages++;
     }
-    s->used = ge.syncs, s->age = ++ge.ages;
+    s->used = ge.syncs, s->age = ++ge.ages, s->epoch = ge.epoch;
     ge.last_page = s, ge.last_epoch = ge.epoch;
     return s->data;
 }
@@ -551,10 +556,11 @@ static const u32 *clut(const GpuPrim *p, int *flags)
 {
     int n = p->depth ? 256 : 16;
     u32 key = 1 + (p->clut_x / 16 | p->clut_y << 6 | p->depth << 15);
-    int same = ge.clut.key == key && ge.clut.syncs == ge.syncs;
-    u32 st = same && ge.clut.epoch == ge.epoch ? ge.clut.stamp : stamp((s32)p->clut_x, (s32)p->clut_y, n, 1);
-    ge.clut.epoch = ge.epoch;
-    if (!same || ge.clut.stamp != st) {
+    __typeof__(ge.cluts[0]) *e = &ge.cluts[(key * 2654435761u) >> (32 - CLUT_BITS)];
+    int same = e->key == key && e->syncs == ge.syncs;
+    u32 st = same && e->epoch == ge.epoch ? e->stamp : stamp((s32)p->clut_x, (s32)p->clut_y, n, 1);
+    e->epoch = ge.epoch;
+    if (!same || e->stamp != st) {
         u32 *c = (u32 *)(((u32)sceGuGetMemory(n * 4 + 16) + 15) & ~15u);
         const u16 *row = ge.psx->gpu.vram + p->clut_y * VRAM_W;
         int f = 0;
@@ -564,11 +570,11 @@ static const u32 *clut(const GpuPrim *p, int *flags)
             f |= !t ? 0 : t & 0x8000 ? 2 : 1;
             c[i] = a << 24 | (t >> 10 & 31) << 19 | (t >> 5 & 31) << 11 | (t & 31) << 3;
         }
-        ge.clut.key = key, ge.clut.stamp = st, ge.clut.syncs = ge.syncs, ge.clut.ptr = c, ge.clut.flags = f;
+        e->key = key, e->stamp = st, e->syncs = ge.syncs, e->ptr = c, e->flags = f;
         ge.s.cluts++;
     }
-    *flags = ge.clut.flags;
-    return ge.clut.ptr;
+    *flags = e->flags;
+    return e->ptr;
 }
 
 static void bind(const GpuPrim *p, const u8 *pg, const u32 *cl)

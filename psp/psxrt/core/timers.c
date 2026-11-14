@@ -6,20 +6,33 @@
  */
 #include "psx.h"
 
-/* CPU cycles per tick, 16.16 fixed point */
-static u64 cpt(Psx *psx, int i)
+/* CPU cycles per tick, 16.16 fixed point; under 2^28. */
+static u32 cpt(Psx *psx, int i)
 {
     u32 src = (psx->tmr.t[i].mode >> 8) & 3;
     if (i == 0 && (src & 1)) {
         static const u32 gpu_div[4] = {10, 8, 5, 4}; /* GPU clocks per dot: 256, 320, 512, 640 */
         u32 div = (psx->gpu.stat & 0x10000) ? 7 : gpu_div[(psx->gpu.stat >> 17) & 3];
-        return ((u64)div * 7 << 16) / 11; /* GPU clock is 11/7 of the CPU clock */
+        return (div * 7 << 16) / 11; /* GPU clock is 11/7 of the CPU clock */
     }
     if (i == 1 && (src & 1))
-        return (u64)psx_line_cycles(psx) << 16;
+        return psx_line_cycles(psx) << 16;
     if (i == 2 && (src & 2))
         return 8u << 16;
     return 1u << 16;
+}
+
+/* Whole ticks in d cycles at c (cpt). Timers are read tens of thousands of times a second, and a
+ * 64-bit division is a library call on a 32-bit CPU: it is used only when 32 bits do not do. */
+static u64 ticks_in(u64 d, u32 c)
+{
+    if (!(c & 0xFFFF)) {
+        u32 whole = c >> 16;
+        if (whole == 1)
+            return d;
+        return d >> 32 ? d / whole : (u32)d / whole;
+    }
+    return d < 0x10000 ? ((u32)d << 16) / c : (d << 16) / c;
 }
 
 static int paused(Psx *psx, int i)
@@ -58,8 +71,8 @@ static void sync(Psx *psx, int i)
         t->base = psx->cycles;
         return;
     }
-    u64 c = cpt(psx, i);
-    u64 ticks = (((psx->cycles - t->base) << 16) / c);
+    u32 c = cpt(psx, i);
+    u64 ticks = ticks_in(psx->cycles - t->base, c);
     if (!ticks)
         return;
     t->base += (ticks * c) >> 16;
@@ -113,7 +126,7 @@ u32 timer_tick(Psx *psx, u32 addr)
     int i = (addr >> 4) & 3;
     if (i > 2 || (addr & 0xF) || paused(psx, i))
         return 0;
-    return (u32)(cpt(psx, i) >> 16);
+    return cpt(psx, i) >> 16;
 }
 
 u32 timer_read(Psx *psx, u32 addr)
