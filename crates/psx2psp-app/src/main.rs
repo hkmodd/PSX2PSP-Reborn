@@ -460,6 +460,20 @@ impl ClipForm {
     }
 }
 
+/// What SND0 gets when it shares the 500 KB with ICON1; `secs` = (music, video) lengths, if known.
+fn shared_note(secs: Option<(f64, f64)>) -> String {
+    match secs {
+        Some((a, v)) => format!(
+            "SND0 at {} kbps ATRAC3; the video gets the rest of the 500 KB",
+            clip::shared_kbps(a, v, tools::SND0_BUDGET)
+        ),
+        None => format!(
+            "SND0 at 132 kbps while the video keeps ≥{:.0} kbps (≈15 s), else 105 or 66; the video gets the rest of the 500 KB",
+            clip::SHARED_MIN_VIDEO_KBPS
+        ),
+    }
+}
+
 /// `[start, end)` in seconds: empty start = 0, empty end = start + 30 s (capped at the source).
 fn span(start: &str, end: &str, len: Option<f64>) -> Option<(f64, f64)> {
     let start = if start.trim().is_empty() {
@@ -1590,9 +1604,9 @@ impl App {
                     snd0: None,
                 };
                 if let Some(t) = &music {
-                    let (kbps, budget) = match video {
-                        Some(_) => (
-                            clip::SHARED_KBPS,
+                    let (kbps, budget) = match &video {
+                        Some(v) => (
+                            clip::shared_kbps(t.2 - t.1, v.2 - v.1, tools::SND0_BUDGET),
                             tools::SND0_BUDGET.saturating_sub(clip::MIN_ICON1),
                         ),
                         None => (kbps, tools::SND0_BUDGET.saturating_sub(kept_icon1)),
@@ -2639,11 +2653,10 @@ impl App {
     fn files_body(&self) -> Element<'_, Message> {
         let (v, m) = (self.clip.video.is_set(), self.clip.music.is_set());
         let note: Element<'_, Message> = match (v, m) {
-            (true, true) => label(format!(
-                "Music as {} kbps ATRAC3; the video gets the rest of the 500 KB",
-                clip::SHARED_KBPS
-            ))
-            .into(),
+            (true, true) => {
+                let secs = |tr: &LocalTrack| tr.span().map(|(s, e)| e - s);
+                label(shared_note(secs(&self.clip.music).zip(secs(&self.clip.video)))).into()
+            }
             (false, true) => self.kbps_row(),
             (true, false) => {
                 label("144×80 H.264 at 29.97 fps, bitrate fitted to the free budget").into()
@@ -2806,11 +2819,7 @@ impl App {
         });
         let audio: Element<'_, Message> = match c.mode {
             ClipMode::Snd0 => self.kbps_row(),
-            ClipMode::Both => label(format!(
-                "SND0 at {} kbps; the video gets the rest of the 500 KB",
-                clip::SHARED_KBPS
-            ))
-            .into(),
+            ClipMode::Both => label(shared_note(span.map(|(s, e)| (e - s, e - s)))).into(),
             ClipMode::Icon1 => {
                 label("144×80 H.264 at 29.97 fps, bitrate fitted to the free budget").into()
             }

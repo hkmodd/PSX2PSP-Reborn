@@ -63,7 +63,8 @@ CLIP OPTIONS:
   --start <t>        clip start, seconds or [h:]m:s (default 0)
   --end <t>          clip end (default start + 30 s, capped at the source length)
   --mode <m>         both | icon1 | snd0   (default both; snd0 = soundtrack only, no video)
-  --snd0-kbps <k>    ATRAC3 rate when SND0 is alone: 66 | 105 | 132 (default 132)
+  --snd0-kbps <k>    ATRAC3 rate when SND0 is alone: 66 | 105 | 132 (default 132). With both,
+                     SND0 gets the best rate that leaves the video >=128 kbps (132 up to ~15 s)
 
 PATCH DATABASE:
   Built in, with your own patches.ini merged on top (same name for the same game wins): a

@@ -140,7 +140,8 @@ The Media card asks one question first: **From YouTube** or **From my files**.
   in its video, AU tables and timestamps.
 - **The 500 KB budget is shared automatically.** `ICON1` and `SND0` together must fit the XMB's
   500 KB: ATRAC3 is constant-rate, so SND0 is encoded first and the video bitrate is fitted to what
-  is left.
+  is left. SND0 gets the best rate that still leaves the video ≥128 kbps: 132 kbps up to ~15 s,
+  105 up to ~17 s, 66 beyond.
 - Ready-made `.pmf` and `.at3` files are accepted as they are.
 
 ### 🩹 Fixes for ~2,000 games, built in

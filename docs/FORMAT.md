@@ -57,7 +57,9 @@ POPS key set (`Sfo::pops`):
 PIC0 is 310×180, as in the PSP's own XMB. 480×272 is the full-screen size that PIC1 and boot use.
 
 ICON1 and SND0 share the 500 KiB budget, and SND0 is encoded first because ATRAC3 is CBR.
-- When both are made, SND0 uses 66 kbps and at least 48 KiB is kept for the video.
+- When both are made, SND0 takes the highest rate (132, then 105, else 66 kbps) that still leaves
+  the video ≥128 kbps (~0.37 bit/pixel at 144×80): 132 up to ~15.2 s, 105 up to ~17 s. At least
+  48 KiB is always kept for the video.
 - The ICON1 bitrate is then fitted to the remaining bytes, re-encoding with a lower bitrate
   whenever the result overshoots.
 

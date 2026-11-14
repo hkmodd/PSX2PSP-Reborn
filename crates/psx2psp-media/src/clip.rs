@@ -7,8 +7,9 @@
 //!                                                 └─► FFmpeg ─► x264 ES ─► psmf::mux ─► ICON1.PMF
 //! ```
 //!
-//! ICON1 + SND0 share the XMB's 500 KiB budget: SND0 is CBR so it is made first, and ICON1's bitrate
-//! is fitted to what is left (re-encoding at a lower rate until the muxed file fits).
+//! ICON1 + SND0 share the XMB's 500 KiB budget: SND0 is CBR so it is made first, at the highest
+//! ATRAC3 rate that leaves the video [`SHARED_MIN_VIDEO_KBPS`] ([`shared_kbps`]), and ICON1's
+//! bitrate is fitted to what is left (re-encoding at a lower rate until the muxed file fits).
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -21,9 +22,23 @@ use crate::tools::{self, At3Encoder, Ffmpeg, Snd0Request, YtDlp};
 
 /// Smallest ICON1 worth making; SND0 never eats into it when both are requested.
 pub const MIN_ICON1: u64 = 48 * 1024;
-/// ATRAC3 rate used when SND0 shares the budget with a video.
-pub const SHARED_KBPS: u32 = 66;
+/// Video rate [`shared_kbps`] protects when SND0 shares the budget: ~0.37 bit/pixel at 144×80
+/// 29.97 fps, where x264 is still clean (Sony's own ICON1 sample runs ~179 kbps over 20 s).
+pub const SHARED_MIN_VIDEO_KBPS: f64 = 128.0;
 const MIN_VIDEO_KBPS: f64 = 12.0;
+/// RIFF header plus the encoder's delay/padding frames, with margin.
+const SND0_OVERHEAD: f64 = 1024.0;
+
+/// ATRAC3 rate for `audio_secs` of SND0 sharing `budget` bytes with a `video_secs` ICON1: the
+/// highest rate (132, then 105) that still leaves the video [`SHARED_MIN_VIDEO_KBPS`], else 66.
+pub fn shared_kbps(audio_secs: f64, video_secs: f64, budget: u64) -> u32 {
+    let video_kbps = |k: u32| {
+        let audio = tools::at3_block_align(k).map_or(f64::INFINITY, |b| tools::at3_bps(b) / 8.0 * audio_secs + SND0_OVERHEAD);
+        let left = budget as f64 - audio;
+        if left < MIN_ICON1 as f64 { 0.0 } else { left * 8.0 * 0.94 / video_secs / 1000.0 }
+    };
+    [132, 105].into_iter().find(|&k| video_kbps(k) >= SHARED_MIN_VIDEO_KBPS).unwrap_or(66)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ClipMode {
@@ -88,7 +103,7 @@ pub struct ClipRequest<'a> {
     pub start: f64,
     pub end: f64,
     pub mode: ClipMode,
-    /// SND0 bitrate when it is the only output (66 / 105 / 132); [`SHARED_KBPS`] otherwise.
+    /// SND0 bitrate when it is the only output (66 / 105 / 132); [`shared_kbps`] picks it otherwise.
     pub snd0_kbps: u32,
     /// Bytes available to ICON1 + SND0.
     pub budget: u64,
@@ -173,7 +188,7 @@ pub fn make_clip(tools: &ClipTools, req: &ClipRequest<'_>, work: &Path, mon: &dy
     let result = (|| {
         let mut clip = Clip::default();
         if req.mode.audio() {
-            let (kbps, budget) = if req.mode.video() { (SHARED_KBPS, req.budget.saturating_sub(MIN_ICON1)) } else { (req.snd0_kbps, req.budget) };
+            let (kbps, budget) = if req.mode.video() { (shared_kbps(dur, dur, req.budget), req.budget.saturating_sub(MIN_ICON1)) } else { (req.snd0_kbps, req.budget) };
             log(&format!("SND0.AT3: ATRAC3 {kbps} kbps ({} encoder)", tools.at3.name()));
             let snd0_req = Snd0Request { input: &input, start_secs: start, max_secs: Some(dur), kbps, budget };
             let snd0 = tools::make_snd0(tools.ffmpeg.as_ref(), &tools.at3, &snd0_req, work, mon)?;
@@ -352,5 +367,26 @@ mod tests {
         assert_eq!(tools::parse_hms("1:02.5"), Some(62.5));
         assert_eq!(tools::parse_hms("1:00:00"), Some(3600.0));
         assert_eq!(tools::parse_hms("x"), None);
+    }
+
+    #[test]
+    fn shared_rate_is_the_best_that_leaves_the_video_enough() {
+        let b = tools::SND0_BUDGET;
+        // 500 KiB: 132 kbps up to 15.2 s, 105 up to 16.97 s, then 66.
+        for (secs, kbps) in [(5.0, 132), (12.0, 132), (15.0, 132), (16.0, 105), (16.9, 105), (17.0, 66), (30.0, 66), (60.0, 66)] {
+            assert_eq!(shared_kbps(secs, secs, b), kbps, "{secs} s");
+        }
+        // Own files, each with its own span: a short video leaves room for long music at 132…
+        assert_eq!(shared_kbps(20.0, 5.0, b), 132);
+        assert_eq!(shared_kbps(5.0, 25.0, b), 132);
+        // …and a video too long to reach the floor gets every byte 66 kbps frees.
+        assert_eq!(shared_kbps(5.0, 30.0, b), 66);
+        // The size model holds for what the encoder really writes (header, delay and padding).
+        let pcm = vec![0i16; 2 * 44_100 * 3];
+        for k in [66, 105, 132] {
+            let at3 = crate::atrac3::encode(&pcm, k, &()).unwrap();
+            let model = tools::at3_bps(tools::at3_block_align(k).unwrap()) / 8.0 * 3.0 + SND0_OVERHEAD;
+            assert!((at3.len() as f64) <= model, "{k} kbps: {} B > {model:.0} B", at3.len());
+        }
     }
 }
