@@ -2875,16 +2875,15 @@ impl App {
                     space().width(Fill),
                     chip(
                         match self.level {
-                            1..=4 => "faster, larger",
-                            5..=6 => "recommended",
+                            ..=6 => "recommended",
                             _ => "slower, ~same size",
                         },
-                        if (5..=6).contains(&self.level) { style::GREEN } else { style::MUTED },
+                        if self.level <= 6 { style::GREEN } else { style::MUTED },
                     ),
                 ]
                 .spacing(8)
                 .align_y(Alignment::Center),
-                container(slider(1..=9, self.level, Message::Level).style(style::slider(style::GREEN))).padding([2, 4]),
+                container(slider(engine::LEVELS, self.level, Message::Level).style(style::slider(style::GREEN))).padding([2, 4]),
                 space().height(2),
                 row![
                     hint(ghost_icon(Icon::Import, "Import EBOOT…").on_press(Message::ImportPbp).width(Fill), "Take title, ID and artwork from an existing EBOOT.PBP".into()),
