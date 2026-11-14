@@ -19,7 +19,17 @@ typedef struct {
     int textured, raw, semi, gouraud;
     u32 clut_x, clut_y;
     u32 tpx, tpy, depth, abr;
+    u32 tw_and_u, tw_or_u, tw_and_v, tw_or_v; /* texture window, from E2 */
+    int mask_check;
+    u16 mask_set;
 } Prim;
+
+/* The per-pixel path is inlined into the loops that walk the pixels. */
+#ifdef _MSC_VER
+#define PIXEL static __forceinline
+#else
+#define PIXEL static inline __attribute__((always_inline))
+#endif
 
 static const s8 dither[4][4] = {{-4, 0, -3, 1}, {2, -2, 3, -1}, {-3, 1, -4, 0}, {3, -1, 2, -2}};
 
@@ -68,15 +78,17 @@ static void prim_from(Psx *psx, Prim *p, u32 cmd, u32 clut, u32 tp)
     p->tpy = ((tp >> 4) & 1) * 256;
     p->abr = (tp >> 5) & 3;
     p->depth = (tp >> 7) & 3;
-    (void)psx;
+    const Gpu *g = &psx->gpu;
+    p->tw_and_u = 0xFF & ~(u32)(g->tw_mask_x * 8), p->tw_or_u = (u32)(g->tw_off_x & g->tw_mask_x) * 8;
+    p->tw_and_v = 0xFF & ~(u32)(g->tw_mask_y * 8), p->tw_or_v = (u32)(g->tw_off_y & g->tw_mask_y) * 8;
+    p->mask_check = g->mask_check;
+    p->mask_set = g->mask_set ? 0x8000 : 0;
 }
 
-static u16 texel(Psx *psx, const Prim *p, u32 u, u32 v)
+PIXEL u16 texel(Psx *psx, const Prim *p, u32 u, u32 v)
 {
-    Gpu *g = &psx->gpu;
-    u &= 0xFF, v &= 0xFF;
-    u = (u & ~(u32)(g->tw_mask_x * 8)) | ((g->tw_off_x & g->tw_mask_x) * 8);
-    v = (v & ~(u32)(g->tw_mask_y * 8)) | ((g->tw_off_y & g->tw_mask_y) * 8);
+    u = (u & p->tw_and_u) | p->tw_or_u;
+    v = (v & p->tw_and_v) | p->tw_or_v;
     switch (p->depth) {
     case 0: {
         u16 w = VRAM(p->tpx + u / 4, p->tpy + v);
@@ -92,11 +104,10 @@ static u16 texel(Psx *psx, const Prim *p, u32 u, u32 v)
 }
 
 /* Writes one pixel. r,g,b are 8-bit (modulated) unless `tex15` is a raw texel. */
-static void plot(Psx *psx, const Prim *p, int x, int y, s32 r, s32 g, s32 b, int dith, int semi, u16 mask_bit)
+PIXEL void plot(Psx *psx, const Prim *p, int x, int y, s32 r, s32 g, s32 b, int dith, int semi, u16 mask_bit)
 {
-    Gpu *gp = &psx->gpu;
     u16 *d = &VRAM(x, y);
-    if (gp->mask_check && (*d & 0x8000))
+    if (p->mask_check && (*d & 0x8000))
         return;
     if (dith) {
         int k = dither[y & 3][x & 3];
@@ -118,12 +129,13 @@ static void plot(Psx *psx, const Prim *p, int x, int y, s32 r, s32 g, s32 b, int
         fg = fg < 0 ? 0 : fg > 31 ? 31 : fg;
         fb = fb < 0 ? 0 : fb > 31 ? 31 : fb;
     }
-    *d = (u16)(fr | fg << 5 | fb << 10 | mask_bit | (gp->mask_set ? 0x8000 : 0));
+    *d = (u16)(fr | fg << 5 | fb << 10 | mask_bit | p->mask_set);
 }
 
 /* Shades one fragment: texture lookup, modulation, transparency. */
-static void fragment(Psx *psx, const Prim *p, int x, int y, s32 r, s32 g, s32 b, s32 u, s32 v, int dith)
+PIXEL void fragment(Psx *psx, const Prim *p, int x, int y, s32 r, s32 g, s32 b, s32 u, s32 v, int dith)
 {
+    psx->gpu.frags++;
     if (!p->textured) {
         plot(psx, p, x, y, r, g, b, dith, p->semi, 0);
         return;
@@ -182,30 +194,62 @@ static void triangle(Psx *psx, const Prim *p, Vtx v0, Vtx v1, Vtx v2)
     }
     int b0 = top_left(&v1, &v2) ? 0 : 1, b1 = top_left(&v2, &v0) ? 0 : 1, b2 = top_left(&v0, &v1) ? 0 : 1;
     int dith = (g->stat & 0x200) && (p->gouraud || (p->textured && !p->raw));
+    /* Edge functions step by constants; the bounding box is at most 1024x512, so they fit in 32
+     * bits. A row of a triangle is one span: the x where all three edges pass, found by division
+     * instead of testing every pixel of the box. */
+    s32 ex[3] = {v1.y - v2.y, v2.y - v0.y, v0.y - v1.y}, ey[3] = {v2.x - v1.x, v0.x - v2.x, v1.x - v0.x};
+    s32 r[3] = {(s32)edge(&v1, &v2, minx, miny), (s32)edge(&v2, &v0, minx, miny), (s32)edge(&v0, &v1, minx, miny)};
+    s32 bias[3] = {b0, b1, b2};
+    s64 ar[5];
+    u32 ax[5];
+    for (int k = 0; k < 5; k++) {
+        ar[k] = (s64)(minx - v0.x) * dx[k] + (s64)(miny - v0.y) * dy[k] + 0x8000;
+        ax[k] = (u32)dx[k];
+    }
     for (s32 y = miny; y <= maxy; y++) {
-        for (s32 x = minx; x <= maxx; x++) {
-            s64 w0 = edge(&v1, &v2, x, y), w1 = edge(&v2, &v0, x, y), w2 = edge(&v0, &v1, x, y);
-            if (w0 < b0 || w1 < b1 || w2 < b2)
-                continue;
-            s32 at[5];
-            for (int k = 0; k < 5; k++)
-                at[k] = a0[k] + (s32)(((s64)(x - v0.x) * dx[k] + (s64)(y - v0.y) * dy[k] + 0x8000) >> 16);
-            fragment(psx, p, x, y, at[0], at[1], at[2], at[3], at[4], dith);
+        /* the span as offsets t from minx where r + ex * t >= bias for every edge */
+        s32 lo = 0, hi = maxx - minx;
+        for (int i = 0; i < 3 && lo <= hi; i++) {
+            s32 n = bias[i] - r[i], e = ex[i];
+            if (e > 0) {
+                s32 t = n <= 0 ? -(-n / e) : (n + e - 1) / e; /* ceil(n / e) */
+                lo = t > lo ? t : lo;
+            } else if (e < 0) {
+                s32 t = n <= 0 ? -n / -e : -((n - e - 1) / -e); /* floor(n / e) */
+                hi = t < hi ? t : hi;
+            } else if (n > 0)
+                hi = -1;
         }
+        if (lo <= hi) {
+            g->tested += (u32)(hi - lo + 1);
+            /* Inside the triangle each 16.16 attribute sum is within a few units of +-255 << 16,
+             * so stepping its low 32 bits gives the value the 64-bit sum would. */
+            u32 a[5];
+            for (int k = 0; k < 5; k++)
+                a[k] = (u32)(ar[k] + (s64)lo * dx[k]);
+            for (s32 x = minx + lo, xe = minx + hi; x <= xe; x++) {
+                fragment(psx, p, x, y, a0[0] + ((s32)a[0] >> 16), a0[1] + ((s32)a[1] >> 16), a0[2] + ((s32)a[2] >> 16),
+                         a0[3] + ((s32)a[3] >> 16), a0[4] + ((s32)a[4] >> 16), dith);
+                for (int k = 0; k < 5; k++)
+                    a[k] += ax[k];
+            }
+        }
+        for (int i = 0; i < 3; i++)
+            r[i] += ey[i];
+        for (int k = 0; k < 5; k++)
+            ar[k] += dy[k];
     }
 }
 
 static void rect(Psx *psx, const Prim *p, s32 x0, s32 y0, s32 w, s32 h, s32 r, s32 gg, s32 b, s32 u0, s32 v0)
 {
     Gpu *g = &psx->gpu;
-    for (s32 y = 0; y < h; y++) {
+    s32 xa = g->clip_x1 - x0, xb = g->clip_x2 - x0 + 1, ya = g->clip_y1 - y0, yb = g->clip_y2 - y0 + 1;
+    xa = xa < 0 ? 0 : xa, ya = ya < 0 ? 0 : ya, xb = xb > w ? w : xb, yb = yb > h ? h : yb;
+    for (s32 y = ya; y < yb; y++) {
         s32 py = y0 + y;
-        if (py < g->clip_y1 || py > g->clip_y2)
-            continue;
-        for (s32 x = 0; x < w; x++) {
+        for (s32 x = xa; x < xb; x++) {
             s32 px = x0 + x;
-            if (px < g->clip_x1 || px > g->clip_x2)
-                continue;
             s32 u = g->tex_flip_x ? u0 - x : u0 + x, v = g->tex_flip_y ? v0 - y : v0 + y;
             fragment(psx, p, px, py, r, gg, b, u, v, 0);
         }
@@ -392,9 +436,14 @@ static void execute(Psx *psx)
         draw(psx);
         return;
     }
-    u32 t = h->usec(h->user);
+    u32 t = h->usec(h->user), cmd = psx->gpu.cmd[0] >> 24;
     draw(psx);
-    psx->gpu.us_draw += h->usec(h->user) - t;
+    t = h->usec(h->user) - t;
+    int k = cmd >= 0x20 && cmd < 0x40 ? 0 : cmd >= 0x40 && cmd < 0x60 ? 1 : cmd >= 0x60 && cmd < 0x80 ? 2
+          : cmd >= 0x80 && cmd < 0xA0 ? 3 : cmd == 0x02 ? 4 : 5;
+    psx->gpu.us_draw += t;
+    psx->gpu.us_kind[k] += t;
+    psx->gpu.n_kind[k]++;
 }
 
 static void draw(Psx *psx)

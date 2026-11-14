@@ -178,6 +178,9 @@ typedef struct Gpu {
     /* host renderer hook: called before a draw that reads VRAM the host may hold */
     void *renderer;
     u32 us_draw; /* microseconds spent drawing, when PsxHost.usec is set */
+    /* per command kind (polygon, line, rectangle, copy, fill, other): count and microseconds;
+     * fragments shaded and pixels tested. The host reads and clears them. */
+    u32 n_kind[6], us_kind[6], frags, tested;
 } Gpu;
 
 typedef struct SpuVoice {

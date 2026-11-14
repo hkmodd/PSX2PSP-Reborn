@@ -316,7 +316,7 @@ static void frame(void)
         t0 = t, c0 = psx.cycles, f0 = frames;
         snprintf(status, sizeof status, "f %u pc %08X %u%% %u fps", (unsigned)frames, (unsigned)psx.cpu.pc, (unsigned)speed, (unsigned)fps);
         if (log_fd >= 0) { /* the speed goes to the file only: the screen has its status line */
-            char line[256];
+            char line[512];
             int n = snprintf(line, sizeof line, "-- %s\n", status);
             if (native) {
                 const NativeStats *s = &native_stats;
@@ -330,6 +330,14 @@ static void frame(void)
                               (unsigned)((s->us_update - n0.us_update) / 1000), (unsigned)((s->us_present - n0.us_present) / 1000),
                               (unsigned)((us_rgb24 - rgb0) / 1000), (unsigned)((s->us_sleep - n0.us_sleep) / 1000));
                 n0 = *s, draw0 = psx.gpu.us_draw, mdec0 = psx.mdec.us_decode, rgb0 = us_rgb24;
+                Gpu *g = &psx.gpu;
+                n += snprintf(line + n, sizeof line - (size_t)n,
+                              "-- gpu: poly %u/%u line %u/%u rect %u/%u copy %u/%u fill %u/%u other %u/%u (n/ms), frags %u tested %u\n",
+                              (unsigned)g->n_kind[0], (unsigned)(g->us_kind[0] / 1000), (unsigned)g->n_kind[1], (unsigned)(g->us_kind[1] / 1000),
+                              (unsigned)g->n_kind[2], (unsigned)(g->us_kind[2] / 1000), (unsigned)g->n_kind[3], (unsigned)(g->us_kind[3] / 1000),
+                              (unsigned)g->n_kind[4], (unsigned)(g->us_kind[4] / 1000), (unsigned)g->n_kind[5], (unsigned)(g->us_kind[5] / 1000),
+                              (unsigned)g->frags, (unsigned)g->tested);
+                memset(g->n_kind, 0, sizeof g->n_kind), memset(g->us_kind, 0, sizeof g->us_kind), g->frags = g->tested = 0;
             }
             log_flush();
             sceIoWrite(log_fd, line, n);
