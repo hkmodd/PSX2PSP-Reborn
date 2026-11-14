@@ -560,13 +560,17 @@ static void frame(void)
                               (unsigned)s->loads, (unsigned)(s->poll_skips - n0.poll_skips), (unsigned)(s->hooks - n0.hooks));
                 n += snprintf(line + n, sizeof line - (size_t)n,
                               "-- ms: interp %u io %u (draw %u mdec %u spu %u) update %u present %u (rgb24 %u) sleep %u;"
-                              " audio drops %u gaps %u trims %u\n",
+                              " audio drops %u gaps %u trims %u; vsync wait %u (%u ms) late %u (avg %u max %u us) skipped %u\n",
                               (unsigned)((s->us_interp - n0.us_interp) / 1000), (unsigned)((s->us_io - n0.us_io) / 1000),
                               (unsigned)((psx.gpu.us_draw - draw0) / 1000), (unsigned)((psx.mdec.us_decode - mdec0) / 1000),
                               (unsigned)((psx.spu.us_mix - spu0) / 1000),
                               (unsigned)((s->us_update - n0.us_update) / 1000), (unsigned)((s->us_present - n0.us_present) / 1000),
                               (unsigned)((us_rgb24 - rgb0) / 1000), (unsigned)((s->us_sleep - n0.us_sleep) / 1000),
-                              (unsigned)audio_drops, (unsigned)audio_gaps, (unsigned)audio_trims);
+                              (unsigned)audio_drops, (unsigned)audio_gaps, (unsigned)audio_trims, (unsigned)(s->vs_wait - n0.vs_wait),
+                              (unsigned)((s->us_vs_wait - n0.us_vs_wait) / 1000), (unsigned)(s->vs_late - n0.vs_late),
+                              (unsigned)((s->us_late - n0.us_late) / ((s->vs_late - n0.vs_late) | 1)), (unsigned)s->us_late_max,
+                              (unsigned)(s->vs_adv - n0.vs_adv));
+                native_stats.us_late_max = 0;
                 audio_drops = audio_gaps = audio_trims = 0;
                 static const char *const io_names[IO_KINDS] = IO_KIND_NAMES;
                 n += snprintf(line + n, sizeof line - (size_t)n, "-- io (n/ms):");
@@ -635,8 +639,11 @@ static u32 host_usec(void *user)
 }
 
 /* ---- audio: the SPU's 44100 Hz stereo through a ring to a thread that feeds one hardware
- * channel. The ring absorbs the SPU's per-frame bursts; when the game runs ahead of the clock the
- * consumer trims the backlog, when it falls behind the channel gets silence. ---- */
+ * channel. PS1 time follows the PSP display (native_vsync), so the SPU makes up to ~0.9% more
+ * samples than the channel's 44100 Hz takes: the consumer resamples, its step following the
+ * ring's smoothed fill (each sample above the target is 1/65536 faster), which settles where the
+ * two rates meet. The ring absorbs the SPU's per-frame bursts; past ~190 ms of backlog the
+ * consumer trims it, when it runs dry the channel gets silence. ---- */
 #define AUDIO_RING 16384 /* stereo samples, a power of two */
 #define AUDIO_BLOCK 1024 /* samples per hardware output, a multiple of 64 */
 static s16 audio_ring[AUDIO_RING * 2];
@@ -665,18 +672,33 @@ static int audio_thread(SceSize args, void *argp)
         say("audio: no channel (%08X)", ch);
         return 0;
     }
+    const s32 target = 3 * AUDIO_BLOCK;
+    s32 avg = target; /* the fill, smoothed over ~16 blocks */
+    u32 pos = 0;      /* 16.16: the fraction of a sample past rd */
     for (;;) {
         u32 rd = audio_rd, fill = audio_wr - rd;
         if (fill > 8 * AUDIO_BLOCK) /* more than ~190 ms behind: catch up to ~70 ms */
-            rd += fill - 3 * AUDIO_BLOCK, fill = 3 * AUDIO_BLOCK, audio_trims++;
-        u32 n = fill < AUDIO_BLOCK ? fill : AUDIO_BLOCK;
-        for (u32 i = 0; i < n; i++, rd++) {
-            u32 at = (rd & (AUDIO_RING - 1)) * 2;
-            buf[2 * i] = audio_ring[at], buf[2 * i + 1] = audio_ring[at + 1];
-        }
-        if (n < AUDIO_BLOCK) {
+            rd += fill - (u32)target, fill = (u32)target, avg = target, audio_trims++;
+        avg += ((s32)fill - avg) / 16;
+        s32 d = avg - target;
+        u32 step = 65536u + (u32)(d < -1311 ? -1311 : d > 1311 ? 1311 : d); /* within 2% */
+        if (fill > ((pos + step * AUDIO_BLOCK) >> 16) + 1) {
+            for (u32 i = 0; i < AUDIO_BLOCK; i++, pos += step) {
+                u32 a = ((rd + (pos >> 16)) & (AUDIO_RING - 1)) * 2, b = (a + 2) & (AUDIO_RING * 2 - 1);
+                s32 f = (s32)(pos & 0xFFFF) >> 1; /* 15 bits: the product fits */
+                buf[2 * i] = (s16)(audio_ring[a] + ((audio_ring[b] - audio_ring[a]) * f >> 15));
+                buf[2 * i + 1] = (s16)(audio_ring[a + 1] + ((audio_ring[b + 1] - audio_ring[a + 1]) * f >> 15));
+            }
+            rd += pos >> 16, pos &= 0xFFFF;
+        } else { /* ran dry: what there is, then silence */
+            u32 n = fill < AUDIO_BLOCK ? fill : AUDIO_BLOCK;
+            for (u32 i = 0; i < n; i++, rd++) {
+                u32 at = (rd & (AUDIO_RING - 1)) * 2;
+                buf[2 * i] = audio_ring[at], buf[2 * i + 1] = audio_ring[at + 1];
+            }
             memset(buf + 2 * n, 0, (AUDIO_BLOCK - n) * 4);
             audio_gaps += n > 0;
+            pos = 0;
         }
         audio_rd = rd;
         sceKernelDcacheWritebackRange(buf, sizeof buf);
@@ -737,8 +759,10 @@ static void host_vblank(void *user)
     for (int i = 0; i < shot_n; i++)
         if ((shot_at[i] & 0x7FFFFFFFu) == frames)
             (shot_at[i] >> 31 ? ram_dump : shot)(&psx, frames);
-    if (native)
+    if (native) {
         frame();
+        native_vsync();
+    }
 }
 
 static int exit_callback(int a, int b, void *c)

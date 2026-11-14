@@ -21,7 +21,10 @@
  * Time: the PS1 cycle count advances with interpreted instructions and loops: each back-edge
  * charges its estimated PS1 cycles to CTX.BUDGET and enters the runtime when that goes negative,
  * which adds what was spent to the count, so a counted wait loop lasts as long as on the PS1.
- * When the count runs ahead of the real clock (checked at every host call and every 256
+ * PS1 time runs at one PS1 frame per PSP display frame (59.94 Hz), and each PS1 vblank waits for
+ * the PSP's (native_vsync), so that every game frame is shown once: PS1 time is the PSP's,
+ * scaled by the frame lengths (+0.2% for NTSC, +0.9% for PAL60).
+ * When the count runs ahead of that clock (checked at every host call and every 256
  * interpreted instructions) the runtime sleeps; when it falls behind by more than BEHIND_MAX,
  * the clock is moved back instead: PS1 time slows down with the host, it never jumps, or devices
  * (the CD's sectors) would run ahead of the guest code that serves them. A 500 us alarm makes the budget negative, so
@@ -32,6 +35,7 @@
  */
 #include "native.h"
 
+#include <pspdisplay.h>
 #include <pspkernel.h>
 #include <stdarg.h>
 #include <pspiofilemgr.h>
@@ -113,6 +117,11 @@ static u32 code_lo, code_hi;
 static u32 cpu_shift; /* DiscInfo.cpu_shift, at most 8 */
 static Psx *P;
 static u64 t_base, c_base;
+static u64 t_lock;     /* when the PSP vblank v_lock started, on native_vsync's grid */
+static u32 v_lock, vc; /* vc: the PSP vblank count at the last PS1 vblank */
+
+/* PS1 cycles in `us` of host time: a PS1 frame per PSP frame, 1001/60 ms */
+static u64 us_cycles(u64 us) { return us * P->frame_cycles * 6u / 100100u; }
 
 #define GRET_DEPTH 64
 static u32 gret[GRET_DEPTH];
@@ -287,14 +296,49 @@ static void sync_time(void)
     if (P->cycles - last < SYNC_STEP)
         return;
     last = P->cycles;
-    u64 now = sceKernelGetSystemTimeWide(), clock = c_base + (now - t_base) * 338688u / 10000u;
+    u64 now = sceKernelGetSystemTimeWide(), clock = c_base + us_cycles(now - t_base);
     if (P->cycles + BEHIND_MAX < clock) /* the host fell behind: PS1 time slows down, never skips */
         c_base = P->cycles + BEHIND_MAX, t_base = now;
     else if (P->cycles > clock + AHEAD_MAX) {
         u32 t = sceKernelGetSystemTimeLow();
-        sceKernelDelayThread((SceUInt)((P->cycles - clock) * 10000u / 338688u));
+        sceKernelDelayThread((SceUInt)((P->cycles - clock) * 100100u / (6u * P->frame_cycles)));
         native_stats.us_sleep += sceKernelGetSystemTimeLow() - t;
     }
+}
+
+/* At each PS1 vblank, its frame presented, the next PS1 frame is given the PSP frame up to
+ * VS_MARGIN before the vblank after this one's: its swap lands there however its work jitters.
+ * When this frame made its vblank, the next one starts at its slot, slept to if still ahead; when
+ * it did not, it shows a vblank late and the next starts at the slot of the vblank that passed
+ * (the frames after then run unslept until they catch up). The vblanks' times come from a grid, a
+ * frame of 1001/60 ms from one seen at boot, kept inside what the count says at each call: vblank
+ * v has come, v + 1 has not. sceDisplayWaitVblankStart is not used: called close to a vblank,
+ * PPSSPP's waits for the next. */
+#define VS_US(n) ((u64)(n) * 50050u / 3u) /* n frames of 16683.3 us */
+#define VS_MARGIN 6000u
+void native_vsync(void)
+{
+    u32 v = sceDisplayGetVcount();
+    u64 now = sceKernelGetSystemTimeWide(), t_v = t_lock + VS_US(v - v_lock);
+    if (t_v > now)
+        t_lock -= t_v - now, t_v = now;
+    else if (now - t_v > VS_US(1))
+        t_lock += now - t_v - VS_US(1), t_v = now - VS_US(1);
+    if (v == vc) {
+        t_base = t_v + VS_US(1) - VS_MARGIN, vc = v + 1;
+        if (t_base > now) {
+            u32 dt = (u32)(t_base - now);
+            sceKernelDelayThread(dt);
+            native_stats.us_sleep += dt, native_stats.us_vs_wait += dt, native_stats.vs_wait++;
+        }
+    } else {
+        u32 late = (u32)(now - t_v);
+        native_stats.vs_late++, native_stats.us_late += late, native_stats.vs_adv += v - vc - 1;
+        if (late > native_stats.us_late_max)
+            native_stats.us_late_max = late;
+        t_base = t_v - VS_MARGIN, vc = v;
+    }
+    c_base = P->cycles;
 }
 
 static void update(void)
@@ -998,8 +1042,10 @@ const char *native_init(Psx *psx, const DiscInfo *info)
 void native_run(u32 host_pc)
 {
     Cpu *c = &P->cpu;
-    t_base = sceKernelGetSystemTimeWide();
+    sceDisplayWaitVblankStart();
+    t_base = t_lock = sceKernelGetSystemTimeWide();
     c_base = P->cycles;
+    v_lock = vc = sceDisplayGetVcount();
     if (sceKernelSetAlarm(ALARM_US, alarm, NULL) < 0)
         say("native: no alarm, interrupts wait for host calls");
     if (!host_pc) {
