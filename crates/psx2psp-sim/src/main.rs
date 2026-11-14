@@ -3,9 +3,11 @@
 //!
 //! ```text
 //! psx2psp-sim <disc.cue|disc.bin> [--frames N] [--every N] [--out DIR] [--press FRAME:BUTTON,...]
+//!             [--poke FRAME:ADDR:HEX,...] [--dump FRAME,...]
 //! ```
 //! Buttons: select start up right down left l2 r2 l1 r1 triangle circle cross square; each press
-//! holds for 6 frames.
+//! holds for 6 frames. A poke writes the bytes `HEX` at the RAM address `ADDR` (hex) before that
+//! frame runs, like a cheat code; a dump writes the 2 MB of RAM as `ramNNNNN.bin` after it.
 
 use std::ffi::{c_char, c_int, c_void};
 use std::fs::File;
@@ -27,6 +29,7 @@ unsafe extern "C" {
     fn sim_boot(s: *mut Sim) -> c_int;
     fn sim_frame(s: *mut Sim) -> c_int;
     fn sim_vram(s: *const Sim) -> *const u16;
+    fn sim_ram(s: *mut Sim) -> *mut u8;
     fn sim_pad(s: *mut Sim, buttons: u16);
     fn sim_display(s: *const Sim, out: *mut c_int);
     fn sim_status(s: *const Sim, out: *mut u32);
@@ -93,11 +96,37 @@ struct Args {
     every: u32,
     out: PathBuf,
     presses: Vec<(u32, u16)>,
+    pokes: Vec<(u32, u32, Vec<u8>)>,
+    dumps: Vec<u32>,
+}
+
+const RAM: usize = 2 << 20;
+
+/// `FRAME:ADDR:HEX` with ADDR in hex (KSEG0/1 or physical), HEX an even run of hex digits.
+fn poke(p: &str) -> Result<(u32, u32, Vec<u8>), String> {
+    let bad = || format!("bad poke {p}");
+    let mut it = p.split(':');
+    let (f, a, h) = (it.next().ok_or_else(bad)?, it.next().ok_or_else(bad)?, it.next().ok_or_else(bad)?);
+    let f = f.parse::<u32>().map_err(|_| bad())?;
+    let a = u32::from_str_radix(a.trim_start_matches("0x"), 16).map_err(|_| bad())? & 0x1F_FFFF;
+    if h.is_empty() || h.len() % 2 != 0 || a as usize + h.len() / 2 > RAM {
+        return Err(bad());
+    }
+    let bytes = (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16)).collect::<Result<Vec<_>, _>>().map_err(|_| bad())?;
+    Ok((f, a, bytes))
 }
 
 fn args() -> Result<Args, String> {
     let mut it = std::env::args().skip(1);
-    let mut a = Args { disc: PathBuf::new(), frames: 600, every: 60, out: PathBuf::from("D:/Temp/PSX2PSP-Reborn/sim"), presses: Vec::new() };
+    let mut a = Args {
+        disc: PathBuf::new(),
+        frames: 600,
+        every: 60,
+        out: PathBuf::from("D:/Temp/PSX2PSP-Reborn/sim"),
+        presses: Vec::new(),
+        pokes: Vec::new(),
+        dumps: Vec::new(),
+    };
     let num = |v: Option<String>, what: &str| v.and_then(|s| s.parse::<u32>().ok()).ok_or(format!("{what} needs a number"));
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -109,6 +138,16 @@ fn args() -> Result<Args, String> {
                     let (f, b) = p.split_once(':').ok_or(format!("bad press {p}"))?;
                     let f = f.parse::<u32>().map_err(|_| format!("bad frame in {p}"))?;
                     a.presses.push((f, button(b).ok_or(format!("unknown button {b}"))?));
+                }
+            }
+            "--poke" => {
+                for p in it.next().ok_or("--poke needs FRAME:ADDR:HEX,...")?.split(',') {
+                    a.pokes.push(poke(p)?);
+                }
+            }
+            "--dump" => {
+                for f in it.next().ok_or("--dump needs FRAME,...")?.split(',') {
+                    a.dumps.push(f.parse::<u32>().map_err(|_| format!("bad dump frame {f}"))?);
                 }
             }
             _ if a.disc.as_os_str().is_empty() => a.disc = PathBuf::from(arg),
@@ -197,8 +236,19 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
         let vram = std::slice::from_raw_parts(sim_vram(sim), 1024 * 512);
+        let ram = sim_ram(sim);
         let mut held: Vec<(u32, u16)> = Vec::new();
         for frame in 1..=a.frames {
+            for (_, addr, bytes) in a.pokes.iter().filter(|p| p.0 == frame) {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), ram.add(*addr as usize), bytes.len());
+                println!("[sim] frame {frame} poke {addr:06X} {} B", bytes.len());
+            }
+            if a.dumps.contains(&frame.wrapping_sub(1)) && frame > 1 {
+                let path = a.out.join(format!("ram{:05}.bin", frame - 1));
+                if let Err(e) = std::fs::write(&path, std::slice::from_raw_parts(ram, RAM)) {
+                    eprintln!("{}: {e}", path.display());
+                }
+            }
             for &(f, b) in &a.presses {
                 if f == frame {
                     held.push((frame + 6, b));

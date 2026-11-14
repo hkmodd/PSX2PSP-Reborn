@@ -25,6 +25,7 @@
 #include <psppower.h>
 #include <pspsysmem.h>
 #include <psputils.h>
+#include <ctype.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -67,6 +68,13 @@ static int pad_n;
 static char base_dir[256]; /* the EBOOT's directory, with the slash */
 static u32 shot_at[32];    /* from psxrt.shots beside the EBOOT: frames to save as BMP */
 static int shot_n;
+#define POKE_MAX 16
+typedef struct {
+    u32 from, to, addr, n;
+    u8 bytes[32];
+} Poke;
+static Poke pokes[POKE_MAX]; /* from psxrt.poke beside the EBOOT: RAM writes, like cheat codes */
+static int poke_n;
 static char log_buf[8192];
 static int log_len;
 
@@ -176,6 +184,32 @@ static void open_log(const char *eboot)
             if (e == s + ram)
                 break;
             shot_at[shot_n++] = f | ram << 31;
+        }
+    }
+    snprintf(slash + 1, sizeof path - (size_t)(slash + 1 - path), "psxrt.poke");
+    fd = sceIoOpen(path, PSP_O_RDONLY, 0);
+    if (fd >= 0) { /* debugging: "from to addr(hex) bytes(hex)" lines, written at every vblank in [from, to] */
+        static char text[2048];
+        sceIoRead(fd, text, sizeof text - 1);
+        sceIoClose(fd);
+        char *s = text, *e;
+        while (poke_n < POKE_MAX) {
+            Poke *p = &pokes[poke_n];
+            p->from = (u32)strtoul(s, &e, 10);
+            if (e == s)
+                break;
+            p->to = (u32)strtoul(e, &s, 10);
+            p->addr = (u32)strtoul(s, &e, 16) & (RAM_SIZE - 1);
+            while (*e == ' ' || *e == '\t')
+                e++;
+            for (p->n = 0; p->n < sizeof p->bytes && isxdigit((unsigned char)e[0]) && isxdigit((unsigned char)e[1]); e += 2) {
+                char hex[3] = {e[0], e[1], 0};
+                p->bytes[p->n++] = (u8)strtoul(hex, NULL, 16);
+            }
+            if (!p->n || p->addr + p->n > RAM_SIZE)
+                break;
+            poke_n++;
+            s = e;
         }
     }
     slash[1] = 0;
@@ -599,6 +633,12 @@ static void host_vblank(void *user)
     frames++;
     if (card_changed && frames - card_changed >= 30) /* a save writes many sectors in a row */
         card_save();
+    for (int i = 0; i < poke_n; i++)
+        if (frames >= pokes[i].from && frames <= pokes[i].to) {
+            memcpy(psx.ram + pokes[i].addr, pokes[i].bytes, pokes[i].n);
+            if (frames == pokes[i].from)
+                say("poke %06X %u B, frames %u-%u", (unsigned)pokes[i].addr, (unsigned)pokes[i].n, (unsigned)pokes[i].from, (unsigned)pokes[i].to);
+        }
     for (int i = 0; i < shot_n; i++)
         if ((shot_at[i] & 0x7FFFFFFFu) == frames)
             (shot_at[i] >> 31 ? ram_dump : shot)(&psx, frames);
