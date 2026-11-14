@@ -21,6 +21,7 @@
 #include <pspgu.h>
 #include <pspiofilemgr.h>
 #include <pspkernel.h>
+#include <psppower.h>
 #include <pspsysmem.h>
 #include <psputils.h>
 #include <stdarg.h>
@@ -366,6 +367,14 @@ static void frame(void)
                               (unsigned)g->n_kind[4], (unsigned)(g->us_kind[4] / 1000), (unsigned)g->n_kind[5], (unsigned)(g->us_kind[5] / 1000),
                               (unsigned)g->frags, (unsigned)g->tested);
                 memset(g->n_kind, 0, sizeof g->n_kind), memset(g->us_kind, 0, sizeof g->us_kind), g->frags = g->tested = 0;
+                Dma *d = &psx.dma;
+                n += snprintf(line + n, sizeof line - (size_t)n, "-- dma (n/ms/kwords):");
+                for (int ch = 0; ch < 7; ch++)
+                    if (d->n_run[ch])
+                        n += snprintf(line + n, sizeof line - (size_t)n, " ch%d %u/%u/%u", ch, (unsigned)d->n_run[ch],
+                                      (unsigned)(d->us_run[ch] / 1000), (unsigned)(d->words[ch] / 1000));
+                n += snprintf(line + n, sizeof line - (size_t)n, "\n");
+                memset(d->n_run, 0, sizeof d->n_run), memset(d->us_run, 0, sizeof d->us_run), memset(d->words, 0, sizeof d->words);
             }
             n += ge_log(line + n, (int)sizeof line - n);
             log_flush();
@@ -436,6 +445,9 @@ int main(int argc, char **argv)
     const char *eboot = argc > 0 ? argv[0] : "";
     open_log(eboot);
     say("PSX2PSP native runtime (psxrt) - S4, built %s %s", __DATE__, __TIME__);
+    /* the PSP starts an application at 222 MHz; POPS runs at 333 */
+    int clock = scePowerSetClockFrequency(333, 333, 166);
+    say("clock %d MHz (%d)", scePowerGetCpuClockFrequencyInt(), clock);
     say("EBOOT %s", eboot);
     if (!fixed)
         halt("0x09800000-0x09C00FFF is not free");

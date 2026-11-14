@@ -371,6 +371,18 @@ static void draw_polygon(Psx *psx, const u32 *c)
     if (tex && p.raw)
         for (int i = 0; i < n; i++)
             v[i].r = v[i].g = v[i].b = 0x80;
+    const GpuRenderer *rd = psx->gpu.renderer;
+    if (quad && rd && rd->quad) {
+        s32 minx = v[0].x, maxx = v[0].x, miny = v[0].y, maxy = v[0].y;
+        for (int i = 1; i < 4; i++) {
+            minx = v[i].x < minx ? v[i].x : minx, maxx = v[i].x > maxx ? v[i].x : maxx;
+            miny = v[i].y < miny ? v[i].y : miny, maxy = v[i].y > maxy ? v[i].y : maxy;
+        }
+        /* within the size limits as a whole: both triangles are, and the renderer may draw them
+         * in one go */
+        if (maxx - minx <= 1023 && maxy - miny <= 511 && rd->quad(rd->self, &p, v) != GPU_SW)
+            return;
+    }
     triangle(psx, &p, v[0], v[1], v[2]);
     if (quad)
         triangle(psx, &p, v[1], v[2], v[3]);
@@ -576,6 +588,38 @@ static void draw(Psx *psx)
             g->stat = (g->stat & ~0x1800u) | ((c[0] & 3) << 11);
             break;
         }
+}
+
+u32 gpu_gp0_pixels(Psx *psx, const u32 *w, u32 n)
+{
+    Gpu *g = &psx->gpu;
+    const u16 *p = (const u16 *)w;
+    u32 left = 2 * n, used = 0;
+    u16 set = g->mask_set ? 0x8000 : 0;
+    while (g->xfer == 1 && used < left) {
+        u32 run = (u32)(g->xw - g->xi), x = (u32)(g->xx + g->xi) & 1023;
+        if (run > left - used)
+            run = left - used;
+        u16 *row = &g->vram[((g->xy + g->xr) & 511) * VRAM_W];
+        const u16 *src = p + used;
+        if (!g->mask_check && !set && x + run <= VRAM_W)
+            memcpy(row + x, src, run * 2);
+        else
+            for (u32 i = 0; i < run; i++) {
+                u16 *d = &row[(x + i) & 1023];
+                if (!(g->mask_check && (*d & 0x8000)))
+                    *d = src[i] | set;
+            }
+        used += run;
+        if ((g->xi += (int)run) < g->xw)
+            break;
+        g->xi = 0;
+        if (++g->xr < g->xh)
+            continue;
+        sw_wrote(psx, g->xx, g->xy, g->xx + g->xw - 1, g->xy + g->xh - 1);
+        g->xfer = 0;
+    }
+    return (used + 1) / 2;
 }
 
 void gpu_gp0(Psx *psx, u32 v)

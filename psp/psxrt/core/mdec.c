@@ -202,6 +202,23 @@ u32 mdec_dma_out(Psx *psx)
     return m->rout < m->nout ? m->out[m->rout++] : 0;
 }
 
+u32 mdec_dma_block(Psx *psx, u32 *dst, u32 n)
+{
+    Mdec *m = &psx->mdec;
+    if (m->rout >= m->nout && more_input(m) && !m->words_left)
+        macroblock(psx);
+    if (m->rout >= m->nout) {
+        *dst = 0;
+        return 1;
+    }
+    u32 k = (u32)(m->nout - m->rout);
+    if (k > n)
+        k = n;
+    memcpy(dst, &m->out[m->rout], k * 4);
+    m->rout += (int)k;
+    return k;
+}
+
 static void param(Mdec *m, u32 v)
 {
     switch (m->state) {

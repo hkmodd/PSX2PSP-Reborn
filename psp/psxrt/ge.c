@@ -73,13 +73,18 @@ static struct {
     int st_check, st_set, blend, dither; /* -2: unknown */
     const void *tex_sent, *clut_sent;    /* NULL: unknown */
     int texfn;                           /* 0 modulate, 1 replace, -1 unknown */
+    int tex_on;                          /* texturing and the alpha test enabled */
+    int a_func, a_ref;                   /* alpha test; a_func -1: unknown */
     u32 fill_color;
     /* texture cache */
     Page pages[PAGE_SLOTS];
     int npages;
     u32 syncs, ages; /* syncs: counts the lists run */
+    u32 epoch;       /* bumped whenever any tile's generation changes */
+    Page *last_page; /* the page last used, current as of last_epoch */
+    u32 last_epoch;
     struct {
-        u32 key, stamp, syncs;
+        u32 key, stamp, syncs, epoch;
         const u32 *ptr;
         int flags;
     } clut; /* the last CLUT converted, in the list `syncs` */
@@ -158,6 +163,7 @@ static void base_state(void)
     ge.st_check = ge.st_set = ge.blend = ge.dither = -2;
     ge.tex_sent = ge.clut_sent = NULL;
     ge.texfn = -1;
+    ge.tex_on = 0, ge.a_func = -1;
     state_valid = 1;
 }
 
@@ -216,6 +222,28 @@ static void blend(int mode)
     ge.blend = mode;
 }
 
+static void tex_mode(int on)
+{
+    if (on == ge.tex_on)
+        return;
+    ge.tex_on = on;
+    if (on) {
+        sceGuEnable(GU_TEXTURE_2D);
+        sceGuEnable(GU_ALPHA_TEST);
+    } else {
+        sceGuDisable(GU_ALPHA_TEST);
+        sceGuDisable(GU_TEXTURE_2D);
+    }
+}
+
+static void alpha(int func, int ref)
+{
+    if (func == ge.a_func && ref == ge.a_ref)
+        return;
+    ge.a_func = func, ge.a_ref = ref;
+    sceGuAlphaFunc(func, ref, 0xFF);
+}
+
 static void dither(int on)
 {
     if (on == ge.dither)
@@ -263,6 +291,7 @@ static void bump(s32 x, s32 y, s32 w, s32 h)
             for (int tx = 0; tx < TILES_X; tx++)
                 if (c >> tx & 1)
                     ge.gen[ty][tx]++;
+    ge.epoch++;
 }
 
 /* Calls fn on the up to four pieces of a rectangle that wraps around VRAM. */
@@ -329,6 +358,7 @@ static void upload(s32 x, s32 y, s32 w, s32 h)
 {
     u16 *ram = ge.psx->gpu.vram;
     sceKernelDcacheWritebackRange(ram + y * VRAM_W + x, (u32)((h - 1) * VRAM_W + w) * 2);
+    tex_mode(0);
     blend(-1);
     dither(0);
     sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGBA);
@@ -342,7 +372,7 @@ static void upload(s32 x, s32 y, s32 w, s32 h)
         cx += cw;
     }
     sceGuDisable(GU_TEXTURE_2D);
-    ge.tex_sent = NULL, ge.texfn = -1;
+    ge.tex_sent = NULL, ge.texfn = -1, ge.a_func = -1;
     ge.s.uploads++, ge.s.upload_px += (u32)(w * h);
 }
 
@@ -383,6 +413,7 @@ static void rd_read(void *self, s32 x, s32 y, s32 w, s32 h)
                 ge.gen[ty][tx]++, ge.s.read_tiles++;
         ge.newer[ty] = 0;
     }
+    ge.epoch++;
     ge.s.readbacks++;
 }
 
@@ -413,6 +444,7 @@ static void prim_state(const GpuPrim *p, s32 x1, s32 y1, s32 x2, s32 y2)
 
 static void sprite(s32 x1, s32 y1, s32 x2, s32 y2, u32 c)
 {
+    tex_mode(0);
     GeVtx *o = sceGuGetMemory(2 * sizeof(GeVtx));
     o[0] = (GeVtx){c, (float)x1, (float)y1, 0};
     o[1] = (GeVtx){c, (float)x2, (float)y2, 0};
@@ -466,8 +498,14 @@ static int tex_ok(const GpuPrim *p)
 static const u8 *page(const GpuPrim *p)
 {
     s32 hw = p->depth ? 128 : 64; /* VRAM halfwords per row */
-    u32 key = 1 + (p->tpx / 64 | p->tpy / 256 << 4 | p->depth << 5), st = stamp((s32)p->tpx, (s32)p->tpy, hw, 256);
-    Page *s = NULL;
+    u32 key = 1 + (p->tpx / 64 | p->tpy / 256 << 4 | p->depth << 5);
+    Page *s = ge.last_page;
+    if (s && s->key == key && ge.last_epoch == ge.epoch) { /* no tile changed since it was checked */
+        s->used = ge.syncs, s->age = ++ge.ages;
+        return s->data;
+    }
+    u32 st = stamp((s32)p->tpx, (s32)p->tpy, hw, 256);
+    s = NULL;
     for (int i = 0; i < ge.npages && !s; i++)
         if (ge.pages[i].key == key)
             s = &ge.pages[i];
@@ -500,6 +538,7 @@ static const u8 *page(const GpuPrim *p)
         ge.s.pages++;
     }
     s->used = ge.syncs, s->age = ++ge.ages;
+    ge.last_page = s, ge.last_epoch = ge.epoch;
     return s->data;
 }
 
@@ -508,8 +547,11 @@ static const u8 *page(const GpuPrim *p)
 static const u32 *clut(const GpuPrim *p, int *flags)
 {
     int n = p->depth ? 256 : 16;
-    u32 key = 1 + (p->clut_x / 16 | p->clut_y << 6 | p->depth << 15), st = stamp((s32)p->clut_x, (s32)p->clut_y, n, 1);
-    if (ge.clut.key != key || ge.clut.stamp != st || ge.clut.syncs != ge.syncs) {
+    u32 key = 1 + (p->clut_x / 16 | p->clut_y << 6 | p->depth << 15);
+    int same = ge.clut.key == key && ge.clut.syncs == ge.syncs;
+    u32 st = same && ge.clut.epoch == ge.epoch ? ge.clut.stamp : stamp((s32)p->clut_x, (s32)p->clut_y, n, 1);
+    ge.clut.epoch = ge.epoch;
+    if (!same || ge.clut.stamp != st) {
         u32 *c = (u32 *)(((u32)sceGuGetMemory(n * 4 + 16) + 15) & ~15u);
         const u16 *row = ge.psx->gpu.vram + p->clut_y * VRAM_W;
         int f = 0;
@@ -570,7 +612,7 @@ static int prim_begin(const GpuPrim *p)
 
 static void tex_pass(const GpuPrim *p, int func, int ref, int mode, int set, int prim, int n, const TexVtx *v)
 {
-    sceGuAlphaFunc(func, ref, 0xFF);
+    alpha(func, ref);
     blend(mode);
     stencil(p->mask_check, set);
     sceGuDrawArray(prim, TEX_VTX, n, NULL, v);
@@ -581,8 +623,7 @@ static void tex_pass(const GpuPrim *p, int func, int ref, int mode, int set, int
 static void tex_draw(const GpuPrim *p, int flags, int prim, int n, const TexVtx *v)
 {
     int semi = p->semi ? (int)p->abr : -1, set = p->mask_set != 0;
-    sceGuEnable(GU_TEXTURE_2D);
-    sceGuEnable(GU_ALPHA_TEST);
+    tex_mode(1);
     if (flags == 1)
         tex_pass(p, GU_GREATER, 0, -1, set, prim, n, v);
     else if (flags == 2)
@@ -593,8 +634,6 @@ static void tex_draw(const GpuPrim *p, int flags, int prim, int n, const TexVtx 
         tex_pass(p, GU_EQUAL, 0xFF, -1, set, prim, n, v);
         tex_pass(p, GU_EQUAL, 0x80, semi, 1, prim, n, v);
     }
-    sceGuDisable(GU_ALPHA_TEST);
-    sceGuDisable(GU_TEXTURE_2D);
 }
 
 /* A polygon vertex while clipping. */
@@ -632,15 +671,18 @@ static s32 col8(float c)
     return v < 0 ? 0 : v > 255 ? 255 : v;
 }
 
-static int rd_triangle(void *self, const GpuPrim *p, const GpuVtx *v0, const GpuVtx *v1, const GpuVtx *v2)
+/* A triangle (n 3, drawn as a fan) or a quad (n 4: the triangles 0,1,2 and 1,2,3, drawn as a
+ * strip). A quad left of or above the VRAM origin, or in compare mode, is GPU_SW: the core
+ * offers its two triangles instead. */
+static int polygon(const GpuPrim *p, const GpuVtx *const *v, int n)
 {
-    (void)self;
-    const GpuVtx *v[3] = {v0, v1, v2};
-    s32 minx = v0->x, maxx = v0->x, miny = v0->y, maxy = v0->y;
-    for (int i = 1; i < 3; i++) {
+    s32 minx = v[0]->x, maxx = v[0]->x, miny = v[0]->y, maxy = v[0]->y;
+    for (int i = 1; i < n; i++) {
         minx = v[i]->x < minx ? v[i]->x : minx, maxx = v[i]->x > maxx ? v[i]->x : maxx;
         miny = v[i]->y < miny ? v[i]->y : miny, maxy = v[i]->y > maxy ? v[i]->y : maxy;
     }
+    if (n == 4 && (minx < 0 || miny < 0 || ge.compare))
+        return GPU_SW;
     if (p->textured && !tex_ok(p))
         return GPU_SW;
     s32 x1, y1, x2, y2;
@@ -653,15 +695,34 @@ static int rd_triangle(void *self, const GpuPrim *p, const GpuVtx *v0, const Gpu
     if (!flags)
         return DONE;
     if (p->textured)
-        ge.s.ttris++;
+        ge.s.ttris += (u32)n - 2;
     else
-        ge.s.tris++;
+        ge.s.tris += (u32)n - 2;
     prim_state(p, x1, y1, x2, y2);
     mark(bx1, by1, bx2, by2);
+    /* +0.5: the GE samples pixel centres, the PS1 integer corners; texels too, where the PS1
+     * rounds and the GE floors */
+    int prim = n == 4 ? GU_TRIANGLE_STRIP : GU_TRIANGLE_FAN;
+    if (minx >= 0 && miny >= 0) {
+        if (!p->textured) {
+            tex_mode(0);
+            GeVtx *o = sceGuGetMemory((u32)n * sizeof(GeVtx));
+            for (int i = 0; i < n; i++)
+                o[i] = (GeVtx){abgr(v[i]->r, v[i]->g, v[i]->b), (float)v[i]->x + 0.5f, (float)v[i]->y + 0.5f, 0};
+            sceGuDrawArray(prim, GE_VTX, n, NULL, o);
+            return DONE;
+        }
+        TexVtx *o = sceGuGetMemory((u32)n * sizeof(TexVtx));
+        for (int i = 0; i < n; i++)
+            o[i] = (TexVtx){(float)v[i]->u + 0.5f, (float)v[i]->v + 0.5f, abgr(v[i]->r, v[i]->g, v[i]->b), (float)v[i]->x + 0.5f,
+                            (float)v[i]->y + 0.5f, 0};
+        tex_draw(p, flags, prim, n, o);
+        return DONE;
+    }
     ClipVtx a[8], b[8], *in = a, *out = b, *t;
     for (int i = 0; i < 3; i++)
         a[i] = (ClipVtx){(float)v[i]->x, (float)v[i]->y, (float)v[i]->r, (float)v[i]->g, (float)v[i]->b, (float)v[i]->u, (float)v[i]->v};
-    int n = 3;
+    n = 3;
     /* left of or above the VRAM origin: the GE's handling is unknown, so cut at -0.25 */
     if (minx < 0)
         n = clip_axis(in, n, out, 0), t = in, in = out, out = t;
@@ -669,9 +730,8 @@ static int rd_triangle(void *self, const GpuPrim *p, const GpuVtx *v0, const Gpu
         n = clip_axis(in, n, out, 1), t = in, in = out, out = t;
     if (n < 3)
         return DONE;
-    /* +0.5: the GE samples pixel centres, the PS1 integer corners; texels too, where the PS1
-     * rounds and the GE floors */
     if (!p->textured) {
+        tex_mode(0);
         GeVtx *o = sceGuGetMemory((u32)n * sizeof(GeVtx));
         for (int i = 0; i < n; i++)
             o[i] = (GeVtx){abgr(col8(in[i].r), col8(in[i].g), col8(in[i].b)), in[i].x + 0.5f, in[i].y + 0.5f, 0};
@@ -683,6 +743,20 @@ static int rd_triangle(void *self, const GpuPrim *p, const GpuVtx *v0, const Gpu
         o[i] = (TexVtx){in[i].u + 0.5f, in[i].v + 0.5f, abgr(col8(in[i].r), col8(in[i].g), col8(in[i].b)), in[i].x + 0.5f, in[i].y + 0.5f, 0};
     tex_draw(p, flags, GU_TRIANGLE_FAN, n, o);
     return DONE;
+}
+
+static int rd_triangle(void *self, const GpuPrim *p, const GpuVtx *v0, const GpuVtx *v1, const GpuVtx *v2)
+{
+    (void)self;
+    const GpuVtx *v[3] = {v0, v1, v2};
+    return polygon(p, v, 3);
+}
+
+static int rd_quad(void *self, const GpuPrim *p, const GpuVtx *v)
+{
+    (void)self;
+    const GpuVtx *q[4] = {&v[0], &v[1], &v[2], &v[3]};
+    return polygon(p, q, 4);
 }
 
 static int rd_rect(void *self, const GpuPrim *p, s32 x, s32 y, s32 w, s32 h, const GpuVtx *c, int flip_x, int flip_y)
@@ -767,7 +841,7 @@ void ge_init(Psx *psx, int compare)
 {
     ge.psx = psx;
     ge.compare = compare;
-    ge.r = (GpuRenderer){&ge, rd_triangle, rd_rect, rd_line, rd_fill, rd_copy, rd_read, rd_wrote};
+    ge.r = (GpuRenderer){&ge, rd_triangle, rd_quad, rd_rect, rd_line, rd_fill, rd_copy, rd_read, rd_wrote};
     if (compare) {
         SceUID uid = sceKernelAllocPartitionMemory(2, "psxrt ge compare", PSP_SMEM_Low, VRAM_W * VRAM_H * 2, NULL);
         ge.cmp = uid < 0 ? NULL : sceKernelGetBlockHeadAddr(uid);

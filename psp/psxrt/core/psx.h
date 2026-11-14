@@ -95,6 +95,7 @@ typedef struct Dma {
     u32 dpcr, dicr;
     u64 due[7];  /* completion time of a channel in flight */
     u32 pending; /* channels in flight */
+    u32 n_run[7], us_run[7], words[7]; /* transfers per channel, their microseconds and words */
 } Dma;
 
 typedef struct Timer {
@@ -176,6 +177,9 @@ enum { GPU_SW, GPU_DRAWN, GPU_BOTH };
 typedef struct GpuRenderer {
     void *self;
     int (*triangle)(void *self, const GpuPrim *p, const GpuVtx *v0, const GpuVtx *v1, const GpuVtx *v2);
+    /* v[4], the triangles 0,1,2 and 1,2,3, both within the size limits; GPU_SW: not drawn, the
+     * core offers the two triangles to `triangle` */
+    int (*quad)(void *self, const GpuPrim *p, const GpuVtx *v);
     int (*rect)(void *self, const GpuPrim *p, s32 x, s32 y, s32 w, s32 h, const GpuVtx *c, int flip_x, int flip_y);
     int (*line)(void *self, const GpuPrim *p, const GpuVtx *a, const GpuVtx *b);
     int (*fill)(void *self, s32 x, s32 y, s32 w, s32 h, u16 color);
@@ -438,6 +442,9 @@ void cd_mix(Psx *psx, s32 *l, s32 *r, int n44100);
 void gpu_init(Psx *psx);
 u32 gpu_read(Psx *psx, int reg);
 void gpu_gp0(Psx *psx, u32 v);
+/* GP0 words while a CPU->VRAM transfer is in progress, a row at a time: the words used (it
+ * stops where the transfer ends; a lone last pixel uses its whole word) */
+u32 gpu_gp0_pixels(Psx *psx, const u32 *w, u32 n);
 void gpu_gp1(Psx *psx, u32 v);
 void gpu_vblank(Psx *psx);
 
@@ -457,6 +464,9 @@ void sio_update(Psx *psx);
 u32 mdec_read(Psx *psx, int reg);
 void mdec_write(Psx *psx, int reg, u32 v);
 u32 mdec_dma_out(Psx *psx);
+/* up to n output words into dst, at most one macroblock's worth: the words written (a 0 when
+ * nothing is left, as mdec_dma_out) */
+u32 mdec_dma_block(Psx *psx, u32 *dst, u32 n);
 int mdec_out_ready(Psx *psx);
 
 #endif

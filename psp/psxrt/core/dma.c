@@ -61,7 +61,20 @@ static u32 dev_read(Psx *psx, int ch)
     return 0xFFFFFFFFu;
 }
 
+static void transfer(Psx *psx, int ch);
+
+/* a transfer is rare next to the clock read that times it */
 static void run(Psx *psx, int ch)
+{
+    const PsxHost *h = psx->host;
+    u32 t = h->usec ? h->usec(h->user) : 0;
+    transfer(psx, ch);
+    if (h->usec)
+        psx->dma.us_run[ch] += h->usec(h->user) - t;
+    psx->dma.n_run[ch]++;
+}
+
+static void transfer(Psx *psx, int ch)
 {
     DmaChan *c = &psx->dma.ch[ch];
     u32 sync = (c->chcr >> 9) & 3, addr = c->madr & 0x1FFFFC, words = 0;
@@ -86,12 +99,29 @@ static void run(Psx *psx, int ch)
             for (u32 i = 0; i < words; i++, addr = (addr - 4) & 0x1FFFFC)
                 wr(psx, addr, i == words - 1 ? 0xFFFFFF : (addr - 4) & 0x1FFFFF);
         } else if (from_ram) {
-            for (u32 i = 0; i < words; i++, addr = (addr + step) & 0x1FFFFC)
+            for (u32 i = 0; i < words;) {
+                /* image data for VRAM: whole rows at a time, up to the end of RAM */
+                if (ch == 2 && step == 4 && psx->gpu.xfer == 1) {
+                    u32 n = words - i, room = (RAM_SIZE - addr) / 4;
+                    n = gpu_gp0_pixels(psx, (const u32 *)(psx->ram + addr), n < room ? n : room);
+                    i += n, addr = (addr + 4 * n) & 0x1FFFFC;
+                    continue;
+                }
                 dev_write(psx, ch, rd(psx, addr));
+                i++, addr = (addr + step) & 0x1FFFFC;
+            }
         } else {
             u32 start = addr;
-            for (u32 i = 0; i < words; i++, addr = (addr + step) & 0x1FFFFC)
+            for (u32 i = 0; i < words;) {
+                if (ch == 1 && step == 4) { /* decoded pixels: a macroblock at a time */
+                    u32 n = words - i, room = (RAM_SIZE - addr) / 4;
+                    n = mdec_dma_block(psx, (u32 *)(psx->ram + addr), n < room ? n : room);
+                    i += n, addr = (addr + 4 * n) & 0x1FFFFC;
+                    continue;
+                }
                 wr(psx, addr, dev_read(psx, ch));
+                i++, addr = (addr + step) & 0x1FFFFC;
+            }
             if (ch == 3 && step == 4 && psx->ram_loaded)
                 psx->ram_loaded(psx, start, words * 4);
         }
@@ -106,6 +136,7 @@ static void run(Psx *psx, int ch)
             sum |= rd(psx, a0 + 4 * i);
         psx_log(psx, "dma%d chcr %08X bcr %08X %u words or %08X", ch, c->chcr, c->bcr, words, sum);
     }
+    psx->dma.words[ch] += words;
     psx->dma.pending |= 1u << ch;
     psx->dma.due[ch] = psx->cycles + (words ? words : 1);
     psx_schedule(psx, psx->dma.due[ch]);
