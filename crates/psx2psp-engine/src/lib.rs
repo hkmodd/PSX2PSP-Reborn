@@ -872,7 +872,7 @@ pub fn native_code_entry(img: &native_code::CodeImage, code: (u32, u32), table: 
 
 /// The PS-X executables of a disc's ISO9660 filesystem (file name, bytes); none when it has no
 /// readable filesystem.
-fn disc_executables(img: &DiscImage) -> Vec<(String, Vec<u8>)> {
+pub fn disc_executables(img: &DiscImage) -> Vec<(String, Vec<u8>)> {
     let Ok(files) = img.iso_files() else { return Vec::new() };
     let mut rd = img.reader();
     let mut out = Vec::new();

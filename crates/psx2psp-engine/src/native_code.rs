@@ -8,8 +8,9 @@
 //! resident together. Nothing here knows a game: what is translated is what the disc holds.
 
 use std::collections::{BTreeMap, HashSet};
+use std::sync::OnceLock;
 
-use psx2psp_recomp::{Discovery, Hazards, PsxExe, layout, translate};
+use psx2psp_recomp::{Discovery, Hazards, Hit, PsxExe, Signatures, layout, translate};
 use rayon::prelude::*;
 
 /// Lowest host address translated code may take: below it are the runtime module, its heap and
@@ -175,6 +176,28 @@ pub fn build(exes: Vec<(String, Vec<u8>)>) -> Result<CodePack, String> {
     }
     pack.images.sort_by(|a, b| (a.text_addr, &a.name).cmp(&(b.text_addr, &b.name)));
     Ok(pack)
+}
+
+/// The PsyQ library signatures ([`psx2psp_recomp::psyq`]), decompressed on first use (~9 MB of
+/// text, about 0.1 s). From RecompOne's `psyq.json` (MIT, `resources/psyq_sigs.LICENSE`).
+pub fn psyq() -> &'static Signatures {
+    static RAW: &[u8] = include_bytes!("../../../resources/psyq_sigs.tsv.z");
+    static DB: OnceLock<Signatures> = OnceLock::new();
+    DB.get_or_init(|| {
+        let text = String::from_utf8(crate::inflate(RAW)).expect("embedded PsyQ signatures are UTF-8");
+        Signatures::parse(&text).expect("embedded PsyQ signatures parse")
+    })
+}
+
+/// The library functions of each executable in `exes` (file name, bytes) that is a PS-X EXE.
+pub fn library_functions(exes: &[(String, Vec<u8>)]) -> Vec<(String, PsxExe, Vec<Hit<'static>>)> {
+    exes.par_iter()
+        .filter_map(|(name, bytes)| {
+            let exe = PsxExe::parse(bytes).ok()?;
+            let hits = psyq().scan(&exe);
+            Some((name.clone(), exe, hits))
+        })
+        .collect()
 }
 
 #[cfg(test)]

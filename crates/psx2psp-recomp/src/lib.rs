@@ -13,6 +13,7 @@ pub mod hazard;
 pub mod insn;
 pub mod interp;
 pub mod layout;
+pub mod psyq;
 
 pub use discover::{Body, DeadEnd, Discovery, Flow, JumpReg, Origin};
 pub use emit::{EmitError, Reason, Translation, translate};
@@ -20,3 +21,4 @@ pub use exe::{ExeError, PsxExe};
 pub use hazard::{HazardKind, Hazards};
 pub use insn::{Insn, Isa, Kind, Uses, decode};
 pub use interp::{Bus, Cpu, Size, Stop, Trap};
+pub use psyq::{Hit, Signature, Signatures};

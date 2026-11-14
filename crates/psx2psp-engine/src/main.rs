@@ -22,6 +22,7 @@ USAGE:
   psx2psp info    <EBOOT.PBP | disc.cue>
   psx2psp patches <disc.cue|disc.bin> [--id <code>] [--ppf <file>]
                                      the patch database's entries for the game, with hits
+  psx2psp libs    <disc.cue|disc.bin>  the PsyQ library functions in each executable
   psx2psp clip    <video|audio|URL> [clip options] [-o <dir>]   → ICON1.PMF / SND0.AT3
   psx2psp art     <image> [--slot icon0|pic0|pic1|boot] [-o <dir>]
                                      frame any picture into the XMB slots (all by default)
@@ -114,6 +115,7 @@ fn main() -> ExitCode {
         Some("clip") => cmd_clip(&args[1..]),
         Some("art") => cmd_art(&args[1..]),
         Some("patches") => cmd_patches(&args[1..]),
+        Some("libs") if args.len() == 2 => cmd_libs(Path::new(&args[1])),
         Some("tools") if args.len() == 1 => cmd_tools(false),
         Some("tools") if args.len() == 2 && args[1] == "install" => cmd_tools(true),
         Some("update") if args.len() == 1 => cmd_update(false),
@@ -457,6 +459,28 @@ fn load_patches() -> PatchDb {
         eprintln!("warning: {e} — your patches.ini is ignored");
     }
     l.db
+}
+
+/// The PsyQ library functions recognised in each executable of a disc (native mode's view).
+fn cmd_libs(disc: &Path) -> R {
+    let img = psx2psp_engine::core::DiscImage::open(disc)?;
+    let exes = psx2psp_engine::disc_executables(&img);
+    for (name, exe, hits) in psx2psp_engine::native_code::library_functions(&exes) {
+        let unsure = hits.iter().filter(|h| !h.rivals.is_empty()).count();
+        println!("{name}: text {:#010x}+{:#x}, {} library functions ({unsure} ambiguous)", exe.text_addr, exe.text.len(), hits.len());
+        let mut libs: std::collections::BTreeMap<&str, Vec<String>> = Default::default();
+        for h in &hits {
+            let mut s = format!("{}@{:08X}", h.sig.name, h.addr);
+            for r in &h.rivals {
+                s += &format!("|{}", r.name);
+            }
+            libs.entry(&h.sig.library).or_default().push(s);
+        }
+        for (lib, fns) in libs {
+            println!("  {lib} ({}): {}", fns.len(), fns.join(" "));
+        }
+    }
+    Ok(())
 }
 
 fn cmd_patches(args: &[String]) -> R {
