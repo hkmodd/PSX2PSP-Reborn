@@ -1,5 +1,7 @@
 //! Content-aware framing: how any picture becomes an exact XMB slot without cutting what matters.
 //!
+//! 0. **Slot-shaped?** A picture already within 3 % of the slot's aspect was composed for it (a
+//!    logo on a black page is a design, not a letterbox): a centred scale, nothing else.
 //! 1. **Trim.** Uniform borders (letterbox/pillarbox bars, scan margins, transparent margins) are
 //!    not content: they go, at most 45 % per side, measured at full resolution.
 //! 2. **Saliency.** On a ≤256 px proxy every pixel gets an importance: colour distinctness
@@ -74,6 +76,9 @@ impl Framing {
 const PROXY: u32 = 256;
 /// Window sizes tried between cover and contain.
 const STEPS: u32 = 32;
+/// A source whose aspect is within this fraction of the slot's was made for it: centred cover
+/// crop (≤ 1.5 % lost per side), no trim, no search. 16:9 art fits every slot but PIC0.
+const ASPECT_TOL: f32 = 0.03;
 /// Trim tolerance: largest channel difference from the border colour, 0–255.
 const TRIM_TOL: i32 = 12;
 /// At most this fraction of each side is trimmed.
@@ -114,6 +119,10 @@ pub fn plan(slot: Slot, src: &RgbaImage) -> Framing {
     let full = Rect::new(0.0, 0.0, sw as f32, sh as f32);
     if sw < 2 || sh < 2 {
         return contain(slot, full, Fill::Transparent);
+    }
+    // Already the slot's shape: the author composed it for this slot, page colour and all.
+    if ((sw as f32 / sh as f32) / (tw as f32 / th as f32) - 1.0).abs() <= ASPECT_TOL {
+        return cover(slot, sw, sh);
     }
     let t = trim(src);
     let (x0, y0, x1, y1) = t.bounds;
@@ -216,6 +225,18 @@ pub fn plan(slot: Slot, src: &RgbaImage) -> Framing {
     let dest = Rect::new((win.0 - v.w) / 2.0 * s, (win.1 - v.h) / 2.0 * s, v.w * s, v.h * s);
     let padded = dest.w < tw as f32 - 0.5 || dest.h < th as f32 - 0.5;
     Framing { crop: Rect::new(x0 as f32 + v.x, y0 as f32 + v.y, v.w, v.h), dest, fill: if padded { fill } else { Fill::None } }
+}
+
+/// The centre of a `sw`×`sh` source at the slot's aspect, scaled to fill the slot.
+fn cover(slot: Slot, sw: u32, sh: u32) -> Framing {
+    let (tw, th) = slot.size();
+    let (a, b) = (sw as u64 * th as u64, tw as u64 * sh as u64);
+    let (w, h) = match a.cmp(&b) {
+        std::cmp::Ordering::Greater => (sh as f32 * tw as f32 / th as f32, sh as f32),
+        std::cmp::Ordering::Less => (sw as f32, sw as f32 * th as f32 / tw as f32),
+        std::cmp::Ordering::Equal => (sw as f32, sh as f32),
+    };
+    Framing { crop: Rect::new((sw as f32 - w) / 2.0, (sh as f32 - h) / 2.0, w, h), dest: Rect::new(0.0, 0.0, tw as f32, th as f32), fill: Fill::None }
 }
 
 /// The whole of `r`, letterboxed into the slot.
@@ -676,6 +697,25 @@ mod tests {
         let f = plan(Slot::Boot, &img);
         assert_eq!((f.crop, f.fill), (Rect::new(0.0, 0.0, 960.0, 544.0), Fill::None), "{f:?}");
         assert_eq!(render(Slot::Boot, &img, &f).dimensions(), (480, 272));
+    }
+
+    #[test]
+    fn slot_shaped_art_on_a_black_page_is_not_reframed() {
+        // Regression (Sheep Dog 'n' Wolf ICON0.jpg): authored at the slot's aspect on a black page
+        // with the art off-centre. The page is the composition, not a letterbox: plain scale.
+        let mut img = RgbaImage::from_pixel(1392, 768, Rgba([0, 2, 1, 255]));
+        patch(&mut img, 273, 30, 1097, 738);
+        // 1392:768 is within 3 % of ICON0 (1.8) and PIC1/BOOT (1.765); PIC0 (1.72) is not.
+        for slot in [Slot::Icon0, Slot::Pic1, Slot::Boot] {
+            let (tw, th) = slot.size();
+            let f = plan(slot, &img);
+            assert_eq!((f.dest, f.fill), (Rect::new(0.0, 0.0, tw as f32, th as f32), Fill::None), "{slot:?}: {f:?}");
+            let a = tw as f32 / th as f32;
+            let (w, h) = (768.0 * a, 768.0);
+            let c = f.crop;
+            assert!((c.w - w).abs() < 0.5 && (c.h - h).abs() < 0.5, "{slot:?}: {f:?}");
+            assert!((c.x - (1392.0 - w) / 2.0).abs() < 0.5 && c.y.abs() < 0.5, "{slot:?} not centred: {f:?}");
+        }
     }
 
     #[test]
