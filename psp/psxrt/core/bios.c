@@ -963,7 +963,7 @@ static int call_b(Psx *psx, u32 fn)
     case 0x5B: /* ChangeClearPad */
         psx->bios.pad_clear = (int)a0;
         return 1;
-    /* InitCard, StartCard, StopCard: the memory card is S7; no card is inserted until then. */
+    /* InitCard, StartCard, StopCard: the cards are images at the BIOS level (card.c) */
     case 0x4A:
     case 0x4B:
     case 0x4C:
@@ -1011,7 +1011,9 @@ int bios_call(Psx *psx, u32 vector)
 {
     u32 fn = G[R_T1] & 0xFF, ra = G[R_RA];
     u32 a0 = G[R_A0], a1 = G[R_A0 + 1], a2 = G[R_A0 + 2];
-    int r = vector == 0xA0 ? call_a(psx, fn) : vector == 0xB0 ? call_b(psx, fn) : call_c(psx, fn);
+    int r = card_call(psx, vector, fn);
+    if (!r)
+        r = vector == 0xA0 ? call_a(psx, fn) : vector == 0xB0 ? call_b(psx, fn) : call_c(psx, fn);
     if ((psx->trace & 1) && r != 3)
         psx_log(psx, "%c0.%02X(%08X, %08X, %08X) = %08X ra %08X", 'A' + (int)(vector - 0xA0) / 16, fn, a0, a1, a2, G[R_V0], ra);
     if (!r)
@@ -1026,6 +1028,8 @@ int bios_call(Psx *psx, u32 vector)
 }
 
 void bios_vblank(Psx *psx) { psx->bios.vsync_count++; }
+
+void bios_event(Psx *psx, u32 cls, u32 spec) { deliver_event(psx, cls, spec); }
 
 void bios_init(Psx *psx)
 {

@@ -1,7 +1,7 @@
 # Build with the pspdev toolchain (WSL: /usr/local/pspdev), then copy the module the converter
 # embeds:  make && cp psxrt.prx ../../resources/psxrt.prx
 TARGET = psxrt
-CORE = bios cdrom cpu dma gpu gte mdec mem psx sio spu timers
+CORE = bios card cdrom cpu dma gpu gte mdec mem psx sio spu timers
 OBJS = main.o disc.o ge.o native.o trampolines.o $(addprefix core/,$(addsuffix .o,$(CORE)))
 
 INCDIR = core

@@ -57,6 +57,15 @@ static char tty_line[COLS + 1];
 static int tty_len;
 static SceUID log_fd = -1;
 static int trace_bits; /* from psxrt.trace beside the EBOOT */
+#define PAD_MAX 256
+typedef struct {
+    u32 frame, buttons, frames;
+} PadPress;
+static PadPress pad_script[PAD_MAX]; /* from psxrt.pad beside the EBOOT */
+static int pad_n;
+static char base_dir[256]; /* the EBOOT's directory, with the slash */
+static u32 shot_at[32];    /* from psxrt.shots beside the EBOOT: frames to save as BMP */
+static int shot_n;
 static char log_buf[8192];
 static int log_len;
 
@@ -133,6 +142,40 @@ static void open_log(const char *eboot)
         sceIoClose(fd);
         trace_bits = (int)strtol(num, NULL, 10);
     }
+    snprintf(slash + 1, sizeof path - (size_t)(slash + 1 - path), "psxrt.pad");
+    fd = sceIoOpen(path, PSP_O_RDONLY, 0);
+    if (fd >= 0) { /* debugging: scripted presses, "frame buttons(hex, PSP bits) frames" triples */
+        static char text[4096];
+        sceIoRead(fd, text, sizeof text - 1);
+        sceIoClose(fd);
+        char *s = text, *e;
+        while (pad_n < PAD_MAX) {
+            u32 f = (u32)strtoul(s, &e, 10);
+            if (e == s)
+                break;
+            u32 b = (u32)strtoul(e, &s, 16);
+            u32 n = (u32)strtoul(s, &e, 10);
+            if (e == s)
+                break;
+            pad_script[pad_n++] = (PadPress){f, b, n};
+            s = e;
+        }
+    }
+    snprintf(slash + 1, sizeof path - (size_t)(slash + 1 - path), "psxrt.shots");
+    fd = sceIoOpen(path, PSP_O_RDONLY, 0);
+    if (fd >= 0) {
+        char text[512] = {0};
+        sceIoRead(fd, text, sizeof text - 1);
+        sceIoClose(fd);
+        for (char *s = text, *e; shot_n < (int)(sizeof shot_at / sizeof *shot_at); s = e) {
+            u32 f = (u32)strtoul(s, &e, 10);
+            if (e == s)
+                break;
+            shot_at[shot_n++] = f;
+        }
+    }
+    slash[1] = 0;
+    snprintf(base_dir, sizeof base_dir, "%s", path);
 }
 
 /* ---- memory ---- */
@@ -266,6 +309,48 @@ static void draw_ps1(Psx *psx)
     sceGuDisable(GU_TEXTURE_2D);
 }
 
+/* Debugging: the PS1 display area as a 24-bit BMP, shotNNNNN.bmp beside the EBOOT. */
+static void shot(Psx *psx, u32 frame_no)
+{
+    const Gpu *g = &psx->gpu;
+    int w, h, deep = display_24bit(psx);
+    if (!display_size(psx, &w, &h))
+        return;
+    if (g->renderer)
+        ge_read(g->disp_x, g->disp_y, deep ? (w * 3 + 1) / 2 + 1 : w, h);
+    if (deep)
+        convert24(g, w, h);
+    char path[300];
+    snprintf(path, sizeof path, "%sshot%05u.bmp", base_dir, (unsigned)frame_no);
+    SceUID fd = sceIoOpen(path, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
+    if (fd < 0)
+        return;
+    u32 stride = ((u32)w * 3 + 3) & ~3u, size = 54 + stride * (u32)h;
+    u8 hdr[54] = {'B', 'M'};
+    u32 fields[] = {2, size, 10, 54, 14, 40, 18, (u32)w, 22, (u32)h, 28, 24, 34, stride * (u32)h};
+    for (u32 i = 0; i < sizeof fields / sizeof *fields; i += 2)
+        memcpy(hdr + fields[i], &fields[i + 1], 4);
+    hdr[26] = 1; /* planes */
+    sceIoWrite(fd, hdr, sizeof hdr);
+    static u8 row[512 * 3 + 4];
+    for (int y = h - 1; y >= 0; y--) {
+        memset(row, 0, stride);
+        for (int x = 0; x < w; x++) {
+            u8 *o = row + x * 3;
+            if (deep) {
+                u32 c = rgb24_tex[y * 512 + x];
+                o[0] = (u8)(c >> 16), o[1] = (u8)(c >> 8), o[2] = (u8)c;
+            } else {
+                u16 c = g->vram[((g->disp_y + y) & (VRAM_H - 1)) * VRAM_W + ((g->disp_x + x) & (VRAM_W - 1))];
+                o[0] = (u8)((c >> 10 & 31) << 3), o[1] = (u8)((c >> 5 & 31) << 3), o[2] = (u8)((c & 31) << 3);
+            }
+        }
+        sceIoWrite(fd, row, stride);
+    }
+    sceIoClose(fd);
+    say("shot %s (%dx%d%s)", path, w, h, deep ? ", 24-bit" : "");
+}
+
 static void present(Psx *psx, const char *status)
 {
     int w, h;
@@ -300,12 +385,16 @@ static void present(Psx *psx, const char *status)
 }
 
 /* ---- pad: PSP bits equal PS1 bits except L/R (PSP 8/9, PS1 L1/R1 10/11); active low ---- */
-static u16 read_pad(void)
+static u16 read_pad(u32 frame_no)
 {
     static u32 prev;
     SceCtrlData d;
     sceCtrlPeekBufferPositive(&d, 1);
-    u32 b = d.Buttons, combo = PSP_CTRL_LTRIGGER | PSP_CTRL_RTRIGGER | PSP_CTRL_SELECT;
+    u32 b = d.Buttons;
+    for (int i = 0; i < pad_n; i++)
+        if (frame_no - pad_script[i].frame < pad_script[i].frames)
+            b |= pad_script[i].buttons;
+    u32 combo = PSP_CTRL_LTRIGGER | PSP_CTRL_RTRIGGER | PSP_CTRL_SELECT;
     if ((b & combo) == combo && (prev & combo) != combo)
         show_text = !show_text;
     prev = b;
@@ -327,7 +416,7 @@ static void frame(void)
     static NativeStats n0;
     static u32 draw0, mdec0, rgb0;
     static char status[64];
-    psx.sio.buttons[0] = read_pad();
+    psx.sio.buttons[0] = read_pad(frames);
     u64 t = sceKernelGetSystemTimeWide();
     if (!t0)
         t0 = t, c0 = psx.cycles;
@@ -394,10 +483,52 @@ static u32 host_usec(void *user)
     return sceKernelGetSystemTimeLow();
 }
 
+/* ---- memory card: slot 1's image in card0.mcr beside the EBOOT (Sony's 128 KB layout) ---- */
+static char card_file[256];
+static u8 *card_image;
+static u32 card_changed; /* frame of the last change, 0 = saved */
+
+static void card_load(const char *eboot)
+{
+    snprintf(card_file, sizeof card_file, "%s", eboot);
+    char *slash = strrchr(card_file, '/');
+    if (!slash || !(card_image = palloc("psxrt card", CARD_SIZE)))
+        return;
+    snprintf(slash + 1, sizeof card_file - (size_t)(slash + 1 - card_file), "card0.mcr");
+    SceUID fd = sceIoOpen(card_file, PSP_O_RDONLY, 0);
+    int n = fd >= 0 ? sceIoRead(fd, card_image, CARD_SIZE) : -1;
+    if (fd >= 0)
+        sceIoClose(fd);
+    if (n != (int)CARD_SIZE)
+        card_format(card_image);
+    say("card %s: %s", card_file, n == (int)CARD_SIZE ? "loaded" : "new, formatted");
+}
+
+static void card_save(void)
+{
+    card_changed = 0;
+    SceUID fd = sceIoOpen(card_file, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
+    int n = fd >= 0 ? sceIoWrite(fd, card_image, CARD_SIZE) : -1;
+    if (fd >= 0)
+        sceIoClose(fd);
+    say("card saved (%d)", n);
+}
+
+static void host_card_dirty(void *user, int slot)
+{
+    (void)user, (void)slot;
+    card_changed = frames | 1;
+}
+
 static void host_vblank(void *user)
 {
     (void)user;
     frames++;
+    if (card_changed && frames - card_changed >= 30) /* a save writes many sectors in a row */
+        card_save();
+    for (int i = 0; i < shot_n; i++)
+        if (shot_at[i] == frames)
+            shot(&psx, frames);
     if (native)
         frame();
 }
@@ -405,6 +536,8 @@ static void host_vblank(void *user)
 static int exit_callback(int a, int b, void *c)
 {
     (void)a, (void)b, (void)c;
+    if (card_changed)
+        card_save();
     log_flush();
     sceKernelExitGame();
     return 0;
@@ -448,6 +581,8 @@ int main(int argc, char **argv)
     /* the PSP starts an application at 222 MHz; POPS runs at 333 */
     int clock = scePowerSetClockFrequency(333, 333, 166);
     say("clock %d MHz (%d)", scePowerGetCpuClockFrequencyInt(), clock);
+    if (pad_n)
+        say("pad script: %d presses", pad_n);
     say("EBOOT %s", eboot);
     if (!fixed)
         halt("0x09800000-0x09C00FFF is not free");
@@ -478,6 +613,9 @@ int main(int argc, char **argv)
     host.log = host_log;
     host.vblank = host_vblank;
     host.usec = host_usec;
+    card_load(eboot);
+    host.card[0] = card_image;
+    host.card_dirty = host_card_dirty;
     psx_init(&psx, &host, (u8 *)FIXED_BASE, (u8 *)SCRATCH_BASE, vram, spu_ram, mdec_in, MDEC_WORDS);
     psx.trace = trace_bits;
     if (!(trace_bits & 16)) /* bit 4: everything in software, for A/B runs */

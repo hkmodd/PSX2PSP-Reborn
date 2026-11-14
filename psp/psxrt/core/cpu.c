@@ -105,7 +105,12 @@ int cpu_step(Psx *psx)
                 c->load_reg = 0;
             }
             if (!bios_call(psx, p)) {
-                psx_log(psx, "BIOS %02X(%02X) not implemented, ra %08X", p, c->gpr[9] & 0xFF, c->gpr[31]);
+                static u32 told[3][8]; /* logged once per function: games poll some in a loop */
+                u32 v = (p - 0xA0) >> 4, fn = c->gpr[9] & 0xFF;
+                if (v < 3 && !(told[v][fn >> 5] >> (fn & 31) & 1)) {
+                    told[v][fn >> 5] |= 1u << (fn & 31);
+                    psx_log(psx, "BIOS %02X(%02X) not implemented, ra %08X", p, fn, c->gpr[31]);
+                }
                 jump_to(c, c->gpr[31]);
             }
             c->next_pc = c->pc + 4;

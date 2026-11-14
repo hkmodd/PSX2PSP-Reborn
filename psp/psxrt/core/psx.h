@@ -303,8 +303,8 @@ typedef struct Bios {
     u32 rand_seed;
     int in_exception;
     /* open files: 0 = stdin/out, 1..15 bu00/bu10 handles */
-    struct {
-        int used, slot, size, pos, first_block;
+    struct BiosFile {
+        int used, slot, size, pos, first_block, async;
     } fd[16];
     int card_last_slot, card_event_due;
     u32 dirent_pos;
@@ -409,6 +409,12 @@ void gte_command(Psx *psx, u32 cmd);
 void bios_init(Psx *psx);
 int bios_rom_entry(Psx *psx, u32 pc); /* the CPU reached a magic BIOS ROM address: 1 handled */
 int bios_call(Psx *psx, u32 vector); /* A0/B0/C0 with t1: 1 handled (pc = ra or redirected) */
+void bios_event(Psx *psx, u32 cls, u32 spec); /* DeliverEvent */
+
+/* card.c: memory card images and the BIOS calls on them */
+#define CARD_SIZE 0x20000u
+void card_format(u8 *card);
+int card_call(Psx *psx, u32 vector, u32 fn); /* 0: not a card call */
 void bios_exception(Psx *psx);       /* CPU took an exception (EPC, cause set) */
 void bios_vblank(Psx *psx);
 int bios_exec(Psx *psx, u32 header, u32 sp, u32 sp_size);
