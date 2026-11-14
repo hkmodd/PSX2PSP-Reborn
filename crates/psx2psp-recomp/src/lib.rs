@@ -10,6 +10,7 @@ pub mod discover;
 pub mod emit;
 pub mod exe;
 pub mod hazard;
+pub mod hooks;
 pub mod insn;
 pub mod interp;
 pub mod layout;

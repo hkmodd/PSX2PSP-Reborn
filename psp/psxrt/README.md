@@ -56,6 +56,23 @@ dispatch table (one word per PS1 RAM word) with MISS.
 The log has a line per second with host calls, misses, interpreted instructions and executables
 loaded.
 
+## Snapshots, bench, recipes (S9)
+
+Files beside the EBOOT drive the runtime for development (`docs/recomp/S9.md`):
+
+| File | Effect |
+|---|---|
+| `psxrt.snap` | written by L+R+START (or a `psxrt.pad` press of those bits) at the next host call of the top-level code: RAM, devices, context, translation state. The next start resumes there instead of booting. Refused, and the disc boots, when it comes from another EBOOT or another translation (the code directory's hash); runtime-only changes keep it valid |
+| `psxrt.bench` | seconds to measure after `BENCH_SKIP` (2); then one `-- bench` line (speed, vblanks, fps, ms/s by kind) and a stop |
+| `psxrt.shots` | frame numbers to save as `shotNNNNN.bmp`; `rNNN` saves a RAM dump instead |
+| `psxrt.pad` | `frame buttons frames` lines: scripted presses |
+
+Recipes (`crates/psx2psp-recomp/src/hooks.rs`) are library code found by its exact words and
+served by the runtime (`native.c`, "recipes") instead of its translation: libpad's
+`_padChkRC2wait` and the /ACK wait of `_padSioRW2`, which spin on root counter 2, become one
+host call that reads the same registers, gives the same results and lets PS1 time jump to the
+expiry. The log's `hooks` counts them.
+
 ## DATA.PSAR (version 4)
 
 Little endian, written by `write_native_psar` in `crates/psx2psp-engine`; offsets are from the

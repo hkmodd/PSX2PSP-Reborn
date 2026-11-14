@@ -35,6 +35,7 @@
 #include "ge.h"
 #include "native.h"
 #include "psx.h"
+#include "snap.h"
 
 PSP_MODULE_INFO("PSX2PSP_psxrt", PSP_MODULE_USER, 0, 3);
 PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER | PSP_THREAD_ATTR_VFPU);
@@ -82,6 +83,15 @@ static Poke pokes[POKE_MAX]; /* from psxrt.poke beside the EBOOT: RAM writes, li
 static int poke_n;
 static char log_buf[8192];
 static int log_len;
+/* psxrt.bench beside the EBOOT: seconds to measure (after BENCH_SKIP), then one summary line
+ * and a stop */
+#define BENCH_SKIP 2
+static u32 bench_secs, bench_n;
+static struct {
+    u32 speed, vbl, fps, interp, io, draw, spu, timer, dma2, update, present, sleep;
+} bench;
+
+static void halt(const char *why) __attribute__((noreturn));
 
 static void log_flush(void)
 {
@@ -163,6 +173,14 @@ static void open_log(const char *eboot)
         sceIoRead(fd, num, sizeof num - 1);
         sceIoClose(fd);
         cpu_override = (int)strtol(num, NULL, 10);
+    }
+    snprintf(slash + 1, sizeof path - (size_t)(slash + 1 - path), "psxrt.bench");
+    fd = sceIoOpen(path, PSP_O_RDONLY, 0);
+    if (fd >= 0) { /* measurements: seconds, decimal */
+        char num[16] = {0};
+        sceIoRead(fd, num, sizeof num - 1);
+        sceIoClose(fd);
+        bench_secs = (u32)strtoul(num, NULL, 10);
     }
     snprintf(slash + 1, sizeof path - (size_t)(slash + 1 - path), "psxrt.watch");
     fd = sceIoOpen(path, PSP_O_RDONLY, 0);
@@ -471,7 +489,14 @@ static u16 read_pad(u32 frame_no)
     u32 combo = PSP_CTRL_LTRIGGER | PSP_CTRL_RTRIGGER | PSP_CTRL_SELECT;
     if ((b & combo) == combo && (prev & combo) != combo)
         show_text = !show_text;
+    /* L+R+START: a snapshot (native.c takes it at its next host call); the game does not see
+     * the three buttons */
+    u32 snap = PSP_CTRL_LTRIGGER | PSP_CTRL_RTRIGGER | PSP_CTRL_START;
+    if ((b & snap) == snap && (prev & snap) != snap)
+        native_snap_req = 1;
     prev = b;
+    if ((b & snap) == snap)
+        b &= ~snap;
     return (u16) ~((b & 0xF0F9u) | ((b >> 8) & 3u) << 10);
 }
 
@@ -530,9 +555,9 @@ static void frame(void)
             }
             if (native) {
                 const NativeStats *s = &native_stats;
-                n += snprintf(line + n, sizeof line - (size_t)n, "-- native: %u calls, %u misses, %u steps, %u hashes, %u loads, %u poll skips\n",(unsigned)(s->calls - n0.calls),
+                n += snprintf(line + n, sizeof line - (size_t)n, "-- native: %u calls, %u misses, %u steps, %u hashes, %u loads, %u poll skips, %u hooks\n",(unsigned)(s->calls - n0.calls),
                               (unsigned)(s->misses - n0.misses), (unsigned)(s->steps - n0.steps), (unsigned)(s->hashes - n0.hashes),
-                              (unsigned)s->loads, (unsigned)(s->poll_skips - n0.poll_skips));
+                              (unsigned)s->loads, (unsigned)(s->poll_skips - n0.poll_skips), (unsigned)(s->hooks - n0.hooks));
                 n += snprintf(line + n, sizeof line - (size_t)n,
                               "-- ms: interp %u io %u (draw %u mdec %u spu %u) update %u present %u (rgb24 %u) sleep %u;"
                               " audio drops %u gaps %u trims %u\n",
@@ -550,6 +575,14 @@ static void frame(void)
                         n += snprintf(line + n, sizeof line - (size_t)n, " %s %u/%u", io_names[k], (unsigned)(s->n_io[k] - n0.n_io[k]),
                                       (unsigned)((s->us_io_kind[k] - n0.us_io_kind[k]) / 1000));
                 n += snprintf(line + n, sizeof line - (size_t)n, "\n");
+                if (bench_secs && ++bench_n > BENCH_SKIP) {
+                    bench.speed += speed, bench.vbl += fps, bench.fps += game_fps;
+                    bench.interp += (s->us_interp - n0.us_interp) / 1000, bench.io += (s->us_io - n0.us_io) / 1000;
+                    bench.draw += (psx.gpu.us_draw - draw0) / 1000, bench.spu += (psx.spu.us_mix - spu0) / 1000;
+                    bench.timer += (s->us_io_kind[IO_TIMER] - n0.us_io_kind[IO_TIMER]) / 1000, bench.dma2 += psx.dma.us_run[2] / 1000;
+                    bench.update += (s->us_update - n0.us_update) / 1000, bench.present += (s->us_present - n0.us_present) / 1000;
+                    bench.sleep += (s->us_sleep - n0.us_sleep) / 1000;
+                }
                 n0 = *s, draw0 = psx.gpu.us_draw, mdec0 = psx.mdec.us_decode, spu0 = psx.spu.us_mix, rgb0 = us_rgb24;
                 Gpu *g = &psx.gpu;
                 n += snprintf(line + n, sizeof line - (size_t)n,
@@ -569,8 +602,19 @@ static void frame(void)
                 memset(d->n_run, 0, sizeof d->n_run), memset(d->us_run, 0, sizeof d->us_run), memset(d->words, 0, sizeof d->words);
             }
             n += ge_log(line + n, (int)sizeof line - n);
+            u32 k = bench_n - BENCH_SKIP;
+            if (bench_secs && bench_n > BENCH_SKIP && k >= bench_secs)
+                n += snprintf(line + n, sizeof line - (size_t)n,
+                              "-- bench %u s at frame %u: speed %u%% vbl %u fps %u.%u | ms/s interp %u io %u (draw %u spu %u timer %u)"
+                              " dma2 %u update %u present %u sleep %u\n",
+                              (unsigned)k, (unsigned)frames, (unsigned)(bench.speed / k), (unsigned)(bench.vbl / k), (unsigned)(bench.fps / k),
+                              (unsigned)(bench.fps * 10 / k % 10), (unsigned)(bench.interp / k), (unsigned)(bench.io / k), (unsigned)(bench.draw / k),
+                              (unsigned)(bench.spu / k), (unsigned)(bench.timer / k), (unsigned)(bench.dma2 / k), (unsigned)(bench.update / k),
+                              (unsigned)(bench.present / k), (unsigned)(bench.sleep / k));
             log_flush();
             sceIoWrite(log_fd, line, n);
+            if (bench_secs && bench_n > BENCH_SKIP && k >= bench_secs)
+                halt("bench done");
         }
     }
     if (!status[0])
@@ -712,7 +756,6 @@ static int callback_thread(SceSize args, void *argp)
     return 0;
 }
 
-static void halt(const char *why) __attribute__((noreturn));
 static void halt(const char *why)
 {
     say("STOP: %s", why);
@@ -724,6 +767,24 @@ static void halt(const char *why)
 }
 
 void runtime_halt(const char *why) { halt(why); }
+
+static DiscInfo disc_info;
+
+static void snap_path(char *path, size_t cap) { snprintf(path, cap, "%spsxrt.snap", base_dir); }
+
+/* native.c, at a host call of the top-level code: the machine to psxrt.snap beside the EBOOT,
+ * which the next start resumes from. */
+void runtime_snapshot(u32 host_pc)
+{
+    char path[300];
+    snap_path(path, sizeof path);
+    u32 t = sceKernelGetSystemTimeLow();
+    if (psx.gpu.renderer)
+        ge_read(0, 0, VRAM_W, VRAM_H);
+    int r = snap_save(path, &psx, &disc_info, host_pc, frames);
+    say("snapshot %s at frame %u: %s (%u ms)", path, (unsigned)frames, r ? "FAILED" : "saved", (unsigned)((sceKernelGetSystemTimeLow() - t) / 1000));
+    log_flush();
+}
 
 int main(int argc, char **argv)
 {
@@ -747,18 +808,17 @@ int main(int argc, char **argv)
     if (!fixed)
         halt("0x09800000-0x09C00FFF is not free");
 
-    DiscInfo info;
-    const char *err = disc_open(eboot, &info);
+    const char *err = disc_open(eboot, &disc_info);
     if (err)
         halt(err);
-    say("disc %s \"%s\": %u sectors, %u blocks", info.disc_id, info.title, (unsigned)info.sectors, (unsigned)info.blocks);
-    native = info.images > 0;
+    say("disc %s \"%s\": %u sectors, %u blocks", disc_info.disc_id, disc_info.title, (unsigned)disc_info.sectors, (unsigned)disc_info.blocks);
+    native = disc_info.images > 0;
     if (native) {
-        u32 size = FIXED_BASE - info.code_base;
-        SceUID uid = info.code_base < FIXED_BASE ? sceKernelAllocPartitionMemory(USER_PARTITION, "psxrt code", PSP_SMEM_Addr, size, (void *)info.code_base) : -1;
-        if (uid < 0 || (u32)sceKernelGetBlockHeadAddr(uid) != info.code_base)
+        u32 size = FIXED_BASE - disc_info.code_base;
+        SceUID uid = disc_info.code_base < FIXED_BASE ? sceKernelAllocPartitionMemory(USER_PARTITION, "psxrt code", PSP_SMEM_Addr, size, (void *)disc_info.code_base) : -1;
+        if (uid < 0 || (u32)sceKernelGetBlockHeadAddr(uid) != disc_info.code_base)
             halt("the translated code's region is not free");
-        say("native: %u executables, code at %08X-%08X", (unsigned)info.images, (unsigned)info.code_base, (unsigned)(info.code_base + info.code_size));
+        say("native: %u executables, code at %08X-%08X", (unsigned)disc_info.images, (unsigned)disc_info.code_base, (unsigned)(disc_info.code_base + disc_info.code_size));
     }
 
     u16 *vram = palloc("psxrt vram", VRAM_W * VRAM_H * 2 + 0x10000); /* + slack for texture reads */
@@ -768,7 +828,7 @@ int main(int argc, char **argv)
     if (!vram || !spu_ram || !mdec_in || !rgb24_tex)
         halt("out of memory");
     host.read_sector = disc_read_sector;
-    host.disc_end = 150 + info.sectors;
+    host.disc_end = 150 + disc_info.sectors;
     host.tty = host_tty;
     host.log = host_log;
     host.vblank = host_vblank;
@@ -782,7 +842,7 @@ int main(int argc, char **argv)
     host.card_dirty = host_card_dirty;
     psx_init(&psx, &host, (u8 *)FIXED_BASE, (u8 *)SCRATCH_BASE, vram, spu_ram, mdec_in, MDEC_WORDS);
     psx.trace = trace_bits;
-    psx.pal60 = !!(info.flags & DISC_PAL60);
+    psx.pal60 = !!(disc_info.flags & DISC_PAL60);
     if (psx.pal60)
         say("PAL60: a PAL picture at 60 Hz");
     if (!(trace_bits & 16)) /* bit 4: everything in software, for A/B runs */
@@ -790,17 +850,34 @@ int main(int argc, char **argv)
     if (psx.gpu.renderer)
         say("GE renderer%s", (trace_bits & 8) ? ", compare mode" : "");
     if (cpu_override >= 0) /* debugging: psxrt.cpu beside the EBOOT overrides the shift */
-        info.cpu_shift = (u32)cpu_override;
-    if (native && info.cpu_shift)
-        say("CPU: loops charge PS1 cycles >> %u", (unsigned)info.cpu_shift);
-    if (native && (err = native_init(&psx, &info)) != NULL)
+        disc_info.cpu_shift = (u32)cpu_override;
+    if (native && disc_info.cpu_shift)
+        say("CPU: loops charge PS1 cycles >> %u", (unsigned)disc_info.cpu_shift);
+    if (native && (err = native_init(&psx, &disc_info)) != NULL)
         halt(err);
-    if (psx_boot(&psx) < 0)
+    u32 resume = 0; /* psxrt.snap beside the EBOOT: the run goes on from there */
+    if (native) {
+        char path[300];
+        u32 f;
+        snap_path(path, sizeof path);
+        int r = snap_load(path, &psx, &disc_info, &resume, &f);
+        if (r == -3)
+            halt("psxrt.snap is unreadable: delete it to boot the disc");
+        if (r == -2)
+            say("%s is from another EBOOT or runtime: booting the disc", path);
+        if (r == 0) {
+            frames = f;
+            say("resumed from %s at frame %u", path, (unsigned)f);
+            if (psx.gpu.renderer) /* the GE's copy of PS1 VRAM from RAM's */
+                psx.gpu.renderer->wrote(psx.gpu.renderer->self, 0, 0, VRAM_W, VRAM_H);
+        }
+    }
+    if (!resume && psx_boot(&psx) < 0)
         halt("cannot boot the disc (SYSTEM.CNF / boot EXE)");
     present(&psx, "booting");
     log_flush();
     if (native)
-        native_run();
+        native_run(resume);
 
     for (;;) {
         u32 f = frames;

@@ -38,6 +38,7 @@ use thiserror::Error;
 use crate::discover::{Discovery, JumpReg};
 use crate::exe::PsxExe;
 use crate::hazard::Hazards;
+use crate::hooks::{self, HOOK, Hook};
 use crate::insn::{Insn, Isa, Kind, Uses, decode};
 use crate::layout::{self, RT_CALL, SCRATCH, ctx, gte, k0_off};
 
@@ -77,12 +78,14 @@ pub enum Reason {
     SlotClobbers,
     /// A load whose delay slot the code depends on (see [`crate::hazard`]).
     Hazard,
+    /// A recipe the runtime runs itself ([`crate::hooks`]).
+    Hook,
 }
 
 impl Reason {
     /// True if the interpreter takes over instead of the code continuing.
     pub const fn resumes(self) -> bool {
-        !matches!(self, Reason::Cop0 | Reason::Cop2 | Reason::Syscall | Reason::Break | Reason::GuestK)
+        !matches!(self, Reason::Cop0 | Reason::Cop2 | Reason::Syscall | Reason::Break | Reason::GuestK | Reason::Hook)
     }
 }
 
@@ -289,6 +292,7 @@ struct Em<'a> {
     runtime: BTreeMap<u32, Reason>,
     /// Conditional branches whose guest target is beyond 16 bits in host code.
     long: &'a BTreeSet<u32>,
+    hooks: &'a BTreeMap<u32, Hook>,
 }
 
 enum Fail {
@@ -311,9 +315,10 @@ pub fn translate(
     if base & 3 != 0 || (base ^ RT_CALL) & 0xF000_0000 != 0 {
         return Err(EmitError::Base(base));
     }
+    let hooks = hooks::find(exe, d);
     let mut long = BTreeSet::new();
     loop {
-        match emit(exe, d, hz, base, &long) {
+        match emit(exe, d, hz, base, &long, &hooks) {
             Ok(t) => return Ok(t),
             Err(Fail::Error(e)) => return Err(e),
             Err(Fail::Far(far)) => {
@@ -334,12 +339,14 @@ fn emit(
     hz: &Hazards,
     base: u32,
     long: &BTreeSet<u32>,
+    hooks: &BTreeMap<u32, Hook>,
 ) -> Result<Translation, Fail> {
     let mut em = Em {
         exe,
         d,
         hz,
         long,
+        hooks,
         out: Code::default(),
         stubs: Vec::new(),
         stub_words: 0,
@@ -491,6 +498,14 @@ impl Em<'_> {
     /// The main-pass instruction at `a` (with its delay slot). Returns where the guest continues
     /// in straight line, if it can.
     fn insn(&mut self, a: u32) -> Option<u32> {
+        if let Some(&h) = self.hooks.get(&a) {
+            // The runtime continues where the recipe's code would, through the dispatch table.
+            self.runtime.insert(a, Reason::Hook);
+            self.out.host_call(a | HOOK, h.id);
+            self.out.push(h.args[0]);
+            self.out.push(h.args[1]);
+            return None;
+        }
         let Some((i, k)) = self.at(a) else {
             let c = self.resume(a, Reason::Outside);
             self.out.append(c);

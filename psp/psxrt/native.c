@@ -34,6 +34,7 @@
 
 #include <pspkernel.h>
 #include <stdarg.h>
+#include <pspiofilemgr.h>
 #include <pspthreadman.h>
 #include <psputils.h>
 #include <stdio.h>
@@ -551,6 +552,160 @@ static int io_fast(u32 pc, u32 insn, u32 back, u32 *next)
 
 /* ---- entries from trampolines.S ---- */
 
+volatile int native_snap_req;
+static int guest_calls; /* native_call() depth */
+
+/* Back to translated code from an entry: the guest state into the context, and a requested
+ * snapshot when no guest call of the BIOS is in progress. */
+static u32 leave(Cpu *c, u32 host)
+{
+    to_ctx(c, host);
+    if (native_snap_req && !guest_calls) {
+        native_snap_req = 0;
+        runtime_snapshot(host);
+    }
+    return host;
+}
+
+/* ---- recipes (crates/psx2psp-recomp/src/hooks.rs) ---- */
+
+#define HOOK 2u
+enum { HOOK_PAD_CHK_RC2_WAIT = 1, HOOK_PAD_SIO_ACK_WAIT = 2 };
+#define T2_COUNT 0x1F801120u
+#define T2_MODE 0x1F801124u
+#define T2_TARGET 0x1F801128u
+
+/* A guest device or memory read, as the recipe's code makes it (2 cycles, like io_fast). */
+static u32 rd(u32 a, int size)
+{
+    native_stats.n_io[io_kind_at(a & 0x1FFFFFFFu)]++;
+    P->cycles += 2;
+    return psx_read(P, a, size);
+}
+
+/* PS1 time on to `due`, never past the next device event, which then runs. */
+static void wait_until(u64 due)
+{
+    u64 to = due < P->next_event ? due : P->next_event;
+    if (to > P->cycles)
+        P->cycles = to;
+    if (P->cycles >= P->next_event)
+        update();
+}
+
+/* libpad's waits on root counter 2: `elapsed` is the count since `start` (a wrap adds the target),
+ * in counter ticks when the mode has bit 9 (sysclock/8), else in eighths of them; the wait expires
+ * when it reaches `limit`. The cycles from `cnt` until it does (one tick at least), or 0 when the
+ * counter is stopped. */
+static u32 rc2_left(u32 cnt_addr, u32 cnt, u32 start, u32 limit, u32 mode)
+{
+    u32 tick = timer_tick(P, cnt_addr & 0x1FFFFFFFu);
+    if (!tick)
+        return 0;
+    s32 d = (s32)(cnt - start), left = (mode & 0x200) ? (s32)limit - d : 8 * (s32)limit - d;
+    return (left > 0 ? (u32)left : 1u) * tick;
+}
+
+/* `_padChkRC2wait()` (hooks.rs PAD_CHK_RC2_WAIT): its reads and its results (v0 expired, v1 the
+ * limit, a0 the count). Its callers poll it until it expires, waiting for nothing but the counter
+ * and the device events (the /ACK), so when it has not, PS1 time moves on to the expiry or to the
+ * next event: the next call returns what the loop would have. Returns to `ra`. */
+static u32 hook_pad_chk(Cpu *c, const u32 *arg)
+{
+    u32 start = ram_r32(P, arg[0]), limit = ram_r32(P, arg[1]);
+    u32 cnt = rd(T2_COUNT, 2) & 0xFFFF;
+    if ((s32)cnt < (s32)start) {
+        u32 t = rd(T2_TARGET, 2);
+        cnt += t ? rd(T2_TARGET, 2) : 0x10000u;
+    }
+    u32 mode = rd(T2_MODE, 2);
+    s32 e = (s32)(cnt - start);
+    if (!(mode & 0x200))
+        e >>= 3;
+    c->gpr[2] = !(e < (s32)limit);
+    c->gpr[3] = limit;
+    c->gpr[4] = cnt;
+    if (!c->gpr[2]) {
+        u32 left = rc2_left(T2_COUNT, cnt, start, limit, mode);
+        wait_until(left ? P->cycles + left : ~0ull);
+    }
+    return c->gpr[31];
+}
+
+/* The /ACK wait loop of `_padSioRW2` (hooks.rs PAD_SIO_ACK_WAIT), on its registers: a pass makes
+ * the loop's reads; between passes PS1 time moves on to the timeout or to the next device event
+ * (the /ACK is one). Returns the /ACK exit (v0 0x80), the timeout exit (v0 -2), or the loop's head
+ * `pc` when an interrupt is to be taken there. */
+#define SIO_PASS 24u /* PS1 cycles of one pass besides its reads */
+static u32 hook_pad_ack(Cpu *c, const u32 *arg, u32 pc)
+{
+    u32 *g = c->gpr;
+    for (;;) {
+        rd(g[7], 2);
+        u32 cnt = rd(g[9], 2) & 0xFFFF;
+        if ((s32)cnt < (s32)g[4]) {
+            u32 t = rd(g[6], 2);
+            cnt += t ? rd(g[6], 2) : g[10];
+        }
+        u32 mode = rd(g[7], 2);
+        s32 e = (s32)(cnt - g[4]);
+        if (!(mode & 0x200))
+            e >>= 3;
+        g[3] = cnt;
+        g[2] = (u32)-2;
+        if (!(e < (s32)g[5]))
+            return arg[1];
+        if (rd(g[8], 4) & 0x80) {
+            g[2] = 0x80;
+            return arg[0];
+        }
+        g[2] = 0;
+        P->cycles += SIO_PASS;
+        u32 left = rc2_left(g[9], cnt, g[4], g[5], mode);
+        wait_until(left ? P->cycles + left : ~0ull);
+        if (psx_irq_pending(P))
+            return pc;
+    }
+}
+
+/* A hook's host call: the recipe runs, then the guest goes on where it says (a guest address or a
+ * host one), through the table. An unknown id runs the guest code instead. */
+static u32 hook(const u32 *site, u32 pc)
+{
+    Cpu *c = &P->cpu;
+    from_ctx(c);
+    charge();
+    sync_time();
+    if (P->cycles >= P->next_event)
+        update();
+    native_stats.calls++;
+    native_stats.hooks++;
+    u32 next = pc;
+    if (!psx_irq_pending(P)) {
+        static u32 n;
+        int timed = !(n++ % PROF_EVERY);
+        u32 t = timed ? sceKernelGetSystemTimeLow() : 0;
+        switch (site[1]) {
+        case HOOK_PAD_CHK_RC2_WAIT: next = hook_pad_chk(c, site + 2); break;
+        case HOOK_PAD_SIO_ACK_WAIT: next = hook_pad_ack(c, site + 2, pc); break;
+        default:
+            jump(c, pc);
+            return leave(c, run_guest(2));
+        }
+        if (timed) { /* the libpad recipes wait on the timer: their time is the timer's */
+            t = (sceKernelGetSystemTimeLow() - t) * PROF_EVERY;
+            native_stats.us_io += t;
+            native_stats.us_io_kind[IO_TIMER] += t;
+        }
+    }
+    if (psx_irq_pending(P)) {
+        cpu_exception(P, 0, next, 0);
+        return leave(c, run_guest(0));
+    }
+    jump(c, next);
+    return leave(c, run_guest(0));
+}
+
 /* A GTE command from translated code (GTE_CMD): no guest state copy, no interrupt service. */
 void native_gte_cmd(u32 cmd)
 {
@@ -565,6 +720,8 @@ u32 native_rt_call(const u32 *site)
     Cpu *c = &P->cpu;
     u32 pc = site[0], insn = site[1], back = (u32)site + 8;
     u32 op = insn >> 26;
+    if (pc & HOOK)
+        return hook(site, pc & ~HOOK);
     /* not timed: two clock reads would cost more than the instruction */
     if (!(pc & RESUME) && (op == 0x12 || op == 0x32 || op == 0x3A) && gte_fast(insn)) {
         native_stats.calls++;
@@ -579,7 +736,7 @@ u32 native_rt_call(const u32 *site)
     native_stats.calls++;
     if (pc & RESUME) {
         jump(c, pc & ~RESUME);
-        return to_ctx(c, run_guest(2));
+        return leave(c, run_guest(2));
     }
     if (op != 0x12 && op != 0x32 && op != 0x3A) { /* the GTE does not need the clock */
         sync_time();
@@ -588,13 +745,13 @@ u32 native_rt_call(const u32 *site)
     }
     if (insn == POLL) {
         if (!psx_irq_pending(P))
-            return to_ctx(c, back);
+            return leave(c, back);
         cpu_exception(P, 0, back, 0);
-        return to_ctx(c, run_guest(0));
+        return leave(c, run_guest(0));
     }
     if (psx_irq_pending(P)) { /* taken before the instruction, which runs on return */
         cpu_exception(P, 0, (u32)site - 12, 0);
-        return to_ctx(c, run_guest(0));
+        return leave(c, run_guest(0));
     }
     jump(c, pc);
     if (ram_r32(P, pc) != insn) {
@@ -620,7 +777,7 @@ u32 native_rt_call(const u32 *site)
         jump(c, back);
     if (psx_irq_pending(P))
         cpu_exception(P, 0, c->pc, 0);
-    return to_ctx(c, run_guest(0));
+    return leave(c, run_guest(0));
 }
 
 u32 native_miss(void)
@@ -630,7 +787,7 @@ u32 native_miss(void)
     charge();
     native_stats.misses++;
     jump(c, ctx[C_TARGET]);
-    return to_ctx(c, run_guest(1));
+    return leave(c, run_guest(1));
 }
 
 u32 native_gret(void)
@@ -639,7 +796,7 @@ u32 native_gret(void)
     from_ctx(c);
     charge();
     jump(c, gret[--gret_top % GRET_DEPTH]);
-    return to_ctx(c, run_guest(1));
+    return leave(c, run_guest(1));
 }
 
 /* PSX.call: the guest function at `addr`, natively where translated. */
@@ -653,7 +810,9 @@ static void native_call(Psx *psx, u32 addr)
     jump(c, addr);
     u32 h = run_guest(1);
     if (h != STUB_CALL_RET) {
+        guest_calls++;
         native_enter(to_ctx(c, h));
+        guest_calls--;
         from_ctx(c);
         charge();
     }
@@ -704,16 +863,55 @@ const char *native_init(Psx *psx, const DiscInfo *info)
     return NULL;
 }
 
-void native_run(void)
+void native_run(u32 host_pc)
 {
     Cpu *c = &P->cpu;
     t_base = sceKernelGetSystemTimeWide();
     c_base = P->cycles;
     if (sceKernelSetAlarm(ALARM_US, alarm, NULL) < 0)
         say("native: no alarm, interrupts wait for host calls");
-    c->load_reg = 0;
-    jump(c, c->pc);
-    u32 h = run_guest(1);
-    native_enter(to_ctx(c, h));
+    if (!host_pc) {
+        c->load_reg = 0;
+        jump(c, c->pc);
+        host_pc = to_ctx(c, run_guest(1));
+    }
+    native_enter(host_pc);
     runtime_halt("translated code returned to the top level");
+}
+
+/* ---- snapshots: the context (with the GTE), the images, the GRET stack, the table ---- */
+#define CTX_BYTES (GTE_ADDR + sizeof(Gte) - CTX_ADDR)
+
+int native_save(int fd)
+{
+    u32 st[MAX_IMAGES][4], n = (u32)nimg;
+    for (u32 i = 0; i < n; i++)
+        st[i][0] = (u32)img[i].resident, st[i][1] = (u32)img[i].installed, st[i][2] = img[i].gen, st[i][3] = img[i].checked;
+    u32 top = gret_top;
+    int w = sceIoWrite(fd, (const void *)CTX_ADDR, CTX_BYTES) != (int)CTX_BYTES || sceIoWrite(fd, &n, 4) != 4 ||
+            sceIoWrite(fd, st, n * 16) != (int)(n * 16) || sceIoWrite(fd, &top, 4) != 4 || sceIoWrite(fd, gret, sizeof gret) != (int)sizeof gret ||
+            sceIoWrite(fd, table, TABLE_WORDS * 4) != (int)(TABLE_WORDS * 4);
+    return w ? -1 : 0;
+}
+
+int native_load(int fd)
+{
+    u32 st[MAX_IMAGES][4], n;
+    if (sceIoRead(fd, (void *)CTX_ADDR, CTX_BYTES) != (int)CTX_BYTES || sceIoRead(fd, &n, 4) != 4 || n != (u32)nimg ||
+        sceIoRead(fd, st, n * 16) != (int)(n * 16) || sceIoRead(fd, &gret_top, 4) != 4 || sceIoRead(fd, gret, sizeof gret) != (int)sizeof gret ||
+        sceIoRead(fd, table, TABLE_WORDS * 4) != (int)(TABLE_WORDS * 4))
+        return -1;
+    sceKernelDcacheWritebackInvalidateAll();
+    for (u32 i = 0; i < n; i++) {
+        Image *m = &img[i];
+        m->resident = (int)st[i][0], m->installed = (int)st[i][1], m->gen = st[i][2], m->checked = st[i][3];
+        if (m->resident && disc_blob(m->e->code_off, m->e->code_stored, (void *)m->e->host_base, m->e->code_len) < 0) {
+            say("native: cannot read the code of %.16s", m->e->name);
+            return -1;
+        }
+        if (m->resident)
+            say("native: %.16s at %08X (snapshot)", m->e->name, (unsigned)m->e->text_addr);
+    }
+    flush_code();
+    return 0;
 }

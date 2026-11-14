@@ -15,6 +15,7 @@ typedef struct NativeStats {
     u32 loads;  /* translated executables loaded */
     u32 hashes; /* texts hashed to recognise an executable */
     u32 poll_skips; /* timer reads in a polling loop that let PS1 time pass */
+    u32 hooks;      /* recipes run (hooks.rs) */
     /* microseconds: in the interpreter (with what it calls), host-call instructions (device
      * I/O, DMA), device events (vblank, IRQs, guest callbacks), presenting, sleeping */
     u32 us_interp, us_io, us_update, us_present, us_sleep;
@@ -28,9 +29,20 @@ extern NativeStats native_stats;
  * dispatch table, the stubs and the interrupt alarm. The code region must be reserved. NULL,
  * or what is wrong. */
 const char *native_init(Psx *psx, const DiscInfo *info);
-/* Runs the guest from psx->cpu.pc; does not return. */
-void native_run(void) __attribute__((noreturn));
+/* Runs the guest from psx->cpu.pc, or enters translated code at `host_pc` (a snapshot's) with
+ * the context as it is; does not return. */
+void native_run(u32 host_pc) __attribute__((noreturn));
 /* Provided by the runtime: stops with a message; does not return. */
 void runtime_halt(const char *why) __attribute__((noreturn));
+
+/* Snapshots (snap.c). Set by the runtime: the next host call of the top-level code (no guest
+ * call of the BIOS in progress) calls runtime_snapshot() with the host address it goes on to,
+ * the guest state being in the context and psx->cpu. */
+extern volatile int native_snap_req;
+void runtime_snapshot(u32 host_pc);
+/* The context, the translation state and the dispatch table, to and from an open file; loading
+ * also brings back the code of the executables that were resident. 0, or -1. */
+int native_save(int fd);
+int native_load(int fd);
 
 #endif
