@@ -41,11 +41,13 @@
 
 #define RAM_HOST 0x09800000u
 #define CTX_ADDR 0x09A00400u
+#define GTE_ADDR 0x09A00500u /* psx->gte: translated code moves to and from it directly */
 #define STUB_RT_CALL 0x09A00F00u
 #define STUB_MISS 0x09A00F40u
 #define STUB_DIRTY 0x09A00F60u
 #define STUB_CALL_RET 0x09A00F80u
 #define STUB_GRET 0x09A00FC0u
+#define STUB_GTE_CMD 0x09A00FA0u
 #define TABLE_ADDR 0x09A01000u
 #define TABLE_WORDS (RAM_SIZE / 4)
 /* CTX words */
@@ -66,6 +68,7 @@ void psxrt_rt_call(void);
 void psxrt_miss(void);
 void psxrt_gret(void);
 void psxrt_call_ret(void);
+void psxrt_gte_cmd(void);
 void native_enter(u32 host_pc);
 u32 native_host_sp, native_host_gp;
 
@@ -430,6 +433,14 @@ static int gte_fast(u32 insn)
 
 /* ---- entries from trampolines.S ---- */
 
+/* A GTE command from translated code (GTE_CMD): no guest state copy, no interrupt service. */
+void native_gte_cmd(u32 cmd)
+{
+    gte_command(P, cmd);
+    P->cycles += 10;
+    native_stats.n_io[IO_GTEC]++;
+}
+
 /* Host call at `site` (the address of its .word pc, .word insn): returns where to go on. */
 u32 native_rt_call(const u32 *site)
 {
@@ -554,8 +565,11 @@ const char *native_init(Psx *psx, const DiscInfo *info)
     stub(STUB_DIRTY, psxrt_miss);
     stub(STUB_CALL_RET, psxrt_call_ret);
     stub(STUB_GRET, psxrt_gret);
+    stub(STUB_GTE_CMD, psxrt_gte_cmd);
     memset((void *)ctx, 0, 0x100);
     ctx[C_BUDGET] = BUDGET;
+    memcpy((void *)GTE_ADDR, psx->gte, sizeof(Gte));
+    psx->gte = (Gte *)GTE_ADDR;
     flush_code();
     __asm__ volatile("move %0, $gp" : "=r"(native_host_gp));
     psx->call = native_call;

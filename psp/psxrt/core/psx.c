@@ -22,6 +22,7 @@ void psx_init(Psx *psx, const PsxHost *host, u8 *ram, u8 *scratch, u16 *vram, u8
 {
     memset(psx, 0, sizeof *psx);
     psx->host = host;
+    psx->gte = &psx->gte_own;
     psx->ram = ram;
     psx->scratch = scratch;
     psx->gpu.vram = vram;

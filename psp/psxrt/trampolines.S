@@ -19,6 +19,7 @@
 #define G(r) (0x3B4 + 4 * (r)) /* CTX GPR r from k0 */
 #define HI 0x434
 #define LO 0x438
+#define GTE_RET 0x448 /* CTX.GTE_RET */
 
 /* frame of native_enter: 16 bytes for the callee, s0-s7, fp, ra, gp, previous host sp */
 #define F_S0 16
@@ -84,6 +85,37 @@ psxrt_gret:
     b restore_and_go
     move $k1, $v0
     .end psxrt_gret
+
+/* GTE_CMD: `sw ra,GPR31(k0); lui k1,hi; jal GTE_CMD; ori k1,k1,lo`. native_gte_cmd(k1) is C:
+ * only the caller-saved registers, gp, sp and HI/LO need saving; s0-s7 and fp survive it. */
+    .globl psxrt_gte_cmd
+    .ent psxrt_gte_cmd
+psxrt_gte_cmd:
+    sw $ra, GTE_RET($k0)
+    .irp r,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,24,25,28,29
+    sw $\r, G(\r)($k0)
+    .endr
+    mfhi $at
+    sw $at, HI($k0)
+    mflo $at
+    sw $at, LO($k0)
+    move $a0, $k1
+    TO_HOST
+    jal native_gte_cmd
+    nop
+    lui $k0, %hi(K0_VALUE)
+    ori $k0, $k0, %lo(K0_VALUE)
+    lw $at, HI($k0)
+    mthi $at
+    lw $at, LO($k0)
+    mtlo $at
+    .irp r,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,24,25,28,29,31
+    lw $\r, G(\r)($k0)
+    .endr
+    lw $k1, GTE_RET($k0)
+    jr $k1
+    nop
+    .end psxrt_gte_cmd
 
 /* The guest state from CTX, then on to the host address in k1. */
     .ent restore_and_go

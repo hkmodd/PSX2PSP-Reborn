@@ -313,7 +313,8 @@ typedef struct Psx Psx;
 
 struct Psx {
     Cpu cpu;
-    Gte gte;
+    Gte *gte;    /* gte_own, or where the host wants the registers (psxrt: translated code reads them) */
+    Gte gte_own;
     u8 *ram;     /* RAM_SIZE */
     u8 *scratch; /* SCRATCH_SIZE */
     u32 i_stat, i_mask;

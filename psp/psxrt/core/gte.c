@@ -5,8 +5,8 @@
  */
 #include "psx.h"
 
-#define D (psx->gte.d)
-#define C (psx->gte.c)
+#define D (psx->gte->d)
+#define C (psx->gte->c)
 
 /* data register indices */
 enum { RGBC = 6, OTZ = 7, IR0 = 8, SXY0 = 12, SXYP = 15, SZ0 = 16, RGB0 = 20, RES1 = 23, MAC0 = 24, LZCS = 30, LZCR = 31 };
@@ -28,13 +28,32 @@ static s32 mat(Psx *psx, int base, int k)
     return (k & 1) ? (s16)(w >> 16) : (s16)w;
 }
 
+/* Hot paths test the high word only: v fits 44 bits when v >> 32 is in [-0x800, 0x7FF]. */
 static s64 mac_chk(Psx *psx, int n, s64 v)
 {
-    if (v > 0x7FFFFFFFFFFLL)
-        flag(psx, 31 - n);
-    else if (v < -0x80000000000LL)
-        flag(psx, 28 - n);
-    return (s64)((u64)v << 20) >> 20; /* wraps to 44 bits */
+    s32 h = (s32)((u64)v >> 32);
+    if (__builtin_expect((u32)(h + 0x800) >= 0x1000u, 0)) {
+        flag(psx, h < 0 ? 28 - n : 31 - n);
+        return (s64)((u64)v << 20) >> 20; /* wraps to 44 bits */
+    }
+    return v;
+}
+
+/* v >> sf for sf 0 or 12, low word: a constant shift instead of a 64-bit variable one */
+static s32 shr_sf(s64 v, int sf) { return sf ? (s32)(v >> 12) : (s32)v; }
+
+static s32 ir_clamp(Psx *psx, int n, s32 v, int lm)
+{
+    s32 lo = lm ? 0 : -0x8000;
+    if (v < lo) {
+        flag(psx, 25 - n);
+        return lo;
+    }
+    if (v > 0x7FFF) {
+        flag(psx, 25 - n);
+        return 0x7FFF;
+    }
+    return v;
 }
 
 static s32 ir_sat(Psx *psx, int n, s64 v, int lm)
@@ -53,17 +72,17 @@ static s32 ir_sat(Psx *psx, int n, s64 v, int lm)
 
 static void set_mac_ir(Psx *psx, int n, s64 v, int sf, int lm)
 {
-    MAC(n) = (s32)(v >> sf);
-    IR(n) = ir_sat(psx, n, MAC(n), lm);
+    s32 m = shr_sf(v, sf);
+    MAC(n) = m;
+    IR(n) = ir_clamp(psx, n, m, lm);
 }
 
 static s32 mac0_chk(Psx *psx, s64 v)
 {
-    if (v > 0x7FFFFFFFLL)
-        flag(psx, 16);
-    else if (v < -0x80000000LL)
-        flag(psx, 15);
-    return (s32)v;
+    s32 lo = (s32)v, hi = (s32)((u64)v >> 32);
+    if (__builtin_expect(hi != lo >> 31, 0))
+        flag(psx, hi < 0 ? 15 : 16);
+    return lo;
 }
 
 static u32 color_sat(Psx *psx, int n, s32 v)
@@ -86,7 +105,7 @@ static void push_rgb(Psx *psx)
     D[RGB0 + 2] = (s32)(color_sat(psx, 1, MAC(1) >> 4) | color_sat(psx, 2, MAC(2) >> 4) << 8 | color_sat(psx, 3, MAC(3) >> 4) << 16 | ((u32)D[RGBC] & 0xFF000000u));
 }
 
-static void push_sz(Psx *psx, s64 v)
+static void push_sz(Psx *psx, s32 v)
 {
     if (v < 0) {
         flag(psx, 18);
@@ -101,7 +120,7 @@ static void push_sz(Psx *psx, s64 v)
     D[SZ0 + 3] = (s32)v;
 }
 
-static s32 sxy_sat(Psx *psx, int bit, s64 v)
+static s32 sxy_sat(Psx *psx, int bit, s32 v)
 {
     if (v < -0x400) {
         flag(psx, bit);
@@ -134,15 +153,14 @@ static u32 divide(Psx *psx, u32 h, u32 sz3)
         }
         unr_ready = 1;
     }
-    int z = 0;
-    while (z < 16 && !(sz3 & (0x8000u >> z)))
-        z++;
-    u64 n = (u64)h << z;
+    /* sz3 is 1..0xFFFF here (h >= 0 = 2 * 0); h < 2 * sz3, so h << z stays under 0x20000 */
+    int z = __builtin_clz(sz3) - 16;
+    u32 n = h << z;
     u32 d = sz3 << z;
     u32 u = unr[(d - 0x7FC0) >> 7] + 0x101u;
     d = (0x2000080u - d * u) >> 8;
     d = (0x0000080u + d * u) >> 8;
-    u64 r = (n * d + 0x8000) >> 16;
+    u64 r = ((u64)n * d + 0x8000) >> 16;
     return r > 0x1FFFF ? 0x1FFFF : (u32)r;
 }
 
@@ -171,23 +189,25 @@ static void rtp(Psx *psx, int v, int sf, int lm, int last)
         else
             z = a;
     }
-    /* IR3: saturated from MAC3, but its flag follows MAC3 >> 12 whatever sf is */
-    MAC(3) = (s32)(z >> sf);
-    s64 z12 = z >> 12;
+    /* IR3: saturated from MAC3, but its flag follows MAC3 >> 12 whatever sf is (z is 44
+     * bits, so z >> 12 fits a word) */
+    s32 m3 = shr_sf(z, sf), z12 = (s32)(z >> 12);
+    MAC(3) = m3;
     if (z12 < -0x8000 || z12 > 0x7FFF)
         flag(psx, 22);
     s32 lo = lm ? 0 : -0x8000;
-    IR(3) = MAC(3) < lo ? lo : MAC(3) > 0x7FFF ? 0x7FFF : MAC(3);
+    IR(3) = m3 < lo ? lo : m3 > 0x7FFF ? 0x7FFF : m3;
     push_sz(psx, z12);
-    u32 q = divide(psx, (u16)C[H], (u32)D[SZ0 + 3]);
+    s32 q = (s32)divide(psx, (u16)C[H], (u32)D[SZ0 + 3]);
+    /* q < 2^17, |IR| <= 2^15: one widening multiply each, and the sums stay under 2^33 */
     s64 sx = (s64)q * IR(1) + C[OFX], sy = (s64)q * IR(2) + C[OFY];
     mac0_chk(psx, sx);
     mac0_chk(psx, sy);
-    push_sxy(psx, sxy_sat(psx, 14, sx >> 16), sxy_sat(psx, 13, sy >> 16));
+    push_sxy(psx, sxy_sat(psx, 14, (s32)(sx >> 16)), sxy_sat(psx, 13, (s32)(sy >> 16)));
     if (last) {
         s64 m = (s64)q * (s16)C[DQA] + C[DQB];
         MAC(0) = mac0_chk(psx, m);
-        s64 i0 = m >> 12;
+        s32 i0 = (s32)(m >> 12);
         if (i0 < 0) {
             flag(psx, 12);
             i0 = 0;
@@ -386,10 +406,11 @@ void gte_command(Psx *psx, u32 cmd)
         break;
     case 0x2D: /* AVSZ3 */
     case 0x2E: { /* AVSZ4 */
-        s64 sum = (cmd & 0x3F) == 0x2D ? (s64)(s16)C[ZSF3] * ((u32)D[SZ0 + 1] + (u32)D[SZ0 + 2] + (u32)D[SZ0 + 3])
-                                       : (s64)(s16)C[ZSF4] * ((u32)D[SZ0] + (u32)D[SZ0 + 1] + (u32)D[SZ0 + 2] + (u32)D[SZ0 + 3]);
+        /* SZ are 16-bit: the sum fits a word, the product 34 bits */
+        s64 sum = (cmd & 0x3F) == 0x2D ? (s64)(s16)C[ZSF3] * (s32)(D[SZ0 + 1] + D[SZ0 + 2] + D[SZ0 + 3])
+                                       : (s64)(s16)C[ZSF4] * (s32)(D[SZ0] + D[SZ0 + 1] + D[SZ0 + 2] + D[SZ0 + 3]);
         MAC(0) = mac0_chk(psx, sum);
-        s64 o = sum >> 12;
+        s32 o = (s32)(sum >> 12);
         if (o < 0) {
             flag(psx, 18);
             o = 0;

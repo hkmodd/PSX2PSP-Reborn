@@ -116,9 +116,11 @@ struct Machine {
     /// `layout::SCRATCH .. layout::END`: scratchpad first.
     hi: Vec<u8>,
     io: Vec<u8>,
-    /// A stand-in GTE: 32 data and 32 control registers, and a command that mixes them.
-    gte: [u32; 64],
 }
+
+/// Byte offset of the GTE registers ([`layout::GTE`]) in [`Machine::hi`]: both sides keep them
+/// there, the oracle with the runtime's write rules and a stand-in command that mixes them.
+const GTE: usize = (layout::GTE - HI) as usize;
 
 impl Machine {
     fn new(x: &PsxExe) -> Self {
@@ -126,7 +128,6 @@ impl Machine {
             ram: vec![0; 0x20_0000],
             hi: vec![0; (layout::END - HI) as usize],
             io: vec![0; 0x2000],
-            gte: [0; 64],
         };
         let o = (x.text_addr & 0x1F_FFFF) as usize;
         m.ram[o..o + x.text.len()].copy_from_slice(&x.text);
@@ -175,7 +176,15 @@ impl Machine {
         if let Some(a) = at(&self.io, &o.io, IO) {
             return Some(format!("I/O at {a:#010x}"));
         }
-        (self.gte != o.gte).then(|| "GTE registers".into())
+        let gte = |m: &Machine| m.hi[GTE..GTE + 0x100].to_vec();
+        (gte(self) != gte(o)).then(|| "GTE registers".into())
+    }
+    /// GTE register `r` (data 0-31, control 32-63) as stored.
+    fn gte(&self, r: usize) -> u32 {
+        rd(&self.hi, GTE + 4 * r, Size::Word)
+    }
+    fn set_gte(&mut self, r: usize, v: u32) {
+        wr(&mut self.hi, GTE + 4 * r, Size::Word, v)
     }
 }
 
@@ -216,17 +225,44 @@ impl Bus for Ps1<'_> {
         wr(b, o, size, value);
         Ok(())
     }
+    /// The runtime's rules (psp/psxrt/core/gte.c).
     fn cop2_read(&mut self, reg: usize) -> Result<u32, Trap> {
-        Ok(self.0.gte[reg])
+        let m = &*self.0;
+        Ok(match reg {
+            15 => m.gte(14),
+            28 | 29 => (0..3).fold(0, |o, k| o | ((m.gte(9 + k) as i32 >> 7).clamp(0, 0x1F) as u32) << (5 * k)),
+            r => m.gte(r),
+        })
     }
-    fn cop2_write(&mut self, reg: usize, value: u32) -> Result<(), Trap> {
-        self.0.gte[reg] = value;
+    fn cop2_write(&mut self, reg: usize, v: u32) -> Result<(), Trap> {
+        let m = &mut *self.0;
+        match reg {
+            1 | 3 | 5 | 8..=11 | 36 | 44 | 52 | 58 | 59 | 61 | 62 => m.set_gte(reg, v as i16 as u32),
+            7 | 16..=19 => m.set_gte(reg, v & 0xFFFF),
+            15 => {
+                m.set_gte(12, m.gte(13));
+                m.set_gte(13, m.gte(14));
+                m.set_gte(14, v);
+            }
+            28 => (0..3).for_each(|k| m.set_gte(9 + k, (v >> (5 * k) & 0x1F) << 7)),
+            29 | 31 => {}
+            30 => {
+                m.set_gte(30, v);
+                m.set_gte(31, if (v as i32) < 0 { !v } else { v }.leading_zeros());
+            }
+            63 => {
+                let f = v & 0x7FFF_F000;
+                m.set_gte(63, if f & 0x7F87_E000 != 0 { f | 0x8000_0000 } else { f });
+            }
+            r => m.set_gte(r, v),
+        }
         Ok(())
     }
     fn cop2_command(&mut self, command: u32) -> Result<(), Trap> {
-        let g = &mut self.0.gte;
+        let m = &mut *self.0;
         for k in 0..32 {
-            g[k] = g[k].rotate_left(5) ^ g[32 + (k + command as usize) % 32] ^ command;
+            let v = m.gte(k).rotate_left(5) ^ m.gte(32 + (k + command as usize) % 32) ^ command;
+            m.set_gte(k, v);
         }
         Ok(())
     }
@@ -336,6 +372,8 @@ struct Log {
     resumed: Option<u32>,
     /// Dispatch misses the interpreter ran (guest targets).
     missed: Vec<u32>,
+    /// GTE commands through [`layout::GTE_CMD`].
+    gte: usize,
 }
 
 /// Runs the translation from guest `init.pc` to `end` on the Allegrex interpreter, at most
@@ -393,6 +431,17 @@ fn run_psp(
             h.jump(g.pc);
             continue;
         }
+        if h.pc == layout::GTE_CMD {
+            // The entry runs the command in k1, restores the guest ra and returns through k1.
+            let ret = h.gpr[RA as usize];
+            log.gte += 1;
+            Ps1(m).cop2_command(h.gpr[K1G as usize] & 0x01FF_FFFF).unwrap();
+            m.set_ctx(ctx::GTE_RET, ret);
+            h.gpr[RA as usize] = m.ctx(ctx::GPR + 4 * RA);
+            h.gpr[K1G as usize] = ret;
+            h.jump(ret);
+            continue;
+        }
         if h.pc == RT_CALL {
             let ra = h.gpr[RA as usize];
             let word_at = |a: u32| code.get(((a - CODE) / 4) as usize).copied().unwrap();
@@ -443,7 +492,8 @@ fn back(g: &Cpu, h: &mut Cpu, m: &mut Machine) {
 }
 
 /// Registers and memory where the translated run `g`/`m2` differs from the oracle's `c`/`m1`;
-/// `ra` and the RAM in `skip` (offsets) are not compared, RAM words pass `same` (`Machine::diff`).
+/// `ra` and the RAM in `skip` (offsets) are not compared, registers and RAM words pass `same`
+/// (`Machine::diff`).
 fn differs(
     c: &Cpu,
     m1: &Machine,
@@ -454,7 +504,7 @@ fn differs(
     same: &dyn Fn(u32, u32) -> bool,
 ) -> Option<String> {
     for r in (1..32).filter(|&r| ra || r != RA as usize) {
-        if g.gpr[r] != c.gpr[r] {
+        if g.gpr[r] != c.gpr[r] && !same(g.gpr[r], c.gpr[r]) {
             return Some(format!("r{r}: translated {:#x}, oracle {:#x}", g.gpr[r], c.gpr[r]));
         }
     }
@@ -577,6 +627,77 @@ fn loads_and_stores_through_every_segment() {
     // Only the I/O accesses reach the runtime.
     let io: Vec<u32> = run.log.calls.keys().copied().collect();
     assert_eq!(io, [at(23), at(24), at(25)]);
+}
+
+/// `mfc2` (`rs` = 0), `cfc2` (2), `mtc2` (4), `ctc2` (6).
+const fn cop2(rs: u32, rt: u32, rd: u32) -> u32 {
+    (0x12 << 26) | (rs << 21) | (rt << 16) | (rd << 11)
+}
+const fn gte_cmd(cmd: u32) -> u32 {
+    (0x12 << 26) | (1 << 25) | cmd
+}
+const LWC2: u32 = 0x32;
+const SWC2: u32 = 0x3A;
+
+#[test]
+fn gte_moves_loads_stores_and_commands_run_inline() {
+    let w = [
+        lui(A0, 0x8002),             // 0
+        addiu(T0, ZERO, -2),         // 1
+        lui(T1, 0x1234),             // 2
+        ori(T1, T1, 0x8765),         // 3  t1 = 0x12348765
+        cop2(4, T1, 0),              // 4  mtc2 VXY0
+        cop2(4, T1, 1),              // 5  mtc2 VZ0: sign-extended
+        cop2(4, T1, 7),              // 6  mtc2 OTZ: zero-extended
+        cop2(4, T0, 15),             // 7  mtc2 SXYP: pushes
+        cop2(4, T1, 15),             // 8
+        cop2(4, T1, 29),             // 9  ORGB: ignored
+        cop2(4, T1, 30),             // 10 LZCS: runtime
+        cop2(4, T1, 28),             // 11 IRGB: runtime
+        cop2(6, T1, 4),              // 12 ctc2 RT33: sign-extended
+        cop2(6, T0, 0),              // 13 ctc2
+        cop2(6, T1, 31),             // 14 ctc2 FLAG: runtime
+        gte_cmd(0x0018_0001),        // 15
+        cop2(0, T2, 15),             // 16 mfc2 SXYP reads SXY2
+        cop2(0, T3, 1),              // 17
+        cop2(0, T4, 29),             // 18 ORGB: runtime
+        cop2(2, T5, 4),              // 19 cfc2
+        cop2(0, ZERO, 3),            // 20
+        mem(SW, T1, 0, A0),          // 21
+        mem(LWC2, 1, 0, A0),         // 22 sign-extended
+        mem(LWC2, 16, 0, A0),        // 23 zero-extended
+        mem(LWC2, 2, 0, A0),         // 24
+        mem(LWC2, 30, 0, A0),        // 25 runtime
+        mem(SWC2, 15, 4, A0),        // 26 SXY2
+        mem(SWC2, 1, 8, A0),         // 27
+        mem(SWC2, 28, 12, A0),       // 28 runtime
+        lui(A1, 0x1F80),             // 29 scratchpad
+        mem(SW, T1, 0x10, A1),       // 30
+        mem(LWC2, 3, 0x10, A1),      // 31
+        mem(SWC2, 9, 0x20, A1),      // 32
+        addu(AT, A0, ZERO),          // 33
+        mem(SWC2, 2, 0x30, AT),      // 34 base at: parks v0 instead
+        ori(A2, A1, 0x1000),         // 35 I/O
+        mem(SWC2, 2, 0, A2),         // 36
+        mem(LWC2, 4, 0, A2),         // 37
+        j(3, 43),                    // 38 jal f
+        gte_cmd(0x0040_0012),        // 39 command in the slot
+        addu(RA, ZERO, ZERO),        // 40 (host and guest return addresses differ)
+        j(2, 46),                    // 41 end
+        NOP,                         // 42
+        mem(SWC2, 0, 0x40, A0),      // 43 f
+        r(8, RA, 0, 0, 0),           // 44 jr ra
+        cop2(0, V1, 14),             // 45 mfc2 in the slot
+        j(2, 46),                    // 46
+        NOP,                         // 47
+    ];
+    let run = check(&w, 41, |c| c.gpr[V0 as usize] = 0x0BAD_F00D, false);
+    let rt: Vec<u32> = run.t.runtime.keys().copied().collect();
+    assert_eq!(rt, [at(10), at(11), at(14), at(18), at(25), at(28)]);
+    assert!(run.t.runtime.values().all(|&r| r == Reason::Cop2));
+    assert_eq!(run.log.gte, 2);
+    let io: Vec<u32> = run.log.calls.keys().copied().filter(|&a| !rt.contains(&a)).collect();
+    assert_eq!(io, [at(36), at(37)]);
 }
 
 /// Calls, returns with a memory access in the slot, a counted loop, a switch through a jump

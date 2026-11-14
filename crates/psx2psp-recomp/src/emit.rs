@@ -11,8 +11,10 @@
 //!   I/O, BIOS and unmapped addresses become a host call that runs the access in the runtime.
 //! * Calls are host calls (`jal` writes a host `ra`, `jr ra` returns natively). A `jal` outside
 //!   the image, `jr` and `jalr` go through the dispatch table.
-//! * COP0, the GTE, `syscall`, `break` and anything touching the guest's `k0`/`k1` run in the
-//!   runtime through a host call and continue after it.
+//! * GTE moves, `lwc2` and `swc2` work directly on the GTE registers at [`layout::GTE`] (but
+//!   for the few registers with unusual rules); GTE commands enter [`layout::GTE_CMD`].
+//! * COP0, the rest of the GTE, `syscall`, `break` and anything touching the guest's `k0`/`k1`
+//!   run in the runtime through a host call and continue after it.
 //! * Anything the translator does not model hands the guest over to the runtime's interpreter
 //!   ("resume"), which comes back to translated code through the dispatch table.
 //! * Loop back-edges charge the loop's estimated PS1 cycles to [`ctx::BUDGET`] first and enter
@@ -37,7 +39,7 @@ use crate::discover::{Discovery, JumpReg};
 use crate::exe::PsxExe;
 use crate::hazard::Hazards;
 use crate::insn::{Insn, Isa, Kind, Uses, decode};
-use crate::layout::{self, RT_CALL, SCRATCH, ctx, k0_off};
+use crate::layout::{self, RT_CALL, SCRATCH, ctx, gte, k0_off};
 
 /// Flag in a host call's `pc` word: interpret from `pc`, do not return.
 pub const RESUME: u32 = 1;
@@ -154,8 +156,14 @@ mod enc {
     pub const fn lui(rt: u32, imm: u16) -> u32 {
         i(0xF, 0, rt, imm)
     }
+    pub const fn lh(rt: u32, off: u16, base: u32) -> u32 {
+        i(0x21, base, rt, off)
+    }
     pub const fn lw(rt: u32, off: u16, base: u32) -> u32 {
         i(0x23, base, rt, off)
+    }
+    pub const fn lhu(rt: u32, off: u16, base: u32) -> u32 {
+        i(0x25, base, rt, off)
     }
     pub const fn sw(rt: u32, off: u16, base: u32) -> u32 {
         i(0x2B, base, rt, off)
@@ -176,6 +184,10 @@ mod enc {
     /// `rt` <- `size` bits of `rs` from bit `pos`.
     pub const fn ext(rt: u32, rs: u32, pos: u32, size: u32) -> u32 {
         (0x1F << 26) | (rs << 21) | (rt << 16) | ((size - 1) << 11) | (pos << 6)
+    }
+    /// `rd` <- low halfword of `rt`, sign-extended.
+    pub const fn seh(rd: u32, rt: u32) -> u32 {
+        (0x1F << 26) | (rt << 16) | (rd << 11) | (0x18 << 6) | 0x20
     }
     /// Bits `pos .. pos + size` of `rt` <- low bits of `rs`.
     pub const fn ins(rt: u32, rs: u32, pos: u32, size: u32) -> u32 {
@@ -512,7 +524,10 @@ impl Em<'_> {
             Div | Divu => self.div(pc, i, k == Div),
             Lb | Lh | Lwl | Lw | Lbu | Lhu | Lwr | Sb | Sh | Swl | Sw | Swr => self.mem(pc, i),
             Mfc0 | Mtc0 | Rfe => self.exec(pc, i.0, Reason::Cop0),
-            Mfc2 | Cfc2 | Mtc2 | Ctc2 | Gte | Lwc2 | Swc2 => self.exec(pc, i.0, Reason::Cop2),
+            Mfc2 | Cfc2 | Mtc2 | Ctc2 | Gte | Lwc2 | Swc2 => match self.cop2(pc, i, k) {
+                Some(c) => c,
+                None => self.exec(pc, i.0, Reason::Cop2),
+            },
             Syscall => self.exec(pc, i.0, Reason::Syscall),
             Break => self.exec(pc, i.0, Reason::Break),
             _ => return (self.resume(pc, Reason::Invalid), false),
@@ -562,9 +577,98 @@ impl Em<'_> {
 
     /// A load or store through the guest address in `k1`.
     fn mem(&mut self, pc: u32, i: Insn) -> Code {
-        let (rs, off) = (i.rs() as u32, i.imm() as u16);
         // Same operation and data register, base k1.
         let op = (i.0 & 0xFC1F_0000) | (K1R << 21);
+        self.access(pc, i, op, &[], &[])
+    }
+
+    /// The GTE without the runtime: moves, loads and stores work on the registers at
+    /// [`layout::GTE`] with the hardware's write rules, commands go through [`layout::GTE_CMD`].
+    /// `None` for the registers whose rules need the runtime (IRGB, ORGB, LZCS, FLAG writes; the
+    /// ORGB/IRGB reads; SXYP and the ignored writes through memory).
+    fn cop2(&mut self, pc: u32, i: Insn, k: Kind) -> Option<Code> {
+        use Kind::*;
+        let (rs, rt, rd) = (i.rs() as u32, i.rt() as u32, i.rd() as u32);
+        let data = |r: u32| k0_off(layout::GTE + gte::data(r));
+        let ctrl = |r: u32| k0_off(layout::GTE + gte::ctrl(r));
+        let gpr = |r: u32| k0_off(layout::CTX + ctx::GPR + 4 * r);
+        let mut c = Code::default();
+        match k {
+            Mfc2 => match rd {
+                28 | 29 => return None,
+                _ if rt == 0 => c.push(NOP),
+                15 => c.push(lw(rt, data(14), K0R)),
+                _ => c.push(lw(rt, data(rd), K0R)),
+            },
+            Cfc2 => c.push(if rt == 0 { NOP } else { lw(rt, ctrl(rd), K0R) }),
+            Mtc2 => match rd {
+                28 | 30 => return None,
+                29 | 31 => c.push(NOP),
+                15 => {
+                    for r in [13, 14] {
+                        c.push(lw(K1R, data(r), K0R));
+                        c.push(sw(K1R, data(r - 1), K0R));
+                    }
+                    c.push(sw(rt, data(14), K0R));
+                }
+                1 | 3 | 5 | 8..=11 => {
+                    c.push(seh(K1R, rt));
+                    c.push(sw(K1R, data(rd), K0R));
+                }
+                7 | 16..=19 => {
+                    c.push(andi(K1R, rt, 0xFFFF));
+                    c.push(sw(K1R, data(rd), K0R));
+                }
+                _ => c.push(sw(rt, data(rd), K0R)),
+            },
+            Ctc2 => match rd {
+                31 => return None,
+                4 | 12 | 20 | 26 | 27 | 29 | 30 => {
+                    c.push(seh(K1R, rt));
+                    c.push(sw(K1R, ctrl(rd), K0R));
+                }
+                _ => c.push(sw(rt, ctrl(rd), K0R)),
+            },
+            Gte => {
+                let cmd = i.0 & 0x01FF_FFFF;
+                c.push(sw(RA, gpr(RA), K0R));
+                c.push(lui(K1R, (cmd >> 16) as u16));
+                c.push(jal(layout::GTE_CMD));
+                c.push(ori(K1R, K1R, cmd as u16));
+            }
+            // The word is loaded into k1, then stored by the register's rule.
+            Lwc2 => {
+                let op = match rt {
+                    15 | 28..=31 => return None,
+                    1 | 3 | 5 | 8..=11 => lh(K1R, 0, K1R),
+                    7 | 16..=19 => lhu(K1R, 0, K1R),
+                    _ => lw(K1R, 0, K1R),
+                };
+                c = self.access(pc, i, op, &[sw(K1R, data(rt), K0R)], &[]);
+            }
+            // The register goes through a guest register parked in its CTX slot.
+            Swc2 => {
+                let src = match rt {
+                    28 | 29 => return None,
+                    15 => 14,
+                    r => r,
+                };
+                let t = if rs == 1 { 2 } else { 1 };
+                c.push(sw(t, gpr(t), K0R));
+                c.push(lw(t, data(src), K0R));
+                c.append(self.access(pc, i, sw(t, 0, K1R), &[], &[lw(t, gpr(t), K0R)]));
+                c.push(lw(t, gpr(t), K0R));
+            }
+            _ => return None,
+        }
+        Some(c)
+    }
+
+    /// `op` (base `k1`, offset 0) on the host address of the guest address of the load or store
+    /// `i`, then `then`. RAM and the scratchpad are reached directly; anything else runs `i` in
+    /// the runtime after `undo`.
+    fn access(&mut self, pc: u32, i: Insn, op: u32, then: &[u32], undo: &[u32]) -> Code {
+        let (rs, off) = (i.rs() as u32, i.imm() as u16);
         let (slow, io, back) = (self.label(), self.label(), self.label());
         let mut c = Code::default();
         c.push(addiu(K1R, rs, off));
@@ -573,6 +677,7 @@ impl Em<'_> {
         c.push(srl(K1R, K1R, 8));
         c.push(ins(K1R, K0R, 21, 11));
         c.push(op);
+        then.iter().for_each(|&w| c.push(w));
         c.def(back);
         // Bit 23 set: scratchpad if bits 10-23 are 0x2000, else the runtime.
         let mut s = Code::default();
@@ -584,9 +689,11 @@ impl Em<'_> {
         s.push(andi(K1R, K1R, 0x3FF));
         s.push(addu(K1R, K1R, K0R));
         s.push(op | k0_off(SCRATCH) as u32);
+        then.iter().for_each(|&w| s.push(w));
         s.jump(2, To::Label(back), pc);
         s.push(NOP);
         s.def(io);
+        undo.iter().for_each(|&w| s.push(w));
         s.host_call(pc, i.0);
         s.jump(2, To::Label(back), pc);
         s.push(NOP);
