@@ -2,6 +2,7 @@
 //! and, translated, on the Allegrex interpreter; registers and memory must match. The test plays
 //! the runtime: it serves host calls, dispatch misses and the interpreter hand-over.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 
 use psx2psp_recomp::emit::RESUME;
@@ -113,7 +114,8 @@ struct Machine {
     /// `layout::SCRATCH .. layout::END`: scratchpad first.
     hi: Vec<u8>,
     io: Vec<u8>,
-    code: Vec<u32>,
+    /// A stand-in GTE: 32 data and 32 control registers, and a command that mixes them.
+    gte: [u32; 64],
 }
 
 impl Machine {
@@ -122,11 +124,20 @@ impl Machine {
             ram: vec![0; 0x20_0000],
             hi: vec![0; (layout::END - HI) as usize],
             io: vec![0; 0x2000],
-            code: Vec::new(),
+            gte: [0; 64],
         };
         let o = (x.text_addr & 0x1F_FFFF) as usize;
         m.ram[o..o + x.text.len()].copy_from_slice(&x.text);
         m
+    }
+    /// Points every dispatch-table entry at the translation, or at [`MISS`].
+    fn table(&mut self, t: &Translation) {
+        for g in (0..0x20_0000).step_by(4) {
+            self.set_word(layout::table_entry(g), MISS);
+        }
+        for (e, v) in t.table() {
+            self.set_word(e, v);
+        }
     }
     fn word(&self, host: u32) -> u32 {
         let o = (host - HI) as usize;
@@ -142,9 +153,26 @@ impl Machine {
     fn set_ctx(&mut self, off: u32, v: u32) {
         self.set_word(layout::CTX + off, v)
     }
-    /// The PS1 side of the memory, for comparisons.
-    fn ps1(&self) -> (&[u8], &[u8], &[u8]) {
-        (&self.ram, &self.hi[..0x400], &self.io)
+    /// Where the PS1 side of two machines differs, RAM in `skip` (word-aligned offsets) aside;
+    /// a RAM word `x` where the oracle has `y` passes when `same(x, y)`.
+    fn diff(&self, o: &Machine, skip: std::ops::Range<usize>, same: &dyn Fn(u32, u32) -> bool) -> Option<String> {
+        let at = |a: &[u8], b: &[u8], base: u32| {
+            a.iter().zip(b).position(|(x, y)| x != y).map(|k| base + k as u32)
+        };
+        let ram = (0..self.ram.len()).step_by(4).filter(|k| !skip.contains(k)).find_map(|k| {
+            let (x, y) = (rd(&self.ram, k, Size::Word), rd(&o.ram, k, Size::Word));
+            (x != y && !same(x, y)).then_some((0x8000_0000 + k as u32, x, y))
+        });
+        if let Some((a, x, y)) = ram {
+            return Some(format!("RAM at {a:#010x}: word {x:#010x}, oracle {y:#010x}"));
+        }
+        if let Some(a) = at(&self.hi[..0x400], &o.hi[..0x400], 0x1F80_0000) {
+            return Some(format!("scratchpad at {a:#010x}"));
+        }
+        if let Some(a) = at(&self.io, &o.io, IO) {
+            return Some(format!("I/O at {a:#010x}"));
+        }
+        (self.gte != o.gte).then(|| "GTE registers".into())
     }
 }
 
@@ -185,10 +213,24 @@ impl Bus for Ps1<'_> {
         wr(b, o, size, value);
         Ok(())
     }
+    fn cop2_read(&mut self, reg: usize) -> Result<u32, Trap> {
+        Ok(self.0.gte[reg])
+    }
+    fn cop2_write(&mut self, reg: usize, value: u32) -> Result<(), Trap> {
+        self.0.gte[reg] = value;
+        Ok(())
+    }
+    fn cop2_command(&mut self, command: u32) -> Result<(), Trap> {
+        let g = &mut self.0.gte;
+        for k in 0..32 {
+            g[k] = g[k].rotate_left(5) ^ g[32 + (k + command as usize) % 32] ^ command;
+        }
+        Ok(())
+    }
 }
 
 /// The machine as the translated code sees it.
-struct Psp<'a>(&'a mut Machine);
+struct Psp<'a>(&'a mut Machine, &'a [u32]);
 
 impl Bus for Psp<'_> {
     fn load(&mut self, addr: u32, size: Size) -> Result<u32, Trap> {
@@ -196,8 +238,8 @@ impl Bus for Psp<'_> {
         match addr {
             layout::RAM..0x09A0_0000 => Ok(rd(&m.ram, (addr - layout::RAM) as usize, size)),
             HI..layout::END => Ok(rd(&m.hi, (addr - HI) as usize, size)),
-            a if a >= CODE && ((a - CODE) / 4) < m.code.len() as u32 && size == Size::Word => {
-                Ok(m.code[((a - CODE) / 4) as usize])
+            a if a >= CODE && ((a - CODE) / 4) < self.1.len() as u32 && size == Size::Word => {
+                Ok(self.1[((a - CODE) / 4) as usize])
             }
             _ => Err(Trap::Bus { addr }),
         }
@@ -218,14 +260,58 @@ fn syscall(c: &mut Cpu) {
     c.gpr[V0 as usize] = c.gpr[A0 as usize] ^ 0x5C;
 }
 
-/// Runs the guest from `c.pc` to `end` on the R3000A interpreter.
-fn run_ps1(m: &mut Machine, c: &mut Cpu, end: u32) -> Result<(), String> {
-    for _ in 0..100_000 {
-        if c.pc == end && c.next_pc == end + 4 {
+/// What the test's BIOS returns in `v0` for a call to the A0/B0/C0 vector `target`, or `None`
+/// for any other address.
+fn bios(target: u32, c: &Cpu) -> Option<u32> {
+    let v = target & 0x1FFF_FFFF;
+    matches!(v, 0xA0 | 0xB0 | 0xC0)
+        .then(|| (v << 8) ^ c.gpr[T1 as usize].wrapping_mul(0x9E37) ^ c.gpr[A0 as usize])
+}
+
+/// Where a run stops: a guest address for the R3000A, a host address for the translation (the
+/// return address of a translated function under test is a host address).
+#[derive(Clone, Copy)]
+struct End {
+    guest: u32,
+    host: u32,
+    /// End of the translated code: the interpreter hands back to it at a host address.
+    code: u32,
+}
+
+/// Why the oracle could not run a program to its end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fault {
+    Trap(Trap),
+    /// A jump into the BIOS area other than its call vectors (a null function pointer).
+    Kernel(u32),
+    Budget,
+}
+
+fn arrived(c: &Cpu, a: u32) -> bool {
+    c.pc == a && c.next_pc == a.wrapping_add(4)
+}
+
+/// Runs the guest from `c.pc` on the R3000A interpreter, at most `budget` steps, until `end` or a
+/// host code address (where the runtime's interpreter hands back to translated code). Returns
+/// the steps taken.
+fn run_ps1(m: &mut Machine, c: &mut Cpu, end: End, budget: usize) -> Result<usize, Fault> {
+    for n in 0..budget {
+        if arrived(c, end.guest) || arrived(c, end.host) || (CODE..end.code).contains(&c.pc) {
             if let Some((r, v)) = c.pending.take() {
                 c.gpr[r] = v;
             }
-            return Ok(());
+            return Ok(n);
+        }
+        if c.pc & 0x1FFF_FFFF < 0x1_0000 && bios(c.pc, c).is_none() {
+            return Err(Fault::Kernel(c.pc));
+        }
+        if let Some(v) = bios(c.pc, c) {
+            if let Some((r, v)) = c.pending.take() {
+                c.gpr[r] = v;
+            }
+            c.gpr[V0 as usize] = v;
+            c.jump(c.gpr[RA as usize]);
+            continue;
         }
         match c.step(&mut Ps1(m)) {
             Ok(()) => {}
@@ -233,10 +319,10 @@ fn run_ps1(m: &mut Machine, c: &mut Cpu, end: u32) -> Result<(), String> {
                 syscall(c);
                 c.jump(pc + 4);
             }
-            Err(s) => return Err(format!("oracle stopped: {s:x?}")),
+            Err(s) => return Err(Fault::Trap(s.trap)),
         }
     }
-    Err("oracle did not reach the end".into())
+    Err(Fault::Budget)
 }
 
 /// What happened on the translated side besides plain execution.
@@ -245,19 +331,21 @@ struct Log {
     calls: BTreeMap<u32, usize>,
     polls: usize,
     resumed: Option<u32>,
+    /// Dispatch misses the interpreter ran (guest targets).
+    missed: Vec<u32>,
 }
 
-/// Runs the translation from guest `entry` to guest `end` on the Allegrex interpreter. Returns
-/// the guest state at the end.
-fn run_psp(m: &mut Machine, t: &Translation, init: &Cpu, end: u32) -> Result<(Cpu, Log), String> {
-    m.code = t.words.clone();
-    for g in (0..0x20_0000).step_by(4) {
-        m.set_word(layout::table_entry(g), MISS);
-    }
-    for (e, v) in t.table() {
-        m.set_word(e, v);
-    }
-    let end_host = t.host(end).ok_or("end not translated")?;
+/// Runs the translation from guest `init.pc` to `end` on the Allegrex interpreter, at most
+/// `budget` steps; `m` holds the dispatch table ([`Machine::table`]). Returns the guest state at
+/// the end.
+fn run_psp(
+    m: &mut Machine,
+    t: &Translation,
+    init: &Cpu,
+    end: End,
+    budget: usize,
+) -> Result<(Cpu, Log), String> {
+    let code = &t.words[..];
     let mut h = Cpu::new(Isa::Allegrex, t.host(init.pc).ok_or("entry not translated")?);
     h.gpr = init.gpr;
     h.hi = init.hi;
@@ -277,23 +365,41 @@ fn run_psp(m: &mut Machine, t: &Translation, init: &Cpu, end: u32) -> Result<(Cp
         g.hi = h.hi;
         g.lo = h.lo;
     };
-    for _ in 0..200_000 {
-        if h.pc == end_host && h.next_pc == end_host + 4 {
+    for _ in 0..budget {
+        if arrived(&h, end.host) {
             to_guest(&h, m, &mut g);
             return Ok((g, log));
         }
         if h.pc == MISS {
-            return Err(format!("dispatch miss to {:#010x}", m.ctx(ctx::TARGET)));
+            let target = m.ctx(ctx::TARGET);
+            if let Some(v) = bios(target, &h) {
+                h.gpr[V0 as usize] = v;
+                h.jump(h.gpr[RA as usize]);
+                continue;
+            }
+            // The runtime interprets from the target until the code returns to a host address.
+            log.missed.push(target);
+            to_guest(&h, m, &mut g);
+            g.jump(target);
+            run_ps1(m, &mut g, end, budget)
+                .map_err(|f| format!("interpreter stopped after a miss to {target:#010x}: {f:x?}"))?;
+            if arrived(&g, end.guest) || arrived(&g, end.host) {
+                return Ok((g, log));
+            }
+            back(&g, &mut h, m);
+            h.jump(g.pc);
+            continue;
         }
         if h.pc == RT_CALL {
             let ra = h.gpr[RA as usize];
-            let (pc, word) = (Psp(m).load(ra, Size::Word).unwrap(), Psp(m).load(ra + 4, Size::Word).unwrap());
+            let word_at = |a: u32| code.get(((a - CODE) / 4) as usize).copied().unwrap();
+            let (pc, word) = (word_at(ra), word_at(ra + 4));
             h.gpr[RA as usize] = m.ctx(ctx::GPR + 4 * RA);
             to_guest(&h, m, &mut g);
             if pc & RESUME != 0 {
                 log.resumed = Some(pc & !RESUME);
                 g.jump(pc & !RESUME);
-                run_ps1(m, &mut g, end)?;
+                run_ps1(m, &mut g, end, budget).map_err(|f| format!("interpreter stopped: {f:x?}"))?;
                 return Ok((g, log));
             }
             if m.ctx(ctx::IRQ) != 0 {
@@ -313,19 +419,46 @@ fn run_psp(m: &mut Machine, t: &Translation, init: &Cpu, end: u32) -> Result<(Cp
                     g.gpr[r] = v;
                 }
             }
-            h.gpr = g.gpr;
-            h.gpr[K0G as usize] = K0;
-            for r in [K0G, K1G] {
-                m.set_ctx(ctx::GPR + 4 * r, g.gpr[r as usize]);
-            }
-            h.hi = g.hi;
-            h.lo = g.lo;
+            back(&g, &mut h, m);
             h.jump(ra + 8);
             continue;
         }
-        h.step(&mut Psp(m)).map_err(|s| format!("translated code stopped: {s:x?}"))?;
+        h.step(&mut Psp(m, code)).map_err(|s| format!("translated code stopped: {s:x?}"))?;
     }
     Err("translated code did not reach the end".into())
+}
+
+/// The guest state `g` back into the translated code's registers and context.
+fn back(g: &Cpu, h: &mut Cpu, m: &mut Machine) {
+    h.gpr = g.gpr;
+    h.gpr[K0G as usize] = K0;
+    for r in [K0G, K1G] {
+        m.set_ctx(ctx::GPR + 4 * r, g.gpr[r as usize]);
+    }
+    h.hi = g.hi;
+    h.lo = g.lo;
+}
+
+/// Registers and memory where the translated run `g`/`m2` differs from the oracle's `c`/`m1`;
+/// `ra` and the RAM in `skip` (offsets) are not compared, RAM words pass `same` (`Machine::diff`).
+fn differs(
+    c: &Cpu,
+    m1: &Machine,
+    g: &Cpu,
+    m2: &Machine,
+    ra: bool,
+    skip: std::ops::Range<usize>,
+    same: &dyn Fn(u32, u32) -> bool,
+) -> Option<String> {
+    for r in (1..32).filter(|&r| ra || r != RA as usize) {
+        if g.gpr[r] != c.gpr[r] {
+            return Some(format!("r{r}: translated {:#x}, oracle {:#x}", g.gpr[r], c.gpr[r]));
+        }
+    }
+    if (g.hi, g.lo) != (c.hi, c.lo) {
+        return Some(format!("hi/lo: translated {:#x}/{:#x}, oracle {:#x}/{:#x}", g.hi, g.lo, c.hi, c.lo));
+    }
+    m2.diff(m1, skip, same)
 }
 
 struct Run {
@@ -345,19 +478,16 @@ fn check(words: &[u32], end: u32, init: impl Fn(&mut Cpu), irq: bool) -> Run {
     let start = c.clone();
     let mut m1 = Machine::new(&x);
     let mut m2 = m1.clone();
-    run_ps1(&mut m1, &mut c, at(end)).unwrap();
+    m2.table(&t);
+    let end = End { guest: at(end), host: t.host(at(end)).unwrap(), code: CODE + 4 * t.words.len() as u32 };
+    run_ps1(&mut m1, &mut c, end, 100_000).unwrap();
     if irq {
         m2.set_ctx(ctx::IRQ, 1);
     }
-    let (g, log) = run_psp(&mut m2, &t, &start, at(end)).unwrap();
-    for r in 1..32 {
-        assert_eq!(g.gpr[r], c.gpr[r], "r{r}: translated {:#x}, oracle {:#x}", g.gpr[r], c.gpr[r]);
+    let (g, log) = run_psp(&mut m2, &t, &start, end, 200_000).unwrap();
+    if let Some(d) = differs(&c, &m1, &g, &m2, true, 0..0, &|_, _| false) {
+        panic!("{d}");
     }
-    assert_eq!((g.hi, g.lo), (c.hi, c.lo), "hi/lo");
-    let ((r1, s1, i1), (r2, s2, i2)) = (m1.ps1(), m2.ps1());
-    assert!(r1 == r2, "RAM differs");
-    assert!(s1 == s2, "scratchpad differs");
-    assert!(i1 == i2, "I/O differs");
     Run { t, log }
 }
 
@@ -637,4 +767,121 @@ fn real_executables_translate() {
     }
     println!("total | {guest} | {host} | {:.2}", host as f64 / guest as f64);
     println!("{total:?}");
+}
+
+/// Name of a fault's kind, for counting.
+fn kind(f: Fault) -> String {
+    let s = format!("{f:?}");
+    s.trim_start_matches("Trap(").split(|c: char| !c.is_alphanumeric()).next().unwrap().to_string()
+}
+
+/// Runs every function of a real executable from a synthetic state (pointer arguments into a
+/// zeroed buffer, BIOS calls served alike on both sides), on the oracle and translated, and
+/// compares registers and memory at the return:
+/// `PSX2PSP_EXES=<dir> cargo test --release -p psx2psp-recomp --test emit real_functions -- --ignored --nocapture`
+/// (`PSX2PSP_EXE` picks the executable, LEV00.EXE by default). Functions the oracle cannot run
+/// to their return (bus errors on synthetic pointers, waits on hardware) are counted, not
+/// compared.
+#[test]
+#[ignore = "needs PSX2PSP_EXES"]
+fn real_functions_match_the_oracle() {
+    /// Return address given to the function: BIOS RAM, never code.
+    const RETURN: u32 = 0x8000_0F00;
+    /// Its host counterpart, below the translated code.
+    const HOST_RETURN: u32 = 0x0880_0000;
+    const STACK_TOP: u32 = 0x801F_FF00;
+    /// The stack below `STACK_TOP` is dead after the return, and holds host return addresses
+    /// on the translated side: not compared.
+    const STACK: u32 = 0x801E_0000;
+    let dir = std::env::var("PSX2PSP_EXES").expect("PSX2PSP_EXES");
+    let name = std::env::var("PSX2PSP_EXE").unwrap_or_else(|_| "LEV00.EXE".into());
+    let x = PsxExe::parse(&std::fs::read(std::path::Path::new(&dir).join(&name)).unwrap()).unwrap();
+    let d = Discovery::run(&x);
+    let hz = Hazards::check(&x, &d);
+    let t = translate(&x, &d, &hz, CODE).unwrap();
+    let mut base = Machine::new(&x);
+    base.table(&t);
+    let top = (x.text_addr + x.text.len() as u32).max(x.bss.0 + x.bss.1);
+    let buf = (top + 0xFFF) & !0xFFF;
+    assert!(buf + 0x2000 <= STACK, "no room for the argument buffer");
+    let end = End { guest: RETURN, host: HOST_RETURN, code: CODE + 4 * t.words.len() as u32 };
+    let skip = (STACK & 0x1F_FFFF) as usize..(STACK_TOP & 0x1F_FFFF) as usize;
+    let mut faults = BTreeMap::<String, usize>::new();
+    let (mut identical, mut steps) = (0usize, 0usize);
+    let mut bad = Vec::new();
+    let mut missed = std::collections::BTreeSet::new();
+    // Words that are the same value seen from each side. A return address the code stores
+    // (setjmp's jmp_buf) is the host address of the same return point: longjmp returns through
+    // it with `jr ra`, which stays native. A word read from stack nobody initialised may carry
+    // the stale upper half of an old return address: garbage on any system, so the same
+    // garbage translated (low half equal, upper halves in guest and host code).
+    let half = |a: u32, n: u32| (a >> 16)..=((a + n - 1) >> 16);
+    let (guest_hi, host_hi) = (half(x.text_addr, x.text.len() as u32), half(CODE, 4 * t.words.len() as u32));
+    let (returns, stale) = (Cell::new(false), Cell::new(false));
+    let same = |w: u32, o: u32| {
+        if o == RETURN && w == HOST_RETURN || t.host(o) == Some(w) {
+            returns.set(true);
+        } else if w & 0xFFFF == o & 0xFFFF && guest_hi.contains(&(o >> 16)) && host_hi.contains(&(w >> 16)) {
+            stale.set(true);
+        } else {
+            return false;
+        }
+        true
+    };
+    let (mut with_returns, mut with_stale) = (Vec::new(), Vec::new());
+    let funcs: Vec<u32> = d.entries.keys().copied().filter(|&f| t.host(f).is_some()).collect();
+    for &f in &funcs {
+        let mut c = Cpu::new(Isa::R3000A, f);
+        for r in 1..32 {
+            c.gpr[r] = buf + 0x40 * r as u32;
+        }
+        c.gpr[28] = x.gp0;
+        c.gpr[SP as usize] = STACK_TOP;
+        c.gpr[RA as usize] = RETURN;
+        let mut start = c.clone();
+        start.gpr[RA as usize] = HOST_RETURN;
+        let mut m1 = base.clone();
+        let n = match run_ps1(&mut m1, &mut c, end, 200_000) {
+            Ok(n) => n,
+            Err(e) => {
+                *faults.entry(kind(e)).or_default() += 1;
+                continue;
+            }
+        };
+        steps += n;
+        let mut m2 = base.clone();
+        returns.set(false);
+        stale.set(false);
+        let why = match run_psp(&mut m2, &t, &start, end, 40 * n + 10_000) {
+            Ok((g, log)) => {
+                missed.extend(log.missed);
+                differs(&c, &m1, &g, &m2, false, skip.clone(), &same)
+            }
+            Err(e) => Some(e),
+        };
+        match why {
+            None => identical += 1,
+            Some(w) => bad.push((f, w)),
+        }
+        if returns.get() {
+            with_returns.push(f);
+        }
+        if stale.get() {
+            with_stale.push(f);
+        }
+    }
+    println!(
+        "{name}: {} functions; {} compared ({steps} guest steps): {identical} identical, {} different; \
+         not run by the oracle: {faults:?}",
+        funcs.len(),
+        identical + bad.len(),
+        bad.len(),
+    );
+    println!("dispatch misses run by the interpreter: {missed:x?}");
+    println!("stored host return addresses: {with_returns:x?}");
+    println!("stale return-address halves from uninitialised stack: {with_stale:x?}");
+    for (f, why) in bad.iter().take(30) {
+        println!("  {f:#010x}: {why}");
+    }
+    assert!(bad.is_empty(), "{} functions differ", bad.len());
 }
