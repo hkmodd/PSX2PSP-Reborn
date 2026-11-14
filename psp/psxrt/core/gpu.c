@@ -521,19 +521,22 @@ static void draw(Psx *psx);
 
 static void execute(Psx *psx)
 {
+    /* the clock may be a syscall: one command in 16 is timed, its time scaled */
+    static u32 n;
     const PsxHost *h = psx->host;
-    if (!h->usec) {
+    u32 cmd = psx->gpu.cmd[0] >> 24;
+    int k = cmd >= 0x20 && cmd < 0x40 ? 0 : cmd >= 0x40 && cmd < 0x60 ? 1 : cmd >= 0x60 && cmd < 0x80 ? 2
+          : cmd >= 0x80 && cmd < 0xA0 ? 3 : cmd == 0x02 ? 4 : 5;
+    psx->gpu.n_kind[k]++;
+    if (!h->usec || n++ % 16) {
         draw(psx);
         return;
     }
-    u32 t = h->usec(h->user), cmd = psx->gpu.cmd[0] >> 24;
+    u32 t = h->usec(h->user);
     draw(psx);
-    t = h->usec(h->user) - t;
-    int k = cmd >= 0x20 && cmd < 0x40 ? 0 : cmd >= 0x40 && cmd < 0x60 ? 1 : cmd >= 0x60 && cmd < 0x80 ? 2
-          : cmd >= 0x80 && cmd < 0xA0 ? 3 : cmd == 0x02 ? 4 : 5;
+    t = (h->usec(h->user) - t) * 16;
     psx->gpu.us_draw += t;
     psx->gpu.us_kind[k] += t;
-    psx->gpu.n_kind[k]++;
 }
 
 static void draw(Psx *psx)

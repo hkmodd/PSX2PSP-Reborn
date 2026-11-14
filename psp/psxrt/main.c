@@ -341,9 +341,9 @@ static void frame(void)
             int n = snprintf(line, sizeof line, "-- %s\n", status);
             if (native) {
                 const NativeStats *s = &native_stats;
-                n += snprintf(line + n, sizeof line - (size_t)n, "-- native: %u calls, %u misses, %u steps, %u hashes, %u loads\n",(unsigned)(s->calls - n0.calls),
+                n += snprintf(line + n, sizeof line - (size_t)n, "-- native: %u calls, %u misses, %u steps, %u hashes, %u loads, %u poll skips\n",(unsigned)(s->calls - n0.calls),
                               (unsigned)(s->misses - n0.misses), (unsigned)(s->steps - n0.steps), (unsigned)(s->hashes - n0.hashes),
-                              (unsigned)s->loads);
+                              (unsigned)s->loads, (unsigned)(s->poll_skips - n0.poll_skips));
                 n += snprintf(line + n, sizeof line - (size_t)n,
                               "-- ms: interp %u io %u (draw %u mdec %u) update %u present %u (rgb24 %u) sleep %u\n",
                               (unsigned)((s->us_interp - n0.us_interp) / 1000), (unsigned)((s->us_io - n0.us_io) / 1000),

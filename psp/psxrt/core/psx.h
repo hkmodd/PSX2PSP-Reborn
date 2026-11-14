@@ -423,6 +423,9 @@ void timer_write(Psx *psx, u32 addr, u32 v);
 void timers_update(Psx *psx);
 u64 timers_next(Psx *psx);
 void timers_hblank_mode(Psx *psx);
+/* CPU cycles per tick of the counter at addr (a count register), 0 for other addresses or a
+ * stopped counter: how far time may jump between two reads without the reader missing a value */
+u32 timer_tick(Psx *psx, u32 addr);
 
 /* cdrom.c */
 u8 cd_read(Psx *psx, int reg);

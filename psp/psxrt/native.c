@@ -64,6 +64,10 @@
 /* Lateness kept before PS1 time slows down: two PAL frames, so that a slow frame's lateness is
  * paid back by the next vsync wait instead of being slept through. */
 #define BEHIND_MAX (PSX_CLOCK / 25)
+/* A clock read is a syscall (~165-250 cycles): the clock is compared once per 0.5 ms of PS1
+ * time, and the profile times one call in PROF_EVERY, scaled. */
+#define SYNC_STEP (PSX_CLOCK / 2000)
+#define PROF_EVERY 16u
 #define HEAD_LEN 2048u              /* bytes of text under CodeEntry.head_hash */
 
 /* trampolines.S */
@@ -264,6 +268,10 @@ static void on_ram_loaded(Psx *psx, u32 addr, u32 len)
 /* ---- time ---- */
 static void sync_time(void)
 {
+    static u64 last;
+    if (P->cycles - last < SYNC_STEP)
+        return;
+    last = P->cycles;
     u64 now = sceKernelGetSystemTimeWide(), clock = c_base + (now - t_base) * 338688u / 10000u;
     if (P->cycles + BEHIND_MAX < clock) /* the host fell behind: PS1 time slows down, never skips */
         c_base = P->cycles + BEHIND_MAX, t_base = now;
@@ -276,9 +284,14 @@ static void sync_time(void)
 
 static void update(void)
 {
+    static u32 n;
+    if (n++ % PROF_EVERY) {
+        psx_update(P);
+        return;
+    }
     u32 t = sceKernelGetSystemTimeLow();
     psx_update(P);
-    native_stats.us_update += sceKernelGetSystemTimeLow() - t;
+    native_stats.us_update += (sceKernelGetSystemTimeLow() - t) * PROF_EVERY;
 }
 
 /* At every entry from translated code: the cycles its loops spent join the count, and the
@@ -324,9 +337,12 @@ static u32 interp(int mode);
 
 static u32 run_guest(int mode)
 {
+    static u32 n;
+    if (n++ % PROF_EVERY)
+        return interp(mode);
     u32 t = sceKernelGetSystemTimeLow();
     u32 h = interp(mode);
-    native_stats.us_interp += sceKernelGetSystemTimeLow() - t;
+    native_stats.us_interp += (sceKernelGetSystemTimeLow() - t) * PROF_EVERY;
     return h;
 }
 
@@ -362,17 +378,9 @@ static u32 interp(int mode)
     }
 }
 
-/* What a host-call instruction touches, for the per-device times in the log. */
-static int io_kind(const Cpu *c, u32 insn)
+/* The device at a physical address, for the per-device times in the log. */
+static int io_kind_at(u32 a)
 {
-    u32 op = insn >> 26;
-    if (op == 0x12 || op == 0x32 || op == 0x3A)
-        return IO_GTE;
-    if (op == 0x10)
-        return IO_COP0;
-    if (op < 0x20)
-        return IO_OTHER;
-    u32 a = (c->gpr[(insn >> 21) & 31] + (u32)(s32)(s16)insn) & 0x1FFFFFFFu;
     if (a >= 0x1F801810 && a < 0x1F801818)
         return IO_GPU;
     if (a >= 0x1F801080 && a < 0x1F801100)
@@ -390,6 +398,19 @@ static int io_kind(const Cpu *c, u32 insn)
     if (a >= 0x1F801040 && a < 0x1F801060)
         return IO_PAD;
     return IO_OTHER;
+}
+
+/* What a host-call instruction touches. */
+static int io_kind(const Cpu *c, u32 insn)
+{
+    u32 op = insn >> 26;
+    if (op == 0x12 || op == 0x32 || op == 0x3A)
+        return IO_GTE;
+    if (op == 0x10)
+        return IO_COP0;
+    if (op < 0x20)
+        return IO_OTHER;
+    return io_kind_at((c->gpr[(insn >> 21) & 31] + (u32)(s32)(s16)insn) & 0x1FFFFFFFu);
 }
 
 /* GTE instructions run straight on the guest registers in CTX: they touch no device, need no
@@ -434,6 +455,99 @@ static int gte_fast(u32 insn)
     return 1;
 }
 
+/* Before a timer read: a loop that polls a counter (a game spinning on VSync(-1), whose stable
+ * read of the hblank counter repeats until two reads agree) lets PS1 time pass instead of
+ * spinning a host call per few dozen cycles. The loop's site is the first read after a pause of
+ * POLL_PAIR cycles or more (a read right after another is the second half of a stable read, and
+ * time must not move between the two). From its fourth return less than POLL_GAP cycles after
+ * the last, the clock moves on to one tick of the counter after that previous read, never past
+ * the next device event: counts derive from the clock and no value is stepped over, so an
+ * equality test still sees its value. */
+#define POLL_PAIR 16u
+#define POLL_GAP 2048u
+static void poll_skip(u32 pc, u32 addr)
+{
+    static u32 hot, streak;
+    static u64 hot_at, last_at;
+    u32 tick = timer_tick(P, addr);
+    u64 now = P->cycles, since = now - last_at;
+    last_at = now;
+    if (!tick)
+        return;
+    if (pc != hot) {
+        if (since >= POLL_PAIR)
+            hot = pc, hot_at = now, streak = 0;
+        return;
+    }
+    u64 period = now - hot_at;
+    hot_at = now;
+    if (period >= POLL_GAP) {
+        streak = 0;
+        return;
+    }
+    if (++streak >= 4 && tick > period && P->next_event > now) {
+        u64 d = P->next_event - now, s = tick - period;
+        P->cycles += d < s ? d : s;
+        hot_at = last_at = P->cycles;
+        native_stats.poll_skips++;
+    }
+}
+
+/* Loads and stores on device registers run straight on the guest registers in CTX, like the GTE
+ * instructions: no CPU state copy and no interpreter. Not when a device event is due or an
+ * interrupt pending (the full path serves those first); an interrupt the access raises is taken
+ * after it, as on the full path. 0 if the full path must run the instruction. */
+static int io_fast(u32 pc, u32 insn, u32 back, u32 *next)
+{
+    u32 op = insn >> 26, rs = (insn >> 21) & 31, rt = (insn >> 16) & 31;
+    int size;
+    switch (op) {
+    case 0x20: case 0x24: case 0x28: size = 1; break;
+    case 0x21: case 0x25: case 0x29: size = 2; break;
+    case 0x23: case 0x2B: size = 4; break;
+    default: return 0;
+    }
+    u32 a = (rs ? ctx[rs] : 0) + (u32)(s32)(s16)insn, p = a & 0x1FFFFFFFu;
+    if ((a & (u32)(size - 1)) || p < 0x1F801000 || p >= 0x1F803000)
+        return 0;
+    charge();
+    sync_time();
+    if (P->cycles >= P->next_event || psx_irq_pending(P))
+        return 0;
+    static u32 n;
+    int kind = io_kind_at(p), timed = !(n++ % PROF_EVERY);
+    u32 t = timed ? sceKernelGetSystemTimeLow() : 0;
+    if (op < 0x28) {
+        if (kind == IO_TIMER)
+            poll_skip(pc, p);
+        u32 v = psx_read(P, a, size);
+        if (op == 0x20)
+            v = (u32)(s32)(s8)v;
+        else if (op == 0x21)
+            v = (u32)(s32)(s16)v;
+        if (rt)
+            ctx[rt] = v;
+    } else
+        psx_write(P, a, rt ? ctx[rt] : 0, size);
+    P->cycles += 2;
+    if (timed) {
+        t = (sceKernelGetSystemTimeLow() - t) * PROF_EVERY;
+        native_stats.us_io += t;
+        native_stats.us_io_kind[kind] += t;
+    }
+    native_stats.calls++;
+    native_stats.n_io[kind]++;
+    *next = back;
+    if (psx_irq_pending(P)) {
+        Cpu *c = &P->cpu;
+        from_ctx(c);
+        jump(c, back);
+        cpu_exception(P, 0, c->pc, 0);
+        *next = to_ctx(c, run_guest(0));
+    }
+    return 1;
+}
+
 /* ---- entries from trampolines.S ---- */
 
 /* A GTE command from translated code (GTE_CMD): no guest state copy, no interrupt service. */
@@ -456,6 +570,9 @@ u32 native_rt_call(const u32 *site)
         native_stats.n_io[IO_GTE]++;
         return back;
     }
+    u32 next;
+    if (!(pc & RESUME) && op >= 0x20 && io_fast(pc, insn, back, &next))
+        return next;
     from_ctx(c);
     charge();
     native_stats.calls++;
@@ -484,13 +601,18 @@ u32 native_rt_call(const u32 *site)
         if (!told++)
             say("native: host call at %08X: RAM %08X, translated %08X", (unsigned)pc, (unsigned)ram_r32(P, pc), (unsigned)insn);
     }
-    int kind = io_kind(c, insn);
-    u32 t = sceKernelGetSystemTimeLow();
+    static u32 n;
+    int kind = io_kind(c, insn), timed = !(n++ % PROF_EVERY);
+    if (kind == IO_TIMER && insn >> 29 == 4) /* loads */
+        poll_skip(pc, (c->gpr[(insn >> 21) & 31] + (u32)(s32)(s16)insn) & 0x1FFFFFFFu);
+    u32 t = timed ? sceKernelGetSystemTimeLow() : 0;
     if (cpu_step(P) < 0)
         P->exiting = 2;
-    t = sceKernelGetSystemTimeLow() - t;
-    native_stats.us_io += t;
-    native_stats.us_io_kind[kind] += t;
+    if (timed) {
+        t = (sceKernelGetSystemTimeLow() - t) * PROF_EVERY;
+        native_stats.us_io += t;
+        native_stats.us_io_kind[kind] += t;
+    }
     native_stats.n_io[kind]++;
     finish_load(c);
     if (c->pc == pc + 4 && !c->in_delay)

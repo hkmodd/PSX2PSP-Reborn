@@ -108,6 +108,14 @@ u64 timers_next(Psx *psx)
 
 void timers_hblank_mode(Psx *psx) { (void)psx; }
 
+u32 timer_tick(Psx *psx, u32 addr)
+{
+    int i = (addr >> 4) & 3;
+    if (i > 2 || (addr & 0xF) || paused(psx, i))
+        return 0;
+    return (u32)(cpt(psx, i) >> 16);
+}
+
 u32 timer_read(Psx *psx, u32 addr)
 {
     int i = (addr >> 4) & 3;
