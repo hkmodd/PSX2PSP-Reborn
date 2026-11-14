@@ -356,6 +356,78 @@ static u32 interp(int mode)
     }
 }
 
+/* What a host-call instruction touches, for the per-device times in the log. */
+static int io_kind(const Cpu *c, u32 insn)
+{
+    u32 op = insn >> 26;
+    if (op == 0x12 || op == 0x32 || op == 0x3A)
+        return IO_GTE;
+    if (op == 0x10)
+        return IO_COP0;
+    if (op < 0x20)
+        return IO_OTHER;
+    u32 a = (c->gpr[(insn >> 21) & 31] + (u32)(s32)(s16)insn) & 0x1FFFFFFFu;
+    if (a >= 0x1F801810 && a < 0x1F801818)
+        return IO_GPU;
+    if (a >= 0x1F801080 && a < 0x1F801100)
+        return IO_DMA;
+    if (a >= 0x1F801800 && a < 0x1F801804)
+        return IO_CD;
+    if (a >= 0x1F801C00 && a < 0x1F802000)
+        return IO_SPU;
+    if (a >= 0x1F801100 && a < 0x1F801130)
+        return IO_TIMER;
+    if (a >= 0x1F801070 && a < 0x1F801078)
+        return IO_IRQ;
+    if (a >= 0x1F801820 && a < 0x1F801828)
+        return IO_MDEC;
+    if (a >= 0x1F801040 && a < 0x1F801060)
+        return IO_PAD;
+    return IO_OTHER;
+}
+
+/* GTE instructions run straight on the guest registers in CTX: they touch no device, need no
+ * clock and take no interrupt, so a host call for one skips the CPU state copy and the
+ * interpreter. LWC2/SWC2 here only reach RAM and the scratchpad, aligned; 0 if the full path
+ * must run the instruction. */
+static int gte_fast(u32 insn)
+{
+    u32 op = insn >> 26, rs = (insn >> 21) & 31, rt = (insn >> 16) & 31, rd = (insn >> 11) & 31;
+    u32 vs = rs ? ctx[rs] : 0, vt = rt ? ctx[rt] : 0;
+    if (op == 0x12) {
+        if (rs & 0x10) {
+            gte_command(P, insn & 0x1FFFFFF);
+            P->cycles += 10;
+            return 1;
+        }
+        switch (rs) {
+        case 0x00: if (rt) ctx[rt] = gte_read_data(P, (int)rd); break;
+        case 0x02: if (rt) ctx[rt] = gte_read_ctrl(P, (int)rd); break;
+        case 0x04: gte_write_data(P, (int)rd, vt); break;
+        case 0x06: gte_write_ctrl(P, (int)rd, vt); break;
+        default: return 0;
+        }
+        P->cycles += 2;
+        return 1;
+    }
+    u32 a = vs + (u32)(s32)(s16)insn, p = a & 0x1FFFFFFFu;
+    u32 *m;
+    if ((a & 3) || (P->cpu.sr & 0x10000))
+        return 0;
+    if (p < 0x800000)
+        m = (u32 *)(P->ram + (p & (RAM_SIZE - 1)));
+    else if (p >= 0x1F800000 && p < 0x1F800400)
+        m = (u32 *)(P->scratch + (p & 0x3FF));
+    else
+        return 0;
+    if (op == 0x32)
+        gte_write_data(P, (int)rt, *m);
+    else
+        *m = gte_read_data(P, (int)rt);
+    P->cycles += 2;
+    return 1;
+}
+
 /* ---- entries from trampolines.S ---- */
 
 /* Host call at `site` (the address of its .word pc, .word insn): returns where to go on. */
@@ -363,6 +435,13 @@ u32 native_rt_call(const u32 *site)
 {
     Cpu *c = &P->cpu;
     u32 pc = site[0], insn = site[1], back = (u32)site + 8;
+    u32 op = insn >> 26;
+    /* not timed: two clock reads would cost more than the instruction */
+    if (!(pc & RESUME) && (op == 0x12 || op == 0x32 || op == 0x3A) && gte_fast(insn)) {
+        native_stats.calls++;
+        native_stats.n_io[IO_GTE]++;
+        return back;
+    }
     from_ctx(c);
     charge();
     native_stats.calls++;
@@ -370,7 +449,6 @@ u32 native_rt_call(const u32 *site)
         jump(c, pc & ~RESUME);
         return to_ctx(c, run_guest(2));
     }
-    u32 op = insn >> 26;
     if (op != 0x12 && op != 0x32 && op != 0x3A) { /* the GTE does not need the clock */
         sync_time();
         if (P->cycles >= P->next_event)
@@ -392,10 +470,14 @@ u32 native_rt_call(const u32 *site)
         if (!told++)
             say("native: host call at %08X: RAM %08X, translated %08X", (unsigned)pc, (unsigned)ram_r32(P, pc), (unsigned)insn);
     }
+    int kind = io_kind(c, insn);
     u32 t = sceKernelGetSystemTimeLow();
     if (cpu_step(P) < 0)
         P->exiting = 2;
-    native_stats.us_io += sceKernelGetSystemTimeLow() - t;
+    t = sceKernelGetSystemTimeLow() - t;
+    native_stats.us_io += t;
+    native_stats.us_io_kind[kind] += t;
+    native_stats.n_io[kind]++;
     finish_load(c);
     if (c->pc == pc + 4 && !c->in_delay)
         jump(c, back);

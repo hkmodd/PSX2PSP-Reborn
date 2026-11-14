@@ -5,6 +5,9 @@
 #include "disc.h"
 #include "psx.h"
 
+enum { IO_GPU, IO_DMA, IO_CD, IO_SPU, IO_TIMER, IO_IRQ, IO_MDEC, IO_PAD, IO_GTE, IO_COP0, IO_OTHER, IO_KINDS };
+#define IO_KIND_NAMES {"gpu", "dma", "cd", "spu", "timer", "irq", "mdec", "pad", "gte", "cop0", "other"}
+
 typedef struct NativeStats {
     u32 calls;  /* host calls (I/O, COP0, GTE, syscalls, polls) */
     u32 misses; /* dispatch-table misses */
@@ -14,6 +17,8 @@ typedef struct NativeStats {
     /* microseconds: in the interpreter (with what it calls), host-call instructions (device
      * I/O, DMA), device events (vblank, IRQs, guest callbacks), presenting, sleeping */
     u32 us_interp, us_io, us_update, us_present, us_sleep;
+    /* host-call instructions by what they touch (IO_KIND_NAMES): count and microseconds */
+    u32 n_io[IO_KINDS], us_io_kind[IO_KINDS];
 } NativeStats;
 
 extern NativeStats native_stats;

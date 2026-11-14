@@ -316,7 +316,7 @@ static void frame(void)
         t0 = t, c0 = psx.cycles, f0 = frames;
         snprintf(status, sizeof status, "f %u pc %08X %u%% %u fps", (unsigned)frames, (unsigned)psx.cpu.pc, (unsigned)speed, (unsigned)fps);
         if (log_fd >= 0) { /* the speed goes to the file only: the screen has its status line */
-            char line[512];
+            char line[1024];
             int n = snprintf(line, sizeof line, "-- %s\n", status);
             if (native) {
                 const NativeStats *s = &native_stats;
@@ -329,6 +329,13 @@ static void frame(void)
                               (unsigned)((psx.gpu.us_draw - draw0) / 1000), (unsigned)((psx.mdec.us_decode - mdec0) / 1000),
                               (unsigned)((s->us_update - n0.us_update) / 1000), (unsigned)((s->us_present - n0.us_present) / 1000),
                               (unsigned)((us_rgb24 - rgb0) / 1000), (unsigned)((s->us_sleep - n0.us_sleep) / 1000));
+                static const char *const io_names[IO_KINDS] = IO_KIND_NAMES;
+                n += snprintf(line + n, sizeof line - (size_t)n, "-- io (n/ms):");
+                for (int k = 0; k < IO_KINDS; k++)
+                    if (s->n_io[k] != n0.n_io[k])
+                        n += snprintf(line + n, sizeof line - (size_t)n, " %s %u/%u", io_names[k], (unsigned)(s->n_io[k] - n0.n_io[k]),
+                                      (unsigned)((s->us_io_kind[k] - n0.us_io_kind[k]) / 1000));
+                n += snprintf(line + n, sizeof line - (size_t)n, "\n");
                 n0 = *s, draw0 = psx.gpu.us_draw, mdec0 = psx.mdec.us_decode, rgb0 = us_rgb24;
                 Gpu *g = &psx.gpu;
                 n += snprintf(line + n, sizeof line - (size_t)n,
