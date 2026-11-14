@@ -24,6 +24,7 @@
 #include <psputils.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "disc.h"
@@ -52,6 +53,7 @@ static int line_head; /* next line to write */
 static char tty_line[COLS + 1];
 static int tty_len;
 static SceUID log_fd = -1;
+static int trace_bits; /* from psxrt.trace beside the EBOOT */
 static char log_buf[8192];
 static int log_len;
 
@@ -120,6 +122,14 @@ static void open_log(const char *eboot)
         return;
     snprintf(slash + 1, sizeof path - (size_t)(slash + 1 - path), "psxrt.log");
     log_fd = sceIoOpen(path, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
+    snprintf(slash + 1, sizeof path - (size_t)(slash + 1 - path), "psxrt.trace");
+    SceUID fd = sceIoOpen(path, PSP_O_RDONLY, 0);
+    if (fd >= 0) { /* debugging: the core's trace bits (psx.h), as a decimal number */
+        char num[16] = {0};
+        sceIoRead(fd, num, sizeof num - 1);
+        sceIoClose(fd);
+        trace_bits = (int)strtol(num, NULL, 10);
+    }
 }
 
 /* ---- memory ---- */
@@ -151,7 +161,7 @@ static int reserve_fixed(void)
 /* ---- screen ---- */
 static unsigned int __attribute__((aligned(16))) gu_list[0x4000];
 static void *draw_buf; /* relative to the start of the PSP's VRAM */
-static int show_text = 1;
+static int show_text; /* the log lines over the picture: drawn by the CPU, so off at start */
 
 typedef struct {
     u16 u, v;
@@ -292,12 +302,17 @@ static void frame(void)
         t0 = t, c0 = psx.cycles, f0 = frames;
         snprintf(status, sizeof status, "f %u pc %08X %u%% %u fps", (unsigned)frames, (unsigned)psx.cpu.pc, (unsigned)speed, (unsigned)fps);
         if (log_fd >= 0) { /* the speed goes to the file only: the screen has its status line */
-            char line[160];
+            char line[256];
             int n = snprintf(line, sizeof line, "-- %s\n", status);
             if (native) {
                 const NativeStats *s = &native_stats;
-                n += snprintf(line + n, sizeof line - (size_t)n, "-- native: %u calls, %u misses, %u steps, %u loads\n",(unsigned)(s->calls - n0.calls),
-                              (unsigned)(s->misses - n0.misses), (unsigned)(s->steps - n0.steps), (unsigned)s->loads);
+                n += snprintf(line + n, sizeof line - (size_t)n, "-- native: %u calls, %u misses, %u steps, %u hashes, %u loads\n",(unsigned)(s->calls - n0.calls),
+                              (unsigned)(s->misses - n0.misses), (unsigned)(s->steps - n0.steps), (unsigned)(s->hashes - n0.hashes),
+                              (unsigned)s->loads);
+                n += snprintf(line + n, sizeof line - (size_t)n, "-- ms: interp %u io %u update %u present %u sleep %u\n",
+                              (unsigned)((s->us_interp - n0.us_interp) / 1000), (unsigned)((s->us_io - n0.us_io) / 1000),
+                              (unsigned)((s->us_update - n0.us_update) / 1000), (unsigned)((s->us_present - n0.us_present) / 1000),
+                              (unsigned)((s->us_sleep - n0.us_sleep) / 1000));
                 n0 = *s;
             }
             log_flush();
@@ -306,7 +321,9 @@ static void frame(void)
     }
     if (!status[0])
         snprintf(status, sizeof status, "booting");
+    u32 tp = sceKernelGetSystemTimeLow();
     present(&psx, status);
+    native_stats.us_present += sceKernelGetSystemTimeLow() - tp;
 }
 
 static void host_vblank(void *user)
@@ -390,6 +407,7 @@ int main(int argc, char **argv)
     host.log = host_log;
     host.vblank = host_vblank;
     psx_init(&psx, &host, (u8 *)FIXED_BASE, (u8 *)SCRATCH_BASE, vram, spu_ram, mdec_in, MDEC_WORDS);
+    psx.trace = trace_bits;
     if (native && (err = native_init(&psx, &info)) != NULL)
         halt(err);
     if (psx_boot(&psx) < 0)

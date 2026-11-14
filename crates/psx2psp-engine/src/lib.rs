@@ -855,7 +855,8 @@ pub fn native_psar_header(disc_id: &str, title: &str, disc_sectors: u32) -> Vec<
 /// Entry of the code directory: text address, text size, text hash, host address, code length,
 /// code offset, stored code length, table offset, stored table length (offsets from the start
 /// of DATA.PSAR; a stored length equal to the raw one means stored as is, the raw table length
-/// is the text size rounded up to words), file name NUL padded to 16 bytes, then zeros.
+/// is the text size rounded up to words), file name NUL padded to 16 bytes, hash of the first
+/// [`native_code::HEAD_LEN`] bytes of the text, then zeros.
 pub fn native_code_entry(img: &native_code::CodeImage, code: (u32, u32), table: (u32, u32)) -> [u8; NATIVE_CODE_ENTRY_LEN] {
     let mut e = [0u8; NATIVE_CODE_ENTRY_LEN];
     let words = [img.text_addr, img.text_size, img.hash, img.host_base, img.code.len() as u32, code.0, code.1, table.0, table.1];
@@ -865,6 +866,7 @@ pub fn native_code_entry(img: &native_code::CodeImage, code: (u32, u32), table: 
     let name = img.name.as_bytes();
     let n = name.len().min(15);
     e[0x24..0x24 + n].copy_from_slice(&name[..n]);
+    e[0x34..0x38].copy_from_slice(&img.head_hash.to_le_bytes());
     e
 }
 

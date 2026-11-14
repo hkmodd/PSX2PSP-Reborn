@@ -11,7 +11,8 @@ typedef struct CodeEntry {
     u32 code_len, code_off, code_stored;
     u32 table_off, table_stored; /* the raw table is one word per text word */
     char name[16];
-    u32 pad[3];
+    u32 head_hash; /* FNV-1a of the first HEAD_LEN bytes of the text */
+    u32 pad[2];
 } CodeEntry;
 
 typedef struct DiscInfo {

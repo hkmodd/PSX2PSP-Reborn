@@ -18,12 +18,14 @@
  * A guest `ra` that has no translation becomes GRET when translated code takes over: its `jr ra`
  * comes back to the interpreter at the address saved on a small stack.
  *
- * Time: the PS1 cycle count is at least the real clock (synced at every host call and every 256
- * interpreted instructions). Loops count too: each back-edge charges its estimated PS1 cycles to
- * CTX.BUDGET and enters the runtime when that goes negative, which adds what was spent to the
- * count, so a counted wait loop lasts as long as on the PS1; when the count runs ahead of the
- * clock the runtime sleeps. A 500 us alarm makes the budget negative, so that loops enter the
- * runtime and interrupts are taken there.
+ * Time: the PS1 cycle count advances with interpreted instructions and loops: each back-edge
+ * charges its estimated PS1 cycles to CTX.BUDGET and enters the runtime when that goes negative,
+ * which adds what was spent to the count, so a counted wait loop lasts as long as on the PS1.
+ * When the count runs ahead of the real clock (checked at every host call and every 256
+ * interpreted instructions) the runtime sleeps; when it falls behind, the clock is moved back
+ * instead: PS1 time slows down with the host, it never jumps, or devices (the CD's sectors) would
+ * run ahead of the guest code that serves them. A 500 us alarm makes the budget negative, so
+ * that loops enter the runtime and interrupts are taken there.
  *
  * Limits: code written by CPU stores (decompressed or copied by the game) is not tracked, EPC
  * holds host addresses while translated code is interrupted, and GRET returns are LIFO.
@@ -57,6 +59,7 @@
 #define POLL 0u /* host-call word of an interrupt poll */
 #define ALARM_US 500
 #define AHEAD_MAX (PSX_CLOCK / 500) /* 2 ms */
+#define HEAD_LEN 2048u              /* bytes of text under CodeEntry.head_hash */
 
 /* trampolines.S */
 void psxrt_rt_call(void);
@@ -74,7 +77,8 @@ static u32 *const table = (u32 *)TABLE_ADDR;
 typedef struct Image {
     const CodeEntry *e;
     u32 text; /* text address & 0x1FFFFC */
-    int resident; /* its code is at host_base */
+    int resident;  /* its code is at host_base */
+    int installed; /* its table slice is in TABLE (resident, and no other slice loaded over it) */
     u32 gen, checked; /* disc loads over its text; gen at the last check */
 } Image;
 
@@ -173,7 +177,7 @@ static void evict(Image *m)
         if (*t >= lo && *t < hi)
             *t = STUB_MISS;
     }
-    m->resident = 0;
+    m->resident = m->installed = 0;
 }
 
 static int load(Image *m)
@@ -194,6 +198,10 @@ static int load(Image *m)
         evict(m);
         return -1;
     }
+    for (int i = 0; i < nimg; i++)
+        if (img[i].text < m->text + e->text_size && m->text < img[i].text + img[i].e->text_size)
+            img[i].installed = 0;
+    m->installed = 1;
     m->checked = m->gen;
     flush_code();
     native_stats.loads++;
@@ -217,8 +225,14 @@ static int try_load(u32 pc, int miss)
         Image *m = &img[i];
         if (p < m->text || p - m->text >= m->e->text_size || m->gen == m->checked)
             continue;
+        /* A MISS entry in an installed slice was not loaded over (it would be DIRTY): the code
+         * there is still that executable's, only not discovered by the translator. */
+        if (*t == STUB_MISS && m->installed)
+            continue;
         candidates++;
-        if (fnv1a(P->ram + m->text, m->e->text_size) == m->e->hash && load(m) == 0)
+        native_stats.hashes++;
+        u32 head = m->e->text_size < HEAD_LEN ? m->e->text_size : HEAD_LEN;
+        if (fnv1a(P->ram + m->text, head) == m->e->head_hash && fnv1a(P->ram + m->text, m->e->text_size) == m->e->hash && load(m) == 0)
             return 1;
         m->checked = m->gen;
     }
@@ -244,11 +258,21 @@ static void on_ram_loaded(Psx *psx, u32 addr, u32 len)
 /* ---- time ---- */
 static void sync_time(void)
 {
-    u64 clock = c_base + (sceKernelGetSystemTimeWide() - t_base) * 338688u / 10000u;
-    if (P->cycles < clock)
-        P->cycles = clock;
-    else if (P->cycles - clock > AHEAD_MAX)
+    u64 now = sceKernelGetSystemTimeWide(), clock = c_base + (now - t_base) * 338688u / 10000u;
+    if (P->cycles + AHEAD_MAX < clock) /* the host fell behind: PS1 time slows down, never skips */
+        c_base = P->cycles, t_base = now;
+    else if (P->cycles > clock + AHEAD_MAX) {
+        u32 t = sceKernelGetSystemTimeLow();
         sceKernelDelayThread((SceUInt)((P->cycles - clock) * 10000u / 338688u));
+        native_stats.us_sleep += sceKernelGetSystemTimeLow() - t;
+    }
+}
+
+static void update(void)
+{
+    u32 t = sceKernelGetSystemTimeLow();
+    psx_update(P);
+    native_stats.us_update += sceKernelGetSystemTimeLow() - t;
 }
 
 /* At every entry from translated code: the cycles its loops spent join the count, and the
@@ -290,7 +314,17 @@ static void fix_ra(Cpu *c)
 /* Interprets from cpu.pc until an instruction boundary with a translation, and returns its host
  * address. `mode`: 0 checks at once, 1 also loads at a MISS first address, 2 runs one
  * instruction first (a resume point maps to its own host call). */
+static u32 interp(int mode);
+
 static u32 run_guest(int mode)
+{
+    u32 t = sceKernelGetSystemTimeLow();
+    u32 h = interp(mode);
+    native_stats.us_interp += sceKernelGetSystemTimeLow() - t;
+    return h;
+}
+
+static u32 interp(int mode)
 {
     Cpu *c = &P->cpu;
     for (u32 n = 0;; n++) {
@@ -315,7 +349,7 @@ static u32 run_guest(int mode)
         if (!(n & 255))
             sync_time();
         if (P->cycles >= P->next_event)
-            psx_update(P);
+            update();
         if (cpu_step(P) < 0)
             P->exiting = 2;
         native_stats.steps++;
@@ -340,7 +374,7 @@ u32 native_rt_call(const u32 *site)
     if (op != 0x12 && op != 0x32 && op != 0x3A) { /* the GTE does not need the clock */
         sync_time();
         if (P->cycles >= P->next_event)
-            psx_update(P);
+            update();
     }
     if (insn == POLL) {
         if (!psx_irq_pending(P))
@@ -358,8 +392,10 @@ u32 native_rt_call(const u32 *site)
         if (!told++)
             say("native: host call at %08X: RAM %08X, translated %08X", (unsigned)pc, (unsigned)ram_r32(P, pc), (unsigned)insn);
     }
+    u32 t = sceKernelGetSystemTimeLow();
     if (cpu_step(P) < 0)
         P->exiting = 2;
+    native_stats.us_io += sceKernelGetSystemTimeLow() - t;
     finish_load(c);
     if (c->pc == pc + 4 && !c->in_delay)
         jump(c, back);
@@ -425,7 +461,7 @@ const char *native_init(Psx *psx, const DiscInfo *info)
         if (text >= RAM_SIZE * 4 || (text & 3) || (text & (RAM_SIZE - 1)) + e->text_size > RAM_SIZE || e->host_base < code_lo ||
             e->host_base + e->code_len > code_hi || (e->host_base & 3))
             return "DATA.PSAR code directory is out of range";
-        img[i] = (Image){e, text & (RAM_SIZE - 4), 0, 0, ~0u};
+        img[i] = (Image){e, text & (RAM_SIZE - 4), 0, 0, 0, ~0u};
     }
     nimg = (int)info->images;
     P = psx;

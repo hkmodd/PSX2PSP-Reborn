@@ -30,6 +30,9 @@ pub struct CodeImage {
     /// [`fnv1a32`] of the text as loaded: the runtime takes this translation only when the
     /// guest RAM holds exactly that.
     pub hash: u32,
+    /// [`fnv1a32`] of the first [`HEAD_LEN`] bytes of the text: the runtime's cheap check before
+    /// it hashes the whole text (data loaded over the address never matches it).
+    pub head_hash: u32,
     /// Host address of `code[0]`.
     pub host_base: u32,
     /// Allegrex code, little-endian words.
@@ -52,6 +55,9 @@ pub struct CodePack {
     /// Executables left to the runtime's interpreter, and why.
     pub skipped: Vec<(String, String)>,
 }
+
+/// Bytes of text covered by [`CodeImage::head_hash`] (fewer when the text is shorter).
+pub const HEAD_LEN: usize = 2048;
 
 /// FNV-1a, 32 bits: the image check the runtime repeats on the guest RAM.
 pub fn fnv1a32(bytes: &[u8]) -> u32 {
@@ -153,6 +159,7 @@ pub fn build(exes: Vec<(String, Vec<u8>)>) -> Result<CodePack, String> {
                 text_addr: p.exe.text_addr,
                 text_size,
                 hash: p.hash,
+                head_hash: fnv1a32(&p.exe.text[..p.exe.text.len().min(HEAD_LEN)]),
                 host_base,
                 code: t.words.iter().flat_map(|w| w.to_le_bytes()).collect(),
                 table: table.iter().flat_map(|w| w.to_le_bytes()).collect(),
@@ -220,6 +227,7 @@ mod tests {
         assert_eq!(a.table.len(), 12);
         assert_eq!(word(&a.table, 0), a.host_base);
         assert_eq!(c.hash, fnv1a32(&[JR_RA.to_le_bytes(), [0; 4]].concat()));
+        assert_eq!(c.head_hash, c.hash); // text shorter than HEAD_LEN
         assert!((0..3).all(|i| word(&a.table, i) == layout::MISS || (a.host_base..a.host_base + a.code.len() as u32).contains(&word(&a.table, i))));
     }
 }

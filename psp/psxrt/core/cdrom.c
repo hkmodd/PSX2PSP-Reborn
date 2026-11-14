@@ -62,7 +62,8 @@ static void deliver(Psx *psx)
     memmove(cd->q, cd->q + 1, sizeof cd->q[0] * (size_t)(cd->nq - 1));
     cd->nq--;
     if (psx->trace & 2)
-        psx_log(psx, "cd INT%d %02X %02X (%d bytes) mask %02X", cd->irq_flags & 7, cd->resp[0], cd->resp[1], cd->nresp, cd->irq_mask);
+        psx_log(psx, "cd INT%d %02X %02X (%d bytes) mask %02X msf %02X:%02X:%02X at %u", cd->irq_flags & 7, cd->resp[0], cd->resp[1], cd->nresp,
+                cd->irq_mask, cd->sector[12], cd->sector[13], cd->sector[14], (unsigned)psx->cycles);
     if (cd->irq_flags & cd->irq_mask & 0x1F)
         psx_raise(psx, IRQ_CDROM);
 }
@@ -116,8 +117,11 @@ static void sector(Psx *psx)
         return; /* XA-ADPCM goes to the audio path (S6) */
     memcpy(cd->pending, raw, sizeof raw);
     for (int i = 0; i < cd->nq; i++)
-        if (cd->q[i].sector)
+        if (cd->q[i].sector) {
+            if (psx->trace & 2)
+                psx_log(psx, "cd: sector %u replaces the waiting one", cd->pos - 1);
             return; /* the guest is behind: the newer sector replaces the waiting one */
+        }
     CdResp *r = push(psx, 1, psx->cycles);
     r->b[0] = cd->stat, r->n = 1;
     r->sector = 1;

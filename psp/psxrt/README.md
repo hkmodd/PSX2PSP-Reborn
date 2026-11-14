@@ -20,7 +20,8 @@ the PC simulator `crates/psx2psp-sim` builds, so a fix lands on both):
 | Pad | PSP buttons map 1:1 to the PS1 pad, L/R to L1/R1 |
 
 The overlay (debug screen over the picture) shows a status line (frame, PC, speed as % of the
-PS1's 33.8688 MHz, fps) and the last log lines; L+R+SELECT toggles it. Every line, plus a status
+PS1's 33.8688 MHz, fps) and the last log lines, which L+R+SELECT toggles (off at start: the CPU
+draws them, which costs time every frame). Every line, plus a status
 line per second, goes to `psxrt.log` next to the EBOOT. HOME exits.
 
 The heap is kept at 256 KB (`PSP_HEAP_SIZE_KB`) so it is taken from the bottom of the user
@@ -34,17 +35,21 @@ at the same address share their host range. The runtime reserves that range and 
 dispatch table (one word per PS1 RAM word) with MISS.
 
 * When the disc or DMA writes RAM (`Psx.ram_loaded`), the entries it covers become DIRTY. On a
-  miss at such an address the runtime hashes the text of each executable that covers it and,
-  on a match, inflates that executable's code and table slice (evicting whichever shared its
-  range). No match: the interpreter runs it.
+  miss at such an address the runtime hashes the text of each executable that covers it (its
+  first 2 KB first) and, on a match, inflates that executable's code and table slice (evicting
+  whichever shared its range). No match: the interpreter runs it. A MISS entry inside an
+  executable whose slice is installed is code the translator did not find: interpreted, no
+  hashing.
 * Translated code enters the runtime through host calls (I/O, COP0, GTE, syscalls, resumes),
   dispatch misses and loop back-edges; the runtime interprets until an address with a
   translation and goes back there.
-* Time: the PS1 cycle count is at least the real clock. Each loop back-edge also charges the
-  loop's estimated PS1 cycles to a budget, and the runtime adds what was spent at its next entry,
-  sleeping when the count gets ahead of the clock: counted wait loops (PsyQ's `VSync` timeout)
-  last as long as on the PS1. A 500 us alarm makes the budget negative so that loops come back
-  to take interrupts.
+* Time: the PS1 cycle count advances with interpreted instructions and loops: each loop
+  back-edge charges the loop's estimated PS1 cycles to a budget, and the runtime adds what was
+  spent at its next entry, sleeping when the count gets ahead of the real clock: counted wait
+  loops (PsyQ's `VSync` timeout) last as long as on the PS1. When the host falls behind, PS1 time
+  slows down rather than jumping, so that devices never outrun the code serving them (a CD
+  sector delivered while the guest could not run is a lost sector). A 500 us alarm makes the
+  budget negative so that loops come back to take interrupts.
 
 The log has a line per second with host calls, misses, interpreted instructions and executables
 loaded.
@@ -90,7 +95,8 @@ bytes per executable (`CodeEntry` in `disc.h`):
 | 0x1C | 4 | offset of the table slice |
 | 0x20 | 4 | stored length of the table slice |
 | 0x24 | 16 | file name on the disc, NUL padded |
-| 0x34 | 12 | zero |
+| 0x34 | 4 | FNV-1a 32 of the first 2048 bytes of the text (all of it when shorter): checked before the whole text, so data loaded over the address costs 2 KB of hashing, not the text size |
+| 0x38 | 8 | zero |
 
 ## Build
 

@@ -10,6 +10,10 @@ typedef struct NativeStats {
     u32 misses; /* dispatch-table misses */
     u32 steps;  /* instructions interpreted */
     u32 loads;  /* translated executables loaded */
+    u32 hashes; /* texts hashed to recognise an executable */
+    /* microseconds: in the interpreter (with what it calls), host-call instructions (device
+     * I/O, DMA), device events (vblank, IRQs, guest callbacks), presenting, sleeping */
+    u32 us_interp, us_io, us_update, us_present, us_sleep;
 } NativeStats;
 
 extern NativeStats native_stats;
