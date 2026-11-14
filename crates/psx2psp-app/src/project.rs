@@ -1527,14 +1527,14 @@ mod tests {
     }
 
     #[test]
-    fn saved_level_below_the_safe_range_loads_as_five() {
-        // Projects saved at level 1 made EBOOTs that hang MediEvil on a real PSP.
+    fn saved_level_loads_clamped_to_the_offered_range() {
+        // The level is kept as saved (a game's minimum is applied at build time, not here).
         let t = tempfile::tempdir().unwrap();
         let mut p = sample(t.path());
         let dir = t.path().join("slot");
-        for (saved, loaded) in [(1, 5), (4, 5), (5, 5), (9, 9), (12, 9)] {
+        for (seq, (saved, loaded)) in [(0, 1), (1, 1), (4, 4), (5, 5), (9, 9), (12, 9)].into_iter().enumerate() {
             p.level = saved;
-            save(&dir, &p, u64::from(saved)).unwrap();
+            save(&dir, &p, seq as u64 + 1).unwrap();
             assert_eq!(load(&dir).unwrap().0.level, loaded, "saved at {saved}");
         }
     }

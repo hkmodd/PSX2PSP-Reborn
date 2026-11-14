@@ -124,6 +124,9 @@ pub struct Game {
     /// The product code written into the EBOOT instead of the disc's own (pop-fe: Terracon
     /// SCES02836 runs on PSP as SCPS02836).
     pub pops_id: Option<String>,
+    /// Lowest deflate level the game loads at on a real PSP (`min_level`): the converter raises
+    /// a lower one. See [`psx2psp_core::psar::LEVELS`].
+    pub min_level: Option<u32>,
     pub origin: Origin,
 }
 
@@ -420,10 +423,17 @@ impl Section<'_> {
                 Some(id)
             }
         };
+        let min_level = match self.take("min_level") {
+            None => None,
+            Some((v, l)) => match v.parse() {
+                Ok(n) if psx2psp_core::psar::LEVELS.contains(&n) => Some(n),
+                _ => return Err(self.err(l, format!("min_level `{v}`: a deflate level is 1..=9"))),
+            },
+        };
         let mut text = |k: &str| self.take(k).map(|v| v.0).unwrap_or_default();
         let (title, source, note) = (text("title"), text("source"), text("note"));
         self.finish()?;
-        Ok(Game { ids, title, config, source, note, switches, libcrypt, pops_id, origin })
+        Ok(Game { ids, title, config, source, note, switches, libcrypt, pops_id, min_level, origin })
     }
 
     fn patch(mut self, origin: Origin) -> Result<Patch, ParseError> {
@@ -584,6 +594,18 @@ impl PatchDb {
         self.games.iter().filter(|g| g.ids.contains(&id)).find_map(field)
     }
 
+    /// The [`Game`] whose POPS config `id` gets: the first that defines one (user before
+    /// built-in), so a `[game]` that only sets other fields does not hide pop-fe's config.
+    pub fn config_game(&self, id: &str) -> Option<&Game> {
+        let id = normalise_id(id);
+        self.games.iter().find(|g| g.ids.contains(&id) && g.config.is_some())
+    }
+
+    /// Lowest deflate level `id` loads at on a real PSP ([`Game::min_level`]), if it has one.
+    pub fn min_level(&self, id: &str) -> Option<u32> {
+        self.game_field(id, |g| g.min_level)
+    }
+
     /// LibCrypt magic word of `id`, if it is protected.
     pub fn libcrypt(&self, id: &str) -> Option<u16> {
         self.game_field(id, |g| g.libcrypt)
@@ -671,7 +693,7 @@ const USER_HEADER: &str = "\
 ;   [patch ID…|*]  name, kind (fix|fps|60hz|other), search + replace [+ align] or ppf (hex),
 ;                  [default], [md5], [note]
 ;   [game ID…]     title, config (POPS config, hex), source, [default (fix fps 60hz)],
-;                  [libcrypt], [pops_id], note
+;                  [libcrypt], [pops_id], [min_level (1-9)], note
 ; Entries here win over the built-in ones: patches by name, games by ID.
 ";
 
@@ -801,6 +823,15 @@ pub(crate) mod tests {
         assert_eq!(popfe.libcrypt("SCES01492"), Some(53610));
         let crack = popfe.patches_for("SCES01492");
         assert_eq!((crack.len(), crack[0].kind), (1, Kind::Other));
+        // MediEvil's minimum level (patches.ini) sits on top of pop-fe's config and LibCrypt word.
+        let db = PatchDb::builtin();
+        for id in ["SCES-00311", "SCES-01492", "SCES-01493", "SCES-01494", "SCES-01495", "SCUS-94227", "SCPS-10081"] {
+            assert_eq!(db.min_level(id), Some(5), "{id}");
+            assert_eq!(db.config_game(id).map(|g| g.config.clone()), popfe.config_game(id).map(|g| g.config.clone()), "{id}");
+            assert!(db.config_game(id).is_some() || id == "SCUS-94227", "{id}");
+        }
+        assert_eq!((db.libcrypt("SCES-01494"), db.game("SCES-01494").map(|g| g.title.as_str())), (Some(0xAAA6), Some("MediEvil")));
+        assert_eq!(db.min_level("SLES-02895"), None);
         // Terracon: built as SCPS02836, which carries the config and pop-fe's PPF fix.
         assert_eq!(popfe.pops_id("SCES-02836"), "SCPS02836");
         assert_eq!(popfe.pops_id("SCPS02836"), "SCPS02836");
@@ -913,6 +944,11 @@ pub(crate) mod tests {
         let user = PatchDb::parse("[game SLES12345]\nconfig = 01\n", Origin::User).unwrap();
         let merged = db.with_user(user);
         assert_eq!((merged.game("SLES12345").unwrap().libcrypt, merged.libcrypt("SLES12345")), (None, Some(0xA5C3)));
+        // ...and a [game] with only a minimum level keeps the config below it.
+        let base = PatchDb::parse("[game SLES12345]\nconfig = 01 02\n", Origin::BuiltIn).unwrap();
+        let merged = base.with_user(PatchDb::parse("[game sles_123.45]\nmin_level = 9\n", Origin::User).unwrap());
+        assert_eq!((merged.min_level("SLES12345"), merged.config_game("SLES12345").and_then(|g| g.config.clone())), (Some(9), Some(vec![1, 2])));
+        assert_eq!((base.min_level("SLES12345"), merged.min_level("SLES12346")), (None, None));
 
         for (bad, line, what) in [
             ("name = x\n", 1, "before any"),
@@ -933,6 +969,9 @@ pub(crate) mod tests {
             ("[game X]\nlibcrypt = 65536\n", 2, "magic word"),
             ("[game X]\nlibcrypt = 0xZZ\n", 2, "magic word"),
             ("[game X]\npops_id = SCPS-0283\n", 2, "4 letters and 5 digits"),
+            ("[game X]\nmin_level = 0\n", 2, "1..=9"),
+            ("[game X]\nmin_level = 10\n", 2, "1..=9"),
+            ("[game X]\nmin_level = five\n", 2, "1..=9"),
         ] {
             let e = PatchDb::parse(bad, Origin::User).unwrap_err();
             assert_eq!(e.line, line, "{bad:?}: {e}");

@@ -91,9 +91,10 @@ icon itself, fits icon and music into the XMB's budget, and knows the fixes ~2,0
 - **Single disc** (`PSISOIMG`) and **multi-disc up to five** (`PSTITLEIMG`). A `.m3u` playlist expands to its discs in order; BIN and CUE picked together
   count as one disc; CDDA audio tracks are carried in the TOC.
 - **Parallel, streaming compressor.** The image is cut into `0x9300`-byte blocks and deflated on
-  every core, and written as it goes: a 700 MB disc is never held in memory. Level 5 to 9
-  (default 5; 9 is ~0.1% smaller and twice as slow, and the PSP reads both just as fast). Levels
-  1–4 are not offered: a level 1 MediEvil hangs on a real PSP.
+  every core, and written as it goes: a 700 MB disc is never held in memory. Level 1 to 9
+  (default and recommended 5; 1 builds faster and larger, 9 is ~0.1% smaller and twice as slow).
+  A few games hang on a real PSP below some level (MediEvil at level 1): the patch database gives
+  them a `min_level`, and the build is raised to it, with a line in the log.
 - **Extraction and inspection.** Any POPS EBOOT back to BIN/CUE, bit-exact; `psx2psp info` dumps
   its SFO, sections, discs and LibCrypt table.
 - **Game database** of 10,109 serials: the XMB title is filled in from the disc's product code.
@@ -254,7 +255,7 @@ psx2psp tools   [install]                          show / download ffmpeg, yt-dl
 | `--fps-unlock` / `--no-fps-unlock`, `--60hz` / `--50hz` | the game's fps and 60 Hz switches |
 | `--no-title-fixes` | skip the game's fixes and POPS config |
 | `--patch <name>`, `--no-patch <name>` | turn one database entry on or off |
-| `--level <5-9>` | deflate level (default 5) |
+| `--level <1-9>` | deflate level (default 5; raised to a game's `min_level`) |
 | `--donor <pbp>` | your own PS1 Classic donor instead of the built-in one |
 
 ```bash

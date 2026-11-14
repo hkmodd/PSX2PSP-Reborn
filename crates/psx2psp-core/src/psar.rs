@@ -503,14 +503,15 @@ fn pad16<W: Write + Seek>(w: &mut W) -> Result<()> {
     Ok(())
 }
 
-/// Deflate levels that load on real hardware. Every block is inflated by the PSP kernel's
-/// `sceKernelDeflateDecompress` (ARK popcorn hooks POPS's scePopsMan 0x0090B2C8 import onto it),
-/// not by POPS. Level 1 broke MediEvil (SCES-01494) on a real PSP (ARK-5): the same disc, art and
-/// LibCrypt table hang after the last FMV at level 1 and reach gameplay at level 5 (A/B builds
-/// T19G/T19A, 2026-11-14). Both decode bit-exact with zlib and use the same deflate features, so
-/// the fault is inside the kernel inflate, which cannot be run off the device: levels below the
-/// proven ones are not offered. Builds at 5 and 9 are proven on the PSP.
-pub const LEVELS: std::ops::RangeInclusive<u32> = 5..=9;
+/// Deflate levels offered (0, stored, is reported not to boot under POPS). Every block is
+/// inflated by the PSP kernel's `sceKernelDeflateDecompress` (ARK popcorn hooks POPS's scePopsMan
+/// 0x0090B2C8 import onto it), not by POPS, and that inflate is not always level-agnostic: level 1
+/// broke MediEvil (SCES-01494) on a real PSP (ARK-5), which hangs after the last FMV at level 1
+/// and reaches gameplay at level 5 with the same disc, art and LibCrypt table (A/B builds
+/// T19G/T19A, 2026-11-14), while Sheep, Dog 'n' Wolf plays at level 1. Both streams decode
+/// bit-exact with zlib, so the fault cannot be reproduced off the device: such games carry a
+/// minimum level in the patch database instead.
+pub const LEVELS: std::ops::RangeInclusive<u32> = 1..=9;
 
 /// Writes DATA.PSAR starting at absolute position `psar` (the writer must be positioned there).
 pub fn write_psar<W: Write + Seek>(w: &mut W, psar: u64, job: &PsarJob<'_>, monitor: &dyn Monitor) -> Result<PsarStats> {
