@@ -1,0 +1,6 @@
+*.o
+*.elf
+*.prx
+*.sym
+*.PBP
+PARAM.SFO

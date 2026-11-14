@@ -640,6 +640,16 @@ fn subchannels_for(d: &DiscInput, img: &DiscImage, disc_id: &str, magic: Option<
     }))
 }
 
+/// The XMB/save ID of a game whose first disc is `id`. Like PSX2PSP, it comes from the game DB,
+/// so disc 2+ of a set and compilation parts share disc 1's save folder.
+fn save_id(id: &str, monitor: &dyn Monitor) -> String {
+    let save_id = gamedb::lookup(id).map(|g| g.save_id.clone()).filter(|s| s.len() == 9 && s[..4].bytes().all(|b| b.is_ascii_uppercase()) && s[4..].bytes().all(|b| b.is_ascii_digit())).unwrap_or_else(|| id.to_owned());
+    if save_id != id {
+        monitor.log(&format!("Save ID {save_id} (shared with the first disc of the set, per game DB)"));
+    }
+    save_id
+}
+
 /// ConvertIsoToPbp: discs (+patches, +media) → EBOOT.PBP.
 pub fn convert(req: &ConvertRequest, monitor: &dyn Monitor) -> Result<ConvertReport> {
     let t0 = Instant::now();
@@ -726,13 +736,7 @@ pub fn convert(req: &ConvertRequest, monitor: &dyn Monitor) -> Result<ConvertRep
         donor: &donor,
     };
 
-    // Like PSX2PSP: the XMB/save ID comes from the game DB, so disc 2+ of a set and compilation
-    // parts share disc 1's save folder.
-    let save_id = gamedb::lookup(&ids[0]).map(|g| g.save_id.clone()).filter(|s| s.len() == 9 && s[..4].bytes().all(|b| b.is_ascii_uppercase()) && s[4..].bytes().all(|b| b.is_ascii_digit())).unwrap_or_else(|| ids[0].clone());
-    if save_id != ids[0] {
-        monitor.log(&format!("Save ID {save_id} (shared with the first disc of the set, per game DB)"));
-    }
-    let sfo = Sfo::pops(&req.title, &save_id);
+    let sfo = Sfo::pops(&req.title, &save_id(&ids[0], monitor));
     let sections = PbpSections {
         param_sfo: sfo.to_bytes(),
         icon0: req.artwork.icon0.clone(),
@@ -782,6 +786,97 @@ pub fn convert(req: &ConvertRequest, monitor: &dyn Monitor) -> Result<ConvertRep
         stats.stored_bytes as f64 * 100.0 / stats.raw_bytes.max(1) as f64,
         report.elapsed.as_secs_f64()
     ));
+    Ok(report)
+}
+
+// ───────────────────────────── native (recomp) output ─────────────────────────────
+
+/// The native runtime (`psp/psxrt`, prebuilt user-mode PRX): DATA.PSP of a native EBOOT.
+pub const NATIVE_RUNTIME: &[u8] = include_bytes!("../../../resources/psxrt.prx");
+/// Start of a native EBOOT's DATA.PSAR, read by psxrt (`PsarHeader` in `psp/psxrt/main.c`).
+pub const NATIVE_PSAR_MAGIC: [u8; 8] = *b"PSXRTDAT";
+pub const NATIVE_PSAR_VERSION: u32 = 1;
+/// magic 8, version 4, header length 4, disc ID 16, title 128.
+pub const NATIVE_PSAR_HEADER_LEN: usize = 0xA0;
+
+/// DATA.PSAR of a native EBOOT; for now only its header. Little endian; disc ID and title are
+/// NUL-padded and cut (on a char boundary) to leave room for their NUL.
+pub fn native_psar_header(disc_id: &str, title: &str) -> Vec<u8> {
+    fn field(out: &mut Vec<u8>, s: &str, len: usize) {
+        let mut end = s.len().min(len - 1);
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.extend_from_slice(&s.as_bytes()[..end]);
+        out.resize(out.len() + len - end, 0);
+    }
+    let mut h = Vec::with_capacity(NATIVE_PSAR_HEADER_LEN);
+    h.extend_from_slice(&NATIVE_PSAR_MAGIC);
+    h.extend_from_slice(&NATIVE_PSAR_VERSION.to_le_bytes());
+    h.extend_from_slice(&(NATIVE_PSAR_HEADER_LEN as u32).to_le_bytes());
+    field(&mut h, disc_id, 16);
+    field(&mut h, title, 128);
+    debug_assert_eq!(h.len(), NATIVE_PSAR_HEADER_LEN);
+    h
+}
+
+/// PARAM.SFO of a native EBOOT: a PSP game (category `MG`, what the pspsdk's mksfo writes),
+/// with the title and ID of the PS1 disc.
+pub fn native_sfo(title: &str, disc_id: &str) -> Sfo {
+    let mut sfo = Sfo::new();
+    sfo.set_int("BOOTABLE", 1);
+    sfo.set_str("CATEGORY", "MG", 4);
+    sfo.set_str("DISC_ID", disc_id, 16);
+    sfo.set_str("DISC_VERSION", "1.00", 8);
+    sfo.set_int("PARENTAL_LEVEL", 1);
+    sfo.set_str("PSP_SYSTEM_VER", "1.00", 8);
+    sfo.set_int("REGION", 0x8000);
+    sfo.set_str("TITLE", title, 128);
+    sfo
+}
+
+/// Output mode Native (recomp backend, `docs/recomp/PLAN.md`): an EBOOT that runs the native
+/// runtime instead of POPS. Same title, ID and artwork as [`convert`]; the disc is only read for
+/// its ID (slice S1: the runtime runs no game code yet). One disc; patches, donor and boot
+/// picture do not apply.
+pub fn convert_native(req: &ConvertRequest, monitor: &dyn Monitor) -> Result<ConvertReport> {
+    let t0 = Instant::now();
+    let [d] = req.discs.as_slice() else {
+        return Err(EngineError::Input(format!("native mode builds one disc, {} selected", req.discs.len())));
+    };
+    if req.title.trim().is_empty() {
+        return Err(EngineError::Input("title is empty".into()));
+    }
+    let img = DiscImage::open(&d.path)?;
+    let disc_id = match &d.disc_id {
+        Some(id) if !id.trim().is_empty() => normalise_id(id),
+        _ => img.probe().disc_id.ok_or_else(|| EngineError::Input("no SYSTEM.CNF game ID found — enter it manually".into()))?,
+    };
+    monitor.log(&format!("Native: {} — ID {disc_id}, runtime psxrt {} B", d.path.display(), NATIVE_RUNTIME.len()));
+    let sections = PbpSections {
+        param_sfo: native_sfo(&req.title, &save_id(&disc_id, monitor)).to_bytes(),
+        icon0: req.artwork.icon0.clone(),
+        icon1: req.artwork.icon1_pmf.clone(),
+        pic0: req.artwork.pic0.clone(),
+        pic1: req.artwork.pic1.clone(),
+        snd0: req.artwork.snd0.clone(),
+        data_psp: NATIVE_RUNTIME.to_vec(),
+    };
+
+    if let Some(dir) = req.output.parent() {
+        std::fs::create_dir_all(dir).map_err(psx2psp_core::Error::io_path(dir))?;
+    }
+    let part = PartFile::new(&req.output);
+    let file = File::create(&part.part).map_err(psx2psp_core::Error::io_path(&part.part))?;
+    let mut w = BufWriter::new(file);
+    write_pbp(&mut w, &sections, 0x10, |w, _| Ok(w.write_all(&native_psar_header(&disc_id, &req.title))?))?;
+    let file = w.into_inner().map_err(|e| EngineError::from(e.into_error()))?;
+    file.sync_all()?;
+    let file_size = file.metadata()?.len();
+    drop(file);
+    part.commit(&req.output)?;
+    let report = ConvertReport { output: req.output.clone(), disc_ids: vec![disc_id], stats: PsarStats::default(), file_size, elapsed: t0.elapsed() };
+    monitor.log(&format!("Done: {} ({} B, native)", report.output.display(), file_size));
     Ok(report)
 }
 
@@ -1217,5 +1312,65 @@ mod tests {
         let other = file(24);
         assert_eq!(w(&other, 0x800 + 0x958), 0x2404_0000, "patched too");
         assert_eq!(other[..0x800], exe(false)[..0x800], "no loader CRC scheme → header untouched");
+    }
+
+    #[test]
+    fn native_eboot_is_an_mg_game_running_the_runtime() {
+        let t = tempfile::tempdir().unwrap();
+        let raw: Vec<u8> = (0..20u32).flat_map(|lba| patching::sector::build_mode2_form1(lba, &[0; 2048])).collect();
+        std::fs::write(t.path().join("g.bin"), &raw).unwrap();
+        let cue = touch(t.path(), "g.cue", "FILE \"g.bin\" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n");
+        let output = t.path().join("NATIVE").join("EBOOT.PBP");
+        let icon0 = b"\x89PNG icon".to_vec();
+        let req = ConvertRequest {
+            discs: vec![DiscInput { path: cue.clone(), disc_id: Some("SLES-02895".into()), ..Default::default() }],
+            patches: PatchDb::default(),
+            title: "Sheep Dog 'n' Wolf".into(),
+            output: output.clone(),
+            donor: None,
+            artwork: Artwork { icon0: Some(icon0.clone()), ..Default::default() },
+            level: 1,
+        };
+        let rep = convert_native(&req, &()).unwrap();
+        assert_eq!(rep.disc_ids, ["SLES02895"]);
+        assert!(!output.with_extension("PBP.part").exists());
+
+        let mut pbp = PbpFile::open(File::open(&output).unwrap()).unwrap();
+        let sfo = Sfo::parse(&pbp.read(Section::ParamSfo).unwrap()).unwrap();
+        assert_eq!(sfo.get_str("CATEGORY"), Some("MG"));
+        assert_eq!(sfo.get_str("DISC_ID"), Some("SLES02895"));
+        assert_eq!(sfo.get_str("TITLE"), Some("Sheep Dog 'n' Wolf"));
+        assert_eq!(sfo.get_int("BOOTABLE"), Some(1));
+        assert_eq!(pbp.read(Section::Icon0).unwrap(), icon0);
+        assert!(pbp.read(Section::Pic1).unwrap().is_empty());
+
+        // DATA.PSP: the runtime, a MIPS ELF of type PRX (0xFFA0), then padding up to DATA.PSAR.
+        let psp = pbp.read(Section::DataPsp).unwrap();
+        assert_eq!(psp[..NATIVE_RUNTIME.len()], *NATIVE_RUNTIME);
+        assert!(psp[NATIVE_RUNTIME.len()..].iter().all(|&b| b == 0) && psp.len() - NATIVE_RUNTIME.len() < 0x10);
+        let half = |at: usize| u16::from_le_bytes([psp[at], psp[at + 1]]);
+        assert_eq!(psp[..6], *b"\x7FELF\x01\x01", "32-bit little-endian ELF");
+        assert_eq!((half(0x10), half(0x12)), (0xFFA0, 8), "PRX for MIPS");
+
+        let psar = pbp.read(Section::DataPsar).unwrap();
+        assert_eq!(pbp.range(Section::DataPsar).start % 0x10, 0);
+        assert_eq!(psar, native_psar_header("SLES02895", "Sheep Dog 'n' Wolf"));
+        assert_eq!(psar.len(), NATIVE_PSAR_HEADER_LEN);
+        assert_eq!(psar[..12], *b"PSXRTDAT\x01\0\0\0");
+        assert_eq!(&psar[0x10..0x1A], b"SLES02895\0");
+        assert_eq!(&psar[0x20..0x33], b"Sheep Dog 'n' Wolf\0");
+
+        let two = ConvertRequest { discs: vec![req.discs[0].clone(), req.discs[0].clone()], ..req };
+        assert!(convert_native(&two, &()).is_err(), "one disc only");
+    }
+
+    #[test]
+    fn native_psar_header_cuts_long_fields() {
+        let h = native_psar_header("ABCDEFGHIJKLMNOPQRS", &"é".repeat(100));
+        assert_eq!(h.len(), NATIVE_PSAR_HEADER_LEN);
+        assert_eq!(&h[0x10..0x20], b"ABCDEFGHIJKLMNO\0");
+        // 63 two-byte chars fit in 127 bytes; the rest of the field is NUL.
+        assert_eq!(std::str::from_utf8(&h[0x20..0x20 + 126]).unwrap(), "é".repeat(63));
+        assert!(h[0x20 + 126..].iter().all(|&b| b == 0));
     }
 }
