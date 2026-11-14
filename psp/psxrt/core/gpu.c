@@ -175,7 +175,8 @@ static int top_left(const Vtx *a, const Vtx *b)
     return dy < 0 || (dy == 0 && dx > 0);
 }
 
-static void triangle(Psx *psx, const Prim *p, Vtx v0, Vtx v1, Vtx v2)
+/* `drawn`: the renderer already drew it (a quad, GPU_BOTH), the core only draws it too. */
+static void triangle(Psx *psx, const Prim *p, Vtx v0, Vtx v1, Vtx v2, int drawn)
 {
     Gpu *g = &psx->gpu;
     s64 area = edge(&v0, &v1, v2.x, v2.y);
@@ -195,7 +196,7 @@ static void triangle(Psx *psx, const Prim *p, Vtx v0, Vtx v1, Vtx v2)
     if (maxx - minx > 1023 || maxy - miny > 511)
         return;
     const GpuRenderer *rd = g->renderer;
-    int how = rd ? rd->triangle(rd->self, p, &v0, &v1, &v2) : GPU_SW;
+    int how = drawn ? GPU_BOTH : rd ? rd->triangle(rd->self, p, &v0, &v1, &v2) : GPU_SW;
     if (how == GPU_DRAWN)
         return;
     if (minx < g->clip_x1) minx = g->clip_x1;
@@ -372,6 +373,7 @@ static void draw_polygon(Psx *psx, const u32 *c)
         for (int i = 0; i < n; i++)
             v[i].r = v[i].g = v[i].b = 0x80;
     const GpuRenderer *rd = psx->gpu.renderer;
+    int drawn = 0;
     if (quad && rd && rd->quad) {
         s32 minx = v[0].x, maxx = v[0].x, miny = v[0].y, maxy = v[0].y;
         for (int i = 1; i < 4; i++) {
@@ -380,12 +382,14 @@ static void draw_polygon(Psx *psx, const u32 *c)
         }
         /* within the size limits as a whole: both triangles are, and the renderer may draw them
          * in one go */
-        if (maxx - minx <= 1023 && maxy - miny <= 511 && rd->quad(rd->self, &p, v) != GPU_SW)
+        int how = maxx - minx <= 1023 && maxy - miny <= 511 ? rd->quad(rd->self, &p, v) : GPU_SW;
+        if (how == GPU_DRAWN)
             return;
+        drawn = how == GPU_BOTH; /* compare mode: the core draws its triangles as well */
     }
-    triangle(psx, &p, v[0], v[1], v[2]);
+    triangle(psx, &p, v[0], v[1], v[2], drawn);
     if (quad)
-        triangle(psx, &p, v[1], v[2], v[3]);
+        triangle(psx, &p, v[1], v[2], v[3], drawn);
 }
 
 static void draw_rect(Psx *psx, const u32 *c)
@@ -529,36 +533,37 @@ static int xfer_pixel(Psx *psx, u16 *io, int write)
     return 1;
 }
 
-static void draw(Psx *psx);
+static void draw(Psx *psx, const u32 *c, int n);
 
-static void execute(Psx *psx)
+/* A whole command of n words; c may be the FIFO or the words in PS1 RAM. */
+static void execute(Psx *psx, const u32 *c, int n)
 {
     /* the clock may be a syscall: one command in 16 is timed, its time scaled */
-    static u32 n;
+    static u32 t16;
     const PsxHost *h = psx->host;
-    u32 cmd = psx->gpu.cmd[0] >> 24;
+    u32 cmd = c[0] >> 24;
     int k = cmd >= 0x20 && cmd < 0x40 ? 0 : cmd >= 0x40 && cmd < 0x60 ? 1 : cmd >= 0x60 && cmd < 0x80 ? 2
           : cmd >= 0x80 && cmd < 0xA0 ? 3 : cmd == 0x02 ? 4 : 5;
     psx->gpu.n_kind[k]++;
-    if (!h->usec || n++ % 16) {
-        draw(psx);
+    if (!h->usec || t16++ % 16) {
+        draw(psx, c, n);
         return;
     }
     u32 t = h->usec(h->user);
-    draw(psx);
+    draw(psx, c, n);
     t = (h->usec(h->user) - t) * 16;
     psx->gpu.us_draw += t;
     psx->gpu.us_kind[k] += t;
 }
 
-static void draw(Psx *psx)
+static void draw(Psx *psx, const u32 *c, int n)
 {
     Gpu *g = &psx->gpu;
-    u32 *c = g->cmd, cmd = c[0] >> 24;
+    u32 cmd = c[0] >> 24;
     if (cmd >= 0x20 && cmd < 0x40)
         draw_polygon(psx, c);
     else if (cmd >= 0x40 && cmd < 0x60)
-        draw_line(psx, c, g->ncmd);
+        draw_line(psx, c, n);
     else if (cmd >= 0x60 && cmd < 0x80)
         draw_rect(psx, c);
     else if (cmd >= 0x80 && cmd < 0xA0)
@@ -636,19 +641,36 @@ void gpu_gp0(Psx *psx, u32 v)
         if (g->polyline)
             g->need = 0;
     } else if (g->polyline && g->ncmd >= 3 && (v & 0xF000F000u) == 0x50005000u) {
-        execute(psx);
+        execute(psx, g->cmd, g->ncmd);
         g->ncmd = 0;
         return;
     }
     if (g->ncmd < (int)(sizeof g->cmd / sizeof g->cmd[0]))
         g->cmd[g->ncmd++] = v;
     if ((!g->polyline && g->ncmd >= g->need)) {
-        execute(psx);
+        execute(psx, g->cmd, g->ncmd);
         g->ncmd = 0;
     } else if (g->polyline && g->ncmd >= (int)(sizeof g->cmd / sizeof g->cmd[0])) {
-        execute(psx); /* very long polyline: draw what fits */
+        execute(psx, g->cmd, g->ncmd); /* very long polyline: draw what fits */
         g->ncmd = 0;
     }
+}
+
+/* n GP0 words of a DMA packet in PS1 RAM: whole commands run where they lie, the same as word by
+ * word through gpu_gp0. A partial command, a polyline or an image transfer's pixels go word by
+ * word (from the first such word to the end of the packet). */
+void gpu_gp0_packet(Psx *psx, const u32 *w, u32 n)
+{
+    Gpu *g = &psx->gpu;
+    while (n && !g->ncmd && g->xfer != 1) {
+        int line, need = cmd_words(w[0] >> 24, &line);
+        if (line || (u32)need > n)
+            break;
+        execute(psx, w, need);
+        w += need, n -= (u32)need;
+    }
+    for (; n; n--)
+        gpu_gp0(psx, *w++);
 }
 
 static void reset(Psx *psx)

@@ -83,8 +83,11 @@ static void transfer(Psx *psx, int ch)
     if (sync == 2) { /* linked list (GPU) */
         for (int guard = 0; guard < 0x40000; guard++) {
             u32 h = rd(psx, addr), n = h >> 24;
-            for (u32 i = 1; i <= n; i++)
-                gpu_gp0(psx, rd(psx, addr + 4 * i));
+            if (addr + 4 * (n + 1) <= RAM_SIZE)
+                gpu_gp0_packet(psx, (const u32 *)(psx->ram + addr + 4), n);
+            else
+                for (u32 i = 1; i <= n; i++)
+                    gpu_gp0(psx, rd(psx, addr + 4 * i));
             words += n + 1;
             addr = h & 0xFFFFFF;
             if (addr & 0x800000)

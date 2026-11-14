@@ -115,8 +115,14 @@ static const s32 K0[5] = {0, 60, 115, 98, 122}, K1[5] = {0, 0, -52, -55, -60};
 
 static s32 clamp16(s32 x) { return x < -0x8000 ? -0x8000 : x > 0x7FFF ? 0x7FFF : x; }
 
-static s32 rd16(const u8 *ram, u32 a) { return (s16)(ram[a] | ram[a + 1] << 8); }
-static void wr16(u8 *ram, u32 a, s32 v) { ram[a] = (u8)v, ram[a + 1] = (u8)(v >> 8); }
+/* SPU RAM halfwords: every address is even and both hosts are little-endian. */
+#ifdef __GNUC__
+typedef s16 __attribute__((may_alias)) ram16;
+#else
+typedef s16 ram16;
+#endif
+static s32 rd16(const u8 *ram, u32 a) { return *(const ram16 *)(ram + a); }
+static void wr16(u8 *ram, u32 a, s32 v) { *(ram16 *)(ram + a) = (s16)v; }
 
 static void irq(Psx *psx)
 {
@@ -275,7 +281,7 @@ static void skip(Psx *psx, SpuVoice *v, int i, int n, u32 pitch)
 
 /* Voice i over n samples: out[] gets its level (the next voice's modulation), the mixes its
  * share. */
-static void voice(Psx *psx, int i, int n, const s16 *mod, s16 *out, const s16 *noise, s32 *dl, s32 *dr, s32 *rl, s32 *rr)
+static void voice(Psx *psx, int i, int n, const s16 *mod, s16 *out, int need_out, const s16 *noise, s32 *dl, s32 *dr, s32 *rl, s32 *rr)
 {
     Spu *s = &psx->spu;
     SpuVoice *v = &s->v[i];
@@ -317,7 +323,8 @@ static void voice(Psx *psx, int i, int n, const s16 *mod, s16 *out, const s16 *n
         }
     }
     if (k < n) {
-        memset(out + k, 0, (size_t)(n - k) * sizeof *out);
+        if (need_out) /* otherwise nothing reads it */
+            memset(out + k, 0, (size_t)(n - k) * sizeof *out);
         skip(psx, v, i, n - k, pitch);
     }
 }
@@ -328,59 +335,72 @@ enum { dAPF1, dAPF2, vIIR, vCOMB1, vCOMB2, vCOMB3, vCOMB4, vWALL, vAPF1, vAPF2, 
 #define RV(k) ((s32)(s16)s->regs[(0x1DC0 - 0x1C00) / 2 + (k)])
 #define RA(k) ((s32)s->regs[(0x1DC0 - 0x1C00) / 2 + (k)] * 4) /* halfwords */
 
-static u32 rv_at(Spu *s, s32 off)
+/* One reverb step's view of the work area: its base and size (halfwords), the step's position
+ * in it, and whether it is written. */
+typedef struct {
+    u8 *ram;
+    s32 base, size, cur;
+    int on;
+} Rv;
+
+static u32 rv_at(const Rv *w, s32 off)
 {
-    s32 base = (s32)G(0x1F801DA2) * 4, size = 0x40000 - base;
-    s32 a = (s32)s->rev_cur - base + off;
-    if (a < 0 || a >= size) {
-        a %= size;
+    s32 a = w->cur + off;
+    if ((u32)a >= (u32)w->size) {
+        a %= w->size;
         if (a < 0)
-            a += size;
+            a += w->size;
     }
-    return (u32)(base + a) * 2;
+    return (u32)(w->base + a) * 2;
 }
 
-static s32 rv_rd(Spu *s, s32 off) { return rd16(s->ram, rv_at(s, off)); }
+static s32 rv_rd(const Rv *w, s32 off) { return rd16(w->ram, rv_at(w, off)); }
 
-static void rv_wr(Spu *s, s32 off, s32 x)
+static void rv_wr(const Rv *w, s32 off, s32 x)
 {
-    if (s->ctrl & 0x80)
-        wr16(s->ram, rv_at(s, off), clamp16(x));
+    if (w->on)
+        wr16(w->ram, rv_at(w, off), clamp16(x));
 }
 
-static s32 rv_side(Spu *s, s32 in, int m, int d)
+static s32 rv_side(Spu *s, const Rv *w, s32 in, int m, int d)
 {
-    s32 p = rv_rd(s, RA(m) - 1);
-    s32 x = clamp16(in + (rv_rd(s, RA(d)) * RV(vWALL) >> 15) - p);
+    s32 p = rv_rd(w, RA(m) - 1);
+    s32 x = clamp16(in + (rv_rd(w, RA(d)) * RV(vWALL) >> 15) - p);
     x = (x * RV(vIIR) >> 15) + p;
-    rv_wr(s, RA(m), x);
+    rv_wr(w, RA(m), x);
     return x;
 }
 
-static s32 rv_apf(Spu *s, s32 x, int m, int d, int vol)
+static s32 rv_apf(Spu *s, const Rv *w, s32 x, int m, int d, int vol)
 {
-    s32 t = rv_rd(s, RA(m) - RA(d)), g = RV(vol);
+    s32 t = rv_rd(w, RA(m) - RA(d)), g = RV(vol);
     x = clamp16(x - (g * t >> 15));
-    rv_wr(s, RA(m), x);
+    rv_wr(w, RA(m), x);
     return clamp16((x * g >> 15) + t);
 }
 
 static void reverb(Spu *s, s32 inl, s32 inr)
 {
-    s32 lin = inl * RV(vLIN) >> 15, rin = inr * RV(vRIN) >> 15;
-    rv_side(s, lin, mLSAME, dLSAME);
-    rv_side(s, rin, mRSAME, dRSAME);
-    rv_side(s, lin, mLDIFF, dRDIFF);
-    rv_side(s, rin, mRDIFF, dLDIFF);
-    s32 l = clamp16((RV(vCOMB1) * rv_rd(s, RA(mLCOMB1)) >> 15) + (RV(vCOMB2) * rv_rd(s, RA(mLCOMB2)) >> 15) +
-                    (RV(vCOMB3) * rv_rd(s, RA(mLCOMB3)) >> 15) + (RV(vCOMB4) * rv_rd(s, RA(mLCOMB4)) >> 15));
-    s32 r = clamp16((RV(vCOMB1) * rv_rd(s, RA(mRCOMB1)) >> 15) + (RV(vCOMB2) * rv_rd(s, RA(mRCOMB2)) >> 15) +
-                    (RV(vCOMB3) * rv_rd(s, RA(mRCOMB3)) >> 15) + (RV(vCOMB4) * rv_rd(s, RA(mRCOMB4)) >> 15));
-    l = rv_apf(s, rv_apf(s, l, mLAPF1, dAPF1, vAPF1), mLAPF2, dAPF2, vAPF2);
-    r = rv_apf(s, rv_apf(s, r, mRAPF1, dAPF1, vAPF1), mRAPF2, dAPF2, vAPF2);
-    s->rev_out[0] = l * (s16)G(0x1F801D84) >> 15;
-    s->rev_out[1] = r * (s16)G(0x1F801D86) >> 15;
     u32 base = (u32)G(0x1F801DA2) * 4;
+    s16 lout = (s16)G(0x1F801D84), rout = (s16)G(0x1F801D86);
+    if (!(s->ctrl & 0x80) && !lout && !rout) { /* nothing written, nothing heard */
+        s->rev_out[0] = s->rev_out[1] = 0;
+    } else {
+        const Rv rv = {s->ram, (s32)base, 0x40000 - (s32)base, (s32)s->rev_cur - (s32)base, (s->ctrl & 0x80) != 0}, *w = &rv;
+        s32 lin = inl * RV(vLIN) >> 15, rin = inr * RV(vRIN) >> 15;
+        rv_side(s, w, lin, mLSAME, dLSAME);
+        rv_side(s, w, rin, mRSAME, dRSAME);
+        rv_side(s, w, lin, mLDIFF, dRDIFF);
+        rv_side(s, w, rin, mRDIFF, dLDIFF);
+        s32 l = clamp16((RV(vCOMB1) * rv_rd(w, RA(mLCOMB1)) >> 15) + (RV(vCOMB2) * rv_rd(w, RA(mLCOMB2)) >> 15) +
+                        (RV(vCOMB3) * rv_rd(w, RA(mLCOMB3)) >> 15) + (RV(vCOMB4) * rv_rd(w, RA(mLCOMB4)) >> 15));
+        s32 r = clamp16((RV(vCOMB1) * rv_rd(w, RA(mRCOMB1)) >> 15) + (RV(vCOMB2) * rv_rd(w, RA(mRCOMB2)) >> 15) +
+                        (RV(vCOMB3) * rv_rd(w, RA(mRCOMB3)) >> 15) + (RV(vCOMB4) * rv_rd(w, RA(mRCOMB4)) >> 15));
+        l = rv_apf(s, w, rv_apf(s, w, l, mLAPF1, dAPF1, vAPF1), mLAPF2, dAPF2, vAPF2);
+        r = rv_apf(s, w, rv_apf(s, w, r, mRAPF1, dAPF1, vAPF1), mRAPF2, dAPF2, vAPF2);
+        s->rev_out[0] = l * lout >> 15;
+        s->rev_out[1] = r * rout >> 15;
+    }
     s->rev_cur = (s->rev_cur + 1) & 0x3FFFF;
     if (s->rev_cur < base)
         s->rev_cur = base;
@@ -400,7 +420,11 @@ static void render(Psx *psx, int n)
     static s16 noise[SPU_CHUNK], va[SPU_CHUNK], vb[SPU_CHUNK], cap1[SPU_CHUNK], cap3[SPU_CHUNK];
     Spu *s = &psx->spu;
     size_t bytes = (size_t)n * sizeof dl[0];
-    memset(dl, 0, bytes), memset(dr, 0, bytes), memset(rl, 0, bytes), memset(rr, 0, bytes);
+    u32 pmon = G(0x1F801D90) | (u32)G(0x1F801D92) << 16;
+    int any_rev = (G(0x1F801D98) | G(0x1F801D9A)) != 0; /* otherwise rl/rr stay as they are, unread */
+    memset(dl, 0, bytes), memset(dr, 0, bytes);
+    if (any_rev)
+        memset(rl, 0, bytes), memset(rr, 0, bytes);
     if (G(0x1F801D94) | G(0x1F801D96)) {
         int step = (s->ctrl >> 8 & 3) + 4, shift = s->ctrl >> 10 & 15;
         for (int k = 0; k < n; k++) {
@@ -415,10 +439,11 @@ static void render(Psx *psx, int n)
             noise[k] = (s16)s->noise;
         }
     }
-    s16 *mod = va, *out = vb;
-    memset(mod, 0, (size_t)n * sizeof *mod);
+    s16 *mod = va, *out = vb; /* voice 0 has no modulation: its mod is not read */
     for (int i = 0; i < 24; i++) {
-        voice(psx, i, n, mod, out, noise, dl, dr, rl, rr);
+        /* a voice's output is read as the next one's modulation, and voices 1 and 3 are captured */
+        int need_out = i == 1 || i == 3 || (pmon >> (i + 1) & 1);
+        voice(psx, i, n, mod, out, need_out, noise, dl, dr, rl, rr);
         if (i == 1 || i == 3)
             memcpy(i == 1 ? cap1 : cap3, out, (size_t)n * sizeof *out);
         s16 *t = mod;
@@ -434,7 +459,7 @@ static void render(Psx *psx, int n)
         if ((s->ctrl & 0x40) && s->irq_addr < 0x1000 && (s->irq_addr & 0x3FF) == c)
             irq(psx);
         s->capture = (s->capture + 1) & 0x1FF;
-        s32 l = dl[k], r = dr[k], vl = rl[k], vr = rr[k];
+        s32 l = dl[k], r = dr[k], vl = any_rev ? rl[k] : 0, vr = any_rev ? rr[k] : 0;
         if (s->ctrl & 1) {
             cl = cl * cdl >> 15, cr = cr * cdr >> 15;
             l += cl, r += cr;

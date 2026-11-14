@@ -77,7 +77,10 @@ void psxrt_miss(void);
 void psxrt_gret(void);
 void psxrt_call_ret(void);
 void psxrt_gte_cmd(void);
+void psxrt_gte_prof(void);
 void native_enter(u32 host_pc);
+/* gte_fast.c */
+void native_gte_fast(u32 cmd);
 u32 native_host_sp, native_host_gp;
 
 NativeStats native_stats;
@@ -706,12 +709,32 @@ static u32 hook(const u32 *site, u32 pc)
     return leave(c, run_guest(0));
 }
 
-/* A GTE command from translated code (GTE_CMD): no guest state copy, no interrupt service. */
-void native_gte_cmd(u32 cmd)
+/* GTE commands with their time (psxrt.trace bit 7): one in PROF_EVERY timed and scaled, less
+ * what an empty timed interval costs (measured in native_init), so the clock's own syscalls,
+ * which cost about as much as a command, are not counted. Wraps, but per-second differences
+ * come out right. */
+static u32 gte_clock_cost;
+
+void native_gte_prof(u32 cmd)
 {
-    gte_command(P, cmd);
-    P->cycles += 10;
-    native_stats.n_io[IO_GTEC]++;
+    static u32 n;
+    if (n++ % PROF_EVERY) {
+        native_gte_fast(cmd);
+        return;
+    }
+    u32 t = sceKernelGetSystemTimeLow();
+    native_gte_fast(cmd);
+    native_stats.us_io_kind[IO_GTEC] += (sceKernelGetSystemTimeLow() - t) * PROF_EVERY - gte_clock_cost;
+}
+
+static void gte_prof_init(void)
+{
+    u32 sum = 0;
+    for (int i = 0; i < 4096; i++) {
+        u32 t = sceKernelGetSystemTimeLow();
+        sum += sceKernelGetSystemTimeLow() - t;
+    }
+    gte_clock_cost = sum * PROF_EVERY / 4096;
 }
 
 /* Host call at `site` (the address of its .word pc, .word insn): returns where to go on. */
@@ -844,6 +867,8 @@ const char *native_init(Psx *psx, const DiscInfo *info)
     nimg = (int)info->images;
     cpu_shift = info->cpu_shift > 8 ? 8 : info->cpu_shift;
     P = psx;
+    extern Psx *gte_fast_psx;
+    gte_fast_psx = psx;
     for (u32 i = 0; i < TABLE_WORDS; i++)
         table[i] = STUB_MISS;
     stub(STUB_RT_CALL, psxrt_rt_call);
@@ -852,6 +877,10 @@ const char *native_init(Psx *psx, const DiscInfo *info)
     stub(STUB_CALL_RET, psxrt_call_ret);
     stub(STUB_GRET, psxrt_gret);
     stub(STUB_GTE_CMD, psxrt_gte_cmd);
+    if (psx->trace & 128) {
+        gte_prof_init();
+        stub(STUB_GTE_CMD, psxrt_gte_prof);
+    }
     memset((void *)ctx, 0, 0x100);
     ctx[C_BUDGET] = BUDGET;
     memcpy((void *)GTE_ADDR, psx->gte, sizeof(Gte));

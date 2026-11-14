@@ -14,6 +14,9 @@ static int __builtin_clz(unsigned x)
     _BitScanReverse(&i, x);
     return 31 - (int)i;
 }
+#define GTE_INLINE __forceinline
+#else
+#define GTE_INLINE inline __attribute__((always_inline))
 #endif
 
 #define D (psx->gte->d)
@@ -40,7 +43,7 @@ static s32 mat(Psx *psx, int base, int k)
 }
 
 /* Hot paths test the high word only: v fits 44 bits when v >> 32 is in [-0x800, 0x7FF]. */
-static s64 mac_chk(Psx *psx, int n, s64 v)
+static GTE_INLINE s64 mac_chk(Psx *psx, int n, s64 v)
 {
     s32 h = (s32)((u64)v >> 32);
     if (__builtin_expect((u32)(h + 0x800) >= 0x1000u, 0)) {
@@ -230,6 +233,57 @@ static void rtp(Psx *psx, int v, int sf, int lm, int last)
     }
 }
 
+#ifndef GTE_FAST
+#define GTE_FAST 1
+#endif
+
+/* RTPS (n 1) or RTPT (n 3) when no MAC1-3 sum can leave 44 bits: with |TR| <= 2^30, TR << 12
+ * plus three products of 16-bit factors stays under 2^42 + 3 * 2^30 < 2^43, so rtp's per-step
+ * checks never fire. The same results and flags as rtp, the matrix read once. */
+static GTE_INLINE int rtp_fits(Psx *psx)
+{
+    return (u32)((C[TR] >> 30) + 1) <= 1 && (u32)((C[TR + 1] >> 30) + 1) <= 1 && (u32)((C[TR + 2] >> 30) + 1) <= 1;
+}
+
+static void rtp_fast(Psx *psx, int n, int sf, int lm)
+{
+    s32 R[9];
+    for (int k = 0; k < 9; k++)
+        R[k] = mat(psx, RT, k);
+    s64 t1 = (s64)C[TR] << 12, t2 = (s64)C[TR + 1] << 12, t3 = (s64)C[TR + 2] << 12;
+    s32 lo = lm ? 0 : -0x8000, q = 0;
+    for (int v = 0; v < n; v++) {
+        s32 x = (s16)D[v * 2], y = (s16)(D[v * 2] >> 16), z = (s16)D[v * 2 + 1];
+        s64 a1 = t1 + (s64)R[0] * x + (s64)R[1] * y + (s64)R[2] * z;
+        s64 a2 = t2 + (s64)R[3] * x + (s64)R[4] * y + (s64)R[5] * z;
+        s64 a3 = t3 + (s64)R[6] * x + (s64)R[7] * y + (s64)R[8] * z;
+        s32 m1 = shr_sf(a1, sf), m2 = shr_sf(a2, sf), m3 = shr_sf(a3, sf), z12 = (s32)(a3 >> 12);
+        MAC(1) = m1, MAC(2) = m2, MAC(3) = m3;
+        IR(1) = ir_clamp(psx, 1, m1, lm);
+        IR(2) = ir_clamp(psx, 2, m2, lm);
+        if (z12 < -0x8000 || z12 > 0x7FFF)
+            flag(psx, 22);
+        IR(3) = m3 < lo ? lo : m3 > 0x7FFF ? 0x7FFF : m3;
+        push_sz(psx, z12);
+        q = (s32)divide(psx, (u16)C[H], (u32)D[SZ0 + 3]);
+        s64 sx = (s64)q * IR(1) + C[OFX], sy = (s64)q * IR(2) + C[OFY];
+        mac0_chk(psx, sx);
+        mac0_chk(psx, sy);
+        push_sxy(psx, sxy_sat(psx, 14, (s32)(sx >> 16)), sxy_sat(psx, 13, (s32)(sy >> 16)));
+    }
+    s64 m = (s64)q * (s16)C[DQA] + C[DQB];
+    MAC(0) = mac0_chk(psx, m);
+    s32 i0 = (s32)(m >> 12);
+    if (i0 < 0) {
+        flag(psx, 12);
+        i0 = 0;
+    } else if (i0 > 0x1000) {
+        flag(psx, 12);
+        i0 = 0x1000;
+    }
+    IR(0) = (s32)i0;
+}
+
 /* MAC = T * 0x1000 + M * V (T may be NULL), IR = saturate(MAC) */
 static void mul(Psx *psx, const s32 M[9], const s32 *T, const s32 V[3], int sf, int lm)
 {
@@ -322,6 +376,39 @@ static void mvmva(Psx *psx, u32 cmd, int sf, int lm)
     }
 }
 
+static GTE_INLINE void nclip(Psx *psx)
+{
+    s32 x0 = (s16)D[SXY0], y0 = (s16)(D[SXY0] >> 16);
+    s32 x1 = (s16)D[SXY0 + 1], y1 = (s16)(D[SXY0 + 1] >> 16);
+    s32 x2 = (s16)D[SXY0 + 2], y2 = (s16)(D[SXY0 + 2] >> 16);
+    MAC(0) = mac0_chk(psx, (s64)x0 * y1 + (s64)x1 * y2 + (s64)x2 * y0 - (s64)x0 * y2 - (s64)x1 * y0 - (s64)x2 * y1);
+}
+
+/* AVSZ3 (0x2D) or AVSZ4 */
+static GTE_INLINE void avsz(Psx *psx, u32 cmd)
+{
+    /* SZ are 16-bit: the sum fits a word, the product 34 bits */
+    s64 sum = (cmd & 0x3F) == 0x2D ? (s64)(s16)C[ZSF3] * (s32)(D[SZ0 + 1] + D[SZ0 + 2] + D[SZ0 + 3])
+                                   : (s64)(s16)C[ZSF4] * (s32)(D[SZ0] + D[SZ0 + 1] + D[SZ0 + 2] + D[SZ0 + 3]);
+    MAC(0) = mac0_chk(psx, sum);
+    s32 o = (s32)(sum >> 12);
+    if (o < 0) {
+        flag(psx, 18);
+        o = 0;
+    } else if (o > 0xFFFF) {
+        flag(psx, 18);
+        o = 0xFFFF;
+    }
+    D[OTZ] = (s32)o;
+}
+
+/* FLAG bit 31: any of the error bits */
+static GTE_INLINE void flag_sum(Psx *psx)
+{
+    if (C[FLAG] & 0x7F87E000)
+        C[FLAG] |= (s32)0x80000000u;
+}
+
 void gte_command(Psx *psx, u32 cmd)
 {
     int sf = (cmd & (1u << 19)) ? 12 : 0;
@@ -330,20 +417,23 @@ void gte_command(Psx *psx, u32 cmd)
     C[FLAG] = 0;
     switch (cmd & 0x3F) {
     case 0x01: /* RTPS */
-        rtp(psx, 0, sf, lm, 1);
+        if (GTE_FAST && rtp_fits(psx))
+            rtp_fast(psx, 1, sf, lm);
+        else
+            rtp(psx, 0, sf, lm, 1);
         break;
     case 0x30: /* RTPT */
+        if (GTE_FAST && rtp_fits(psx)) {
+            rtp_fast(psx, 3, sf, lm);
+            break;
+        }
         rtp(psx, 0, sf, lm, 0);
         rtp(psx, 1, sf, lm, 0);
         rtp(psx, 2, sf, lm, 1);
         break;
-    case 0x06: { /* NCLIP */
-        s32 x0 = (s16)D[SXY0], y0 = (s16)(D[SXY0] >> 16);
-        s32 x1 = (s16)D[SXY0 + 1], y1 = (s16)(D[SXY0 + 1] >> 16);
-        s32 x2 = (s16)D[SXY0 + 2], y2 = (s16)(D[SXY0 + 2] >> 16);
-        MAC(0) = mac0_chk(psx, (s64)x0 * y1 + (s64)x1 * y2 + (s64)x2 * y0 - (s64)x0 * y2 - (s64)x1 * y0 - (s64)x2 * y1);
+    case 0x06: /* NCLIP */
+        nclip(psx);
         break;
-    }
     case 0x0C: { /* OP */
         s32 d1 = mat(psx, RT, 0), d2 = mat(psx, RT, 4), d3 = mat(psx, RT, 8);
         set_mac_ir(psx, 1, mac_chk(psx, 1, (s64)IR(3) * d2 - (s64)IR(2) * d3), sf, lm);
@@ -416,22 +506,9 @@ void gte_command(Psx *psx, u32 cmd)
         interpolate(psx, m, sf, lm);
         break;
     case 0x2D: /* AVSZ3 */
-    case 0x2E: { /* AVSZ4 */
-        /* SZ are 16-bit: the sum fits a word, the product 34 bits */
-        s64 sum = (cmd & 0x3F) == 0x2D ? (s64)(s16)C[ZSF3] * (s32)(D[SZ0 + 1] + D[SZ0 + 2] + D[SZ0 + 3])
-                                       : (s64)(s16)C[ZSF4] * (s32)(D[SZ0] + D[SZ0 + 1] + D[SZ0 + 2] + D[SZ0 + 3]);
-        MAC(0) = mac0_chk(psx, sum);
-        s32 o = (s32)(sum >> 12);
-        if (o < 0) {
-            flag(psx, 18);
-            o = 0;
-        } else if (o > 0xFFFF) {
-            flag(psx, 18);
-            o = 0xFFFF;
-        }
-        D[OTZ] = (s32)o;
+    case 0x2E: /* AVSZ4 */
+        avsz(psx, cmd);
         break;
-    }
     case 0x3D: /* GPF */
         for (int i = 0; i < 3; i++)
             set_mac_ir(psx, i + 1, mac_chk(psx, i + 1, (s64)IR(0) * IR(i + 1)), sf, lm);
@@ -445,8 +522,7 @@ void gte_command(Psx *psx, u32 cmd)
     default:
         break;
     }
-    if (C[FLAG] & 0x7F87E000)
-        C[FLAG] |= (s32)0x80000000u;
+    flag_sum(psx);
 }
 
 static u32 lzc(u32 v)

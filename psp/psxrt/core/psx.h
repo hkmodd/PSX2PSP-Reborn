@@ -473,6 +473,8 @@ void cd_audio(Psx *psx, s32 *l, s32 *r);
 void gpu_init(Psx *psx);
 u32 gpu_read(Psx *psx, int reg);
 void gpu_gp0(Psx *psx, u32 v);
+/* GP0 words of a DMA packet, in PS1 RAM (word aligned) */
+void gpu_gp0_packet(Psx *psx, const u32 *w, u32 n);
 /* GP0 words while a CPU->VRAM transfer is in progress, a row at a time: the words used (it
  * stops where the transfer ends; a lone last pixel uses its whole word) */
 u32 gpu_gp0_pixels(Psx *psx, const u32 *w, u32 n);

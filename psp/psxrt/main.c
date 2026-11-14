@@ -574,6 +574,10 @@ static void frame(void)
                     if (s->n_io[k] != n0.n_io[k])
                         n += snprintf(line + n, sizeof line - (size_t)n, " %s %u/%u", io_names[k], (unsigned)(s->n_io[k] - n0.n_io[k]),
                                       (unsigned)((s->us_io_kind[k] - n0.us_io_kind[k]) / 1000));
+                n += snprintf(line + n, sizeof line - (size_t)n, "\n-- gte ops (hex/n):");
+                for (int k = 0; k < 64; k++)
+                    if (s->n_gte[k] != n0.n_gte[k])
+                        n += snprintf(line + n, sizeof line - (size_t)n, " %02X/%u", k, (unsigned)(s->n_gte[k] - n0.n_gte[k]));
                 n += snprintf(line + n, sizeof line - (size_t)n, "\n");
                 if (bench_secs && ++bench_n > BENCH_SKIP) {
                     bench.speed += speed, bench.vbl += fps, bench.fps += game_fps;

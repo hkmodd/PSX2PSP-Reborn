@@ -21,6 +21,7 @@ typedef struct NativeStats {
     u32 us_interp, us_io, us_update, us_present, us_sleep;
     /* host-call instructions by what they touch (IO_KIND_NAMES): count and microseconds */
     u32 n_io[IO_KINDS], us_io_kind[IO_KINDS];
+    u32 n_gte[64]; /* GTE commands by opcode */
 } NativeStats;
 
 extern NativeStats native_stats;

@@ -48,6 +48,7 @@ typedef struct {
     u32 tris, ttris, rects, trects, fills, lines, line_runs, sw_tex15, sw_texwin, sw_copy, pages, cluts;
     u32 readbacks, read_tiles, read_us, uploads, upload_px, flushes;
     u32 ge_copy, null_copy, copy_px, copy_from_ge; /* copies: on the GE, onto themselves, pixels, read from the GE */
+    u32 bind_tex, bind_clut, kicks, rd_checks;     /* textures and CLUTs sent, stall moves, readback checks */
 } GeStats;
 
 /* A 4/8-bit texture page as a 256x256 T4/T8 texture. */
@@ -73,6 +74,9 @@ static struct {
     int compare;
     u16 *cmp;                  /* compare mode: the GE's copy, read back */
     u16 newer[TILES_Y];        /* per tile row, a bit per tile column: the GE's copy is newer */
+    u32 nver;                  /* bumped whenever `newer` gains a bit */
+    s32 mk_x1, mk_y1, mk_x2, mk_y2; /* tiles all marked newer (inclusive pixels); empty after a readback */
+    u32 rk_tex, rk_clut, rk_ver;    /* prim_begin: this page and CLUT had no newer tile at nver rk_ver */
     u32 gen[TILES_Y][TILES_X]; /* bumped whenever RAM's copy of the tile changes */
     /* GE state as last sent */
     int sc_x1, sc_y1, sc_x2, sc_y2;
@@ -129,6 +133,7 @@ static void ge_kick(void)
     if (n - list_stall >= STALL_STEP) {
         list_stall = n;
         sceGeListUpdateStallAddr(list_id, LIST_UNCACHED + n);
+        ge.s.kicks++;
     }
 }
 
@@ -268,8 +273,8 @@ static u16 span(s32 v, s32 n, u32 size, u32 tile)
 {
     if (n >= (s32)size)
         return 0xFFFF;
-    u32 v0 = (u32)v & (size - 1), v1 = v0 + (u32)n - 1;
-    u64 m = ((2ull << (v1 / tile)) - 1) & ~((1ull << (v0 / tile)) - 1);
+    u32 v0 = (u32)v & (size - 1), v1 = v0 + (u32)n - 1; /* v1 / tile <= 31: 2u << 31 wraps to 0, all ones */
+    u32 m = ((2u << (v1 / tile)) - 1) & ~((1u << (v0 / tile)) - 1);
     return (u16)(m | m >> 16);
 }
 
@@ -283,10 +288,24 @@ static void mark(s32 x1, s32 y1, s32 x2, s32 y2)
         bump(x1, y1, x2 - x1 + 1, y2 - y1 + 1);
         return;
     }
+    if (x1 >= ge.mk_x1 && y1 >= ge.mk_y1 && x2 <= ge.mk_x2 && y2 <= ge.mk_y2)
+        return; /* its tiles are newer already */
+    ge.mk_x1 = x1 & ~(TILE_W - 1), ge.mk_y1 = y1 & ~(TILE_H - 1);
+    ge.mk_x2 = x2 | (TILE_W - 1), ge.mk_y2 = y2 | (TILE_H - 1);
     u16 c = span(x1, x2 - x1 + 1, VRAM_W, TILE_W), r = span(y1, y2 - y1 + 1, VRAM_H, TILE_H);
     for (int ty = 0; ty < TILES_Y; ty++)
-        if (r >> ty & 1)
-            ge.newer[ty] |= c;
+        if (r >> ty & 1) {
+            u16 o = ge.newer[ty];
+            if ((o | c) != o)
+                ge.newer[ty] = o | c, ge.nver++;
+        }
+}
+
+/* No tile is newer, so none is cached as marked. */
+static void newer_clear(void)
+{
+    memset(ge.newer, 0, sizeof ge.newer);
+    ge.mk_x1 = ge.mk_y1 = 1, ge.mk_x2 = ge.mk_y2 = 0;
 }
 
 static void bump(s32 x, s32 y, s32 w, s32 h)
@@ -428,8 +447,8 @@ static void rd_read(void *self, s32 x, s32 y, s32 w, s32 h)
         for (int tx = 0; tx < TILES_X; tx++)
             if (ge.newer[ty] >> tx & 1)
                 ge.gen[ty][tx]++, ge.s.read_tiles++;
-        ge.newer[ty] = 0;
     }
+    newer_clear();
     ge.epoch++;
     ge.s.readbacks++;
 }
@@ -592,6 +611,7 @@ static void bind(const GpuPrim *p, const u8 *pg, const u32 *cl)
         sceGuClutMode(GU_PSM_8888, 0, 0xFF, 0);
         sceGuClutLoad(p->depth ? 32 : 2, cl); /* blocks of 8 entries */
         ge.clut_sent = cl;
+        ge.s.bind_clut++;
     }
     if (pg != ge.tex_sent) {
         sceGuTexMode(p->depth ? GU_PSM_T8 : GU_PSM_T4, 0, 0, 0);
@@ -599,6 +619,7 @@ static void bind(const GpuPrim *p, const u8 *pg, const u32 *cl)
         sceGuTexImage(0, 256, 256, 256, pg);
         sceGuTexFlush();
         ge.tex_sent = pg;
+        ge.s.bind_tex++;
     }
     int fn = p->raw;
     if (fn != ge.texfn) {
@@ -616,9 +637,14 @@ static int prim_begin(const GpuPrim *p)
         begin();
         return 3;
     }
-    s32 hw = p->depth ? 128 : 64;
-    rd_read(&ge, (s32)p->tpx, (s32)p->tpy, hw, 256);
-    rd_read(&ge, (s32)p->clut_x, (s32)p->clut_y, p->depth ? 256 : 16, 1);
+    /* While no tile turned newer, a page and CLUT checked before need no readback. */
+    u32 tk = 1 + (p->tpx | p->tpy << 10 | p->depth << 20), ck = p->clut_x | p->clut_y << 10 | p->depth << 20;
+    if (tk != ge.rk_tex || ck != ge.rk_clut || ge.nver != ge.rk_ver) {
+        ge.s.rd_checks++;
+        rd_read(&ge, (s32)p->tpx, (s32)p->tpy, p->depth ? 128 : 64, 256);
+        rd_read(&ge, (s32)p->clut_x, (s32)p->clut_y, p->depth ? 256 : 16, 1);
+        ge.rk_tex = tk, ge.rk_clut = ck, ge.rk_ver = ge.nver;
+    }
     begin();
     const u8 *pg = page(p);
     int flags;
@@ -690,8 +716,8 @@ static s32 col8(float c)
 }
 
 /* A triangle (n 3, drawn as a fan) or a quad (n 4: the triangles 0,1,2 and 1,2,3, drawn as a
- * strip). A quad left of or above the VRAM origin, or in compare mode, is GPU_SW: the core
- * offers its two triangles instead. */
+ * strip). A quad left of or above the VRAM origin is GPU_SW: the core offers its two triangles
+ * instead. In compare mode the core draws a quad's two triangles too (GPU_BOTH). */
 static int polygon(const GpuPrim *p, const GpuVtx *const *v, int n)
 {
     s32 minx = v[0]->x, maxx = v[0]->x, miny = v[0]->y, maxy = v[0]->y;
@@ -699,7 +725,7 @@ static int polygon(const GpuPrim *p, const GpuVtx *const *v, int n)
         minx = v[i]->x < minx ? v[i]->x : minx, maxx = v[i]->x > maxx ? v[i]->x : maxx;
         miny = v[i]->y < miny ? v[i]->y : miny, maxy = v[i]->y > maxy ? v[i]->y : maxy;
     }
-    if (n == 4 && (minx < 0 || miny < 0 || ge.compare))
+    if (n == 4 && (minx < 0 || miny < 0))
         return GPU_SW;
     if (p->textured && !tex_ok(p))
         return GPU_SW;
@@ -952,7 +978,7 @@ void ge_init(Psx *psx, int compare)
     psx_log(psx, "ge: %d texture page slots", ge.npages);
     rd_fill(&ge, 0, 0, VRAM_W, VRAM_H, 0); /* also makes the oracle create the framebuffer */
     ge_sync();
-    memset(ge.newer, 0, sizeof ge.newer); /* both copies are zero */
+    newer_clear(); /* both copies are zero */
     memset(&ge.s, 0, sizeof ge.s);
     psx->gpu.renderer = &ge.r;
 }
@@ -1008,14 +1034,15 @@ int ge_log(char *buf, int cap)
     int n = clampn(snprintf(buf, (size_t)cap,
                             "-- ge: tri %u+%u tex, rect %u+%u tex, fill %u, line %u (%u runs); sw tex15 %u texwin %u "
                             "copy %u+%u sw+%u null (%u kpx, %u from ge); pages %u cluts %u, readback %u (%u tiles, %u ms), upload %u "
-                            "(%u kpx), flush %u\n",
+                            "(%u kpx), flush %u; bind %u tex %u clut, kick %u, rd check %u\n",
                             (unsigned)s->tris, (unsigned)s->ttris, (unsigned)s->rects, (unsigned)s->trects,
                             (unsigned)s->fills, (unsigned)s->lines, (unsigned)s->line_runs, (unsigned)s->sw_tex15,
                             (unsigned)s->sw_texwin,
                             (unsigned)s->ge_copy, (unsigned)s->sw_copy, (unsigned)s->null_copy, (unsigned)(s->copy_px / 1000), (unsigned)s->copy_from_ge,
                             (unsigned)s->pages, (unsigned)s->cluts, (unsigned)s->readbacks, (unsigned)s->read_tiles,
                             (unsigned)(s->read_us / 1000), (unsigned)s->uploads, (unsigned)(s->upload_px / 1000),
-                            (unsigned)s->flushes),
+                            (unsigned)s->flushes, (unsigned)s->bind_tex, (unsigned)s->bind_clut, (unsigned)s->kicks,
+                            (unsigned)s->rd_checks),
                    cap);
     memset(&ge.s, 0, sizeof ge.s);
     if (ge.compare && n < cap - 1)

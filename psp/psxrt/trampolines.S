@@ -86,11 +86,42 @@ psxrt_gret:
     move $k1, $v0
     .end psxrt_gret
 
-/* GTE_CMD: `sw ra,GPR31(k0); lui k1,hi; jal GTE_CMD; ori k1,k1,lo`. native_gte_cmd(k1) is C:
- * only the caller-saved registers, gp, sp and HI/LO need saving; s0-s7 and fp survive it. */
+/* GTE_CMD: `sw ra,GPR31(k0); lui k1,hi; jal GTE_CMD; ori k1,k1,lo`. native_gte_fast(k1) is C
+ * that keeps every register but at, v0 and a0 (gte_fast.c): those, gp, sp and HI/LO are saved. */
     .globl psxrt_gte_cmd
     .ent psxrt_gte_cmd
 psxrt_gte_cmd:
+    sw $ra, GTE_RET($k0)
+    .irp r,1,2,4,28,29
+    sw $\r, G(\r)($k0)
+    .endr
+    mfhi $at
+    sw $at, HI($k0)
+    mflo $at
+    sw $at, LO($k0)
+    move $a0, $k1
+    TO_HOST
+    jal native_gte_fast
+    nop
+    lui $k0, %hi(K0_VALUE)
+    ori $k0, $k0, %lo(K0_VALUE)
+    lw $at, HI($k0)
+    mthi $at
+    lw $at, LO($k0)
+    mtlo $at
+    .irp r,1,2,4,28,29,31
+    lw $\r, G(\r)($k0)
+    .endr
+    lw $k1, GTE_RET($k0)
+    jr $k1
+    nop
+    .end psxrt_gte_cmd
+
+/* GTE_CMD when psxrt.trace bit 7 asks for the GTE's time: native_gte_prof is ordinary C, so
+ * every caller-saved register is saved. */
+    .globl psxrt_gte_prof
+    .ent psxrt_gte_prof
+psxrt_gte_prof:
     sw $ra, GTE_RET($k0)
     .irp r,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,24,25,28,29
     sw $\r, G(\r)($k0)
@@ -101,7 +132,7 @@ psxrt_gte_cmd:
     sw $at, LO($k0)
     move $a0, $k1
     TO_HOST
-    jal native_gte_cmd
+    jal native_gte_prof
     nop
     lui $k0, %hi(K0_VALUE)
     ori $k0, $k0, %lo(K0_VALUE)
@@ -115,7 +146,7 @@ psxrt_gte_cmd:
     lw $k1, GTE_RET($k0)
     jr $k1
     nop
-    .end psxrt_gte_cmd
+    .end psxrt_gte_prof
 
 /* The guest state from CTX, then on to the host address in k1. */
     .ent restore_and_go
