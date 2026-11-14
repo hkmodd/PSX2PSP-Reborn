@@ -108,6 +108,7 @@ typedef struct Timers {
 } Timers;
 
 #define CD_FIFO 16
+#define CD_XA_FIFO 16384 /* stereo samples: two sectors of the slowest rate (mono 18.9 kHz) */
 typedef struct CdResp {
     u8 irq, n;
     u8 b[CD_FIFO];
@@ -140,10 +141,12 @@ typedef struct Cdrom {
     u8 pending[2352];     /* sector waiting in q */
     u8 data[2340];
     int data_len, data_pos;
-    /* XA */
+    /* XA-ADPCM: decoded, resampled to 44100 Hz and queued for the SPU's CD input */
     s32 xa_prev[2][2];
-    s16 xa_buf[2][4032 * 2];
-    int xa_len;
+    s16 xa_last[2];
+    u32 xa_phase; /* 16.16 position between xa_last and the next decoded sample */
+    s16 xa_fifo[CD_XA_FIFO * 2];
+    u32 xa_rd, xa_wr;
     u8 vol[4]; /* LL LR RL RR */
     u8 vol_next[4];
     int muted;
@@ -221,18 +224,26 @@ typedef struct Gpu {
     u32 n_kind[6], us_kind[6], frags, tested;
 } Gpu;
 
+/* A volume that is either fixed or sweeping (the voice volumes and the main volume). */
+typedef struct SpuSweep {
+    s32 level; /* 0..7FFF, the sign comes from the register */
+    s32 wait;  /* samples to the next step */
+} SpuSweep;
+
 typedef struct SpuVoice {
-    u16 vol_l, vol_r, pitch, start, adsr1, adsr2, repeat;
-    s16 adsr_vol;
-    u32 addr;    /* current address in 8-byte units */
-    u32 counter; /* pitch counter, 12 fraction bits */
-    s16 buf[28];
-    s16 hist[2];
-    int phase; /* ADSR phase: 0 off, 1 attack, 2 decay, 3 sustain, 4 release */
-    s32 env_counter;
-    int on;
-    int ended;
+    u32 addr;        /* byte address of the ADPCM block being played */
+    u32 repeat;      /* byte address a loop end jumps to */
+    u32 counter;     /* pitch counter: sample index in the block << 12 | fraction */
+    s32 env;         /* ADSR level, 0..7FFF */
+    s32 env_wait;    /* samples to the next envelope step */
+    int phase;       /* SPU_OFF, SPU_ATTACK, SPU_DECAY, SPU_SUSTAIN, SPU_RELEASE */
+    int ignore_loop; /* the repeat address was written after key-on: loop-start flags keep out */
+    s16 hist[2];     /* ADPCM filter history */
+    s16 buf[3 + 28]; /* last three samples of the previous block, then the current block */
+    SpuSweep vol[2];
 } SpuVoice;
+
+#define SPU_CHUNK 256 /* samples mixed at once */
 
 typedef struct Spu {
     u8 *ram; /* 512 KB */
@@ -242,10 +253,17 @@ typedef struct Spu {
     u16 ctrl, stat;
     u32 irq_addr;
     u32 endx;
-    u64 last;  /* cycle of the last mixed sample */
+    u64 last; /* cycle of the last mixed sample */
+    s32 noise, noise_timer;
+    SpuSweep main[2];
+    u32 rev_cur;    /* reverb work-area position, halfwords */
+    s32 rev_in[2];  /* input summed over the two samples of one reverb step */
+    s32 rev_out[2]; /* output of the last reverb step */
+    int rev_odd;
+    u32 capture; /* capture-buffer position, halfwords 0..1FF */
     s16 out[2 * 1024];
     int nout;
-    double resample; /* 44100 output phase */
+    u32 us_mix; /* microseconds spent mixing, when PsxHost.usec is set */
 } Spu;
 
 typedef struct Sio {
@@ -442,7 +460,9 @@ u8 cd_read(Psx *psx, int reg);
 void cd_write(Psx *psx, int reg, u8 v);
 void cd_update(Psx *psx);
 u32 cd_dma_word(Psx *psx);
-void cd_mix(Psx *psx, s32 *l, s32 *r, int n44100);
+/* The next 44100 Hz stereo sample of the CD audio (XA), through the CD volume matrix; 0 when
+ * nothing is queued. */
+void cd_audio(Psx *psx, s32 *l, s32 *r);
 
 /* gpu.c */
 void gpu_init(Psx *psx);

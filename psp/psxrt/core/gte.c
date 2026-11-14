@@ -5,6 +5,17 @@
  */
 #include "psx.h"
 
+#ifdef _MSC_VER /* the PC simulator's compiler */
+#include <intrin.h>
+#define __builtin_expect(x, v) (x)
+static int __builtin_clz(unsigned x)
+{
+    unsigned long i;
+    _BitScanReverse(&i, x);
+    return 31 - (int)i;
+}
+#endif
+
 #define D (psx->gte->d)
 #define C (psx->gte->c)
 

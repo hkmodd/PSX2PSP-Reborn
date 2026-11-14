@@ -15,6 +15,7 @@
  * allocated. The translated code goes to the region DATA.PSAR names, below the PS1 RAM. VRAM,
  * SPU RAM and the MDEC input are ordinary partition blocks.
  */
+#include <pspaudio.h>
 #include <pspctrl.h>
 #include <pspdebug.h>
 #include <pspdisplay.h>
@@ -422,6 +423,7 @@ static Psx psx;
 static PsxHost host;
 static u32 frames;
 static int native;
+static u32 audio_drops, audio_gaps, audio_trims; /* per second; the audio ring below */
 
 /* Pad, status line, picture; once per second the speed (and native counters) to the log. */
 static void frame(void)
@@ -430,7 +432,7 @@ static void frame(void)
     static u64 c0;
     static u32 f0, speed, fps;
     static NativeStats n0;
-    static u32 draw0, mdec0, rgb0;
+    static u32 draw0, mdec0, spu0, rgb0;
     static char status[64];
     psx.sio.buttons[0] = read_pad(frames);
     u64 t = sceKernelGetSystemTimeWide();
@@ -451,11 +453,15 @@ static void frame(void)
                               (unsigned)(s->misses - n0.misses), (unsigned)(s->steps - n0.steps), (unsigned)(s->hashes - n0.hashes),
                               (unsigned)s->loads, (unsigned)(s->poll_skips - n0.poll_skips));
                 n += snprintf(line + n, sizeof line - (size_t)n,
-                              "-- ms: interp %u io %u (draw %u mdec %u) update %u present %u (rgb24 %u) sleep %u\n",
+                              "-- ms: interp %u io %u (draw %u mdec %u spu %u) update %u present %u (rgb24 %u) sleep %u;"
+                              " audio drops %u gaps %u trims %u\n",
                               (unsigned)((s->us_interp - n0.us_interp) / 1000), (unsigned)((s->us_io - n0.us_io) / 1000),
                               (unsigned)((psx.gpu.us_draw - draw0) / 1000), (unsigned)((psx.mdec.us_decode - mdec0) / 1000),
+                              (unsigned)((psx.spu.us_mix - spu0) / 1000),
                               (unsigned)((s->us_update - n0.us_update) / 1000), (unsigned)((s->us_present - n0.us_present) / 1000),
-                              (unsigned)((us_rgb24 - rgb0) / 1000), (unsigned)((s->us_sleep - n0.us_sleep) / 1000));
+                              (unsigned)((us_rgb24 - rgb0) / 1000), (unsigned)((s->us_sleep - n0.us_sleep) / 1000),
+                              (unsigned)audio_drops, (unsigned)audio_gaps, (unsigned)audio_trims);
+                audio_drops = audio_gaps = audio_trims = 0;
                 static const char *const io_names[IO_KINDS] = IO_KIND_NAMES;
                 n += snprintf(line + n, sizeof line - (size_t)n, "-- io (n/ms):");
                 for (int k = 0; k < IO_KINDS; k++)
@@ -463,7 +469,7 @@ static void frame(void)
                         n += snprintf(line + n, sizeof line - (size_t)n, " %s %u/%u", io_names[k], (unsigned)(s->n_io[k] - n0.n_io[k]),
                                       (unsigned)((s->us_io_kind[k] - n0.us_io_kind[k]) / 1000));
                 n += snprintf(line + n, sizeof line - (size_t)n, "\n");
-                n0 = *s, draw0 = psx.gpu.us_draw, mdec0 = psx.mdec.us_decode, rgb0 = us_rgb24;
+                n0 = *s, draw0 = psx.gpu.us_draw, mdec0 = psx.mdec.us_decode, spu0 = psx.spu.us_mix, rgb0 = us_rgb24;
                 Gpu *g = &psx.gpu;
                 n += snprintf(line + n, sizeof line - (size_t)n,
                               "-- gpu: poly %u/%u line %u/%u rect %u/%u copy %u/%u fill %u/%u other %u/%u (n/ms), frags %u tested %u\n",
@@ -497,6 +503,57 @@ static u32 host_usec(void *user)
 {
     (void)user;
     return sceKernelGetSystemTimeLow();
+}
+
+/* ---- audio: the SPU's 44100 Hz stereo through a ring to a thread that feeds one hardware
+ * channel. The ring absorbs the SPU's per-frame bursts; when the game runs ahead of the clock the
+ * consumer trims the backlog, when it falls behind the channel gets silence. ---- */
+#define AUDIO_RING 16384 /* stereo samples, a power of two */
+#define AUDIO_BLOCK 1024 /* samples per hardware output, a multiple of 64 */
+static s16 audio_ring[AUDIO_RING * 2];
+static volatile u32 audio_rd, audio_wr;
+
+static void host_audio(void *user, const s16 *samples, int frames)
+{
+    (void)user;
+    u32 wr = audio_wr, room = AUDIO_RING - (wr - audio_rd);
+    if ((u32)frames > room)
+        audio_drops += (u32)frames - room, frames = (int)room;
+    for (int i = 0; i < frames; i++, wr++) {
+        u32 at = (wr & (AUDIO_RING - 1)) * 2;
+        audio_ring[at] = samples[2 * i], audio_ring[at + 1] = samples[2 * i + 1];
+    }
+    __asm__ volatile("" ::: "memory"); /* the samples before the index that publishes them */
+    audio_wr = wr;
+}
+
+static int audio_thread(SceSize args, void *argp)
+{
+    (void)args, (void)argp;
+    static s16 buf[AUDIO_BLOCK * 2] __attribute__((aligned(64)));
+    int ch = sceAudioChReserve(PSP_AUDIO_NEXT_CHANNEL, AUDIO_BLOCK, PSP_AUDIO_FORMAT_STEREO);
+    if (ch < 0) {
+        say("audio: no channel (%08X)", ch);
+        return 0;
+    }
+    for (;;) {
+        u32 rd = audio_rd, fill = audio_wr - rd;
+        if (fill > 8 * AUDIO_BLOCK) /* more than ~190 ms behind: catch up to ~70 ms */
+            rd += fill - 3 * AUDIO_BLOCK, fill = 3 * AUDIO_BLOCK, audio_trims++;
+        u32 n = fill < AUDIO_BLOCK ? fill : AUDIO_BLOCK;
+        for (u32 i = 0; i < n; i++, rd++) {
+            u32 at = (rd & (AUDIO_RING - 1)) * 2;
+            buf[2 * i] = audio_ring[at], buf[2 * i + 1] = audio_ring[at + 1];
+        }
+        if (n < AUDIO_BLOCK) {
+            memset(buf + 2 * n, 0, (AUDIO_BLOCK - n) * 4);
+            audio_gaps += n > 0;
+        }
+        audio_rd = rd;
+        sceKernelDcacheWritebackRange(buf, sizeof buf);
+        sceAudioOutputBlocking(ch, PSP_AUDIO_VOLUME_MAX, buf);
+    }
+    return 0;
 }
 
 /* ---- memory card: slot 1's image in card0.mcr beside the EBOOT (Sony's 128 KB layout) ---- */
@@ -629,6 +686,10 @@ int main(int argc, char **argv)
     host.log = host_log;
     host.vblank = host_vblank;
     host.usec = host_usec;
+    host.audio = host_audio;
+    int ath = sceKernelCreateThread("psxrt audio", audio_thread, 0x12, 0x2000, PSP_THREAD_ATTR_USER, NULL);
+    if (ath >= 0)
+        sceKernelStartThread(ath, 0, NULL);
     card_load(eboot);
     host.card[0] = card_image;
     host.card_dirty = host_card_dirty;

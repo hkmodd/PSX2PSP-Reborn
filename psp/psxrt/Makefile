@@ -7,7 +7,7 @@ OBJS = main.o disc.o ge.o native.o trampolines.o $(addprefix core/,$(addsuffix .
 INCDIR = core
 CFLAGS = -std=gnu99 -O2 -G0 -Wall -Wextra -Werror
 ASFLAGS = $(CFLAGS)
-LIBS = -lpspgu -lpsppower -lz
+LIBS = -lpspgu -lpspaudio -lpsppower -lz
 
 BUILD_PRX = 1
 

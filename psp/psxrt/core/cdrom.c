@@ -25,6 +25,8 @@ static void msf(u32 lba, u8 *m)
     m[0] = bcd(lba / 4500), m[1] = bcd(lba / 75 % 60), m[2] = bcd(lba % 75);
 }
 
+static void xa_sector(Psx *psx, const u8 *raw);
+
 static u32 period(const Cdrom *cd) { return (cd->mode & 0x80) ? SECTOR_1X / 2 : SECTOR_1X; }
 
 static CdResp *push(Psx *psx, u8 irq, u64 at)
@@ -113,8 +115,10 @@ static void sector(Psx *psx)
     int xa_audio = (sub & 0x04) && (sub & 0x40) && raw[15] == 2;
     if ((cd->mode & 0x08) && xa_audio && (file != cd->filter_file || chan != cd->filter_chan))
         return; /* filtered out */
-    if ((cd->mode & 0x40) && xa_audio)
-        return; /* XA-ADPCM goes to the audio path (S6) */
+    if ((cd->mode & 0x40) && xa_audio) { /* XA-ADPCM: to the SPU, no INT1 */
+        xa_sector(psx, raw);
+        return;
+    }
     memcpy(cd->pending, raw, sizeof raw);
     for (int i = 0; i < cd->nq; i++)
         if (cd->q[i].sector) {
@@ -393,7 +397,78 @@ u32 cd_dma_word(Psx *psx)
     return v;
 }
 
-void cd_mix(Psx *psx, s32 *l, s32 *r, int n44100)
+static s32 clamp16(s32 x) { return x < -0x8000 ? -0x8000 : x > 0x7FFF ? 0x7FFF : x; }
+
+static void xa_push(Cdrom *cd, s32 l, s32 r)
 {
-    (void)psx, (void)l, (void)r, (void)n44100; /* XA playback arrives with S6 */
+    if (cd->xa_wr - cd->xa_rd >= CD_XA_FIFO)
+        return; /* the SPU is not consuming: drop rather than grow the delay */
+    u32 i = cd->xa_wr++ % CD_XA_FIFO;
+    cd->xa_fifo[2 * i] = (s16)l, cd->xa_fifo[2 * i + 1] = (s16)r;
+}
+
+/* An XA-ADPCM sector (psx-spx "CDROM XA Audio ADPCM Compression"): 18 sound groups of 128 bytes,
+ * each eight 28-sample units (4-bit) after a 16-byte header whose bytes 4..11 hold the units'
+ * shift and filter; stereo alternates left and right units. Resampled to 44100 Hz by linear
+ * interpolation (the hardware's 7-tap zigzag filter is not reproduced). Follows RecompOne's
+ * XaAudio.cs (MIT, notice in spu.c). */
+static void xa_sector(Psx *psx, const u8 *raw)
+{
+    static const s32 k0[4] = {0, 60, 115, 98}, k1[4] = {0, 0, -52, -55};
+    Cdrom *cd = &psx->cd;
+    u8 ci = raw[19];
+    int stereo = (ci & 3) == 1, rate = (ci >> 2 & 3) == 1 ? 18900 : 37800;
+    if ((ci >> 4 & 3) != 0) {
+        static int told;
+        if (!told++)
+            psx_log(psx, "cd: 8-bit XA-ADPCM not supported (coding %02X)", ci);
+        return;
+    }
+    static s16 pcm[2][4032];
+    int n[2] = {0, 0};
+    for (int g = 0; g < 18; g++) {
+        const u8 *grp = raw + 24 + g * 128;
+        for (int u = 0; u < 8; u++) {
+            int ch = stereo ? u & 1 : 0, shift = grp[4 + u] & 15, f = grp[4 + u] >> 4 & 3;
+            if (shift > 12)
+                shift = 9;
+            s32 h0 = cd->xa_prev[ch][0], h1 = cd->xa_prev[ch][1];
+            const u8 *d = grp + 16 + (u >> 1);
+            int nib = (u & 1) * 4;
+            for (int j = 0; j < 28; j++) {
+                s32 x = ((s32)(s16)((d[j * 4] >> nib & 15) << 12) >> shift) + ((h0 * k0[f] + h1 * k1[f] + 32) >> 6);
+                x = clamp16(x);
+                h1 = h0, h0 = x;
+                pcm[ch][n[ch]++] = (s16)x;
+            }
+            cd->xa_prev[ch][0] = h0, cd->xa_prev[ch][1] = h1;
+        }
+    }
+    u32 step = (u32)(((u64)rate << 16) / 44100);
+    for (int i = 0; i < n[0]; i++) {
+        s32 l = pcm[0][i], r = stereo ? pcm[1][i] : l;
+        for (; cd->xa_phase < 0x10000; cd->xa_phase += step) {
+            s32 t = (s32)(cd->xa_phase >> 1); /* 15 bits keep the product in range */
+            xa_push(cd, cd->xa_last[0] + ((l - cd->xa_last[0]) * t >> 15), cd->xa_last[1] + ((r - cd->xa_last[1]) * t >> 15));
+        }
+        cd->xa_phase -= 0x10000;
+        cd->xa_last[0] = (s16)l, cd->xa_last[1] = (s16)r;
+    }
+}
+
+void cd_audio(Psx *psx, s32 *l, s32 *r)
+{
+    Cdrom *cd = &psx->cd;
+    if (cd->xa_rd == cd->xa_wr) {
+        *l = *r = 0;
+        return;
+    }
+    u32 i = cd->xa_rd++ % CD_XA_FIFO;
+    s32 a = cd->xa_fifo[2 * i], b = cd->xa_fifo[2 * i + 1];
+    if (cd->muted) {
+        *l = *r = 0;
+        return;
+    }
+    *l = clamp16((a * cd->vol[0] + b * cd->vol[2]) >> 7); /* LL, RL: 0x80 is 100% */
+    *r = clamp16((a * cd->vol[1] + b * cd->vol[3]) >> 7); /* LR, RR */
 }

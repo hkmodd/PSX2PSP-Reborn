@@ -2,6 +2,7 @@
  * interpreter by frames, and exposes VRAM and the display mode to the Rust driver. */
 #include "psx.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -30,6 +31,15 @@ static void log_line(void *user, const char *line)
 }
 
 static void vblank(void *user) { ((Sim *)user)->frames++; }
+
+/* PSX2PSP_SIM_AUDIO=<file>: the SPU's output as raw 44100 Hz stereo s16le, for offline checks. */
+static FILE *audio_file;
+
+static void audio(void *user, const s16 *samples, int frames)
+{
+    (void)user;
+    fwrite(samples, 4, (size_t)frames, audio_file);
+}
 
 static void *rust_user;
 static ReadFn rust_read;
@@ -61,6 +71,9 @@ Sim *sim_new(void *user, ReadFn rd, u32 disc_end, TextFn tty, TextFn log)
     s->host.tty = tty_fwd;
     s->host.log = log_line;
     s->host.vblank = vblank;
+    const char *audio_path = getenv("PSX2PSP_SIM_AUDIO");
+    if (audio_path && !audio_file && (audio_file = fopen(audio_path, "wb")) != NULL)
+        s->host.audio = audio;
     psx_init(&s->psx, &s->host, s->ram, s->scratch, s->vram, s->spu_ram, s->mdec_in, MDEC_CAP);
     return s;
 }
