@@ -50,6 +50,7 @@ typedef struct {
     u32 ge_copy, null_copy, copy_px, copy_from_ge; /* copies: on the GE, onto themselves, pixels, read from the GE */
     u32 bind_tex, bind_clut, kicks, rd_checks;     /* textures and CLUTs sent, stall moves, readback checks */
     u32 fast, fast_setups, fast_hits;              /* polygons through the fast lane; its state changes, found cached */
+    u32 slow_tex, slow_big, flat, clipped;        /* fast lane: turned away for texture or size; no area; cut at the origin */
 } GeStats;
 
 /* A 4/8-bit texture page as a 256x256 T4/T8 texture. */
@@ -1139,9 +1140,30 @@ static void fl_setup(u32 cmd, u32 clut)
     ge.s.fast_setups++;
 }
 
-/* A polygon command (GP0 20-3F) straight from its words, when it lies inside VRAM (no clipping
- * at the origin) and the GE can sample its texture; -1 otherwise. Each vertex is written once
- * into the ring; the list gets BASE when it moves, VADDR and PRIM, per pass. */
+/* A draw of n ring vertices at vp in the lane's state: BASE when it moves, VADDR and PRIM, per
+ * pass. Returns the list's next word. */
+static unsigned int *fl_draw(unsigned int *l, const u8 *vp, int prim, int n)
+{
+    u32 base = (u32)vp >> 8 & 0xF0000, va = 0x01000000u | ((u32)vp & 0xFFFFFF);
+    u32 pr = 0x04000000u | (u32)prim << 16 | (u32)n;
+    if (fl.two)
+        for (int i = 0; i < fl.n1; i++)
+            *l++ = fl.pass1[i];
+    if (base != fl.base)
+        *l++ = 0x10000000u | base, fl.base = base;
+    *l++ = va, *l++ = pr;
+    if (fl.two) {
+        for (int i = 0; i < fl.n2; i++)
+            *l++ = fl.pass2[i];
+        *l++ = va, *l++ = pr;
+    }
+    return l;
+}
+
+/* A polygon command (GP0 20-3F) straight from its words, when the GE can sample its texture and
+ * it is within the core's size limits; -1 otherwise. Each vertex is written once into the ring.
+ * One left of or above the VRAM origin is cut there, triangle by triangle, as polygon() cuts the
+ * core's triangles. One with no area draws nothing, as in the core. */
 static int rd_poly(void *self, const u32 *c)
 {
     (void)self;
@@ -1149,7 +1171,7 @@ static int rd_poly(void *self, const u32 *c)
     u32 cmd = c[0] >> 24;
     int quad = cmd >> 3 & 1, tex = cmd >> 2 & 1, gour = cmd >> 4 & 1, n = quad ? 4 : 3;
     if (tex && ((g->texpage >> 7 & 3) >= 2 || g->tw_mask_x || g->tw_mask_y || !ge.npages))
-        return -1;
+        return ge.s.slow_tex++, -1;
     s32 x[4], y[4];
     u32 col[4], uv[4];
     u32 cl = c[0] & 0xFFFFFF;
@@ -1168,12 +1190,13 @@ static int rd_poly(void *self, const u32 *c)
         minx = x[i] < minx ? x[i] : minx, maxx = x[i] > maxx ? x[i] : maxx;
         miny = y[i] < miny ? y[i] : miny, maxy = y[i] > maxy ? y[i] : maxy;
     }
-    if ((minx | miny) < 0 || maxx > VRAM_W - 1 || maxy > VRAM_H - 1)
-        return -1;
     if (!quad && (x[1] - x[0]) * (y[2] - y[0]) == (x[2] - x[0]) * (y[1] - y[0]))
-        return -1; /* no area: the core draws nothing */
+        return ge.s.flat++, DONE; /* no area: the core draws nothing either */
+    if (maxx - minx > 1023 || maxy - miny > 511)
+        return ge.s.slow_big++, -1; /* the core drops what is too large, triangle by triangle */
+    int cut = (minx | miny) < 0; /* left of or above the VRAM origin: cut as polygon() does */
     u32 vsz = tex ? sizeof(TexVtx) : sizeof(GeVtx);
-    if (fl.ring_off + (u32)n * vsz > fl.ring_bytes) {
+    if (fl.ring_off + (u32)(cut ? 10 : n) * vsz > fl.ring_bytes) {
         ge_sync();
         ge.s.flushes++;
     } else if (fl.valid && (u32)((u8 *)gu_list->current - (u8 *)gu_list->start) > LIST_BYTES - LIST_SLACK)
@@ -1209,36 +1232,62 @@ static int rd_poly(void *self, const u32 *c)
         ge.s.tris += (u32)n - 2;
     ge.s.fast++;
     mark(bx1, by1, bx2, by2);
-    /* +0.5 as in polygon() */
-    u8 *vp = fl.ring + fl.ring_off;
-    if (tex) {
-        TexVtx *o = (TexVtx *)vp;
-        for (int i = 0; i < n; i++) {
-            o[i].u = (float)(uv[i] & 0xFF) + 0.5f, o[i].v = (float)(uv[i] >> 8 & 0xFF) + 0.5f;
-            o[i].c = raw ? 0xFF808080u : 0xFF000000u | col[i];
-            o[i].x = (float)x[i] + 0.5f, o[i].y = (float)y[i] + 0.5f, o[i].z = 0;
-        }
-    } else {
-        GeVtx *o = (GeVtx *)vp;
-        for (int i = 0; i < n; i++) {
-            o[i].c = 0xFF000000u | col[i];
-            o[i].x = (float)x[i] + 0.5f, o[i].y = (float)y[i] + 0.5f, o[i].z = 0;
-        }
-    }
-    fl.ring_off += (u32)n * vsz;
-    u32 base = (u32)vp >> 8 & 0xF0000, va = 0x01000000u | ((u32)vp & 0xFFFFFF);
-    u32 pr = 0x04000000u | (u32)(quad ? GU_TRIANGLE_STRIP : GU_TRIANGLE_FAN) << 16 | (u32)n;
+    if (raw)
+        for (int i = 0; i < n; i++)
+            col[i] = 0x808080;
     unsigned int *l = gu_list->current;
-    if (fl.two)
-        for (int i = 0; i < fl.n1; i++)
-            *l++ = fl.pass1[i];
-    if (base != fl.base)
-        *l++ = 0x10000000u | base, fl.base = base;
-    *l++ = va, *l++ = pr;
-    if (fl.two) {
-        for (int i = 0; i < fl.n2; i++)
-            *l++ = fl.pass2[i];
-        *l++ = va, *l++ = pr;
+    u8 *vp = fl.ring + fl.ring_off;
+    if (!cut) {
+        /* +0.5 as in polygon() */
+        if (tex) {
+            TexVtx *o = (TexVtx *)vp;
+            for (int i = 0; i < n; i++) {
+                o[i].u = (float)(uv[i] & 0xFF) + 0.5f, o[i].v = (float)(uv[i] >> 8 & 0xFF) + 0.5f;
+                o[i].c = 0xFF000000u | col[i];
+                o[i].x = (float)x[i] + 0.5f, o[i].y = (float)y[i] + 0.5f, o[i].z = 0;
+            }
+        } else {
+            GeVtx *o = (GeVtx *)vp;
+            for (int i = 0; i < n; i++) {
+                o[i].c = 0xFF000000u | col[i];
+                o[i].x = (float)x[i] + 0.5f, o[i].y = (float)y[i] + 0.5f, o[i].z = 0;
+            }
+        }
+        l = fl_draw(l, vp, quad ? GU_TRIANGLE_STRIP : GU_TRIANGLE_FAN, n);
+        fl.ring_off += (u32)n * vsz;
+    } else {
+        /* the core's triangles (a quad's are 0,1,2 and 1,2,3), each cut to a fan */
+        ge.s.clipped++;
+        for (int t = 0; t + 2 < n; t++) {
+            int i0 = t, i1 = t + 1, i2 = t + 2;
+            if ((x[i1] - x[i0]) * (y[i2] - y[i0]) == (x[i2] - x[i0]) * (y[i1] - y[i0]))
+                continue;
+            ClipVtx a[8], b[8], *in = a, *out = b, *s;
+            for (int j = 0; j < 3; j++) {
+                int i = t + j;
+                a[j] = (ClipVtx){(float)x[i], (float)y[i], (float)(col[i] & 0xFF), (float)(col[i] >> 8 & 0xFF),
+                                 (float)(col[i] >> 16 & 0xFF), (float)(uv[i] & 0xFF), (float)(uv[i] >> 8 & 0xFF)};
+            }
+            int m = 3;
+            if (minx < 0)
+                m = clip_axis(in, m, out, 0), s = in, in = out, out = s;
+            if (miny < 0 && m >= 3)
+                m = clip_axis(in, m, out, 1), s = in, in = out, out = s;
+            if (m < 3)
+                continue;
+            if (tex) {
+                TexVtx *o = (TexVtx *)vp;
+                for (int i = 0; i < m; i++)
+                    o[i] = (TexVtx){in[i].u + 0.5f, in[i].v + 0.5f, abgr(col8(in[i].r), col8(in[i].g), col8(in[i].b)),
+                                    in[i].x + 0.5f, in[i].y + 0.5f, 0};
+            } else {
+                GeVtx *o = (GeVtx *)vp;
+                for (int i = 0; i < m; i++)
+                    o[i] = (GeVtx){abgr(col8(in[i].r), col8(in[i].g), col8(in[i].b)), in[i].x + 0.5f, in[i].y + 0.5f, 0};
+            }
+            l = fl_draw(l, vp, GU_TRIANGLE_FAN, m);
+            vp += (u32)m * vsz, fl.ring_off += (u32)m * vsz;
+        }
     }
     gu_list->current = l;
     ge_kick();
@@ -1337,7 +1386,7 @@ int ge_log(char *buf, int cap)
     int n = clampn(snprintf(buf, (size_t)cap,
                             "-- ge: tri %u+%u tex, rect %u+%u tex, fill %u, line %u (%u runs); sw tex15 %u texwin %u "
                             "copy %u+%u sw+%u null (%u kpx, %u from ge); pages %u cluts %u, readback %u (%u tiles, %u ms), upload %u "
-                            "(%u kpx), flush %u; bind %u tex %u clut, kick %u, rd check %u; fast %u (%u setups, %u cached)\n",
+                            "(%u kpx), flush %u; bind %u tex %u clut, kick %u, rd check %u; fast %u (%u setups, %u cached), slow tex %u big %u, flat %u, clipped %u\n",
                             (unsigned)s->tris, (unsigned)s->ttris, (unsigned)s->rects, (unsigned)s->trects,
                             (unsigned)s->fills, (unsigned)s->lines, (unsigned)s->line_runs, (unsigned)s->sw_tex15,
                             (unsigned)s->sw_texwin,
@@ -1345,7 +1394,7 @@ int ge_log(char *buf, int cap)
                             (unsigned)s->pages, (unsigned)s->cluts, (unsigned)s->readbacks, (unsigned)s->read_tiles,
                             (unsigned)(s->read_us / 1000), (unsigned)s->uploads, (unsigned)(s->upload_px / 1000),
                             (unsigned)s->flushes, (unsigned)s->bind_tex, (unsigned)s->bind_clut, (unsigned)s->kicks,
-                            (unsigned)s->rd_checks, (unsigned)s->fast, (unsigned)s->fast_setups, (unsigned)s->fast_hits),
+                            (unsigned)s->rd_checks, (unsigned)s->fast, (unsigned)s->fast_setups, (unsigned)s->fast_hits, (unsigned)s->slow_tex, (unsigned)s->slow_big, (unsigned)s->flat, (unsigned)s->clipped),
                    cap);
     memset(&ge.s, 0, sizeof ge.s);
     if (ge.compare && n < cap - 1)

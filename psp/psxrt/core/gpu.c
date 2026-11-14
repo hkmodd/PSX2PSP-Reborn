@@ -339,6 +339,9 @@ static void vtx_col(Vtx *v, u32 w)
     v->r = w & 0xFF, v->g = (w >> 8) & 0xFF, v->b = (w >> 16) & 0xFF;
 }
 
+u32 gpu_slow_us; /* polygons past the renderer's fast lane, timed as execute() times them */
+static int poly_slow;
+
 static void draw_polygon(Psx *psx, const u32 *c)
 {
     u32 cmd = c[0] >> 24;
@@ -347,6 +350,7 @@ static void draw_polygon(Psx *psx, const u32 *c)
     if (tex) /* the second vertex's texpage, as the loop below sets it */
         set_texpage(psx, (psx->gpu.texpage & ~0x1FFu) | (c[gour ? 5 : 4] >> 16 & 0x1FF));
     int fast = rd && rd->poly ? rd->poly(rd->self, c) : -1;
+    poly_slow = fast != GPU_DRAWN;
     if (fast == GPU_DRAWN)
         return;
     Vtx v[4];
@@ -559,6 +563,8 @@ static void execute(Psx *psx, const u32 *c, int n)
     t = (h->usec(h->user) - t) * 16;
     psx->gpu.us_draw += t;
     psx->gpu.us_kind[k] += t;
+    if (k == 0 && poly_slow)
+        gpu_slow_us += t;
 }
 
 static void draw(Psx *psx, const u32 *c, int n)

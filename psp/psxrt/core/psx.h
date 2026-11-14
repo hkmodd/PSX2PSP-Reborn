@@ -475,6 +475,7 @@ void cd_audio(Psx *psx, s32 *l, s32 *r);
 
 /* gpu.c */
 void gpu_init(Psx *psx);
+extern u32 gpu_slow_us; /* us a second in polygons the renderer's fast lane turned away */
 u32 gpu_read(Psx *psx, int reg);
 void gpu_gp0(Psx *psx, u32 v);
 /* GP0 words of a DMA packet, in PS1 RAM (word aligned) */

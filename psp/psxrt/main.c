@@ -595,12 +595,13 @@ static void frame(void)
                 n0 = *s, draw0 = psx.gpu.us_draw, mdec0 = psx.mdec.us_decode, spu0 = psx.spu.us_mix, rgb0 = us_rgb24;
                 Gpu *g = &psx.gpu;
                 n += snprintf(line + n, sizeof line - (size_t)n,
-                              "-- gpu: poly %u/%u line %u/%u rect %u/%u copy %u/%u fill %u/%u other %u/%u (n/ms), frags %u tested %u\n",
-                              (unsigned)g->n_kind[0], (unsigned)(g->us_kind[0] / 1000), (unsigned)g->n_kind[1], (unsigned)(g->us_kind[1] / 1000),
+                              "-- gpu: poly %u/%u (slow %u ms) line %u/%u rect %u/%u copy %u/%u fill %u/%u other %u/%u (n/ms), frags %u tested %u\n",
+                              (unsigned)g->n_kind[0], (unsigned)(g->us_kind[0] / 1000), (unsigned)(gpu_slow_us / 1000), (unsigned)g->n_kind[1], (unsigned)(g->us_kind[1] / 1000),
                               (unsigned)g->n_kind[2], (unsigned)(g->us_kind[2] / 1000), (unsigned)g->n_kind[3], (unsigned)(g->us_kind[3] / 1000),
                               (unsigned)g->n_kind[4], (unsigned)(g->us_kind[4] / 1000), (unsigned)g->n_kind[5], (unsigned)(g->us_kind[5] / 1000),
                               (unsigned)g->frags, (unsigned)g->tested);
                 memset(g->n_kind, 0, sizeof g->n_kind), memset(g->us_kind, 0, sizeof g->us_kind), g->frags = g->tested = 0;
+                gpu_slow_us = 0;
                 Dma *d = &psx.dma;
                 n += snprintf(line + n, sizeof line - (size_t)n, "-- dma (n/ms/kwords):");
                 for (int ch = 0; ch < 7; ch++)
