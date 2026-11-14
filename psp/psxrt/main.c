@@ -506,6 +506,7 @@ static PsxHost host;
 static u32 frames;
 static int native;
 static u32 audio_drops, audio_gaps, audio_trims; /* per second; the audio ring below */
+static u32 audio_peak_in, audio_peak_out; /* per second: the largest sample from the SPU, to the channel */
 
 static u32 watch_word(u32 a)
 {
@@ -560,18 +561,18 @@ static void frame(void)
                               (unsigned)s->loads, (unsigned)(s->poll_skips - n0.poll_skips), (unsigned)(s->hooks - n0.hooks));
                 n += snprintf(line + n, sizeof line - (size_t)n,
                               "-- ms: interp %u io %u (draw %u mdec %u spu %u) update %u present %u (rgb24 %u) sleep %u;"
-                              " audio drops %u gaps %u trims %u; vsync wait %u (%u ms) late %u (avg %u max %u us) skipped %u\n",
+                              " audio drops %u gaps %u trims %u peak %u/%u; vsync wait %u (%u ms) late %u (avg %u max %u us) skipped %u\n",
                               (unsigned)((s->us_interp - n0.us_interp) / 1000), (unsigned)((s->us_io - n0.us_io) / 1000),
                               (unsigned)((psx.gpu.us_draw - draw0) / 1000), (unsigned)((psx.mdec.us_decode - mdec0) / 1000),
                               (unsigned)((psx.spu.us_mix - spu0) / 1000),
                               (unsigned)((s->us_update - n0.us_update) / 1000), (unsigned)((s->us_present - n0.us_present) / 1000),
                               (unsigned)((us_rgb24 - rgb0) / 1000), (unsigned)((s->us_sleep - n0.us_sleep) / 1000),
-                              (unsigned)audio_drops, (unsigned)audio_gaps, (unsigned)audio_trims, (unsigned)(s->vs_wait - n0.vs_wait),
+                              (unsigned)audio_drops, (unsigned)audio_gaps, (unsigned)audio_trims, (unsigned)audio_peak_in, (unsigned)audio_peak_out, (unsigned)(s->vs_wait - n0.vs_wait),
                               (unsigned)((s->us_vs_wait - n0.us_vs_wait) / 1000), (unsigned)(s->vs_late - n0.vs_late),
                               (unsigned)((s->us_late - n0.us_late) / ((s->vs_late - n0.vs_late) | 1)), (unsigned)s->us_late_max,
                               (unsigned)(s->vs_adv - n0.vs_adv));
                 native_stats.us_late_max = 0;
-                audio_drops = audio_gaps = audio_trims = 0;
+                audio_drops = audio_gaps = audio_trims = audio_peak_in = audio_peak_out = 0;
                 static const char *const io_names[IO_KINDS] = IO_KIND_NAMES;
                 n += snprintf(line + n, sizeof line - (size_t)n, "-- io (n/ms):");
                 for (int k = 0; k < IO_KINDS; k++)
@@ -658,6 +659,9 @@ static void host_audio(void *user, const s16 *samples, int frames)
     for (int i = 0; i < frames; i++, wr++) {
         u32 at = (wr & (AUDIO_RING - 1)) * 2;
         audio_ring[at] = samples[2 * i], audio_ring[at + 1] = samples[2 * i + 1];
+        u32 l = (u32)abs(samples[2 * i]), r = (u32)abs(samples[2 * i + 1]), m = l > r ? l : r;
+        if (m > audio_peak_in)
+            audio_peak_in = m;
     }
     __asm__ volatile("" ::: "memory"); /* the samples before the index that publishes them */
     audio_wr = wr;
@@ -700,6 +704,9 @@ static int audio_thread(SceSize args, void *argp)
             audio_gaps += n > 0;
             pos = 0;
         }
+        for (u32 i = 0; i < AUDIO_BLOCK * 2; i++)
+            if ((u32)abs(buf[i]) > audio_peak_out)
+                audio_peak_out = (u32)abs(buf[i]);
         audio_rd = rd;
         sceKernelDcacheWritebackRange(buf, sizeof buf);
         sceAudioOutputBlocking(ch, PSP_AUDIO_VOLUME_MAX, buf);

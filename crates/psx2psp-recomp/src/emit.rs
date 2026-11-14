@@ -13,7 +13,7 @@
 //!   the image, `jr` and `jalr` go through the dispatch table.
 //! * GTE moves, `lwc2` and `swc2` work directly on the GTE registers at [`layout::GTE`] (but
 //!   for the few registers with unusual rules); GTE commands enter [`layout::GTE_CMD`], or the
-//!   entry of their own [`layout::GTE_OWN`] gives them.
+//!   entry of their own [`layout::GTE_OWN`] or [`layout::GTE_WORD`] gives them.
 //! * COP0, the rest of the GTE, `syscall`, `break` and anything touching the guest's `k0`/`k1`
 //!   run in the runtime through a host call and continue after it.
 //! * Anything the translator does not model hands the guest over to the runtime's interpreter
@@ -653,8 +653,9 @@ impl Em<'_> {
                     c.push(jal(entry));
                     c.push(NOP);
                 } else {
+                    let entry = layout::GTE_WORD.iter().find(|&&(_, m, v)| cmd & m == v);
                     c.push(lui(K1R, (cmd >> 16) as u16));
-                    c.push(jal(layout::GTE_CMD));
+                    c.push(jal(entry.map_or(layout::GTE_CMD, |e| e.0)));
                     c.push(ori(K1R, K1R, cmd as u16));
                 }
             }

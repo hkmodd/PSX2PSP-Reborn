@@ -517,6 +517,200 @@ rtp_far:
     nop
     .end psxrt_gte_rtpt
 
+
+/* MVMVA and GPF take their word in k1, as GTE_CMD does: the return waits in GTE_RET, t0-t7 and
+ * HI/LO are parked, t4 gathers FLAG. What they do not take (MVMVA's matrix 3 and far-colour
+ * bug, a translation that does not fit 31 bits) goes on to GTE_CMD with everything as it came.
+ * The IR registers are 16-bit values, as every way of writing them leaves them, so no product or
+ * sum here can leave 44 bits. */
+.macro WORD_ENTER
+    sw $ra, GTE_RET($k0)
+    mfhi $ra
+    sw $ra, HI($k0)
+    mflo $ra
+    sw $ra, LO($k0)
+    .irp r,8,9,10,11,12,13,14,15
+    sw $\r, G(\r)($k0)
+    .endr
+    move $12, $zero
+.endm
+
+/* The MAC in t0 to IR(n+1), saturated by the word's lm bit (FLAG bit 24-n). */
+.macro WORD_IR n
+    ext $ra, $k1, 10, 1
+    bnez $ra, .Llm\@
+    seh $9, $8
+    beq $9, $8, .Lok\@
+    sra $ra, $8, 31 /* the sign, 0 or -1, for the saturated value */
+    b .Lsat\@
+    xori $9, $ra, 0x7FFF
+.Llm\@:
+    srl $9, $8, 15
+    beqz $9, .Lok\@
+    move $9, $8
+    slt $9, $8, $zero
+    ori $ra, $zero, 0x7FFF
+    movn $ra, $zero, $9
+    move $9, $ra
+.Lsat\@:
+    lui $ra, 1 << (8 - \n)
+    or $12, $12, $ra
+.Lok\@:
+    sw $9, GD(9 + \n)($k0)
+.endm
+
+/* HI:LO to MAC(n+1) in t0, shifted by the word's sf bit, then IR(n+1). */
+.macro WORD_MAC n
+    mflo $8
+    ext $ra, $k1, 19, 1
+    beqz $ra, .Lsf\@
+    mfhi $9
+    srl $8, $8, 12
+    ins $8, $9, 20, 12
+.Lsf\@:
+    sw $8, GD(25 + \n)($k0)
+    WORD_IR \n
+.endm
+
+/* MAC(n+1) >> 4 saturated to 0..0xFF (FLAG bit 21-n) into byte \n of t5. */
+.macro WORD_RGB n
+    lw $8, GD(25 + \n)($k0)
+    sra $8, $8, 4
+    srl $9, $8, 8
+    beqz $9, .Lc\@
+    slt $9, $8, $zero
+    ori $8, $zero, 0xFF
+    movn $8, $zero, $9
+    lui $9, 1 << (5 - \n)
+    or $12, $12, $9
+.Lc\@:
+    ins $13, $8, 8 * \n, 8
+.endm
+
+/* MVMVA row n: T[n] * 0x1000 (t2) + row n of the matrix (t3) times the vector (t5-t7). */
+.macro MV_ROW n
+    lw $8, 4 * \n($10)
+    sll $9, $8, 12
+    mtlo $9
+    sra $9, $8, 20
+    mthi $9
+    lh $9, GC(0) + 6 * \n($11)
+    madd $9, $13
+    lh $9, GC(0) + 6 * \n + 2($11)
+    madd $9, $14
+    lh $9, GC(0) + 6 * \n + 4($11)
+    madd $9, $15
+    WORD_MAC \n
+.endm
+
+    .globl psxrt_gte_mvmva
+    .ent psxrt_gte_mvmva
+psxrt_gte_mvmva:
+    WORD_ENTER
+    ext $8, $k1, 17, 2 /* mx: RT, LLM, LCM, 3 the garbage one */
+    xori $9, $8, 3
+    beqz $9, word_far
+    sll $8, $8, 5
+    addu $11, $k0, $8
+    ext $9, $k1, 13, 2 /* cv: TR, BK, FC (the bug), 3 none */
+    xori $10, $9, 3
+    beqz $10, mv_none
+    xori $10, $9, 2
+    beqz $10, word_far
+    sll $9, $9, 5
+    addu $10, $k0, $9
+    addiu $10, $10, GC(5)
+    lw $8, 0($10)
+    sll $9, $8, 1
+    xor $8, $8, $9
+    lw $9, 4($10)
+    sll $13, $9, 1
+    xor $9, $9, $13
+    or $8, $8, $9
+    lw $9, 8($10)
+    sll $13, $9, 1
+    xor $9, $9, $13
+    or $8, $8, $9
+    bltz $8, word_far
+    nop
+    b mv_vec
+    nop
+mv_none:
+    lui $10, %hi(psxrt_zero3)
+    addiu $10, $10, %lo(psxrt_zero3)
+mv_vec:
+    ext $9, $k1, 15, 2 /* v: V0-V2, 3 IR */
+    xori $8, $9, 3
+    bnez $8, mv_vxyz
+    sll $9, $9, 3
+    lw $13, GD(9)($k0)
+    lw $14, GD(10)($k0)
+    b mv_rows
+    lw $15, GD(11)($k0)
+mv_vxyz:
+    addu $9, $k0, $9
+    lh $13, GD(0)($9)
+    lh $14, GD(0) + 2($9)
+    lh $15, GD(1)($9)
+mv_rows:
+    MV_ROW 0
+    MV_ROW 1
+    MV_ROW 2
+    b word_leave
+    nop
+    .end psxrt_gte_mvmva
+
+/* GPF: MAC = IR0 * IR, then the colour pushed. */
+.macro GPF_ROW n
+    lw $9, GD(9 + \n)($k0)
+    mult $10, $9
+    WORD_MAC \n
+.endm
+
+    .globl psxrt_gte_gpf
+    .ent psxrt_gte_gpf
+psxrt_gte_gpf:
+    WORD_ENTER
+    lw $10, GD(8)($k0)
+    GPF_ROW 0
+    GPF_ROW 1
+    GPF_ROW 2
+    lw $8, GD(21)($k0)
+    sw $8, GD(20)($k0)
+    lw $8, GD(22)($k0)
+    sw $8, GD(21)($k0)
+    lw $13, GD(6)($k0)
+    srl $13, $13, 24
+    sll $13, $13, 24
+    WORD_RGB 0
+    WORD_RGB 1
+    WORD_RGB 2
+    sw $13, GD(22)($k0)
+/* FLAG with bit 31 from its error bits, the parked registers back, return through GTE_RET. */
+word_leave:
+    lui $8, 0x7F87
+    ori $8, $8, 0xE000
+    and $8, $12, $8
+    beqz $8, 1f
+    lui $8, 0x8000
+    or $12, $12, $8
+1:  move $ra, $12
+    .irp r,10,11,12,13,14,15
+    lw $\r, G(\r)($k0)
+    .endr
+    b gte_leave
+    lw $k1, GTE_RET($k0)
+word_far:
+    lw $8, HI($k0)
+    mthi $8
+    lw $8, LO($k0)
+    mtlo $8
+    .irp r,8,9,10,11,12,13,14,15
+    lw $\r, G(\r)($k0)
+    .endr
+    j psxrt_gte_cmd
+    lw $ra, GTE_RET($k0)
+    .end psxrt_gte_gpf
 /* The same entries through GTE_CMD, for when native_init's check finds a difference. */
 .macro GTE_DOOR name, cmd
     .globl psxrt_gte_\name\()_door

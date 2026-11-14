@@ -58,6 +58,8 @@
 #define STUB_GTE_AVSZ4 0x09A00FE0u
 #define STUB_GTE_RTPS 0x09A00FE8u
 #define STUB_GTE_RTPT 0x09A00FF0u
+#define STUB_GTE_MVMVA 0x09A00FC8u /* these two take their word in k1 */
+#define STUB_GTE_GPF 0x09A00FF8u
 #define TABLE_ADDR 0x09A01000u
 #define TABLE_WORDS (RAM_SIZE / 4)
 /* CTX words */
@@ -92,6 +94,8 @@ void psxrt_gte_avsz3(void), psxrt_gte_avsz3_door(void);
 void psxrt_gte_avsz4(void), psxrt_gte_avsz4_door(void);
 void psxrt_gte_rtps(void), psxrt_gte_rtps_door(void);
 void psxrt_gte_rtpt(void), psxrt_gte_rtpt_door(void);
+void psxrt_gte_mvmva(void), psxrt_gte_gpf(void);
+u32 psxrt_zero3[3]; /* MVMVA's translation when it has none */
 void native_enter(u32 host_pc);
 /* gte_fast.c */
 void native_gte_fast(u32 cmd);
@@ -915,15 +919,28 @@ static const struct {
     {STUB_GTE_AVSZ4, 0x0168002Eu, psxrt_gte_avsz4, psxrt_gte_avsz4_door},
     {STUB_GTE_RTPS, 0x00180001u, psxrt_gte_rtps, psxrt_gte_rtps_door},
     {STUB_GTE_RTPT, 0x00280030u, psxrt_gte_rtpt, psxrt_gte_rtpt_door},
+    /* MVMVA and GPF as Sheep Dog's executables word them, and the other matrix, BK and lm */
+    {STUB_GTE_MVMVA, 0x0041E012u, psxrt_gte_mvmva, psxrt_gte_cmd},
+    {STUB_GTE_MVMVA, 0x0049E012u, psxrt_gte_mvmva, psxrt_gte_cmd},
+    {STUB_GTE_MVMVA, 0x00486012u, psxrt_gte_mvmva, psxrt_gte_cmd},
+    {STUB_GTE_MVMVA, 0x00480012u, psxrt_gte_mvmva, psxrt_gte_cmd},
+    {STUB_GTE_MVMVA, 0x00426012u, psxrt_gte_mvmva, psxrt_gte_cmd},
+    {STUB_GTE_MVMVA, 0x00488012u, psxrt_gte_mvmva, psxrt_gte_cmd},
+    {STUB_GTE_MVMVA, 0x00490012u, psxrt_gte_mvmva, psxrt_gte_cmd},
+    {STUB_GTE_MVMVA, 0x00406012u, psxrt_gte_mvmva, psxrt_gte_cmd},
+    {STUB_GTE_MVMVA, 0x000CA412u, psxrt_gte_mvmva, psxrt_gte_cmd},
+    {STUB_GTE_GPF, 0x0190003Du, psxrt_gte_gpf, psxrt_gte_cmd},
+    {STUB_GTE_GPF, 0x0198003Du, psxrt_gte_gpf, psxrt_gte_cmd},
+    {STUB_GTE_GPF, 0x0008043Du, psxrt_gte_gpf, psxrt_gte_cmd},
 };
 #define GTE_OPS (int)(sizeof gte_ops / sizeof gte_ops[0])
 
 /* The divide's reciprocal table for psxrt_gte_rtps/rtpt, as core/gte.c builds its own. */
 u8 psxrt_unr[0x104];
 
-static void gte_call_asm(void (*fn)(void))
+static void gte_call_asm(void (*fn)(void), u32 cmd)
 {
-    __asm__ volatile("lui $26, 0x09A0\n\tori $26, $26, 0x004C\n\tjalr %0\n\tnop" : : "r"(fn) : "$26", "$27", "$31", "memory");
+    __asm__ volatile("lui $26, 0x09A0\n\tori $26, $26, 0x004C\n\tmove $27, %1\n\tjalr %0\n\tnop" : : "r"(fn), "r"(cmd) : "$26", "$27", "$31", "memory");
 }
 
 static u32 rnd_state = 0x2545F491u;
@@ -958,15 +975,17 @@ static int gte_asm_check(Psx *psx, int n)
             in.d[r] = rnd_pair();
         for (int r = 16; r < 20; r++)
             in.d[r] = (s32)rnd16();
+        for (int r = 8; r < 12; r++) /* IR0-IR3: 16-bit values, as every write leaves them */
+            in.d[r] = rnd_mag(16);
         for (int r = 5; r < 8; r++)
-            in.c[r] = rnd_mag(31);
+            in.c[r] = rnd_mag(31), in.c[r + 8] = rnd_mag(31); /* TR, BK */
         in.c[24] = rnd_mag(32), in.c[25] = rnd_mag(32), in.c[28] = rnd_mag(32);
         int k = i % GTE_OPS;
         *g = in;
         gte_command(psx, gte_ops[k].cmd);
         want = *g;
         *g = in;
-        gte_call_asm(gte_ops[k].fn);
+        gte_call_asm(gte_ops[k].fn, gte_ops[k].cmd);
         if (memcmp(g, &want, sizeof want) && !per[k]++)
             for (int r = 0; r < 64; r++)
                 if ((r < 32 ? g->d[r] : g->c[r - 32]) != (r < 32 ? want.d[r] : want.c[r - 32]))
@@ -1030,7 +1049,7 @@ const char *native_init(Psx *psx, const DiscInfo *info)
     }
     int bad = gte_asm_check(psx, GTE_OPS * 4096);
     gte_stubs(!bad);
-    say("native: GTE NCLIP/AVSZ/RTPS/RTPT in asm, %d of %d checks differ%s", bad, GTE_OPS * 4096,
+    say("native: GTE NCLIP/AVSZ/RTPS/RTPT/MVMVA/GPF in asm, %d of %d checks differ%s", bad, GTE_OPS * 4096,
         bad ? ": through the runtime" : "");
     flush_code();
     __asm__ volatile("move %0, $gp" : "=r"(native_host_gp));

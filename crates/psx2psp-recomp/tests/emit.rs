@@ -438,8 +438,9 @@ fn run_psp(
             continue;
         }
         let own = layout::GTE_OWN.iter().find(|e| e.0 == h.pc).map(|e| e.2);
-        if h.pc == layout::GTE_CMD || own.is_some() {
-            // The entry runs the command (in k1 for GTE_CMD), restores the guest ra and returns
+        let word = layout::GTE_WORD.iter().any(|e| e.0 == h.pc);
+        if h.pc == layout::GTE_CMD || word || own.is_some() {
+            // The entry runs the command (in k1 for GTE_CMD and GTE_WORD), restores the guest ra and returns
             // through k1.
             let ret = h.gpr[RA as usize];
             log.gte += 1;
@@ -722,7 +723,7 @@ fn gte_commands_with_entries_of_their_own() {
         cop2(4, T1, 17),                       // 3  SZ1
         gte_cmd(0x0140_0006),                  // 4  NCLIP
         gte_cmd(0x0158_002D | 1 << 19),        // 5  AVSZ3
-        gte_cmd(0x0040_0012),                  // 6  MVMVA: GTE_CMD
+        gte_cmd(0x0040_0012),                  // 6  MVMVA: GTE_MVMVA, word in k1
         gte_cmd(0x0028_0030),                  // 7  RTPT
         gte_cmd(0x0018_0401),                  // 8  RTPS with lm: GTE_CMD
         gte_cmd(0x0018_0001),                  // 9  RTPS
