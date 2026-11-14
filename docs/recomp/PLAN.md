@@ -17,8 +17,14 @@ psp-web-recomp): the tool is generic, each supported game has a **recipe**. The 
 the universal path for every other disc.
 
 The game's code never ships with PSX2PSP. The translator runs on the user's disc at conversion
-time; the runtime contains no game code and is MIT/Apache like the rest of the project.
-PSXRecomp (PolyForm Noncommercial) is a reference for ideas only: none of its code is used.
+time; the runtime contains no game code.
+
+Prior art is reused, not rediscovered. Licences decide how:
+- RecompOne (MIT): code may be ported, keeping its copyright notice.
+- psxrecomp (PolyForm Noncommercial 1.0.0 + its PERMISSIONS.md): code may be ported into files
+  that keep that licence and are marked as such; the project stays free of charge. Everything
+  else stays MIT OR Apache-2.0.
+- ps1-recomp (GPL-3.0): reference only, no code copied.
 
 ## Architecture
 
