@@ -8,7 +8,10 @@
  * last saw them, `read` brings all of VRAM back (one block transfer) before the CPU reads one of
  * those, `wrote` sends the CPU's pixels up as textured sprites. Textures come from RAM's copy:
  * 4/8-bit pages are copied into a cache of T4/T8 textures, CLUTs are converted into the list.
+ * The list is built in a GU_SEND context and enqueued when it opens; the GE runs behind it up to
+ * a stall address moved every STALL_STEP bytes, not after every draw as GU_DIRECT would.
  */
+#include <pspge.h>
 #include <pspgu.h>
 #include <pspkernel.h>
 #include <pspsysmem.h>
@@ -89,19 +92,40 @@ static const ScePspIMatrix4 ps1_dither = {{-4, 0, -3, 1}, {2, -2, 3, -1}, {-3, 1
 
 #define DONE (ge.compare ? GPU_BOTH : GPU_DRAWN)
 
+/* The list runs while it is written, but its stall address moves every STALL_STEP bytes and at
+ * the end, not after every draw as GU_DIRECT does (one system call per draw): a GU_SEND list,
+ * queued here with its stall at the start. pspgu writes it through the uncached mirror. */
+#define STALL_STEP (16 * 1024)
+#define LIST_UNCACHED ((u8 *)((u32)list | 0x40000000u))
+static int list_id;
+static u32 list_stall; /* bytes the GE may run */
+
 void ge_open(void)
 {
     if (!list_open) {
-        sceGuStart(GU_DIRECT, list);
+        sceGuStart(GU_SEND, list);
+        list_id = sceGeListEnQueue(LIST_UNCACHED, LIST_UNCACHED, -1, NULL);
+        list_stall = 0;
         list_open = 1;
     }
     state_valid = 0;
 }
 
+/* Lets the GE run what is written so far, once STALL_STEP more bytes are there. */
+static void ge_kick(void)
+{
+    u32 n = (u32)sceGuCheckList();
+    if (n - list_stall >= STALL_STEP) {
+        list_stall = n;
+        sceGeListUpdateStallAddr(list_id, LIST_UNCACHED + n);
+    }
+}
+
 void ge_sync(void)
 {
     if (list_open) {
-        sceGuFinish();
+        u32 n = (u32)sceGuFinish();
+        sceGeListUpdateStallAddr(list_id, LIST_UNCACHED + n);
         sceGuSync(0, 0);
         list_open = 0;
         ge.syncs++;
@@ -140,9 +164,12 @@ static void base_state(void)
 /* Before renderer commands: a list with room, in the renderer's state. */
 static void begin(void)
 {
-    if (list_open && sceGuCheckList() > LIST_BYTES - LIST_SLACK) {
-        ge_sync();
-        ge.s.flushes++;
+    if (list_open) {
+        if (sceGuCheckList() > LIST_BYTES - LIST_SLACK) {
+            ge_sync();
+            ge.s.flushes++;
+        } else
+            ge_kick();
     }
     if (!list_open)
         ge_open();

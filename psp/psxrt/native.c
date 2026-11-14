@@ -22,9 +22,9 @@
  * charges its estimated PS1 cycles to CTX.BUDGET and enters the runtime when that goes negative,
  * which adds what was spent to the count, so a counted wait loop lasts as long as on the PS1.
  * When the count runs ahead of the real clock (checked at every host call and every 256
- * interpreted instructions) the runtime sleeps; when it falls behind, the clock is moved back
- * instead: PS1 time slows down with the host, it never jumps, or devices (the CD's sectors) would
- * run ahead of the guest code that serves them. A 500 us alarm makes the budget negative, so
+ * interpreted instructions) the runtime sleeps; when it falls behind by more than BEHIND_MAX,
+ * the clock is moved back instead: PS1 time slows down with the host, it never jumps, or devices
+ * (the CD's sectors) would run ahead of the guest code that serves them. A 500 us alarm makes the budget negative, so
  * that loops enter the runtime and interrupts are taken there.
  *
  * Limits: code written by CPU stores (decompressed or copied by the game) is not tracked, EPC
@@ -61,6 +61,9 @@
 #define POLL 0u /* host-call word of an interrupt poll */
 #define ALARM_US 500
 #define AHEAD_MAX (PSX_CLOCK / 500) /* 2 ms */
+/* Lateness kept before PS1 time slows down: two PAL frames, so that a slow frame's lateness is
+ * paid back by the next vsync wait instead of being slept through. */
+#define BEHIND_MAX (PSX_CLOCK / 25)
 #define HEAD_LEN 2048u              /* bytes of text under CodeEntry.head_hash */
 
 /* trampolines.S */
@@ -262,8 +265,8 @@ static void on_ram_loaded(Psx *psx, u32 addr, u32 len)
 static void sync_time(void)
 {
     u64 now = sceKernelGetSystemTimeWide(), clock = c_base + (now - t_base) * 338688u / 10000u;
-    if (P->cycles + AHEAD_MAX < clock) /* the host fell behind: PS1 time slows down, never skips */
-        c_base = P->cycles, t_base = now;
+    if (P->cycles + BEHIND_MAX < clock) /* the host fell behind: PS1 time slows down, never skips */
+        c_base = P->cycles + BEHIND_MAX, t_base = now;
     else if (P->cycles > clock + AHEAD_MAX) {
         u32 t = sceKernelGetSystemTimeLow();
         sceKernelDelayThread((SceUInt)((P->cycles - clock) * 10000u / 338688u));
