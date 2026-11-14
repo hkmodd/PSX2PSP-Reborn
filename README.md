@@ -92,7 +92,10 @@ icon itself, fits icon and music into the XMB's budget, and knows the fixes ~2,0
   count as one disc; CDDA audio tracks are carried in the TOC.
 - **Parallel, streaming compressor.** The image is cut into `0x9300`-byte blocks and deflated on
   every core, and written as it goes: a 700 MB disc is never held in memory. Level 1 to 9
-  (default and recommended 5; 1 builds faster and larger, 9 is ~0.1% smaller and twice as slow).
+  (default and recommended 5; 1–4 are 2–3% larger and no faster, 9 is ~0.1% smaller in about the
+  same time, measured on three games). The encoder is miniz_oxide, pinned to the exact version
+  every hardware-tested EBOOT was built with; zlib-rs is 4x faster but never smaller (level 1 is
+  11% larger), and a golden test fails if the streams the PSP inflates ever change.
   A few games hang on a real PSP below some level (MediEvil at level 1): the patch database gives
   them a `min_level`, and the build is raised to it, with a line in the log.
 - **Extraction and inspection.** Any POPS EBOOT back to BIN/CUE, bit-exact; `psx2psp info` dumps
@@ -339,10 +342,16 @@ The full matrix, with sources and the gaps still open: **[docs/COMPARISON.md](do
 <details>
 <summary><b>Has it been tested on real hardware?</b></summary>
 
-Yes, on a real PSP: a PAL game built with its config, physics fix, frame-cap unlock and 60 Hz
-patches boots, loads and plays. The layouts are also validated against Sony's own EBOOTs and
-samples. Not yet confirmed on hardware: a PS Vita, disc swapping in a multi-disc EBOOT, a
-LibCrypt title, and the generated ICON1/SND0 on the XMB. Reports are very welcome.
+Yes, on a real PSP:
+- a PAL game built with its config, physics fix, frame-cap unlock and 60 Hz patches boots,
+  loads and plays;
+- a multi-disc EBOOT swaps discs (Abe's Exoddus);
+- a LibCrypt title plays (MediEvil);
+- the generated ICON1.PMF and SND0.AT3 play on the XMB.
+
+The layouts are also validated against Sony's own EBOOTs and samples. Not yet confirmed on
+hardware: a PS Vita, and the six generic PAL→NTSC rules on a game without its own patch. Linux
+and macOS builds have not been run yet. Reports are very welcome.
 </details>
 
 <details>

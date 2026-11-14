@@ -24,7 +24,11 @@ psx2psp-media = { path = "crates/psx2psp-media" }
 psx2psp-engine = { path = "crates/psx2psp-engine" }
 
 thiserror = "2.0"
-flate2 = "1.1"
+# Exact pin: these deflate streams are what the PSP kernel inflates, and every EBOOT proven on
+# hardware came from this version. A bump must pass psar::tests::deflate_streams_are_pinned,
+# which only changes after a re-test on a real PSP. Used directly, so no feature unification
+# elsewhere in the graph (flate2's zlib-rs backend, say) can switch the encoder silently.
+miniz_oxide = "=0.9.1"
 rayon = "1.12"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "gif", "webp"] }
 bytemuck = { version = "1.25", features = ["derive"] }

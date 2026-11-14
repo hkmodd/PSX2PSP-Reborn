@@ -2867,9 +2867,10 @@ impl App {
         let status = chip(format!("Level {}", raised.unwrap_or(self.level)), if raised.is_some() { style::AMBER } else { style::GREEN });
         let (note, accent) = match (raised, self.level) {
             (Some(m), _) => (format!("raised to {m}: this game hangs on a PSP below it"), style::AMBER),
-            (None, ..=4) => ("faster build, larger file".to_owned(), style::MUTED),
+            // Measured on three games: every level builds in about the same time.
+            (None, ..=4) => ("2–3% larger file, not faster".to_owned(), style::MUTED),
             (None, 5..=6) => ("recommended".to_owned(), style::GREEN),
-            (None, _) => ("slower, ~same size".to_owned(), style::MUTED),
+            (None, _) => ("~0.1% smaller file".to_owned(), style::MUTED),
         };
         self.section(BUILD, status, || {
             let output = self.output_path().map_or_else(|| "<disc folder>/<GAME ID>/EBOOT.PBP".into(), |p| p.display().to_string());

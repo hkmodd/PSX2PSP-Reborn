@@ -84,7 +84,11 @@ sectors), and the last block is zero-padded. Each block is raw deflate (no zlib 
 level 1–9 (default 5). On ARK the blocks are inflated by the kernel's
 `sceKernelDeflateDecompress`, and that is not level-agnostic for every game: a level 1 build of
 MediEvil hangs on a real PSP where the same build at level 5 plays, though both inflate to the
-same disc with zlib. Such games carry `min_level` in the patch database. `len == 0x9300` means a block stored verbatim, but
+same disc with zlib. Such games carry `min_level` in the patch database. A strict audit of both
+MediEvil builds (puff and zlib 1.1.4 rules: tree completeness, symbols 286/287, distance codes
+30/31, far distances, end-of-block) found no stream the specification forbids, and both read the
+same block sizes, so the cause cannot be pinned offline. Hence the encoder is pinned too
+(miniz_oxide =0.9.1, `psar::tests::deflate_streams_are_pinned`). `len == 0x9300` means a block stored verbatim, but
 the writer never emits one, because POPS 6.61 does not load raw blocks. An incompressible block
 becomes deflate stored blocks instead (0x9305 bytes). The index can hold at most (0x100000 − 0x4000) / 32 = 32 256
 blocks, about 1.18 GB of raw image.

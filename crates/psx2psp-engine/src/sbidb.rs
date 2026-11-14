@@ -8,7 +8,6 @@
 //! parsed once, on first lookup.
 
 use std::collections::HashMap;
-use std::io::Read;
 use std::sync::OnceLock;
 
 use psx2psp_core::subq::{self, Entries};
@@ -30,8 +29,7 @@ pub struct Sbi {
 fn db() -> &'static HashMap<String, Vec<Sbi>> {
     static DB: OnceLock<HashMap<String, Vec<Sbi>>> = OnceLock::new();
     DB.get_or_init(|| {
-        let mut text = String::new();
-        flate2::read::ZlibDecoder::new(RAW).read_to_string(&mut text).expect("embedded SBI set is valid zlib UTF-8");
+        let text = String::from_utf8(crate::inflate(RAW)).expect("embedded SBI set is UTF-8");
         let mut db: HashMap<String, Vec<Sbi>> = HashMap::new();
         for l in text.lines().filter(|l| !l.starts_with('#')) {
             let [serial, title, region, hex] = l.split('\t').collect::<Vec<_>>()[..] else { panic!("embedded SBI set: bad line {l}") };

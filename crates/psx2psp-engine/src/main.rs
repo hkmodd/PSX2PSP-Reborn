@@ -51,8 +51,8 @@ CONVERT OPTIONS:
   --icon1 <pmf>      ready-made ICON1.PMF
   --snd0 <audio>     any audio/video → SND0.AT3 (needs ffmpeg + at3tool/atracdenc)
   --snd0-start <s>   start offset in seconds (default 0)
-  --level <1-9>      deflate level (default 5, recommended; 1 builds faster and larger, 9 is
-                     ~0.1% smaller and twice as slow). Games that hang on a real PSP below
+  --level <1-9>      deflate level (default 5, recommended; 1-4 are 2-3% larger and no faster,
+                     9 is ~0.1% smaller in about the same time). Games that hang on a real PSP below
                      some level are raised to it (patch database min_level, e.g. MediEvil)
   --native           experimental: a native EBOOT (category MG) that runs the psxrt runtime
                      instead of POPS; one disc, same title/ID/artwork, no disc patches
