@@ -2830,6 +2830,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "psx2psp-recomp"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "pxfm"
 version = "0.1.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"

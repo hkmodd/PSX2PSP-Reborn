@@ -1,0 +1,11 @@
+[package]
+name = "psx2psp-recomp"
+description = "Static recompiler: PS1 R3000A executables translated ahead of time into PSP Allegrex code"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror.workspace = true
