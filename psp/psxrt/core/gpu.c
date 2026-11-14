@@ -24,6 +24,7 @@ static void sw_read(Psx *psx, s32 x0, s32 y0, s32 x1, s32 y1)
 static void sw_wrote(Psx *psx, s32 x0, s32 y0, s32 x1, s32 y1)
 {
     const GpuRenderer *r = psx->gpu.renderer;
+    gpu_writes++;
     if (r)
         r->wrote(r->self, x0, y0, x1 - x0 + 1, y1 - y0 + 1);
 }
@@ -340,6 +341,7 @@ static void vtx_col(Vtx *v, u32 w)
 }
 
 u32 gpu_slow_us; /* polygons past the renderer's fast lane, timed as execute() times them */
+u32 gpu_writes;
 static int poly_slow;
 
 static void draw_polygon(Psx *psx, const u32 *c)
@@ -554,6 +556,7 @@ static void execute(Psx *psx, const u32 *c, int n)
     int k = cmd >= 0x20 && cmd < 0x40 ? 0 : cmd >= 0x40 && cmd < 0x60 ? 1 : cmd >= 0x60 && cmd < 0x80 ? 2
           : cmd >= 0x80 && cmd < 0xA0 ? 3 : cmd == 0x02 ? 4 : 5;
     psx->gpu.n_kind[k]++;
+    gpu_writes += k < 5; /* draws, copies and fills; transfers count in sw_wrote */
     if (!h->usec || t16++ % 16) {
         draw(psx, c, n);
         return;

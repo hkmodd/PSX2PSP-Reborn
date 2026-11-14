@@ -51,6 +51,7 @@ typedef struct {
     u32 bind_tex, bind_clut, kicks, rd_checks;     /* textures and CLUTs sent, stall moves, readback checks */
     u32 fast, fast_setups, fast_hits;              /* polygons through the fast lane; its state changes, found cached */
     u32 slow_tex, slow_big, flat, clipped;        /* fast lane: turned away for texture or size; no area; cut at the origin */
+    u32 ring_wb_us;                               /* writing the cached ring back */
 } GeStats;
 
 /* A 4/8-bit texture page as a 256x256 T4/T8 texture. */
@@ -119,9 +120,13 @@ static struct {
     int n1, n2;
     const u32 *pass1, *pass2; /* the key's cache entry's */
     int dirty;          /* a cached block set the GE's state: ge's copy of it is stale */
-    u8 *ring;           /* vertices, through the uncached mirror; NULL: no lane */
+    u8 *ring;           /* where vertices are written: ring_c or ring_u; NULL: no lane */
+    u8 *ring_c, *ring_u; /* the ring through the cache, and through the uncached mirror */
     u32 ring_bytes, ring_off;
+    u32 ring_wb;        /* cached: bytes written back, the GE may read them */
+    int cached, want;   /* the ring is written through the cache; the mode after the next sync */
 } fl;
+static int ring_ab = 1; /* the mode changes every second, and the "-- ge:" line says which ran */
 static u32 fl_arena_off; /* words of the arena (below) used by the open list's blocks */
 
 /* The PS1 dither matrix, row = y & 3, column = x & 3; the GE adds it to 8-bit colours before
@@ -132,8 +137,11 @@ static const ScePspIMatrix4 ps1_dither = {{-4, 0, -3, 1}, {2, -2, 3, -1}, {-3, 1
 
 /* The list runs while it is written, but its stall address moves every STALL_STEP bytes and at
  * the end, not after every draw as GU_DIRECT does (one system call per draw): a GU_SEND list,
- * queued here with its stall at the start. pspgu writes it through the uncached mirror. */
-#define STALL_STEP (16 * 1024)
+ * queued here with its stall at the start. pspgu writes it through the uncached mirror.
+ * A frame of level 1 is ~20 KB of list: with a 16 KB step the real GE got its work at present()
+ * and drew it while the CPU waited (6-10 ms a frame). 1 KB is ~60 polygons, a few hundred
+ * system calls a second. */
+#define STALL_STEP 1024
 #define LIST_UNCACHED ((u8 *)((u32)list | 0x40000000u))
 static int list_id;
 static u32 list_stall; /* bytes the GE may run */
@@ -150,11 +158,30 @@ void ge_open(void)
     fl.valid = 0;
 }
 
+/* pspgu's display list (guInternal.h): both pointers through the uncached mirror. */
+typedef struct {
+    unsigned int *start, *current;
+    int parent_context;
+} GuListHead;
+extern GuListHead *gu_list;
+
+/* Before the GE may run more of the list: the vertices written through the cache go to RAM. */
+static void ring_flush(void)
+{
+    if (fl.cached && fl.ring_off > fl.ring_wb) {
+        u32 a = fl.ring_wb & ~63u, t = sceKernelGetSystemTimeLow();
+        sceKernelDcacheWritebackRange(fl.ring_c + a, fl.ring_off - a);
+        ge.s.ring_wb_us += sceKernelGetSystemTimeLow() - t;
+        fl.ring_wb = fl.ring_off;
+    }
+}
+
 /* Lets the GE run what is written so far, once STALL_STEP more bytes are there. */
 static void ge_kick(void)
 {
-    u32 n = (u32)sceGuCheckList();
+    u32 n = (u32)((u8 *)gu_list->current - (u8 *)gu_list->start); /* sceGuCheckList, inline */
     if (n - list_stall >= STALL_STEP) {
+        ring_flush();
         list_stall = n;
         sceGeListUpdateStallAddr(list_id, LIST_UNCACHED + n);
         ge.s.kicks++;
@@ -165,6 +192,7 @@ void ge_sync(void)
 {
     if (list_open) {
         u32 n = (u32)sceGuFinish();
+        ring_flush();
         sceGeListUpdateStallAddr(list_id, LIST_UNCACHED + n);
         sceGuSync(0, 0);
         list_open = 0;
@@ -172,7 +200,13 @@ void ge_sync(void)
         fl_arena_off = 0; /* the GE is done with its blocks */
     }
     state_valid = 0;
-    fl.valid = 0, fl.ring_off = 0; /* the GE is done with the ring */
+    fl.valid = 0, fl.ring_off = fl.ring_wb = 0; /* the GE is done with the ring */
+    if (fl.want != fl.cached && fl.ring_c) {
+        /* no line of the ring stays in the cache: one dirty from the cached mode would be written
+         * back over uncached writes, one clean but stale would be written back with them */
+        sceKernelDcacheWritebackInvalidateRange(fl.ring_c, fl.ring_bytes);
+        fl.cached = fl.want, fl.ring = fl.cached ? fl.ring_c : fl.ring_u;
+    }
 }
 
 /* The state every renderer list starts from; the rest is sent as primitives need it. */
@@ -993,13 +1027,6 @@ static int rd_copy(void *self, s32 sx, s32 sy, s32 dx, s32 dy, s32 w, s32 h, int
 
 /* ---- the polygon fast lane ---- */
 
-/* pspgu's display list (guInternal.h): both pointers through the uncached mirror. */
-typedef struct {
-    unsigned int *start, *current;
-    int parent_context;
-} GuListHead;
-extern GuListHead *gu_list;
-
 /* A key's state as a block of GE words, sent from unknown so that they alone set it, with what
  * prim_begin found for it. The blocks live in an arena the GE calls into, written while a list is
  * open and kept until it has run (the CLUTs they load live in that list too): a key seen again in
@@ -1296,6 +1323,28 @@ static int rd_poly(void *self, const u32 *c)
 
 /* ---- setup and log ---- */
 
+/* At boot: 64 KB of vertices written as rd_poly writes them, through the uncached mirror and
+ * through the cache with the writeback the GE needs; the PSP's own figures (an emulator charges
+ * neither the bus nor the cache). */
+static void ring_bench(Psx *psx)
+{
+    u32 t[2], n = 64 * 1024 / sizeof(TexVtx);
+    for (int m = 0; m < 2; m++) {
+        TexVtx *o = (TexVtx *)(m ? fl.ring_c : fl.ring_u);
+        u32 t0 = sceKernelGetSystemTimeLow();
+        for (u32 i = 0; i < n; i++) {
+            o[i].u = (float)(i & 0xFF) + 0.5f, o[i].v = (float)(i >> 8 & 0xFF) + 0.5f;
+            o[i].c = 0xFF000000u | i;
+            o[i].x = (float)(i & 511) + 0.5f, o[i].y = (float)(i >> 9) + 0.5f, o[i].z = 0;
+        }
+        if (m)
+            sceKernelDcacheWritebackRange(o, n * sizeof(TexVtx));
+        t[m] = sceKernelGetSystemTimeLow() - t0;
+    }
+    sceKernelDcacheWritebackInvalidateRange(fl.ring_c, fl.ring_bytes);
+    psx_log(psx, "ge: 64 KB of vertices in %u us uncached, %u us cached and written back", (unsigned)t[0], (unsigned)t[1]);
+}
+
 void ge_init(Psx *psx, int compare)
 {
     ge.psx = psx;
@@ -1319,9 +1368,11 @@ void ge_init(Psx *psx, int compare)
         if (uid < 0)
             continue;
         u8 *r = (u8 *)(((u32)sceKernelGetBlockHeadAddr(uid) + 63) & ~63u);
-        sceKernelDcacheWritebackInvalidateRange(r, b); /* written through the uncached mirror only */
-        fl.ring = (u8 *)((u32)r | 0x40000000u), fl.ring_bytes = b;
+        sceKernelDcacheWritebackInvalidateRange(r, b); /* first written through the uncached mirror */
+        fl.ring_c = r, fl.ring_u = fl.ring = (u8 *)((u32)r | 0x40000000u), fl.ring_bytes = b;
     }
+    if (fl.ring)
+        ring_bench(psx);
     for (int i = 0; i < 1 << FL_BITS; i++)
         fl_cache[i].k0 = ~0u; /* no key */
     sceKernelDcacheWritebackInvalidateRange(fl_arena, sizeof fl_arena); /* written uncached from now on */
@@ -1386,7 +1437,7 @@ int ge_log(char *buf, int cap)
     int n = clampn(snprintf(buf, (size_t)cap,
                             "-- ge: tri %u+%u tex, rect %u+%u tex, fill %u, line %u (%u runs); sw tex15 %u texwin %u "
                             "copy %u+%u sw+%u null (%u kpx, %u from ge); pages %u cluts %u, readback %u (%u tiles, %u ms), upload %u "
-                            "(%u kpx), flush %u; bind %u tex %u clut, kick %u, rd check %u; fast %u (%u setups, %u cached), slow tex %u big %u, flat %u, clipped %u\n",
+                            "(%u kpx), flush %u; bind %u tex %u clut, kick %u, rd check %u; fast %u (%u setups, %u cached), slow tex %u big %u, flat %u, clipped %u; ring %s (wb %u ms)\n",
                             (unsigned)s->tris, (unsigned)s->ttris, (unsigned)s->rects, (unsigned)s->trects,
                             (unsigned)s->fills, (unsigned)s->lines, (unsigned)s->line_runs, (unsigned)s->sw_tex15,
                             (unsigned)s->sw_texwin,
@@ -1394,9 +1445,12 @@ int ge_log(char *buf, int cap)
                             (unsigned)s->pages, (unsigned)s->cluts, (unsigned)s->readbacks, (unsigned)s->read_tiles,
                             (unsigned)(s->read_us / 1000), (unsigned)s->uploads, (unsigned)(s->upload_px / 1000),
                             (unsigned)s->flushes, (unsigned)s->bind_tex, (unsigned)s->bind_clut, (unsigned)s->kicks,
-                            (unsigned)s->rd_checks, (unsigned)s->fast, (unsigned)s->fast_setups, (unsigned)s->fast_hits, (unsigned)s->slow_tex, (unsigned)s->slow_big, (unsigned)s->flat, (unsigned)s->clipped),
+                            (unsigned)s->rd_checks, (unsigned)s->fast, (unsigned)s->fast_setups, (unsigned)s->fast_hits, (unsigned)s->slow_tex, (unsigned)s->slow_big, (unsigned)s->flat, (unsigned)s->clipped,
+                            fl.cached ? "cached" : "uncached", (unsigned)(s->ring_wb_us / 1000)),
                    cap);
     memset(&ge.s, 0, sizeof ge.s);
+    if (ring_ab)
+        fl.want = !fl.cached; /* from the next sync */
     if (ge.compare && n < cap - 1)
         n += compare(buf + n, cap - n);
     return n;

@@ -316,6 +316,9 @@ static void screen_init(void)
 /* 24-bit display modes (MDEC movies) are converted to this 8888 texture, 512x512. */
 static u32 *rgb24_tex;
 static u32 us_rgb24; /* time spent converting, for the log */
+/* present's parts, for the log: waiting for the GE to finish the frame's drawing, then its own
+ * list (the PS1 picture to the screen), then the text */
+static u32 us_pwait, us_pdraw, us_ptext;
 
 static const void *convert24(const Gpu *g, int w, int h)
 {
@@ -379,9 +382,17 @@ static int display_ge24(const Psx *psx, int *w, int *h)
            (g->disp_x & 7) * 2 + 3 * *w <= 1024 && g->disp_x * 2 + 3 * *w <= VRAM_W * 2;
 }
 
+/* GE_RGB24 converted from what is shown; the conversion is redone only when the display area
+ * moved or VRAM was written since (a movie at 15 fps was converted at every vblank: on the real
+ * GE its 960 one-pixel columns cost several ms), and at least once a second. */
 static void *ge24(const Gpu *g, int w, int h)
 {
+    static u32 g24_pos, g24_writes, g24_age;
     int d = (g->disp_x & 7) * 2, key = w | h << 10 | d << 20;
+    u32 pos = (u32)g->disp_x | (u32)g->disp_y << 16;
+    if (key == g24_key && pos == g24_pos && gpu_writes == g24_writes && ++g24_age < 60)
+        return (void *)(0x04000000u + GE_RGB24);
+    g24_pos = pos, g24_writes = gpu_writes, g24_age = 0;
     if (key != g24_key) {
         int k = 0;
         for (int c = 0; c < 3; c++)
@@ -549,6 +560,10 @@ static void ram_dump(Psx *psx, u32 frame_no)
 static void present(Psx *psx, const char *status)
 {
     int w, h, chk = 0;
+    u32 t0 = sceKernelGetSystemTimeLow();
+    ge_sync(); /* what the GE has still to draw of the frame: how far it is behind the CPU */
+    u32 t1 = sceKernelGetSystemTimeLow();
+    us_pwait += t1 - t0;
     if (psx && psx->gpu.renderer && display_24bit(psx) && display_size(psx, &w, &h)) {
         int ge = display_ge24(psx, &w, &h);
         ++g24_frames;
@@ -571,6 +586,8 @@ static void present(Psx *psx, const char *status)
     ge_sync();
     if (chk)
         g24_check(&psx->gpu, w, h);
+    u32 t2 = sceKernelGetSystemTimeLow();
+    us_pdraw += t2 - t1;
     pspDebugScreenSetBase((u32 *)(0x44000000u + (u32)draw_buf));
     pspDebugScreenSetXY(0, 0);
     pspDebugScreenSetTextColor(0xFF40FFFF);
@@ -583,6 +600,7 @@ static void present(Psx *psx, const char *status)
             pspDebugScreenPrintf("%-60s", lines[(line_head - n + i + LINES) % LINES]);
         }
     }
+    us_ptext += sceKernelGetSystemTimeLow() - t2;
     draw_buf = sceGuSwapBuffers();
 }
 
@@ -670,18 +688,20 @@ static void frame(void)
                               (unsigned)(s->misses - n0.misses), (unsigned)(s->steps - n0.steps), (unsigned)(s->hashes - n0.hashes),
                               (unsigned)s->loads, (unsigned)(s->poll_skips - n0.poll_skips), (unsigned)(s->hooks - n0.hooks));
                 n += snprintf(line + n, sizeof line - (size_t)n,
-                              "-- ms: interp %u io %u (draw %u mdec %u spu %u) update %u present %u (rgb24 %u) sleep %u;"
+                              "-- ms: interp %u io %u (draw %u mdec %u spu %u) update %u present %u (wait %u draw %u text %u rgb24 %u) sleep %u;"
                               " audio drops %u gaps %u trims %u peak %u/%u; vsync wait %u (%u ms) late %u (avg %u max %u us) skipped %u\n",
                               (unsigned)((s->us_interp - n0.us_interp) / 1000), (unsigned)((s->us_io - n0.us_io) / 1000),
                               (unsigned)((psx.gpu.us_draw - draw0) / 1000), (unsigned)((psx.mdec.us_decode - mdec0) / 1000),
                               (unsigned)((psx.spu.us_mix - spu0) / 1000),
                               (unsigned)((s->us_update - n0.us_update) / 1000), (unsigned)((s->us_present - n0.us_present) / 1000),
+                              (unsigned)(us_pwait / 1000), (unsigned)(us_pdraw / 1000), (unsigned)(us_ptext / 1000),
                               (unsigned)((us_rgb24 - rgb0) / 1000), (unsigned)((s->us_sleep - n0.us_sleep) / 1000),
                               (unsigned)audio_drops, (unsigned)audio_gaps, (unsigned)audio_trims, (unsigned)audio_peak_in, (unsigned)audio_peak_out, (unsigned)(s->vs_wait - n0.vs_wait),
                               (unsigned)((s->us_vs_wait - n0.us_vs_wait) / 1000), (unsigned)(s->vs_late - n0.vs_late),
                               (unsigned)((s->us_late - n0.us_late) / ((s->vs_late - n0.vs_late) | 1)), (unsigned)s->us_late_max,
                               (unsigned)(s->vs_adv - n0.vs_adv));
                 native_stats.us_late_max = 0;
+                us_pwait = us_pdraw = us_ptext = 0;
                 audio_drops = audio_gaps = audio_trims = audio_peak_in = audio_peak_out = 0;
                 static const char *const io_names[IO_KINDS] = IO_KIND_NAMES;
                 n += snprintf(line + n, sizeof line - (size_t)n, "-- io (n/ms):");
