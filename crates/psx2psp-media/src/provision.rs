@@ -1,8 +1,8 @@
 //! One-click provisioning of the external tools into `<exe dir>/tools/`, where
 //! [`crate::tools::which`] looks after the executable's own folder.
 //!
-//! Official release binaries only: yt-dlp (Unlicense), FFmpeg GPL static builds by BtbN (include
-//! libx264) and atracdenc (LGPL-2.1, Windows builds only). Downloads go through the OS's own `curl`
+//! Official release binaries only: yt-dlp (Unlicense) and FFmpeg GPL static builds by BtbN
+//! (include libx264). Downloads go through the OS's own `curl`
 //! and archives are unpacked by `tar` (bsdtar on Windows 10+ reads `.zip`), so no HTTP/TLS/zip
 //! code is linked into the app.
 
@@ -10,23 +10,22 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use crate::MediaError;
-use crate::tools::{self, At3Encoder, Ffmpeg, YtDlp};
+use crate::tools::{self, Ffmpeg, YtDlp};
 
+/// The ATRAC3 encoder is built in ([`crate::atrac3`]), so only these two are ever downloaded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
     YtDlp,
     Ffmpeg,
-    Atracdenc,
 }
 
 impl Tool {
-    pub const ALL: [Self; 3] = [Self::Ffmpeg, Self::YtDlp, Self::Atracdenc];
+    pub const ALL: [Self; 2] = [Self::Ffmpeg, Self::YtDlp];
 
     pub fn exe(self) -> &'static str {
         match self {
             Self::YtDlp => "yt-dlp",
             Self::Ffmpeg => "ffmpeg",
-            Self::Atracdenc => "atracdenc",
         }
     }
 
@@ -35,7 +34,6 @@ impl Tool {
         match self {
             Self::YtDlp => YtDlp::detect().is_some(),
             Self::Ffmpeg => Ffmpeg::detect().is_some_and(|f| f.has_x264()),
-            Self::Atracdenc => At3Encoder::detect().is_some(),
         }
     }
 
@@ -53,8 +51,6 @@ impl Tool {
             (Self::Ffmpeg, "windows", true) => (gh("BtbN/FFmpeg-Builds", "download/latest", "ffmpeg-master-latest-winarm64-gpl.zip"), true, 136),
             (Self::Ffmpeg, "linux", false) => (gh("BtbN/FFmpeg-Builds", "download/latest", "ffmpeg-master-latest-linux64-gpl.tar.xz"), true, 150),
             (Self::Ffmpeg, "linux", true) => (gh("BtbN/FFmpeg-Builds", "download/latest", "ffmpeg-master-latest-linuxarm64-gpl.tar.xz"), true, 126),
-            // x86 build; runs on x64 and on Windows-on-ARM through emulation.
-            (Self::Atracdenc, "windows", _) => (gh("dcherednik/atracdenc", "download/0.2.3", "atracdenc-win-x86_0.2.3.zip"), true, 1),
             _ => return None,
         };
         Some(Asset { tool: self, url, archive, approx_mb: mb })
@@ -65,7 +61,6 @@ impl Tool {
         match self {
             Self::YtDlp => "pip install yt-dlp",
             Self::Ffmpeg => "brew install ffmpeg (or your package manager's ffmpeg with libx264)",
-            Self::Atracdenc => "build atracdenc from github.com/dcherednik/atracdenc (cmake) and put it on PATH",
         }
     }
 }
@@ -124,7 +119,7 @@ pub fn install(asset: &Asset, log: &dyn Fn(&str)) -> Result<PathBuf, MediaError>
         } else {
             file
         };
-        // The executable plus any DLLs beside it (atracdenc ships its runtime next to the .exe).
+        // The executable plus any DLLs beside it (shared builds keep their runtime next to the .exe).
         let mut files = vec![src.clone()];
         if asset.archive && cfg!(windows) {
             let parent = src.parent().unwrap_or(&tmp);

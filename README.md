@@ -165,10 +165,11 @@ The Media card asks one question first: **From YouTube** or **From my files**.
 
 - **Donor built in.** The PS1 Classic `DATA.PSP` and `BASE.PBP` are compiled into the binary;
   `--donor` overrides them from the CLI if you have your own.
-- **One-click tools.** The media features need ffmpeg (with libx264), yt-dlp and an ATRAC3 encoder
-  (atracdenc or Sony's at3tool). **Install missing** in the GUI, or `psx2psp tools install`,
-  downloads the official release binaries into `<exe folder>/tools/`, with the size shown first.
-  None of them are needed to build a plain EBOOT.
+- **One-click tools.** The ATRAC3 encoder and the audio decoder for local files (MP3, AAC, FLAC,
+  Vorbis, ALAC, WAV, AIFF) are built in, so SND0 from your own music needs nothing. ICON1 needs
+  ffmpeg (with libx264), YouTube needs yt-dlp. **Install missing** in the GUI, or
+  `psx2psp tools install`, downloads the official release binaries into `<exe folder>/tools/`,
+  with the size shown first. None of them are needed to build a plain EBOOT.
 - **Projects with save slots and autosave.** Everything is autosaved as you work, including the
   ICON1/SND0 you made from YouTube, and comes back on the next start, after a crash or an
   accidental close, with an **Undo** toast if you wanted a clean slate. **Save as…** keeps named
@@ -243,7 +244,7 @@ psx2psp extract <EBOOT.PBP> <out-dir>              EBOOT -> BIN/CUE, bit-exact
 psx2psp info    <EBOOT.PBP | disc.cue>             SFO, sections, discs / ID, region, tracks, MD5
 psx2psp patches <disc> [--id <code>] [--ppf <f>]   the patch database's entries for a game, with hits
 psx2psp clip    <video|audio|URL> [clip options] [-o <dir>]   ICON1.PMF and/or SND0.AT3
-psx2psp tools   [install]                          show / download ffmpeg, yt-dlp, atracdenc
+psx2psp tools   [install]                          show the tools / download ffmpeg, yt-dlp
 ```
 
 | `convert` option | Meaning |
@@ -287,8 +288,9 @@ flowchart LR
 crates/
   psx2psp-core      PBP · SFO · CUE/BIN · PSISOIMG/PSTITLEIMG writer and reader · TOC
   psx2psp-patching  sector model · EDC/ECC · PPF 1/2/3 · pattern patches · EXE loader CRCs
-  psx2psp-media     artwork fitting · PSMF (ICON1) muxer and parser · clip pipeline ·
-                    ffmpeg / yt-dlp / atracdenc / at3tool adapters · tool provisioning
+  psx2psp-media     artwork fitting · PSMF (ICON1) muxer and parser · ATRAC3 encoder (SND0) ·
+                    audio decode + resampler · clip pipeline · ffmpeg / yt-dlp adapters
+                    (optional atracdenc / at3tool) · tool provisioning
   psx2psp-engine    use cases (convert / extract / inspect / probe) · patch DB · the `psx2psp` CLI
   psx2psp-app       the iced GUI `psx2psp-reborn` · XMB WGSL shader · preview audio
 ```
@@ -372,13 +374,14 @@ over the generic PAL→NTSC preset when it has one. Found a fix that works? Put 
 </details>
 
 <details>
-<summary><b>Do I need ffmpeg, yt-dlp or atracdenc?</b></summary>
+<summary><b>Do I need ffmpeg or yt-dlp?</b></summary>
 
-Only for clips and SND0. Plain EBOOTs, artwork, patches and the preview need nothing. The tools
-are looked up next to the executable, in `<exe>/tools/` and on `PATH`. **Install missing** fetches
-all three on Windows, ffmpeg and yt-dlp on Linux, and yt-dlp on macOS. Elsewhere: `brew install
-ffmpeg` on macOS, and atracdenc built from [its source](https://github.com/dcherednik/atracdenc)
-on Linux and macOS (or Sony's at3tool, if you have it).
+Only for ICON1 videos and YouTube. Plain EBOOTs, artwork, patches, the preview and SND0 from a
+local audio file need nothing: the ATRAC3 encoder is built in (ffmpeg is still used for audio
+formats it can't read, such as Opus or WebM, and to play SND0 back in the preview). The tools are
+looked up next to the executable, in `<exe>/tools/` and on `PATH`. **Install missing** fetches both
+on Windows and Linux, and yt-dlp on macOS; there, `brew install ffmpeg`. To use an external
+encoder instead (atracdenc or Sony's at3tool), set `PSX2PSP_ATRAC3` to its path.
 </details>
 
 <details>
@@ -419,9 +422,10 @@ lets you check the file first.
   rules and the 10,109-serial title database.
 - **popstation / popstationr**, **[PSXPackager](https://github.com/RupertAvery/PSXPackager)** and
   pop-fe again, against which every byte of the format was cross-checked.
-- **[atracdenc](https://github.com/dcherednik/atracdenc)**, **[FFmpeg](https://ffmpeg.org)** with
-  x264, and **[yt-dlp](https://github.com/yt-dlp/yt-dlp)**: downloaded on request from their
-  official releases, never bundled.
+- **[FFmpeg](https://ffmpeg.org)** with x264, and **[yt-dlp](https://github.com/yt-dlp/yt-dlp)**:
+  downloaded on request from their official releases, never bundled.
+  **[atracdenc](https://github.com/dcherednik/atracdenc)**: the reference the native ATRAC3 encoder
+  was measured against, and still usable through `PSX2PSP_ATRAC3`.
 - **[iced](https://github.com/iced-rs/iced)** and **[wgpu](https://github.com/gfx-rs/wgpu)**, which
   draw every pixel of the GUI.
 

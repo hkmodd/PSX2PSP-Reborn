@@ -2,11 +2,15 @@
 //!
 //! * [`images`] — in-process XMB artwork pipeline (decode → fit → PNG), zero external deps.
 //! * [`framing`] — content-aware crop/pad of any picture into an XMB slot.
-//! * [`tools`]  — FFmpeg / ATRAC3 encoder / yt-dlp process adapters.
+//! * [`atrac3`] — native ATRAC3 encoder (SND0.AT3).
+//! * [`audio`]  — native audio decode + resampling to 44.1 kHz stereo for it.
+//! * [`tools`]  — FFmpeg / external ATRAC3 encoders / yt-dlp process adapters.
 //! * [`psmf`]   — native PSMF muxer/parser (ICON1.PMF).
 //! * [`clip`]   — file/URL → trimmed ICON1.PMF + SND0.AT3 pipeline.
 //! * [`provision`] — one-click install of the external tools into `<exe>/tools`.
 
+pub mod atrac3;
+pub mod audio;
 pub mod clip;
 pub mod framing;
 pub mod images;

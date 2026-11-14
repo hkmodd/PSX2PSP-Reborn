@@ -31,14 +31,14 @@ Legend: ✓ supported · ◐ partial · ✗ absent · *test* = covered by an aut
 | **Animated XMB preview (wave), Game/Save/Boot** | ✓ WGSL shader, *GPU test* | ◐ wave, without the 3 screens | ✗ | ✗ |
 | **ICON1.PMF generated** | ✓ **native PSMF muxer**, *test vs Sony layout*; plays on the PSP XMB | ✗ | ✗ (GIF only) | ✗ |
 | **Animated ICON1 in the preview** | ✓ *GPU test* | ✗ | ✗ | ✗ |
-| SND0.AT3 from an audio/video file | ✓ plays on the PSP XMB (atracdenc) | ✗ | ✓ (at3tool) | ✓ (atracdenc) |
+| SND0.AT3 from an audio/video file | ✓ native ATRAC3 encoder, *SNR test vs atracdenc* (real-PSP test pending; atracdenc output plays on the PSP XMB) | ✗ | ✓ (at3tool) | ✓ (atracdenc) |
 | CDDA tracks → ATRAC3, manuals (DOCUMENT.DAT), memory cards | ✗ | ✗ | ✗ | ✓ |
 | SND0 from YouTube | ✓ yt-dlp | ✗ | ✓ | ✓ |
 | **Start/end trimming** | ✓ any span | ✗ | ? | ◐ (fixed 59 s cut) |
 | **YouTube → ICON1 + SND0 from the same clip** | ✓ | ✗ | ✗ | ✗ |
 | **Soundtrack only, detached from the video** | ✓ `SND0 only` mode | ✗ | ✓ | ✓ |
 | **Shared 500 KB XMB budget, bitrate fitted** | ✓ ICON1 fitted to what is left | ✗ | ✗ | ✗ |
-| One-click tool download | ✓ ffmpeg, yt-dlp, atracdenc | n/a | ? | ? |
+| One-click tool download | ✓ ffmpeg, yt-dlp (the ATRAC3 encoder is built in) | n/a | ? | ? |
 | CHD / ZIP / 7z / RAR input | ✗ | ✓ native CHD, 7z/rar/tar | ✗ | ✓ CHD |
 | Game database (automatic title and cover) | ◐ title (10,109 serials), no covers | ✓ | ◐ covers and BGM fetched from several sites | ✓ Redump |
 | PS3 / PS2 / PS Classic / PSIO / Vita bubble targets | ✗ | ✗ | ✗ | ✓ |
@@ -62,8 +62,8 @@ Legend: ✓ supported · ◐ partial · ✗ absent · *test* = covered by an aut
 3. **Animated WYSIWYG preview.** The XMB wave, the layers and the ICON1 playing in the ICON0 slot
    are rendered on the GPU, with the three screens Game, Save and Boot.
 4. **Everything included.** The donor (`BASE.PBP` and `DATA.PSP`) is built into the binary. The
-   external tools install with one click into `<exe>/tools`: FFmpeg GPL with libx264, yt-dlp and
-   atracdenc, all from their official releases.
+   ATRAC3 encoder is native too. The external tools install with one click into `<exe>/tools`:
+   FFmpeg GPL with libx264 and yt-dlp, both from their official releases.
 5. **Verified per-game code patches.** Each patch comes from reverse engineering, with its exact
    pattern and expected hit count, and executables guarded by a loader CRC get it recomputed.
 
@@ -72,7 +72,6 @@ Legend: ✓ supported · ◐ partial · ✗ absent · *test* = covered by an aut
 | Gap | Who has it | Estimated cost |
 |---|---|---|
 | Linux and macOS builds actually built and run | PSXPackager (CLI), pop-fe | low in code, blocked on CI (never ran: billing) and on hardware to test |
-| SND0 without a hand-built encoder on Linux/macOS | nobody: atracdenc ships Windows builds only | medium–high: native ATRAC3 encoder (see `docs/DEPENDENCIES.md`) |
 | CHD and archive input | PSXPackager, pop-fe | medium: a CHD decoder (zstd/lzma/flac) and archive reading |
 | Game database with automatic covers | PSXPackager (`gameInfo.db`), pop-fe (Redump) | medium: needs a source with a compatible licence |
 | Import of PSX2PSP's own `patches.ini` | PSX2PSP-Enhanced | low: map its format onto the pattern patcher |

@@ -3,8 +3,8 @@
 //!
 //! ```text
 //! URL ──yt-dlp (section only, frame-exact cut)──┐
-//! file ─────────────────────────────────────────┴─► FFmpeg ─┬─► WAV ─► ATRAC3 ─► SND0.AT3
-//!                                                           └─► x264 ES ─► psmf::mux ─► ICON1.PMF
+//! file ─────────────────────────────────────────┴─┬─► symphonia, or FFmpeg ─► PCM ─► atrac3 ─► SND0.AT3
+//!                                                 └─► FFmpeg ─► x264 ES ─► psmf::mux ─► ICON1.PMF
 //! ```
 //!
 //! ICON1 + SND0 share the XMB's 500 KiB budget: SND0 is CBR so it is made first, and ICON1's bitrate
@@ -62,17 +62,22 @@ impl std::fmt::Display for ClipMode {
     }
 }
 
-/// External tools the pipeline drives.
+/// Tools the pipeline drives. FFmpeg is needed for ICON1, URLs and audio formats the native
+/// decoder lacks; SND0 from a local MP3/AAC/FLAC/Vorbis/WAV needs nothing external.
 #[derive(Debug, Clone)]
 pub struct ClipTools {
-    pub ffmpeg: Ffmpeg,
-    pub at3: Option<At3Encoder>,
+    pub ffmpeg: Option<Ffmpeg>,
+    pub at3: At3Encoder,
     pub yt_dlp: Option<YtDlp>,
 }
 
 impl ClipTools {
-    pub fn detect() -> Result<Self, MediaError> {
-        Ok(Self { ffmpeg: Ffmpeg::detect().ok_or(MediaError::Missing("ffmpeg"))?, at3: At3Encoder::detect(), yt_dlp: YtDlp::detect() })
+    pub fn detect() -> Self {
+        Self { ffmpeg: Ffmpeg::detect(), at3: At3Encoder::detect(), yt_dlp: YtDlp::detect() }
+    }
+
+    fn ffmpeg(&self) -> Result<&Ffmpeg, MediaError> {
+        self.ffmpeg.as_ref().ok_or(MediaError::Missing("ffmpeg"))
     }
 }
 
@@ -106,7 +111,11 @@ pub fn probe(tools: &ClipTools, source: &str, mon: &dyn Monitor) -> Result<(Opti
         let i = tools.yt_dlp.as_ref().ok_or(MediaError::Missing("yt-dlp"))?.info(source.trim(), mon)?;
         Ok((i.duration, Some(i.title)))
     } else {
-        Ok((Some(tools.ffmpeg.duration(Path::new(source), mon)?), None))
+        let path = Path::new(source);
+        match crate::audio::duration(path) {
+            Some(d) => Ok((Some(d), None)),
+            None => Ok((Some(tools.ffmpeg()?.duration(path, mon)?), None)),
+        }
     }
 }
 
@@ -136,8 +145,7 @@ pub fn make_clip(tools: &ClipTools, req: &ClipRequest<'_>, work: &Path, mon: &dy
     if !(req.start >= 0.0 && dur >= 1.0) {
         return Err(bad(format!("clip {}–{}: needs start ≥ 0 and at least 1 s", tools::fmt_hms(req.start), tools::fmt_hms(req.end))));
     }
-    let at3 = if req.mode.audio() { Some(tools.at3.as_ref().ok_or(MediaError::Missing("ATRAC3 encoder (atracdenc/at3tool)"))?) } else { None };
-    if req.mode.video() && !tools.ffmpeg.has_x264() {
+    if req.mode.video() && !tools.ffmpeg()?.has_x264() {
         return Err(MediaError::Missing("FFmpeg build with libx264"));
     }
     std::fs::create_dir_all(work).map_err(|e| MediaError::Io(work.display().to_string(), e))?;
@@ -157,17 +165,18 @@ pub fn make_clip(tools: &ClipTools, req: &ClipRequest<'_>, work: &Path, mon: &dy
         log(&format!("Downloading {}–{} of {}", tools::fmt_hms(req.start), tools::fmt_hms(req.end), req.source.trim()));
         let stage = Stage { mon, lo: 0.0, hi: dl_end };
         let section = tools::Section { url: req.source.trim(), start: req.start, end: req.end, video: req.mode.video() };
-        (yt.fetch_section(&tools.ffmpeg, &section, work, mon, &|f| stage.at(f))?, 0.0, true)
+        (yt.fetch_section(tools.ffmpeg()?, &section, work, mon, &|f| stage.at(f))?, 0.0, true)
     } else {
         (PathBuf::from(req.source), req.start, false)
     };
 
     let result = (|| {
         let mut clip = Clip::default();
-        if let Some(enc) = at3 {
+        if req.mode.audio() {
             let (kbps, budget) = if req.mode.video() { (SHARED_KBPS, req.budget.saturating_sub(MIN_ICON1)) } else { (req.snd0_kbps, req.budget) };
-            log(&format!("SND0.AT3: ATRAC3 {kbps} kbps"));
-            let snd0 = tools::make_snd0(&tools.ffmpeg, enc, &Snd0Request { input: &input, start_secs: start, max_secs: Some(dur), kbps, budget }, work, mon)?;
+            log(&format!("SND0.AT3: ATRAC3 {kbps} kbps ({} encoder)", tools.at3.name()));
+            let snd0_req = Snd0Request { input: &input, start_secs: start, max_secs: Some(dur), kbps, budget };
+            let snd0 = tools::make_snd0(tools.ffmpeg.as_ref(), &tools.at3, &snd0_req, work, mon)?;
             log(&format!("SND0.AT3: {} bytes", snd0.len()));
             Stage { mon, lo: 0.0, hi: snd0_end }.at(1.0);
             clip.snd0 = Some(snd0);
@@ -175,7 +184,7 @@ pub fn make_clip(tools: &ClipTools, req: &ClipRequest<'_>, work: &Path, mon: &dy
         if req.mode.video() {
             let budget = req.budget.saturating_sub(clip.snd0.as_ref().map_or(0, |s| s.len() as u64));
             let stage = Stage { mon, lo: snd0_end, hi: 1.0 };
-            let pmf = encode_icon1(&tools.ffmpeg, &input, start, dur, budget, work, mon, &|f| stage.at(f))?;
+            let pmf = encode_icon1(tools.ffmpeg()?, &input, start, dur, budget, work, mon, &|f| stage.at(f))?;
             clip.icon1 = Some(pmf);
         }
         Ok(clip)
@@ -309,7 +318,7 @@ mod tests {
             src.as_os_str(),
         ])
         .unwrap();
-        let tools = ClipTools { ffmpeg: ff.clone(), at3: None, yt_dlp: None };
+        let tools = ClipTools { ffmpeg: Some(ff.clone()), at3: At3Encoder::Native, yt_dlp: None };
         assert!((probe(&tools, src.to_str().unwrap(), &()).unwrap().0.unwrap() - 6.0).abs() < 0.1);
 
         let budget = 120 * 1024;
@@ -329,11 +338,16 @@ mod tests {
 
     #[test]
     fn clip_validation() {
-        let tools = ClipTools { ffmpeg: Ffmpeg { path: "ffmpeg".into() }, at3: None, yt_dlp: None };
+        let tools = ClipTools { ffmpeg: None, at3: At3Encoder::Native, yt_dlp: None };
+        let work = tempfile::tempdir().unwrap();
         let req = ClipRequest { source: "x.mp4", start: 5.0, end: 5.5, mode: ClipMode::Icon1, snd0_kbps: 132, budget: 1 };
-        assert!(matches!(make_clip(&tools, &req, Path::new("."), &()), Err(MediaError::Format(_))));
-        let req = ClipRequest { mode: ClipMode::Snd0, end: 30.0, ..req };
-        assert!(matches!(make_clip(&tools, &req, Path::new("."), &()), Err(MediaError::Missing(_))));
+        assert!(matches!(make_clip(&tools, &req, work.path(), &()), Err(MediaError::Format(_))));
+        let req = ClipRequest { end: 30.0, ..req };
+        assert!(matches!(make_clip(&tools, &req, work.path(), &()), Err(MediaError::Missing("ffmpeg"))), "ICON1 needs FFmpeg");
+        // SND0 from a file the native decoder cannot open falls back to FFmpeg, which is missing.
+        let req = ClipRequest { mode: ClipMode::Snd0, ..req };
+        assert!(matches!(make_clip(&tools, &req, work.path(), &()), Err(MediaError::Missing(_))));
+        assert!(matches!(probe(&tools, "x.mp4", &()), Err(MediaError::Missing("ffmpeg"))));
         assert!(is_url(" https://youtu.be/x") && !is_url("C:/v.mp4"));
         assert_eq!(tools::parse_hms("1:02.5"), Some(62.5));
         assert_eq!(tools::parse_hms("1:00:00"), Some(3600.0));

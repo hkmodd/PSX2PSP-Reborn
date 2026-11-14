@@ -1,8 +1,8 @@
 //! External tool adapters (FFmpeg, ATRAC3 encoders, yt-dlp), invoked as child processes.
 //!
-//! FFmpeg 8.x has **no ATRAC3 encoder** (decoders only) and no PMF muxer, so SND0.AT3 needs a
-//! dedicated encoder: Sony `at3tool` or the open-source `atracdenc`. FFmpeg normalises any input
-//! to 44.1 kHz stereo PCM first.
+//! FFmpeg 8.x has **no ATRAC3 encoder** (decoders only) and no PMF muxer. SND0.AT3 comes from the
+//! built-in encoder ([`crate::atrac3`]) fed by [`crate::audio`]; FFmpeg only decodes what
+//! symphonia cannot. Sony `at3tool` or `atracdenc` can still be chosen through [`AT3_ENV`].
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -75,8 +75,14 @@ pub fn which(name: &str) -> Option<PathBuf> {
     candidates(name).into_iter().next()
 }
 
+/// Environment variable naming an external ATRAC3 encoder (`at3tool` or `atracdenc`, as a path
+/// or a name looked up like the other tools) to use instead of the built-in one.
+pub const AT3_ENV: &str = "PSX2PSP_ATRAC3";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum At3Encoder {
+    /// The built-in encoder ([`crate::atrac3`]): no external program.
+    Native,
     /// Sony `at3tool`: `at3tool -e -br <kbps> in.wav out.at3`.
     At3Tool(PathBuf),
     /// `atracdenc`: `atracdenc -e atrac3 -i in.wav -o out.at3 --bitrate <kbps>`.
@@ -84,8 +90,14 @@ pub enum At3Encoder {
 }
 
 impl At3Encoder {
-    pub fn detect() -> Option<Self> {
-        which("at3tool").map(Self::At3Tool).or_else(|| which("atracdenc").map(Self::Atracdenc))
+    /// The built-in encoder, unless [`AT3_ENV`] names an external one that exists.
+    pub fn detect() -> Self {
+        Self::from_env(std::env::var_os(AT3_ENV).as_deref())
+    }
+
+    fn from_env(v: Option<&OsStr>) -> Self {
+        let p = v.filter(|v| !v.is_empty()).map(PathBuf::from);
+        p.and_then(|p| if p.is_file() { Some(p) } else { p.to_str().and_then(which) }).map_or(Self::Native, Self::from_path)
     }
 
     pub fn from_path(p: PathBuf) -> Self {
@@ -93,35 +105,39 @@ impl At3Encoder {
         if stem.contains("atracdenc") { Self::Atracdenc(p) } else { Self::At3Tool(p) }
     }
 
-    pub fn path(&self) -> &Path {
+    /// The external program, if any.
+    pub fn path(&self) -> Option<&Path> {
         match self {
-            Self::At3Tool(p) | Self::Atracdenc(p) => p,
+            Self::Native => None,
+            Self::At3Tool(p) | Self::Atracdenc(p) => Some(p),
         }
     }
 
-    /// Encodes `wav` to a RIFF ATRAC3 file at one of the Sony rates (66/105/132 kbps).
+    /// For logs, errors and the tool status line.
+    pub fn name(&self) -> String {
+        self.path().map_or_else(|| "built-in".into(), |p| p.display().to_string())
+    }
+
+    /// Runs an external encoder on `wav` → RIFF ATRAC3 at one of the Sony rates (66/105/132
+    /// kbps). The built-in encoder works on PCM in memory instead: see [`make_snd0`].
     ///
     /// atracdenc quirks, measured on 0.2.3: it picks the container from the output extension
     /// case-sensitively (`.AT3` → EA3/OMA, `.at3` → RIFF), and maps `--bitrate` through its own
     /// thresholds (66 → 272-byte frames, 132 → 424: non-Sony sizes). `--bitrate 64/100/128`
     /// are the arguments that yield Sony's 192/304/384-byte frames.
-    pub fn encode(&self, wav: &Path, out: &Path, kbps: u32, mon: &dyn Monitor) -> Result<(), MediaError> {
-        let bad = || MediaError::Tool { tool: self.path().display().to_string(), detail: format!("{kbps} kbps is not an ATRAC3 rate (66, 105, 132)") };
-        at3_block_align(kbps).ok_or_else(bad)?;
-        let br = match self {
-            Self::At3Tool(_) => kbps,
-            Self::Atracdenc(_) => match kbps {
-                66 => 64,
-                105 => 100,
-                _ => 128,
-            },
-        }
-        .to_string();
+    fn encode_file(&self, wav: &Path, out: &Path, kbps: u32, mon: &dyn Monitor) -> Result<(), MediaError> {
+        let atracdenc_br = match kbps {
+            66 => "64",
+            105 => "100",
+            _ => "128",
+        };
+        let br = kbps.to_string();
         let (p, args): (&Path, Vec<&OsStr>) = match self {
+            Self::Native => unreachable!("the built-in encoder takes PCM, not a file"),
             Self::At3Tool(p) => (p, vec!["-e".as_ref(), "-br".as_ref(), br.as_ref(), wav.as_os_str(), out.as_os_str()]),
             Self::Atracdenc(p) => (
                 p,
-                vec!["-e".as_ref(), "atrac3".as_ref(), "-i".as_ref(), wav.as_os_str(), "-o".as_ref(), out.as_os_str(), "--bitrate".as_ref(), br.as_ref()],
+                vec!["-e".as_ref(), "atrac3".as_ref(), "-i".as_ref(), wav.as_os_str(), "-o".as_ref(), out.as_os_str(), "--bitrate".as_ref(), atracdenc_br.as_ref()],
             ),
         };
         run_watched(p, &args, mon, &mut |_| {}, None)?;
@@ -374,9 +390,11 @@ pub struct Snd0Request<'a> {
     pub budget: u64,
 }
 
-/// Full SND0.AT3 pipeline: FFmpeg → WAV → ATRAC3, sized to fit the XMB budget.
-pub fn make_snd0(ffmpeg: &Ffmpeg, enc: &At3Encoder, req: &Snd0Request<'_>, work: &Path, mon: &dyn Monitor) -> Result<Vec<u8>, MediaError> {
-    let tool_err = |detail: String| MediaError::Tool { tool: enc.path().display().to_string(), detail };
+/// Full SND0.AT3 pipeline, sized to fit the XMB budget: local audio → PCM (natively, or through
+/// FFmpeg for formats symphonia lacks) → ATRAC3 (built-in, or an external encoder via a WAV).
+/// `ffmpeg` is only needed for those formats and for external encoders.
+pub fn make_snd0(ffmpeg: Option<&Ffmpeg>, enc: &At3Encoder, req: &Snd0Request<'_>, work: &Path, mon: &dyn Monitor) -> Result<Vec<u8>, MediaError> {
+    let tool_err = |detail: String| MediaError::Tool { tool: enc.name(), detail };
     let block = at3_block_align(req.kbps).ok_or_else(|| tool_err(format!("{} kbps is not an ATRAC3 rate (66, 105, 132)", req.kbps)))?;
     // ATRAC3 is CBR: size = header + frames. Reserve 512 B for RIFF chunks and 3 frames for the
     // encoder's delay/padding (measured overhead: ~430 B at 132 kbps), the rest is audio.
@@ -384,13 +402,34 @@ pub fn make_snd0(ffmpeg: &Ffmpeg, enc: &At3Encoder, req: &Snd0Request<'_>, work:
     let fit = (req.budget.saturating_sub(overhead) as f64 * 8.0 / at3_bps(block)).clamp(1.0, 60.0);
     let max_secs = req.max_secs.map_or(fit, |s| s.clamp(1.0, fit));
     let wav = work.join("snd0.wav");
-    // Lower-case extension: atracdenc writes EA3/OMA instead of RIFF for `.AT3`.
-    let at3 = work.join("snd0.at3");
-    ffmpeg.to_wav(req.input, &wav, req.start_secs, max_secs, mon)?;
-    enc.encode(&wav, &at3, req.kbps, mon)?;
-    let bytes = std::fs::read(&at3).map_err(|e| MediaError::Io(at3.display().to_string(), e))?;
-    let _ = std::fs::remove_file(&wav);
-    let _ = std::fs::remove_file(&at3);
+    let to_wav = || -> Result<(), MediaError> {
+        let ff = ffmpeg.ok_or(MediaError::Missing("ffmpeg (to decode this audio format)"))?;
+        ff.to_wav(req.input, &wav, req.start_secs, max_secs, mon)
+    };
+    let bytes = if *enc == At3Encoder::Native {
+        let pcm = match crate::audio::decode(req.input, req.start_secs, max_secs, mon)? {
+            Some(pcm) => pcm,
+            None => {
+                to_wav()?;
+                let b = std::fs::read(&wav).map_err(|e| MediaError::Io(wav.display().to_string(), e))?;
+                let _ = std::fs::remove_file(&wav);
+                crate::atrac3::read_wav(&b).ok_or_else(|| MediaError::Format("FFmpeg's WAV is not 44.1 kHz stereo s16".into()))?
+            }
+        };
+        if pcm.is_empty() {
+            return Err(MediaError::Format(format!("{}: no audio from {}", req.input.display(), fmt_hms(req.start_secs))));
+        }
+        crate::atrac3::encode(&pcm, req.kbps, mon)?
+    } else {
+        // Lower-case extension: atracdenc writes EA3/OMA instead of RIFF for `.AT3`.
+        let at3 = work.join("snd0.at3");
+        to_wav()?;
+        enc.encode_file(&wav, &at3, req.kbps, mon)?;
+        let bytes = std::fs::read(&at3).map_err(|e| MediaError::Io(at3.display().to_string(), e))?;
+        let _ = std::fs::remove_file(&wav);
+        let _ = std::fs::remove_file(&at3);
+        bytes
+    };
     match riff_atrac3_block_align(&bytes) {
         None => {
             let head = String::from_utf8_lossy(&bytes[..bytes.len().min(4)]).into_owned();
@@ -451,36 +490,67 @@ mod tests {
         assert!(b.len() > 44100 * 4, "≈2 s of stereo s16");
     }
 
-    /// Real encoder, all three rates: RIFF (not OMA) with Sony frame sizes, sized to the budget.
     #[test]
-    fn make_snd0_sony_frames_if_available() {
+    fn encoder_from_env() {
+        assert_eq!(At3Encoder::from_env(None), At3Encoder::Native);
+        assert_eq!(At3Encoder::from_env(Some("".as_ref())), At3Encoder::Native);
+        assert_eq!(At3Encoder::from_env(Some("no-such-atrac3-encoder".as_ref())), At3Encoder::Native, "a name that is not installed");
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join(exe_name("atracdenc"));
+        std::fs::write(&p, b"").unwrap();
+        assert_eq!(At3Encoder::from_env(Some(p.as_os_str())), At3Encoder::Atracdenc(p.clone()));
+        assert_eq!(At3Encoder::Atracdenc(p.clone()).name(), p.display().to_string());
+        assert_eq!(At3Encoder::Native.name(), "built-in");
+    }
+
+    /// 44.1 kHz stereo s16 WAV of a 440 Hz sine at amplitude 1/8 (RMS ≈ 2900).
+    fn sine_wav(path: &Path, secs: usize) {
+        let n = 44_100 * secs;
+        let mut b = b"RIFF".to_vec();
+        b.extend((36 + 4 * n as u32).to_le_bytes());
+        b.extend(b"WAVEfmt \x10\0\0\0\x01\0\x02\0");
+        b.extend(44_100u32.to_le_bytes());
+        b.extend((44_100u32 * 4).to_le_bytes());
+        b.extend(b"\x04\0\x10\0data");
+        b.extend((4 * n as u32).to_le_bytes());
+        for i in 0..n {
+            let v = (4096.0 * (2.0 * std::f64::consts::PI * 440.0 * i as f64 / 44_100.0).sin()) as i16;
+            b.extend(v.to_le_bytes().repeat(2));
+        }
+        std::fs::write(path, b).unwrap();
+    }
+
+    /// All three rates, built-in encoder (no external tool needed) and any external one found:
+    /// RIFF (not OMA) with Sony frame sizes, sized to the budget, and — when FFmpeg is there to
+    /// decode it like the preview does — the right length and level.
+    #[test]
+    fn make_snd0_sony_frames() {
         let bundled = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/release/tools").join(exe_name("atracdenc"));
-        let Some(enc) = At3Encoder::detect().or_else(|| bundled.is_file().then_some(At3Encoder::Atracdenc(bundled))) else { return };
-        let Some(ff) = Ffmpeg::detect() else { return };
+        let ext = which("at3tool").map(At3Encoder::At3Tool).or_else(|| which("atracdenc").map(At3Encoder::Atracdenc));
+        let ext = ext.or_else(|| bundled.is_file().then_some(At3Encoder::Atracdenc(bundled)));
+        let ff = Ffmpeg::detect();
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("in.wav");
-        let ok = command(&ff.path)
-            .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "sine=f=440:d=4", "-ac", "2", "-ar", "44100"])
-            .arg(&src)
-            .status()
-            .unwrap();
-        assert!(ok.success());
-        for kbps in [66, 105, 132] {
-            let req = Snd0Request { input: &src, start_secs: 0.0, max_secs: Some(3.0), kbps, budget: SND0_BUDGET };
-            let b = make_snd0(&ff, &enc, &req, dir.path(), &()).unwrap_or_else(|e| panic!("{kbps} kbps: {e}"));
-            assert_eq!(riff_atrac3_block_align(&b), at3_block_align(kbps), "{kbps} kbps");
-            let expect = at3_bps(at3_block_align(kbps).unwrap()) / 8.0 * 3.0;
-            assert!((b.len() as f64) < expect * 1.15 && (b.len() as f64) > expect * 0.9, "{kbps} kbps: {} B", b.len());
-            // What the preview plays: the AT3 bytes decoded back. ~3 s of a 440 Hz sine at the
-            // lavfi default amplitude 1/8 (RMS ≈ 2900 in s16).
-            let pcm = crate::clip::snd0_pcm(&ff, &b, dir.path()).unwrap_or_else(|e| panic!("{kbps} kbps decode: {e}"));
-            let secs = pcm.len() as f64 / 2.0 / f64::from(crate::clip::SND0_RATE);
-            assert!((2.8..3.3).contains(&secs), "{kbps} kbps: decoded {secs:.2} s");
-            let mid = &pcm[pcm.len() / 4..pcm.len() * 3 / 4];
-            let rms = (mid.iter().map(|&x| f64::from(x).powi(2)).sum::<f64>() / mid.len() as f64).sqrt();
-            assert!((2000.0..3800.0).contains(&rms), "{kbps} kbps: RMS {rms:.0}");
+        sine_wav(&src, 4);
+        for enc in std::iter::once(At3Encoder::Native).chain(ext.filter(|_| ff.is_some())) {
+            for kbps in [66, 105, 132] {
+                let req = Snd0Request { input: &src, start_secs: 0.0, max_secs: Some(3.0), kbps, budget: SND0_BUDGET };
+                let b = make_snd0(ff.as_ref(), &enc, &req, dir.path(), &()).unwrap_or_else(|e| panic!("{} {kbps} kbps: {e}", enc.name()));
+                assert_eq!(riff_atrac3_block_align(&b), at3_block_align(kbps), "{kbps} kbps");
+                let expect = at3_bps(at3_block_align(kbps).unwrap()) / 8.0 * 3.0;
+                assert!((b.len() as f64) < expect * 1.15 && (b.len() as f64) > expect * 0.9, "{kbps} kbps: {} B", b.len());
+                let Some(ff) = &ff else { continue };
+                let pcm = crate::clip::snd0_pcm(ff, &b, dir.path()).unwrap_or_else(|e| panic!("{kbps} kbps decode: {e}"));
+                let secs = pcm.len() as f64 / 2.0 / f64::from(crate::clip::SND0_RATE);
+                assert!((2.8..3.3).contains(&secs), "{} {kbps} kbps: decoded {secs:.2} s", enc.name());
+                let mid = &pcm[pcm.len() / 4..pcm.len() * 3 / 4];
+                let rms = (mid.iter().map(|&x| f64::from(x).powi(2)).sum::<f64>() / mid.len() as f64).sqrt();
+                assert!((2000.0..3800.0).contains(&rms), "{} {kbps} kbps: RMS {rms:.0}", enc.name());
+            }
+            let tight = Snd0Request { input: &src, start_secs: 0.0, max_secs: None, kbps: 132, budget: 20_000 };
+            assert!(make_snd0(ff.as_ref(), &enc, &tight, dir.path(), &()).unwrap().len() <= 20_000);
         }
-        let tight = Snd0Request { input: &src, start_secs: 0.0, max_secs: None, kbps: 132, budget: 20_000 };
-        assert!(make_snd0(&ff, &enc, &tight, dir.path(), &()).unwrap().len() <= 20_000);
+        let late = Snd0Request { input: &src, start_secs: 10.0, max_secs: Some(3.0), kbps: 66, budget: SND0_BUDGET };
+        assert!(matches!(make_snd0(None, &At3Encoder::Native, &late, dir.path(), &()), Err(MediaError::Format(_))), "start past the end");
     }
 }

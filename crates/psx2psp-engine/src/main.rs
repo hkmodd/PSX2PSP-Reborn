@@ -26,7 +26,9 @@ USAGE:
   psx2psp art     <image> [--slot icon0|pic0|pic1|boot] [-o <dir>]
                                      frame any picture into the XMB slots (all by default)
                                      as the converter would; prints the crop chosen
-  psx2psp tools   [install]          show / download ffmpeg, yt-dlp, atracdenc into <exe>/tools
+  psx2psp tools   [install]          show the tools; download ffmpeg, yt-dlp into <exe>/tools
+                                     (the ATRAC3 encoder is built in; PSX2PSP_ATRAC3=<at3tool|
+                                     atracdenc> uses an external one instead)
   psx2psp update  [--check]          replace this executable with the latest GitHub release
                                      (SHA-256 verified); --check only reports
 
@@ -49,7 +51,8 @@ CONVERT OPTIONS:
   --no-patch <name>  turn one patch off by name
   --icon0/--pic0/--pic1/--boot <image>   artwork (any format; auto-fitted)
   --icon1 <pmf>      ready-made ICON1.PMF
-  --snd0 <audio>     any audio/video → SND0.AT3 (needs ffmpeg + at3tool/atracdenc)
+  --snd0 <audio>     any audio/video → SND0.AT3 (built-in decoder + encoder; ffmpeg for formats
+                     it can't read, e.g. Opus/WebM)
   --snd0-start <s>   start offset in seconds (default 0)
   --level <1-9>      deflate level (default 5, recommended; 1-4 are 2-3% larger and no faster,
                      9 is ~0.1% smaller in about the same time). Games that hang on a real PSP below
@@ -185,7 +188,7 @@ impl ClipArgs {
 
     fn run(&self, work: &Path, budget: u64) -> Result<Clip, Box<dyn std::error::Error>> {
         let src = self.source.as_deref().ok_or("no clip source")?;
-        let tools = ClipTools::detect()?;
+        let tools = ClipTools::detect();
         let (len, title) = clip::probe(&tools, src, &())?;
         if let Some(t) = title {
             eprintln!("Source: {t}");
@@ -281,6 +284,7 @@ fn cmd_tools(install: bool) -> R {
         let state = if t.present() { "ok" } else if t.asset().is_some() { "missing (installable)" } else { "missing" };
         println!("{:<10} {state}", t.exe());
     }
+    println!("{:<10} {}", "atrac3", At3Encoder::detect().name());
     if !install {
         return Ok(());
     }
@@ -419,12 +423,11 @@ fn cmd_convert(args: &[String]) -> R {
     }
     let snd0 = match snd0 {
         Some(src) => {
-            let ff = Ffmpeg::detect().ok_or(psx2psp_engine::media::MediaError::Missing("ffmpeg"))?;
-            let enc = At3Encoder::detect().ok_or(psx2psp_engine::media::MediaError::Missing("at3tool/atracdenc"))?;
+            let (ff, enc) = (Ffmpeg::detect(), At3Encoder::detect());
             let icon1_len = icon1.as_ref().and_then(|p: &PathBuf| std::fs::metadata(p).ok()).map_or(0, |m| m.len());
             let work = psx2psp_engine::work_dir(&output);
             std::fs::create_dir_all(&work)?;
-            let r = tools::make_snd0(&ff, &enc, &Snd0Request { input: &src, start_secs: snd0_start, max_secs: None, kbps: 132, budget: tools::SND0_BUDGET.saturating_sub(icon1_len) }, &work, &());
+            let r = tools::make_snd0(ff.as_ref(), &enc, &Snd0Request { input: &src, start_secs: snd0_start, max_secs: None, kbps: 132, budget: tools::SND0_BUDGET.saturating_sub(icon1_len) }, &work, &());
             let _ = std::fs::remove_dir_all(&work);
             Some(r?)
         }

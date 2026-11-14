@@ -480,6 +480,7 @@ fn span(start: &str, end: &str, len: Option<f64>) -> Option<(f64, f64)> {
 struct Tools {
     ffmpeg: Option<PathBuf>,
     x264: bool,
+    /// External ATRAC3 encoder chosen with `PSX2PSP_ATRAC3`; `None` = the built-in one.
     at3: Option<PathBuf>,
     yt_dlp: Option<PathBuf>,
     /// Missing tools with a published binary for this OS/CPU.
@@ -491,7 +492,7 @@ fn detect_tools() -> Tools {
     Tools {
         x264: ff.as_ref().is_some_and(Ffmpeg::has_x264),
         ffmpeg: ff.map(|f| f.path),
-        at3: At3Encoder::detect().map(|e| e.path().to_path_buf()),
+        at3: At3Encoder::detect().path().map(Path::to_path_buf),
         yt_dlp: YtDlp::detect().map(|y| y.path),
         missing: provision::missing(),
     }
@@ -1372,7 +1373,7 @@ impl App {
                         "Tools: ffmpeg {}{} · ATRAC3 {} · yt-dlp {}",
                         at(&t.ffmpeg),
                         if t.ffmpeg.is_some() && !t.x264 { " (no libx264: ICON1 disabled)" } else { "" },
-                        at(&t.at3),
+                        t.at3.as_deref().map_or("built-in".into(), |p| p.display().to_string()),
                         at(&t.yt_dlp)
                     ));
                     self.tools = Some(t);
@@ -1538,7 +1539,7 @@ impl App {
         let key = src.clone();
         worker::blocking(
             move || {
-                let tools = ClipTools::detect().map_err(|e| e.to_string())?;
+                let tools = ClipTools::detect();
                 clip::probe(&tools, &src, &()).map_err(|e| e.to_string())
             },
             move |r| Message::TrackProbed(t, key.clone(), r),
@@ -1638,7 +1639,7 @@ impl App {
         let cancel = Arc::clone(&self.clip.probe_cancel);
         worker::blocking(
             move || {
-                let tools = ClipTools::detect().map_err(|e| e.to_string())?;
+                let tools = ClipTools::detect();
                 clip::probe(&tools, &src, &*cancel).map_err(|e| e.to_string())
             },
             move |r| Message::ClipProbed(key.clone(), r),
@@ -1772,7 +1773,7 @@ fn snd0_from(source: String, bytes: Vec<u8>) -> Result<Snd0, String> {
 
 /// Worker side of "Make clip": source → ICON1.PMF and/or SND0.AT3 (+ decoded preview).
 fn run_clip(req: &ClipRequest<'_>, label: String, m: &dyn Monitor) -> Result<ClipOut, String> {
-    let tools = ClipTools::detect().map_err(|e| e.to_string())?;
+    let tools = ClipTools::detect();
     let work = scratch("clip");
     let r = clip::make_clip(&tools, req, &work, m);
     let _ = std::fs::remove_dir_all(&work);
@@ -2433,7 +2434,7 @@ impl App {
                     icons::icon(Icon::Wrench, 14.0, style::MUTED),
                     tool("ffmpeg", t.ffmpeg.is_some()),
                     tool("x264", t.x264),
-                    tool("ATRAC3", t.at3.is_some()),
+                    tool(if t.at3.is_some() { "ATRAC3 (external)" } else { "ATRAC3" }, true),
                     tool("yt-dlp", t.yt_dlp.is_some()),
                 ]
                 .spacing(6)

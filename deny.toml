@@ -19,7 +19,8 @@ allow = [
     "Unlicense",
     "Unicode-3.0",
     "CDLA-Permissive-2.0",
-    # File-level copyleft (symphonia, the MP3 decoder of the preview): used unmodified, its
+    # File-level copyleft (symphonia: the MP3 preview decoder and the native SND0 audio decode
+    # — MP3/AAC/ALAC/FLAC/Vorbis/PCM/ADPCM in WAV/AIFF/Ogg/MP4): used unmodified, its
     # source stays on crates.io; listed in the third-party notices.
     "MPL-2.0",
 ]
