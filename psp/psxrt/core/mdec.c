@@ -59,6 +59,90 @@ static void idct(const Mdec *m, s16 *blk)
         }
 }
 
+/* The standard scale table is 0x8000 * c(u) * cos((2y+1)u pi/16), c(0) = 1/sqrt2: the two passes
+ * above then compute the textbook 2-D IDCT, f = 1/4 sum c(u) c(v) F cos cos. With that table the
+ * Loeffler-Ligtenberg-Moschytz factorisation does the same in 12 multiplies per 1-D pass instead
+ * of 64 (13-bit constants, results within +-1 of the exact passes). */
+static int standard_scale(const s16 *s)
+{
+    static const s32 c[8] = {32768, 32138, 30274, 27245, 23170, 18204, 12539, 6392}; /* 0x8000 cos(k pi/16) */
+    for (int u = 0; u < 8; u++)
+        for (int y = 0; y < 8; y++) {
+            s32 want;
+            if (!u)
+                want = c[4];
+            else {
+                int k = ((2 * y + 1) * u) & 31;
+                if (k > 16)
+                    k = 32 - k;
+                want = k > 8 ? -c[16 - k] : c[k];
+            }
+            s32 d = s[u * 8 + y] - want;
+            if (d < -2 || d > 2)
+                return 0;
+        }
+    return 1;
+}
+
+#define CB 13 /* constant bits */
+#define P1 2  /* extra precision bits between the passes */
+#define F(x) ((s32)((x) * (1 << CB) + 0.5))
+#define DESCALE(x, n) (((x) + (1 << ((n) - 1))) >> (n))
+
+/* One 1-D IDCT over in[0], in[st], .. in[7 st]; outputs before the final descale. */
+#define IDCT_1D(i0, i1, i2, i3, i4, i5, i6, i7)                                                     \
+    s32 z1 = ((i2) + (i6)) * F(0.541196100);                                                          \
+    s32 e2 = z1 - (i6) * F(1.847759065), e3 = z1 + (i2) * F(0.765366865);                             \
+    s32 e0 = ((i0) + (i4)) * (1 << CB), e1 = ((i0) - (i4)) * (1 << CB);                               \
+    s32 t10 = e0 + e3, t13 = e0 - e3, t11 = e1 + e2, t12 = e1 - e2;                                   \
+    s32 o0 = (i7), o1 = (i5), o2 = (i3), o3 = (i1);                                                   \
+    s32 a1 = o0 + o3, a2 = o1 + o2, a3 = o0 + o2, a4 = o1 + o3, a5 = (a3 + a4) * F(1.175875602);      \
+    o0 *= F(0.298631336), o1 *= F(2.053119869), o2 *= F(3.072711026), o3 *= F(1.501321110);           \
+    a1 *= -F(0.899976223), a2 *= -F(2.562915447), a3 = a3 * -F(1.961570560) + a5,                     \
+        a4 = a4 * -F(0.390180644) + a5;                                                               \
+    o0 += a1 + a3, o1 += a2 + a4, o2 += a2 + a3, o3 += a1 + a4
+
+static void idct_fast(s16 *blk)
+{
+    s32 ws[64];
+    for (int x = 0; x < 8; x++) { /* columns: frequency u down blk, results down ws */
+        const s16 *in = blk + x;
+        s32 *o = ws + x;
+        if (!(in[8] | in[16] | in[24] | in[32] | in[40] | in[48] | in[56])) {
+            s32 dc = in[0] * (1 << P1);
+            for (int y = 0; y < 8; y++)
+                o[y * 8] = dc;
+            continue;
+        }
+        IDCT_1D(in[0], in[8], in[16], in[24], in[32], in[40], in[48], in[56]);
+        o[0] = DESCALE(t10 + o3, CB - P1), o[56] = DESCALE(t10 - o3, CB - P1);
+        o[8] = DESCALE(t11 + o2, CB - P1), o[48] = DESCALE(t11 - o2, CB - P1);
+        o[16] = DESCALE(t12 + o1, CB - P1), o[40] = DESCALE(t12 - o1, CB - P1);
+        o[24] = DESCALE(t13 + o0, CB - P1), o[32] = DESCALE(t13 - o0, CB - P1);
+    }
+    for (int y = 0; y < 8; y++) { /* rows */
+        const s32 *in = ws + y * 8;
+        s16 *o = blk + y * 8;
+        s32 r[8];
+        if (!(in[1] | in[2] | in[3] | in[4] | in[5] | in[6] | in[7])) {
+            s32 dc = DESCALE(in[0], P1 + 3);
+            for (int x = 0; x < 8; x++)
+                r[x] = dc;
+        } else {
+            IDCT_1D(in[0], in[1], in[2], in[3], in[4], in[5], in[6], in[7]);
+            const int n = CB + P1 + 3;
+            r[0] = DESCALE(t10 + o3, n), r[7] = DESCALE(t10 - o3, n);
+            r[1] = DESCALE(t11 + o2, n), r[6] = DESCALE(t11 - o2, n);
+            r[2] = DESCALE(t12 + o1, n), r[5] = DESCALE(t12 - o1, n);
+            r[3] = DESCALE(t13 + o0, n), r[4] = DESCALE(t13 - o0, n);
+        }
+        for (int x = 0; x < 8; x++) {
+            s32 v = (s32)((u32)r[x] << 23) >> 23; /* 9-bit result, as the exact passes */
+            o[x] = (s16)(v < -128 ? -128 : v > 127 ? 127 : v);
+        }
+    }
+}
+
 /* Decodes one block; 0 when the input ran out. */
 static int block(Mdec *m, s16 *blk, const u8 *qt)
 {
@@ -84,24 +168,56 @@ static int block(Mdec *m, s16 *blk, const u8 *qt)
             break;
         val = (sext10(n) * qt[k] * q + 4) / 8;
     }
-    idct(m, blk);
+    if (m->std_scale)
+        idct_fast(blk);
+    else
+        idct(m, blk);
     return 1;
 }
 
 static u8 clamp8(s32 v) { return (u8)(v < -128 ? -128 : v > 127 ? 127 : v); }
 
-static void put_rgb(Mdec *m, int x, int y, s32 r, s32 g, s32 b)
+/* clamp_tab[sign][512 + v]: v clamped to a signed byte, offset to unsigned when !sign. Y + the
+ * chroma terms stay within +-360. */
+static u8 clamp_tab[2][1024];
+
+static void clamp_init(void)
 {
-    u8 rr = clamp8(r), gg = clamp8(g), bb = clamp8(b);
-    if (!m->sign)
-        rr ^= 0x80, gg ^= 0x80, bb ^= 0x80;
-    if (m->depth == 2) {
-        u8 *o = (u8 *)m->out + (y * 16 + x) * 3;
-        o[0] = rr, o[1] = gg, o[2] = bb;
-    } else {
-        u16 *o = (u16 *)m->out + y * 16 + x;
-        *o = (u16)((rr >> 3) | (gg >> 3) << 5 | (bb >> 3) << 10 | (m->bit15 ? 0x8000 : 0));
+    if (clamp_tab[1][0]) /* 0x80 once built */
+        return;
+    for (int v = -512; v < 512; v++) {
+        u8 c = clamp8(v);
+        clamp_tab[1][512 + v] = c, clamp_tab[0][512 + v] = c ^ 0x80;
     }
+}
+
+/* One 8x8 luma block of a colour macroblock at (xx, yy): each 2x2 shares one chroma sample.
+ * Inlined twice, once per output depth. */
+#ifdef _MSC_VER
+#define INLINE static __forceinline
+#else
+#define INLINE static inline __attribute__((always_inline))
+#endif
+INLINE void yuv(Mdec *m, const s16 *cr, const s16 *cb, const s16 *y, int xx, int yy, int depth)
+{
+    const u8 *cl = clamp_tab[m->sign] + 512;
+    u16 hi = m->bit15 ? 0x8000 : 0;
+    for (int py = 0; py < 8; py += 2)
+        for (int px = 0; px < 8; px += 2) {
+            int c = ((px + xx) >> 1) + ((py + yy) >> 1) * 8;
+            s32 r = cr[c], b = cb[c];
+            s32 G = (-88 * b - 183 * r) >> 8, R = (359 * r) >> 8, B = (454 * b) >> 8;
+            for (int k = 0; k < 4; k++) {
+                int ox = xx + px + (k & 1), oy = yy + py + (k >> 1);
+                s32 Y = y[(px + (k & 1)) + (py + (k >> 1)) * 8];
+                u8 rr = cl[Y + R], gg = cl[Y + G], bb = cl[Y + B];
+                if (depth == 2) {
+                    u8 *o = (u8 *)m->out + (oy * 16 + ox) * 3;
+                    o[0] = rr, o[1] = gg, o[2] = bb;
+                } else
+                    ((u16 *)m->out)[oy * 16 + ox] = (u16)((rr >> 3) | (gg >> 3) << 5 | (bb >> 3) << 10 | hi);
+            }
+        }
 }
 
 static void decode(Mdec *m);
@@ -121,6 +237,7 @@ static void decode(Mdec *m)
     m->nout = m->rout = 0;
     if (m->depth >= 2) {
         s16 cr[64], cb[64], y[64];
+        clamp_init();
         m->block = 4;
         if (!block(m, cr, m->iq_uv))
             return;
@@ -132,15 +249,10 @@ static void decode(Mdec *m)
             if (!block(m, y, m->iq_y))
                 return;
             int xx = (i & 1) * 8, yy = (i >> 1) * 8;
-            for (int py = 0; py < 8; py++)
-                for (int px = 0; px < 8; px++) {
-                    int c = ((px + xx) >> 1) + ((py + yy) >> 1) * 8;
-                    s32 R = cr[c], B = cb[c];
-                    s32 G = (-88 * B - 183 * R) >> 8;
-                    R = (359 * R) >> 8, B = (454 * B) >> 8;
-                    s32 Y = y[px + py * 8];
-                    put_rgb(m, px + xx, py + yy, Y + R, Y + G, Y + B);
-                }
+            if (m->depth == 2)
+                yuv(m, cr, cb, y, xx, yy, 2);
+            else
+                yuv(m, cr, cb, y, xx, yy, 3);
         }
         m->nout = m->depth == 2 ? 192 : 128;
     } else {
@@ -235,6 +347,8 @@ static void param(Mdec *m, u32 v)
     case 3: {
         int i = 32 - m->words_left;
         m->scale[i * 2] = (s16)v, m->scale[i * 2 + 1] = (s16)(v >> 16);
+        if (m->words_left == 1)
+            m->std_scale = standard_scale(m->scale);
         break;
     }
     }
@@ -254,6 +368,11 @@ void mdec_write(Psx *psx, int reg, u32 v)
     }
     if (m->words_left) {
         param(m, v);
+        if (m->state == 3 && !m->words_left) {
+            static int logged;
+            if (!logged++)
+                psx_log(psx, "mdec: scale table %s", m->std_scale ? "standard, fast IDCT" : "not standard, exact IDCT");
+        }
         return;
     }
     m->cmd = v;
@@ -271,7 +390,7 @@ void mdec_write(Psx *psx, int reg, u32 v)
         m->words_left = m->color ? 32 : 16;
         break;
     case 3:
-        m->state = 3, m->words_left = 32;
+        m->state = 3, m->words_left = 32, m->std_scale = 0;
         break;
     default:
         m->words_left = 0;

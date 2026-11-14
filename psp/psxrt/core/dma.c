@@ -194,6 +194,11 @@ void dma_write(Psx *psx, u32 addr, u32 v)
     case 0: c->madr = v & 0xFFFFFF; return;
     case 4: c->bcr = v; return;
     case 8:
+        /* A start while the previous transfer's completion is still due: its words have moved
+         * already, so it completes now. Native code can restart a channel within fewer emulated
+         * cycles than the last transfer's length (libpress sends the IDCT tables back to back). */
+        if ((v & 0x01000000u) && (d->pending & (1u << ch)))
+            dma_done(psx, ch);
         if (ch == 6)
             c->chcr = (v & 0x51000000u) | 2;
         else
@@ -204,6 +209,6 @@ void dma_write(Psx *psx, u32 addr, u32 v)
     }
     u32 sync = (c->chcr >> 9) & 3;
     int go = (c->chcr & 0x01000000u) && (sync != 0 || (c->chcr & 0x10000000u));
-    if (go && (d->dpcr & (8u << (4 * ch))) && !(d->pending & (1u << ch)))
+    if (go && (d->dpcr & (8u << (4 * ch))))
         run(psx, ch);
 }

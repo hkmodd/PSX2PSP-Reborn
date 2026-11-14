@@ -292,6 +292,7 @@ typedef struct Mdec {
     u32 ctl; /* control register: bit 30 DMA in, bit 29 DMA out */
     u8 iq_y[64], iq_uv[64];
     s16 scale[64];
+    int std_scale; /* the scale table is the standard DCT basis: the fast IDCT applies */
     u32 *in; /* parameter words of the command, from the host (in_cap words) */
     int nin, in_cap;
     int hpos; /* next halfword of `in` to decode */
