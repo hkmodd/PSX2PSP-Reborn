@@ -357,15 +357,94 @@ static int display_size(const Psx *psx, int *w, int *h)
 
 static int display_24bit(const Psx *psx) { return (psx->gpu.stat & 0x200000) && rgb24_tex; }
 
-/* The PS1 display area: a 5551 texture of the GE's PS1 VRAM, or a converted copy in 24-bit modes
- * (present() has brought the GE's pixels into RAM). */
+/* 24-bit display on the GE, when the renderer holds PS1 VRAM: no readback, no CPU conversion.
+ * Pixel x's channel c (R, G, B) is byte b = d + 3x + c of the line, d the line's start past a
+ * 16-byte boundary. PS1 VRAM read as a 16-bit index texture (T16) gives halfword b >> 1, and CLUT
+ * shift 8 * (b & 1) that byte; a grey CLUT makes it all three channels and the pixel mask keeps
+ * channel c. So for each (c, s) one draw of 1-pixel column sprites, every x with
+ * (d + 3x + c) & 1 == s: 6 draws, 3w columns, into a 5650 buffer in the VRAM left after the two
+ * display buffers. The scaled sprite then reads that buffer.
+ * A 16-bit framebuffer read as T16 is what PPSSPP emulates (as T32 it reads black, and a GE copy
+ * to RAM first crashes it). Lines past 512 halfwords (the GE's widest texture) or past VRAM's right
+ * edge stay on the CPU path. */
+#define GE_RGB24 0x188000u /* 512 x 256 x 2 bytes, to 0x1C8000 */
+static u32 g24_clut[256] __attribute__((aligned(64)));
+static Vertex g24_v[3 * 512 * 2] __attribute__((aligned(64)));
+static int g24_at[3][3], g24_key = -1, g24_bad, g24_frames;
+
+static int display_ge24(const Psx *psx, int *w, int *h)
+{
+    const Gpu *g = &psx->gpu;
+    return !g24_bad && g->renderer && display_24bit(psx) && display_size(psx, w, h) && *h <= 256 &&
+           (g->disp_x & 7) * 2 + 3 * *w <= 1024 && g->disp_x * 2 + 3 * *w <= VRAM_W * 2;
+}
+
+static void *ge24(const Gpu *g, int w, int h)
+{
+    int d = (g->disp_x & 7) * 2, key = w | h << 10 | d << 20;
+    if (key != g24_key) {
+        int k = 0;
+        for (int c = 0; c < 3; c++)
+            for (int s = 0; s < 2; s++) {
+                g24_at[c][s] = k;
+                for (int x = 0; x < w; x++) {
+                    u32 b = (u32)(d + 3 * x + c);
+                    if ((int)(b & 1) != s)
+                        continue;
+                    g24_v[k++] = (Vertex){(u16)(b >> 1), 0, (s16)x, 0, 0};
+                    g24_v[k++] = (Vertex){(u16)((b >> 1) + 1), (u16)h, (s16)(x + 1), (s16)h, 0};
+                }
+                g24_at[c][s + 1] = k;
+            }
+        for (int i = 0; i < 256; i++)
+            g24_clut[i] = 0xFF000000u | (u32)i * 0x010101u;
+        sceKernelDcacheWritebackRange(g24_v, (u32)k * sizeof(Vertex));
+        sceKernelDcacheWritebackRange(g24_clut, sizeof g24_clut);
+        g24_key = key;
+    }
+    sceGuTexSync();
+    sceGuDrawBufferList(GU_PSM_5650, (void *)GE_RGB24, 512);
+    sceGuScissor(0, 0, w, h);
+    sceGuDisable(GU_ALPHA_TEST);
+    sceGuDisable(GU_DEPTH_TEST);
+    sceGuTexMode(GU_PSM_T16, 0, 0, 0);
+    sceGuTexImage(0, 512, 256, VRAM_W, (void *)(0x04000000u + GE_PS1_VRAM + ((u32)g->disp_y * VRAM_W + (g->disp_x & ~7u)) * 2));
+    sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGB);
+    sceGuTexFilter(GU_NEAREST, GU_NEAREST);
+    sceGuClutMode(GU_PSM_8888, 0, 0xFF, 0);
+    sceGuClutLoad(32, g24_clut);
+    sceGuTexFlush();
+    sceGuEnable(GU_TEXTURE_2D);
+    for (int c = 0; c < 3; c++) {
+        sceGuPixelMask(0xFFFFFFu & ~(0xFFu << 8 * c));
+        for (int s = 0; s < 2; s++) {
+            int n = g24_at[c][s + 1] - g24_at[c][s];
+            if (!n)
+                continue;
+            sceGuClutMode(GU_PSM_8888, 8 * s, 0xFF, 0);
+            sceGuDrawArray(GU_SPRITES, GU_TEXTURE_16BIT | GU_VERTEX_16BIT | GU_TRANSFORM_2D, n, 0, g24_v + g24_at[c][s]);
+        }
+    }
+    sceGuPixelMask(0);
+    sceGuDrawBufferList(GU_PSM_5650, draw_buf, 512);
+    sceGuScissor(0, 0, 480, 272);
+    sceGuTexSync();
+    return (void *)(0x04000000u + GE_RGB24);
+}
+
+/* The PS1 display area: a 5551 texture of the GE's PS1 VRAM, or in 24-bit modes the GE's own
+ * conversion (ge24) or a CPU one (present() has brought the GE's pixels into RAM). */
 static void draw_ps1(Psx *psx)
 {
     const Gpu *g = &psx->gpu;
     int w, h;
     if (!display_size(psx, &w, &h))
         return;
-    if (display_24bit(psx)) {
+    if (display_ge24(psx, &w, &h)) {
+        void *t = ge24(g, w, h);
+        sceGuTexMode(GU_PSM_5650, 0, 0, 0);
+        sceGuTexImage(0, 512, 256, 512, t);
+    } else if (display_24bit(psx)) {
         sceGuTexMode(GU_PSM_8888, 0, 0, 0);
         sceGuTexImage(0, 512, 512, 512, convert24(g, w, h));
     } else if (!g->renderer) {
@@ -430,6 +509,30 @@ static void shot(Psx *psx, u32 frame_no)
     say("shot %s (%dx%d%s)", path, w, h, deep ? ", 24-bit" : "");
 }
 
+/* On the 60th and 600th frames the GE converts: the CPU's conversion of the same pixels must match it
+ * to the bit, or the CPU path takes over for good. */
+static void g24_check(const Gpu *g, int w, int h)
+{
+    const u32 *ref = convert24(g, w, h);
+    u16 *got = (u16 *)(rgb24_tex + 512 * 256); /* the GE copies its buffer here, past ref */
+    sceKernelDcacheWritebackInvalidateRange(got, 512u * (u32)h * 2);
+    ge_open();
+    sceGuCopyImage(GU_PSM_5650, 0, 0, w, h, 512, (void *)(0x04000000u + GE_RGB24), 0, 0, 512, got);
+    ge_sync();
+    u32 bad = 0, lit = 0;
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) {
+            u32 c = ref[y * 512 + x];
+            lit += (c & 0xFFFFFF) != 0;
+            u16 e = (u16)((c >> 3 & 0x1F) | (c >> 10 & 0x3F) << 5 | (c >> 19 & 0x1F) << 11);
+            if (got[y * 512 + x] != e && bad++ < 4)
+                say("rgb24 on the GE: (%d, %d) %04x, expected %04x", x, y, got[y * 512 + x], e);
+        }
+    g24_bad = bad != 0;
+    say("rgb24 on the GE: %u of %u pixels (%u not black) differ%s", (unsigned)bad, (unsigned)(w * h), (unsigned)lit,
+        bad ? ", the CPU converts from now on" : "");
+}
+
 /* Debugging: the 2 MB of PS1 RAM, ramNNNNN.bin beside the EBOOT. */
 static void ram_dump(Psx *psx, u32 frame_no)
 {
@@ -445,9 +548,14 @@ static void ram_dump(Psx *psx, u32 frame_no)
 
 static void present(Psx *psx, const char *status)
 {
-    int w, h;
-    if (psx && psx->gpu.renderer && display_24bit(psx) && display_size(psx, &w, &h))
-        ge_read(psx->gpu.disp_x, psx->gpu.disp_y, (w * 3 + 1) / 2 + 1, h);
+    int w, h, chk = 0;
+    if (psx && psx->gpu.renderer && display_24bit(psx) && display_size(psx, &w, &h)) {
+        int ge = display_ge24(psx, &w, &h);
+        ++g24_frames;
+        chk = ge && (g24_frames == 60 || g24_frames == 600);
+        if (!ge || chk)
+            ge_read(psx->gpu.disp_x, psx->gpu.disp_y, (w * 3 + 1) / 2 + 1, h);
+    }
     if (psx && psx->gpu.renderer)
         ge_touch();
     ge_open();
@@ -461,6 +569,8 @@ static void present(Psx *psx, const char *status)
     if (psx)
         draw_ps1(psx);
     ge_sync();
+    if (chk)
+        g24_check(&psx->gpu, w, h);
     pspDebugScreenSetBase((u32 *)(0x44000000u + (u32)draw_buf));
     pspDebugScreenSetXY(0, 0);
     pspDebugScreenSetTextColor(0xFF40FFFF);
