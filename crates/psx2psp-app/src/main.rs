@@ -111,6 +111,8 @@ struct App {
     music: soundtrack::Music,
     clip: ClipForm,
     level: u32,
+    /// Output mode Native: the game's code translated for the PSP (psxrt) instead of POPS.
+    native: bool,
     output: Option<PathBuf>,
     screen: Screen,
     job: Option<Job>,
@@ -614,6 +616,7 @@ enum Message {
     SaveMusic,
     InstallTools,
     Level(u32),
+    Native(bool),
     PickOutput,
     OutputPicked(Option<PathBuf>),
     ResetOutput,
@@ -682,6 +685,7 @@ impl App {
             music: soundtrack::Music::default(),
             clip: ClipForm::default(),
             level: DEFAULT_LEVEL,
+            native: false,
             output: None,
             screen: Screen::Game,
             job: None,
@@ -1258,6 +1262,7 @@ impl App {
             Message::SaveMusic => self.music.save(),
             Message::InstallTools => return self.install_tools(),
             Message::Level(l) => self.level = l,
+            Message::Native(on) => self.native = on,
             Message::PickOutput => {
                 let mut d = rfd::AsyncFileDialog::new().set_title("Save EBOOT.PBP").set_file_name("EBOOT.PBP").add_filter("EBOOT", &["pbp"]);
                 if let Some(dir) = self.output_path().as_deref().and_then(Path::parent) {
@@ -1398,6 +1403,8 @@ impl App {
             Some(format!("{}: no game ID detected — type it (e.g. SLUS00594)", file_name(&d.path)))
         } else if self.title.trim().is_empty() {
             Some("Enter a title".to_owned())
+        } else if self.native && self.discs.len() > 1 {
+            Some(format!("Native builds one disc; {} are selected — use POPS for multi-disc games", self.discs.len()))
         } else if self.media_bytes() > tools::SND0_BUDGET {
             Some(format!("ICON1 + SND0 take {} KB; the XMB allows 500 KB — make a shorter clip", self.media_bytes().div_ceil(1024)))
         } else {
@@ -1437,8 +1444,9 @@ impl App {
             },
             level: self.level,
         };
+        let native = self.native;
         let Some(cancel) = self.start_job("Build") else { return Task::none() };
-        worker::job(cancel, move |m| build(&req, m), Message::Job)
+        worker::job(cancel, move |m| build(&req, native, m), Message::Job)
     }
 
     /// Shared progress/log handling; yields the label and result once the job is done.
@@ -1786,14 +1794,15 @@ fn run_clip(req: &ClipRequest<'_>, label: String, m: &dyn Monitor) -> Result<Cli
     })
 }
 
-/// Worker side of "Build": EBOOT.PBP with the prepared artwork and media.
-fn build(req: &ConvertRequest, m: &dyn Monitor) -> Result<String, String> {
+/// Worker side of "Build": EBOOT.PBP with the prepared artwork and media, for POPS or (`native`)
+/// for the translated code.
+fn build(req: &ConvertRequest, native: bool, m: &dyn Monitor) -> Result<String, String> {
     for (name, b) in [("ICON1.PMF", &req.artwork.icon1_pmf), ("SND0.AT3", &req.artwork.snd0)] {
         if let Some(b) = b {
             m.log(&format!("{name}: {} B", b.len()));
         }
     }
-    let rep = engine::convert(req, m).map_err(|e| e.to_string())?;
+    let rep = if native { engine::convert_native(req, m) } else { engine::convert(req, m) }.map_err(|e| e.to_string())?;
     Ok(format!(
         "{} ({:.1} MB, {:.1}% of raw) in {:.1}s",
         rep.output.display(),
@@ -2862,8 +2871,9 @@ impl App {
 
     fn build_card(&self) -> Element<'_, Message> {
         // The engine raises the level to a game's `min_level` (games that hang on a PSP below it).
+        // Native skips POPS, so a POPS `min_level` does not apply to it.
         let floor = self.discs.iter().filter_map(|d| d.db_id(&self.patches).and_then(|id| self.patches.min_level(&id))).max();
-        let raised = floor.filter(|&m| m > self.level);
+        let raised = floor.filter(|&m| !self.native && m > self.level);
         let status = chip(format!("Level {}", raised.unwrap_or(self.level)), if raised.is_some() { style::AMBER } else { style::GREEN });
         let (note, accent) = match (raised, self.level) {
             (Some(m), _) => (format!("raised to {m}: this game hangs on a PSP below it"), style::AMBER),
@@ -2875,9 +2885,30 @@ impl App {
         self.section(BUILD, status, || {
             let output = self.output_path().map_or_else(|| "<disc folder>/<GAME ID>/EBOOT.PBP".into(), |p| p.display().to_string());
             let reset = (Icon::Reset, "Back to the default location", self.output.as_ref().map(|_| Message::ResetOutput));
+            let runtime = [(false, Icon::Disc, "POPS"), (true, Icon::Sparkles, "Native")].into_iter().fold(row![].spacing(4), |r, (native, glyph, name)| {
+                let on = self.native == native;
+                let ink = if on { Color::WHITE } else { style::MUTED };
+                let content = row![icons::icon(glyph, 13.0, ink), text(name).size(12).font(style::BOLD)].spacing(6).align_y(Alignment::Center);
+                let explanation = if native {
+                    "The game's code translated to PSP code (psxrt). One disc; patches and donor do not apply"
+                } else {
+                    "Sony's PS1 emulator (POPS) runs the disc image"
+                };
+                r.push(container(hint(
+                    button(container(content).center_x(Fill)).padding([8, 2]).width(Fill).style(style::segment(on, style::PINK)).on_press(Message::Native(native)),
+                    explanation.into(),
+                ))
+                .width(Fill))
+            });
+            let runtime_note = if self.native { "experimental" } else { "Sony emulator" };
             column![
                 caption("OUTPUT"),
                 slot_row(Icon::Package, style::GREEN, "EBOOT.PBP", output, self.output_path().is_some(), Message::PickOutput, reset),
+                space().height(2),
+                row![icons::icon(Icon::Wrench, 14.0, style::MUTED), caption("RUNTIME"), space().width(Fill), chip(runtime_note.to_owned(), if self.native { style::AMBER } else { style::MUTED })]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                container(runtime).padding(4).style(style::segmented),
                 space().height(2),
                 row![
                     icons::icon(Icon::Layers, 14.0, style::MUTED),
@@ -3102,6 +3133,42 @@ mod tests {
             assert_eq!((m.width, m.height, m.frames.len()), (144, 80, 605));
         }
         assert!(load_snd0(p).is_err(), "a PMF is not an AT3");
+    }
+
+    /// Native mode refuses more than one disc before any work starts.
+    #[test]
+    fn native_takes_one_disc() {
+        let mut app = App::boot().0;
+        app.title = "Game".into();
+        for (n, id) in [(1, "SLUS00001"), (2, "SLUS00002")] {
+            app.discs.push(Disc::new(n, PathBuf::from(format!("d{n}.cue"))));
+            app.discs.last_mut().unwrap().id = id.into();
+        }
+        let _ = app.update(Message::Native(true));
+        let _ = app.convert();
+        assert!(app.job.is_none());
+        assert!(app.toasts.last().unwrap().text.contains("Native builds one disc"), "{}", app.toasts.last().unwrap().text);
+    }
+
+    /// The GUI's Native build produces an EBOOT.PBP (needs a local disc image).
+    #[test]
+    #[ignore]
+    fn native_build_writes_eboot() {
+        let Some(cue) = std::env::var_os("PSX2PSP_NATIVE_CUE").map(PathBuf::from) else { return };
+        let t = tempfile::tempdir().unwrap();
+        let output = t.path().join("EBOOT.PBP");
+        let req = ConvertRequest {
+            discs: vec![DiscInput { path: cue, ..DiscInput::default() }],
+            patches: PatchDb::default(),
+            title: "Native test".into(),
+            output: output.clone(),
+            donor: None,
+            artwork: Artwork::default(),
+            level: DEFAULT_LEVEL,
+        };
+        let out = build(&req, true, &()).unwrap();
+        let pbp = std::fs::read(&output).unwrap();
+        assert_eq!(&pbp[..4], b"\0PBP", "{out}");
     }
 
     /// The window icon decodes with the trimmed codec set (no silent `None`).
