@@ -10,6 +10,7 @@
 //! | [`RT_CALL`] | | Runtime entry for host calls (written by the runtime) |
 //! | [`MISS`] | | Runtime entry for a dispatch-table miss (written by the runtime) |
 //! | [`GTE_CMD`] | | Runtime entry for a GTE command (written by the runtime) |
+//! | [`GTE_NCLIP`] .. [`GTE_RTPT`] | | Runtime entries for the commands of [`GTE_OWN`] |
 //! | [`TABLE`] | 2 MB | Dispatch table: host address of the code for guest `addr & 0x1FFFFF` |
 //!
 //! Allegrex `k0` holds [`K0`] at all times: it is the base for [`CTX`] and [`TABLE`], and its
@@ -33,6 +34,26 @@ pub const MISS: u32 = 0x09A0_0F40;
 /// command's low 25 bits in `k1`. Runs the command on [`GTE`] and returns with every guest
 /// register (`ra` from [`ctx::GPR`]) as it was; `k1` is clobbered.
 pub const GTE_CMD: u32 = 0x09A0_0FA0;
+/// NCLIP entry: `sw ra,GPR31(k0); jal GTE_NCLIP; nop`. Same contract as [`GTE_CMD`], for the
+/// words [`GTE_OWN`] gives it, without the runtime's C.
+pub const GTE_NCLIP: u32 = 0x09A0_0FD0;
+/// AVSZ3 entry, as [`GTE_NCLIP`].
+pub const GTE_AVSZ3: u32 = 0x09A0_0FD8;
+/// AVSZ4 entry, as [`GTE_NCLIP`].
+pub const GTE_AVSZ4: u32 = 0x09A0_0FE0;
+/// RTPS entry (sf = 1, lm = 0), as [`GTE_NCLIP`].
+pub const GTE_RTPS: u32 = 0x09A0_0FE8;
+/// RTPT entry (sf = 1, lm = 0), as [`GTE_NCLIP`].
+pub const GTE_RTPT: u32 = 0x09A0_0FF0;
+/// The GTE commands with an entry of their own, `(entry, mask, value)`: a command word `w` with
+/// `w & mask == value` means the same as `value`, and goes to `entry`.
+pub const GTE_OWN: [(u32, u32, u32); 5] = [
+    (GTE_NCLIP, 0x3F, 0x06),
+    (GTE_AVSZ3, 0x3F, 0x2D),
+    (GTE_AVSZ4, 0x3F, 0x2E),
+    (GTE_RTPS, 0x8_043F, 0x8_0001),
+    (GTE_RTPT, 0x8_043F, 0x8_0030),
+];
 /// Dispatch table, one word per guest word address of RAM.
 pub const TABLE: u32 = 0x09A0_1000;
 /// End of everything above (exclusive).

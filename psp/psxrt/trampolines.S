@@ -148,6 +148,391 @@ psxrt_gte_prof:
     nop
     .end psxrt_gte_prof
 
+/* NCLIP, AVSZ3, AVSZ4, RTPS and RTPT without the runtime's C: `sw ra,GPR31(k0); jal GTE_x; nop` from
+ * translated code. ra is free (the guest's is in CTX) and k1 keeps the return; t0 and t1 are
+ * parked in CTX, HI/LO too since the products use them. Same results as core/gte.c, which
+ * native_init checks on random registers before installing them. */
+#define GD(r) (0x4B4 + 4 * (r)) /* GTE data register r from k0 */
+#define GC(r) (0x534 + 4 * (r)) /* GTE control register r from k0 */
+
+.macro GTE_ENTER
+    move $k1, $ra
+    mfhi $ra
+    sw $ra, HI($k0)
+    mflo $ra
+    sw $ra, LO($k0)
+    sw $8, G(8)($k0)
+    sw $9, G(9)($k0)
+.endm
+
+    .globl psxrt_gte_nclip
+    .ent psxrt_gte_nclip
+psxrt_gte_nclip:
+    GTE_ENTER
+    /* x0*y1 + x1*y2 + x2*y0 - x0*y2 - x1*y0 - x2*y1 */
+    lh $8, GD(12)($k0)
+    lh $9, GD(13) + 2($k0)
+    mult $8, $9
+    lh $ra, GD(14) + 2($k0)
+    msub $8, $ra
+    lh $8, GD(13)($k0)
+    madd $8, $ra
+    lh $9, GD(12) + 2($k0)
+    msub $8, $9
+    lh $8, GD(14)($k0)
+    madd $8, $9
+    lh $9, GD(13) + 2($k0)
+    msub $8, $9
+    mflo $8
+    mfhi $9
+    sw $8, GD(24)($k0)
+    sra $ra, $8, 31
+    bne $ra, $9, mac0_over
+    move $ra, $zero /* FLAG */
+gte_leave:
+    sw $ra, GC(31)($k0)
+    lw $8, G(8)($k0)
+    lw $9, G(9)($k0)
+    lw $ra, HI($k0)
+    mthi $ra
+    lw $ra, LO($k0)
+    mtlo $ra
+    jr $k1
+    lw $ra, G(31)($k0)
+/* MAC0 does not hold HI:LO: FLAG bit 16 (positive) or 15, and 31 */
+mac0_over:
+    lui $ra, 0x8001
+    bgez $9, gte_leave
+    nop
+    lui $ra, 0x8000
+    b gte_leave
+    ori $ra, $ra, 0x8000
+    .end psxrt_gte_nclip
+
+    .globl psxrt_gte_avsz3
+    .ent psxrt_gte_avsz3
+psxrt_gte_avsz3:
+    GTE_ENTER
+    lw $8, GD(17)($k0)
+    lw $9, GD(18)($k0)
+    addu $8, $8, $9
+    lw $9, GD(19)($k0)
+    addu $8, $8, $9
+    b avsz
+    lh $9, GC(29)($k0)
+    .end psxrt_gte_avsz3
+
+    .globl psxrt_gte_avsz4
+    .ent psxrt_gte_avsz4
+psxrt_gte_avsz4:
+    GTE_ENTER
+    lw $8, GD(16)($k0)
+    lw $9, GD(17)($k0)
+    addu $8, $8, $9
+    lw $9, GD(18)($k0)
+    addu $8, $8, $9
+    lw $9, GD(19)($k0)
+    addu $8, $8, $9
+    lh $9, GC(30)($k0)
+/* t0 = SZ sum, t1 = ZSF: MAC0 = the product, OTZ = product >> 12 saturated to 0..0xFFFF */
+avsz:
+    mult $9, $8
+    mflo $8
+    mfhi $9
+    sw $8, GD(24)($k0)
+    sra $ra, $8, 31
+    bne $ra, $9, avsz_over
+    move $ra, $zero /* FLAG */
+avsz_otz:
+    srl $8, $8, 12
+    ins $8, $9, 20, 12
+    srl $9, $8, 16
+    bnez $9, avsz_sat
+    nop
+avsz_store:
+    b gte_leave
+    sw $8, GD(7)($k0)
+/* FLAG bit 18, and 31 */
+avsz_sat:
+    lui $9, 0x8004
+    or $ra, $ra, $9
+    slt $9, $8, $zero
+    ori $8, $zero, 0xFFFF
+    b avsz_store
+    movn $8, $zero, $9
+avsz_over:
+    lui $ra, 0x8001
+    bgez $9, avsz_otz
+    nop
+    lui $ra, 0x8000
+    b avsz_otz
+    ori $ra, $ra, 0x8000
+    .end psxrt_gte_avsz4
+
+/* RTPS and RTPT with sf = 1 and lm = 0 (the words the translator sends here), as core/gte.c's
+ * rtp_fast: TR must fit 31 bits so the sums cannot leave 44, otherwise GTE_CMD runs them.
+ * t2-t7 are parked as well; t4 gathers FLAG and t6 holds the divide's result. */
+
+/* MAC(n+1) of the vertex in t0-t2, IR(n+1) saturated to -0x8000..0x7FFF (FLAG bit 24-n).
+ * Leaves the MAC in t3. */
+.macro RTP_ROW n
+    lw $11, GC(5 + \n)($k0)
+    sll $15, $11, 12
+    mtlo $15
+    sra $15, $11, 20
+    mthi $15
+    lh $15, GC(0) + 6 * \n($k0)
+    madd $15, $8
+    lh $15, GC(0) + 6 * \n + 2($k0)
+    madd $15, $9
+    lh $15, GC(0) + 6 * \n + 4($k0)
+    madd $15, $10
+    mflo $11
+    mfhi $15
+    srl $11, $11, 12
+    ins $11, $15, 20, 12
+    sw $11, GD(25 + \n)($k0)
+    seh $15, $11
+    beq $15, $11, .Lrow\@
+    sw $15, GD(9 + \n)($k0)
+    sra $15, $11, 31
+    xori $15, $15, 0x7FFF
+    sw $15, GD(9 + \n)($k0)
+    lui $ra, 1 << (8 - \n)
+    or $12, $12, $ra
+.Lrow\@:
+.endm
+
+/* \out = (q * IR(\ir) + C[\of]) >> 16 with the MAC0 range flags (15/16), saturated to
+ * -0x400..0x3FF (FLAG \bit). */
+.macro RTP_SXY ir, of, bit, out
+    lw $8, GC(\of)($k0)
+    sra $9, $8, 31
+    mtlo $8
+    mthi $9
+    lw $9, GD(8 + \ir)($k0)
+    madd $14, $9
+    mflo $8
+    mfhi $9
+    sra $15, $8, 31
+    beq $15, $9, .Lm\@
+    srl \out, $8, 16
+    lui $ra, 1
+    bgez $9, .Lmf\@
+    nop
+    ori $ra, $zero, 0x8000
+.Lmf\@:
+    or $12, $12, $ra
+.Lm\@:
+    ins \out, $9, 16, 16
+    sra $15, \out, 10
+    addiu $15, $15, 1
+    sltiu $15, $15, 2
+    bnez $15, .Ls\@
+    sra $15, \out, 31
+    xori \out, $15, 0x3FF
+    ori $12, $12, \bit
+.Ls\@:
+.endm
+
+/* Vertex \v: MAC/IR 1-3, SZ (written to data register \sz), q in t6, SXY (to \sxy). */
+.macro RTP_V v, sz, sxy
+    lh $8, GD(2 * \v)($k0)
+    lh $9, GD(2 * \v) + 2($k0)
+    lh $10, GD(2 * \v + 1)($k0)
+    RTP_ROW 0
+    RTP_ROW 1
+    RTP_ROW 2
+    /* SZ = MAC3 saturated to 0..0xFFFF (FLAG bit 18) */
+    srl $15, $11, 16
+    beqz $15, .Lsz\@
+    move $10, $11
+    slt $15, $11, $zero
+    ori $10, $zero, 0xFFFF
+    movn $10, $zero, $15
+    lui $ra, 0x0004
+    or $12, $12, $ra
+.Lsz\@:
+    sw $10, GD(\sz)($k0)
+    /* q = H / SZ by the UNR table; 0x1FFFF and FLAG bit 17 when H >= 2 * SZ */
+    lhu $8, GC(26)($k0)
+    sll $15, $10, 1
+    sltu $15, $8, $15
+    bnez $15, .Ldiv\@
+    lui $14, 1
+    ori $14, $14, 0xFFFF
+    lui $ra, 0x0002
+    b .Lq\@
+    or $12, $12, $ra
+.Ldiv\@:
+    clz $15, $10
+    addiu $15, $15, -16
+    sllv $8, $8, $15
+    sllv $9, $10, $15
+    addiu $ra, $9, -0x7FC0
+    srl $ra, $ra, 7
+    lui $11, %hi(psxrt_unr)
+    addu $ra, $ra, $11
+    lbu $ra, %lo(psxrt_unr)($ra)
+    addiu $ra, $ra, 0x101
+    mult $9, $ra
+    mflo $9
+    lui $11, 0x0200
+    ori $11, $11, 0x0080
+    subu $9, $11, $9
+    srl $9, $9, 8
+    mult $9, $ra
+    mflo $9
+    addiu $9, $9, 0x80
+    srl $9, $9, 8
+    ori $11, $zero, 0x8000
+    mtlo $11
+    mthi $zero
+    maddu $8, $9
+    mflo $14
+    mfhi $11
+    srl $14, $14, 16
+    ins $14, $11, 16, 16
+    srl $11, $14, 17
+    beqz $11, .Lq\@
+    lui $11, 1
+    ori $14, $11, 0xFFFF
+.Lq\@:
+    RTP_SXY 1, 24, 0x4000, $10
+    RTP_SXY 2, 25, 0x2000, $11
+    ins $10, $11, 16, 16
+    sw $10, GD(\sxy)($k0)
+.endm
+
+/* Parks t2-t7 and checks TR: bits 31 and 30 of each equal, else on to \far. */
+.macro RTP_ENTER far
+    GTE_ENTER
+    .irp r,10,11,12,13,14,15
+    sw $\r, G(\r)($k0)
+    .endr
+    lw $8, GC(5)($k0)
+    sll $9, $8, 1
+    xor $8, $8, $9
+    lw $9, GC(6)($k0)
+    sll $10, $9, 1
+    xor $9, $9, $10
+    or $8, $8, $9
+    lw $9, GC(7)($k0)
+    sll $10, $9, 1
+    xor $9, $9, $10
+    or $8, $8, $9
+    bltz $8, \far
+    move $12, $zero
+.endm
+
+    .globl psxrt_gte_rtps
+    .ent psxrt_gte_rtps
+psxrt_gte_rtps:
+    RTP_ENTER rtps_far
+    lw $8, GD(17)($k0)
+    sw $8, GD(16)($k0)
+    lw $8, GD(18)($k0)
+    sw $8, GD(17)($k0)
+    lw $8, GD(19)($k0)
+    sw $8, GD(18)($k0)
+    lw $8, GD(13)($k0)
+    sw $8, GD(12)($k0)
+    lw $8, GD(14)($k0)
+    sw $8, GD(13)($k0)
+    RTP_V 0, 19, 14
+    b rtp_tail
+    nop
+rtps_far:
+    lui $ra, 0x0008
+    b rtp_far
+    ori $ra, $ra, 0x0001
+    .end psxrt_gte_rtps
+
+    .globl psxrt_gte_rtpt
+    .ent psxrt_gte_rtpt
+psxrt_gte_rtpt:
+    RTP_ENTER rtpt_far
+    /* three pushes: SZ0 = the old SZ3, the rest new */
+    lw $8, GD(19)($k0)
+    sw $8, GD(16)($k0)
+    RTP_V 0, 17, 12
+    RTP_V 1, 18, 13
+    RTP_V 2, 19, 14
+/* MAC0 = q * DQA + DQB (flags 15/16), IR0 = MAC0 >> 12 saturated to 0..0x1000 (flag 12), then
+ * FLAG bit 31 from the error bits. */
+rtp_tail:
+    lh $8, GC(27)($k0)
+    lw $9, GC(28)($k0)
+    sra $10, $9, 31
+    mtlo $9
+    mthi $10
+    madd $14, $8
+    mflo $8
+    mfhi $9
+    sw $8, GD(24)($k0)
+    sra $15, $8, 31
+    beq $15, $9, 1f
+    srl $8, $8, 12
+    lui $ra, 1
+    bgez $9, 2f
+    nop
+    ori $ra, $zero, 0x8000
+2:  or $12, $12, $ra
+1:  ins $8, $9, 20, 12
+    sltiu $15, $8, 0x1001
+    bnez $15, 3f
+    slt $15, $8, $zero
+    ori $8, $zero, 0x1000
+    movn $8, $zero, $15
+    ori $12, $12, 0x1000
+3:  sw $8, GD(8)($k0)
+    lui $15, 0x7F87
+    ori $15, $15, 0xE000
+    and $15, $12, $15
+    beqz $15, 4f
+    lui $15, 0x8000
+    or $12, $12, $15
+4:  move $ra, $12
+    .irp r,10,11,12,13,14,15
+    lw $\r, G(\r)($k0)
+    .endr
+    b gte_leave
+    nop
+rtpt_far:
+    lui $ra, 0x0008
+    ori $ra, $ra, 0x0030
+/* The command word in ra: everything back as it came, then GTE_CMD with ra and k1 swapped. */
+rtp_far:
+    lw $8, HI($k0)
+    mthi $8
+    lw $8, LO($k0)
+    mtlo $8
+    .irp r,8,9,10,11,12,13,14,15
+    lw $\r, G(\r)($k0)
+    .endr
+    xor $k1, $k1, $ra
+    xor $ra, $ra, $k1
+    xor $k1, $k1, $ra
+    j psxrt_gte_cmd
+    nop
+    .end psxrt_gte_rtpt
+
+/* The same entries through GTE_CMD, for when native_init's check finds a difference. */
+.macro GTE_DOOR name, cmd
+    .globl psxrt_gte_\name\()_door
+    .ent psxrt_gte_\name\()_door
+psxrt_gte_\name\()_door:
+    lui $k1, \cmd >> 16
+    j psxrt_gte_cmd
+    ori $k1, $k1, \cmd & 0xFFFF
+    .end psxrt_gte_\name\()_door
+.endm
+    GTE_DOOR nclip, 0x00000006
+    GTE_DOOR avsz3, 0x0000002D
+    GTE_DOOR avsz4, 0x0000002E
+    GTE_DOOR rtps, 0x00080001
+    GTE_DOOR rtpt, 0x00080030
+
 /* The guest state from CTX, then on to the host address in k1. */
     .ent restore_and_go
 restore_and_go:

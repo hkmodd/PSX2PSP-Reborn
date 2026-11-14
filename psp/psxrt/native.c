@@ -49,6 +49,11 @@
 #define STUB_CALL_RET 0x09A00F80u
 #define STUB_GRET 0x09A00FC0u
 #define STUB_GTE_CMD 0x09A00FA0u
+#define STUB_GTE_NCLIP 0x09A00FD0u /* 8 bytes each */
+#define STUB_GTE_AVSZ3 0x09A00FD8u
+#define STUB_GTE_AVSZ4 0x09A00FE0u
+#define STUB_GTE_RTPS 0x09A00FE8u
+#define STUB_GTE_RTPT 0x09A00FF0u
 #define TABLE_ADDR 0x09A01000u
 #define TABLE_WORDS (RAM_SIZE / 4)
 /* CTX words */
@@ -78,6 +83,11 @@ void psxrt_gret(void);
 void psxrt_call_ret(void);
 void psxrt_gte_cmd(void);
 void psxrt_gte_prof(void);
+void psxrt_gte_nclip(void), psxrt_gte_nclip_door(void);
+void psxrt_gte_avsz3(void), psxrt_gte_avsz3_door(void);
+void psxrt_gte_avsz4(void), psxrt_gte_avsz4_door(void);
+void psxrt_gte_rtps(void), psxrt_gte_rtps_door(void);
+void psxrt_gte_rtpt(void), psxrt_gte_rtpt_door(void);
 void native_enter(u32 host_pc);
 /* gte_fast.c */
 void native_gte_fast(u32 cmd);
@@ -850,6 +860,91 @@ static void stub(u32 at, void (*fn)(void))
     w[1] = 0;                                           /* nop */
 }
 
+/* The GTE commands translated code enters directly (layout.rs GTE_OWN), with their routines in
+ * trampolines.S and a door to STUB_GTE_CMD each; `cmd` is a word the translator sends there. */
+static const struct {
+    u32 at, cmd;
+    void (*fn)(void), (*door)(void);
+} gte_ops[] = {
+    {STUB_GTE_NCLIP, 0x01400006u, psxrt_gte_nclip, psxrt_gte_nclip_door},
+    {STUB_GTE_AVSZ3, 0x0158002Du, psxrt_gte_avsz3, psxrt_gte_avsz3_door},
+    {STUB_GTE_AVSZ4, 0x0168002Eu, psxrt_gte_avsz4, psxrt_gte_avsz4_door},
+    {STUB_GTE_RTPS, 0x00180001u, psxrt_gte_rtps, psxrt_gte_rtps_door},
+    {STUB_GTE_RTPT, 0x00280030u, psxrt_gte_rtpt, psxrt_gte_rtpt_door},
+};
+#define GTE_OPS (int)(sizeof gte_ops / sizeof gte_ops[0])
+
+/* The divide's reciprocal table for psxrt_gte_rtps/rtpt, as core/gte.c builds its own. */
+u8 psxrt_unr[0x104];
+
+static void gte_call_asm(void (*fn)(void))
+{
+    __asm__ volatile("lui $26, 0x09A0\n\tori $26, $26, 0x004C\n\tjalr %0\n\tnop" : : "r"(fn) : "$26", "$27", "$31", "memory");
+}
+
+static u32 rnd_state = 0x2545F491u;
+static u32 rnd(void)
+{
+    rnd_state ^= rnd_state << 13, rnd_state ^= rnd_state >> 17, rnd_state ^= rnd_state << 5;
+    return rnd_state;
+}
+
+/* Random values of random magnitude: the products then fall both in range and out of it. */
+static s32 rnd_mag(int bits) { return (s32)rnd() >> (32 - bits + (rnd() % bits)); }
+static u32 rnd16(void) { return (u32)rnd_mag(16) & 0xFFFF; }
+static s32 rnd_pair(void) { return (s32)(rnd16() | rnd16() << 16); }
+
+/* Each routine against gte_command on random registers (TR within 31 bits, as the routines take
+ * them): the number of differing results. The GTE and the CTX words the routines park guest
+ * state in are kept. */
+static int gte_asm_check(Psx *psx, int n)
+{
+    Gte *g = psx->gte, keep = *g, in, want;
+    u32 park[10];
+    for (int r = 0; r < 8; r++)
+        park[r] = ctx[8 + r];
+    park[8] = ctx[C_HI], park[9] = ctx[C_LO];
+    int bad = 0, per[GTE_OPS] = {0};
+    for (int i = 0; i < n; i++) {
+        for (int r = 0; r < 32; r++)
+            in.d[r] = (s32)rnd(), in.c[r] = rnd_pair();
+        for (int r = 0; r < 6; r++)
+            in.d[r] = rnd_pair();
+        for (int r = 12; r < 15; r++)
+            in.d[r] = rnd_pair();
+        for (int r = 16; r < 20; r++)
+            in.d[r] = (s32)rnd16();
+        for (int r = 5; r < 8; r++)
+            in.c[r] = rnd_mag(31);
+        in.c[24] = rnd_mag(32), in.c[25] = rnd_mag(32), in.c[28] = rnd_mag(32);
+        int k = i % GTE_OPS;
+        *g = in;
+        gte_command(psx, gte_ops[k].cmd);
+        want = *g;
+        *g = in;
+        gte_call_asm(gte_ops[k].fn);
+        if (memcmp(g, &want, sizeof want) && !per[k]++)
+            for (int r = 0; r < 64; r++)
+                if ((r < 32 ? g->d[r] : g->c[r - 32]) != (r < 32 ? want.d[r] : want.c[r - 32]))
+                    say("native: GTE %08X in asm: %s%d %08X, want %08X", (unsigned)gte_ops[k].cmd, r < 32 ? "d" : "c",
+                        r & 31, (unsigned)(r < 32 ? g->d[r] : g->c[r - 32]), (unsigned)(r < 32 ? want.d[r] : want.c[r - 32]));
+    }
+    for (int k = 0; k < GTE_OPS; k++)
+        bad += per[k];
+    *g = keep;
+    for (int r = 0; r < 8; r++)
+        ctx[8 + r] = park[r];
+    ctx[C_HI] = park[8], ctx[C_LO] = park[9];
+    return bad;
+}
+
+/* The direct GTE entries: their routines when `asm_ok`, else their doors. */
+static void gte_stubs(int asm_ok)
+{
+    for (int i = 0; i < GTE_OPS; i++)
+        stub(gte_ops[i].at, asm_ok ? gte_ops[i].fn : gte_ops[i].door);
+}
+
 const char *native_init(Psx *psx, const DiscInfo *info)
 {
     if (info->images > MAX_IMAGES)
@@ -885,6 +980,14 @@ const char *native_init(Psx *psx, const DiscInfo *info)
     ctx[C_BUDGET] = BUDGET;
     memcpy((void *)GTE_ADDR, psx->gte, sizeof(Gte));
     psx->gte = (Gte *)GTE_ADDR;
+    for (int i = 0; i < 0x101; i++) {
+        int v = (0x40000 / (i + 0x100) + 1) / 2 - 0x101;
+        psxrt_unr[i] = (u8)(v < 0 ? 0 : v);
+    }
+    int bad = gte_asm_check(psx, GTE_OPS * 4096);
+    gte_stubs(!bad);
+    say("native: GTE NCLIP/AVSZ/RTPS/RTPT in asm, %d of %d checks differ%s", bad, GTE_OPS * 4096,
+        bad ? ": through the runtime" : "");
     flush_code();
     __asm__ volatile("move %0, $gp" : "=r"(native_host_gp));
     psx->call = native_call;

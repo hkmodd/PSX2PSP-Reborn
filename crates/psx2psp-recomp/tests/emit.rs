@@ -6,6 +6,7 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 
 use psx2psp_recomp::emit::RESUME;
+use psx2psp_recomp::hooks::HOOK;
 use psx2psp_recomp::layout::{self, K0, MISS, RT_CALL, ctx};
 use psx2psp_recomp::{
     Bus, Cpu, Discovery, Hazards, Isa, PsxExe, Reason, Size, Stop, Translation, Trap, translate,
@@ -260,6 +261,11 @@ impl Bus for Ps1<'_> {
     }
     fn cop2_command(&mut self, command: u32) -> Result<(), Trap> {
         let m = &mut *self.0;
+        // A command with an entry of its own is the same whatever its word's other bits.
+        let command = match layout::GTE_OWN.iter().find(|&&(_, m, v)| command & m == v) {
+            Some(&(_, m, _)) => command & m,
+            None => command,
+        };
         for k in 0..32 {
             let v = m.gte(k).rotate_left(5) ^ m.gte(32 + (k + command as usize) % 32) ^ command;
             m.set_gte(k, v);
@@ -431,12 +437,16 @@ fn run_psp(
             h.jump(g.pc);
             continue;
         }
-        if h.pc == layout::GTE_CMD {
-            // The entry runs the command in k1, restores the guest ra and returns through k1.
+        let own = layout::GTE_OWN.iter().find(|e| e.0 == h.pc).map(|e| e.2);
+        if h.pc == layout::GTE_CMD || own.is_some() {
+            // The entry runs the command (in k1 for GTE_CMD), restores the guest ra and returns
+            // through k1.
             let ret = h.gpr[RA as usize];
             log.gte += 1;
-            Ps1(m).cop2_command(h.gpr[K1G as usize] & 0x01FF_FFFF).unwrap();
-            m.set_ctx(ctx::GTE_RET, ret);
+            Ps1(m).cop2_command(own.unwrap_or(h.gpr[K1G as usize] & 0x01FF_FFFF)).unwrap();
+            if own.is_none() {
+                m.set_ctx(ctx::GTE_RET, ret);
+            }
             h.gpr[RA as usize] = m.ctx(ctx::GPR + 4 * RA);
             h.gpr[K1G as usize] = ret;
             h.jump(ret);
@@ -448,9 +458,10 @@ fn run_psp(
             let (pc, word) = (word_at(ra), word_at(ra + 4));
             h.gpr[RA as usize] = m.ctx(ctx::GPR + 4 * RA);
             to_guest(&h, m, &mut g);
-            if pc & RESUME != 0 {
-                log.resumed = Some(pc & !RESUME);
-                g.jump(pc & !RESUME);
+            // A hook's recipe does what its code does, so the interpreter runs that code instead.
+            if pc & (RESUME | HOOK) != 0 {
+                log.resumed = Some(pc & !(RESUME | HOOK));
+                g.jump(pc & !(RESUME | HOOK));
                 run_ps1(m, &mut g, end, budget).map_err(|f| format!("interpreter stopped: {f:x?}"))?;
                 return Ok((g, log));
             }
@@ -698,6 +709,38 @@ fn gte_moves_loads_stores_and_commands_run_inline() {
     assert_eq!(run.log.gte, 2);
     let io: Vec<u32> = run.log.calls.keys().copied().filter(|&a| !rt.contains(&a)).collect();
     assert_eq!(io, [at(36), at(37)]);
+}
+
+/// NCLIP, AVSZ3 (with bits it ignores), AVSZ4, RTPS and RTPT through their own entries, one in
+/// a `jal` slot, next to commands through [`layout::GTE_CMD`].
+#[test]
+fn gte_commands_with_entries_of_their_own() {
+    let w = [
+        lui(T1, 0x1234),                       // 0
+        ori(T1, T1, 0x8765),                   // 1
+        cop2(4, T1, 12),                       // 2  SXY0
+        cop2(4, T1, 17),                       // 3  SZ1
+        gte_cmd(0x0140_0006),                  // 4  NCLIP
+        gte_cmd(0x0158_002D | 1 << 19),        // 5  AVSZ3
+        gte_cmd(0x0040_0012),                  // 6  MVMVA: GTE_CMD
+        gte_cmd(0x0028_0030),                  // 7  RTPT
+        gte_cmd(0x0018_0401),                  // 8  RTPS with lm: GTE_CMD
+        gte_cmd(0x0018_0001),                  // 9  RTPS
+        j(3, 17),                              // 10 jal f
+        gte_cmd(0x0168_002E),                  // 11 AVSZ4 in the slot
+        addu(RA, ZERO, ZERO),                  // 12 (host and guest return addresses differ)
+        cop2(0, T2, 24),                       // 13 MAC0
+        cop2(0, T3, 7),                        // 14 OTZ
+        j(2, 20),                              // 15 end
+        NOP,                                   // 16
+        cop2(2, T4, 31),                       // 17 f: FLAG
+        r(8, RA, 0, 0, 0),                     // 18 jr ra
+        gte_cmd(0x0140_0006),                  // 19 NCLIP in the slot
+        j(2, 20),                              // 20
+        NOP,                                   // 21
+    ];
+    let run = check(&w, 15, |_| {}, false);
+    assert_eq!(run.log.gte, 8);
 }
 
 /// Calls, returns with a memory access in the slot, a counted loop, a switch through a jump

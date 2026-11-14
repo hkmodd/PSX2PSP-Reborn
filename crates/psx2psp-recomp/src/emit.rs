@@ -12,7 +12,8 @@
 //! * Calls are host calls (`jal` writes a host `ra`, `jr ra` returns natively). A `jal` outside
 //!   the image, `jr` and `jalr` go through the dispatch table.
 //! * GTE moves, `lwc2` and `swc2` work directly on the GTE registers at [`layout::GTE`] (but
-//!   for the few registers with unusual rules); GTE commands enter [`layout::GTE_CMD`].
+//!   for the few registers with unusual rules); GTE commands enter [`layout::GTE_CMD`], or the
+//!   entry of their own [`layout::GTE_OWN`] gives them.
 //! * COP0, the rest of the GTE, `syscall`, `break` and anything touching the guest's `k0`/`k1`
 //!   run in the runtime through a host call and continue after it.
 //! * Anything the translator does not model hands the guest over to the runtime's interpreter
@@ -598,7 +599,8 @@ impl Em<'_> {
     }
 
     /// The GTE without the runtime: moves, loads and stores work on the registers at
-    /// [`layout::GTE`] with the hardware's write rules, commands go through [`layout::GTE_CMD`].
+    /// [`layout::GTE`] with the hardware's write rules, commands go through [`layout::GTE_CMD`] or
+    /// their entry in [`layout::GTE_OWN`].
     /// `None` for the registers whose rules need the runtime (IRGB, ORGB, LZCS, FLAG writes; the
     /// ORGB/IRGB reads; SXYP and the ignored writes through memory).
     fn cop2(&mut self, pc: u32, i: Insn, k: Kind) -> Option<Code> {
@@ -647,9 +649,14 @@ impl Em<'_> {
             Gte => {
                 let cmd = i.0 & 0x01FF_FFFF;
                 c.push(sw(RA, gpr(RA), K0R));
-                c.push(lui(K1R, (cmd >> 16) as u16));
-                c.push(jal(layout::GTE_CMD));
-                c.push(ori(K1R, K1R, cmd as u16));
+                if let Some(&(entry, ..)) = layout::GTE_OWN.iter().find(|&&(_, m, v)| cmd & m == v) {
+                    c.push(jal(entry));
+                    c.push(NOP);
+                } else {
+                    c.push(lui(K1R, (cmd >> 16) as u16));
+                    c.push(jal(layout::GTE_CMD));
+                    c.push(ori(K1R, K1R, cmd as u16));
+                }
             }
             // The word is loaded into k1, then stored by the register's rule.
             Lwc2 => {
