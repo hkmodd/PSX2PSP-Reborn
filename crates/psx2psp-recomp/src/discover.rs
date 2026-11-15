@@ -38,6 +38,24 @@ fn after_return(exe: &PsxExe, a: u32) -> bool {
     false
 }
 
+/// `a` holds a non-zero word right after a transfer that does not fall through (`jr ra`, `j`,
+/// `b`, `jr`), its delay slot and up to 3 zero words.
+fn after_end(img: Image, a: u32) -> bool {
+    if img.0.word(a).is_none_or(|w| w == 0) {
+        return false;
+    }
+    for pad in 0..4u32 {
+        let slot = a.wrapping_sub(4 * (pad + 1));
+        if matches!(img.flow_at(slot.wrapping_sub(4)), Some(Flow::Return | Flow::Goto(_) | Flow::JumpReg)) {
+            return true;
+        }
+        if img.0.word(slot) != Some(0) {
+            return false;
+        }
+    }
+    false
+}
+
 /// From `a`, every word decodes up to a `jr ra` (and its delay slot) within [`LEAF_MAX`].
 fn leaf_shape(img: Image, a: u32) -> bool {
     (0..LEAF_MAX).map(|n| a.wrapping_add(4 * n)).try_for_each(|p| match img.at(p) {
@@ -92,6 +110,10 @@ pub enum Origin {
     /// Straight after a `jr ra` and its delay slot (and any zero padding), with a clean decode
     /// up to its own `jr ra`: a leaf reached only through a pointer built at run time.
     AfterReturn,
+    /// A word of the image points at it, it starts where a previous function ends (after a
+    /// `jr ra`, `j`, `b` or `jr` and its delay slot, and any zero padding), and every path from
+    /// it decodes: a handler in a table of function pointers.
+    Pointer,
 }
 
 /// A `jr` through a register other than `ra`.
@@ -292,17 +314,27 @@ impl Discovery {
         d.entries.insert(exe.pc0, Origin::Entry);
         d.explore(img, vec![exe.pc0]);
         let mut tried = HashSet::new();
+        let pointed: HashSet<u32> = (exe.text_addr..exe.text_end())
+            .step_by(4)
+            .filter_map(|a| exe.word(a))
+            .filter(|&w| w & 3 == 0 && exe.contains(w))
+            .collect();
         loop {
             let mut changed = false;
             for a in (exe.text_addr..exe.text_end()).step_by(4) {
                 let w = exe.word(a).unwrap_or(0);
                 let prologue = matches!(w >> 16, 0x27BD | 0x23BD) && w & 0x8000 != 0;
-                if d.code.contains(&a) || !(prologue || after_return(exe, a)) || !tried.insert(a) {
+                let pointer = pointed.contains(&a) && after_end(img, a);
+                if d.code.contains(&a) || !(prologue || pointer || after_return(exe, a)) || !tried.insert(a) {
                     continue;
                 }
                 if !prologue {
-                    if leaf_shape(img, a) {
+                    if after_return(exe, a) && leaf_shape(img, a) {
                         d.entries.entry(a).or_insert(Origin::AfterReturn);
+                        d.explore(img, vec![a]);
+                        changed = true;
+                    } else if pointer && d.clean_from(img, a) {
+                        d.entries.entry(a).or_insert(Origin::Pointer);
                         d.explore(img, vec![a]);
                         changed = true;
                     }
@@ -386,6 +418,13 @@ impl Discovery {
                 break;
             }
         }
+    }
+
+    /// Every path the descent would take from `a` decodes and stays in the text.
+    fn clean_from(&self, img: Image, a: u32) -> bool {
+        let mut trial = Discovery { visited: self.visited.clone(), ..Discovery::default() };
+        trial.explore(img, vec![a]);
+        trial.dead_ends.is_empty()
     }
 
     fn call(&mut self, exe: &PsxExe, target: u32, site: u32, work: &mut Vec<u32>) {

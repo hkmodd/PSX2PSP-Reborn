@@ -56,5 +56,8 @@ void runtime_snapshot(u32 host_pc);
  * also brings back the code of the executables that were resident. 0, or -1. */
 int native_save(int fd);
 int native_load(int fd);
+/* The ten guest pcs where the interpreter ran most instructions since the last call (psxrt.trace
+ * bit 8), as one log line into `buf`; clears the counts. Its length. */
+int native_entries_log(char *buf, int len);
 
 #endif

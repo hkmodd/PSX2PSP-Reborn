@@ -841,6 +841,8 @@ static void frame(int show)
                     if (s->n_gte[k] != n0.n_gte[k])
                         n += snprintf(line + n, sizeof line - (size_t)n, " %02X/%u", k, (unsigned)(s->n_gte[k] - n0.n_gte[k]));
                 n += snprintf(line + n, sizeof line - (size_t)n, "\n");
+                if (trace_bits & 256)
+                    n += native_entries_log(line + n, (int)sizeof line - n);
                 if (bench_secs && ++bench_n > BENCH_SKIP) {
                     bench.speed += speed, bench.vbl += fps, bench.fps += game_fps;
                     bench.interp += ms_of(s->us_interp - n0.us_interp), bench.io += ms_of(s->us_io - n0.us_io);

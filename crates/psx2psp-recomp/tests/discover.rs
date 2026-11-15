@@ -104,6 +104,29 @@ fn discovery_finds_calls_switch_tables_and_prologues() {
     assert_eq!(d.body(&x, at(17)).returns, [at(17)]);
 }
 
+/// A handler that ends in a tail call, reached only through a pointer in data, is found; a
+/// pointer to a word that does not decode is not followed.
+#[test]
+fn discovery_follows_pointers_to_handlers() {
+    let x = exe(&[
+        r(8, RA, 0, 0, 0),         // 0 jr ra
+        NOP,                       // 1
+        i(9, ZERO, V0, 15),        // 2 h: addiu v0,zero,15
+        j(2, 0),                   // 3 j 0: a tail call, no jr ra of its own
+        NOP,                       // 4
+        at(2),                     // 5 pointer to h
+        at(9),                     // 6 pointer to 9
+        j(2, 0),                   // 7 j 0
+        NOP,                       // 8
+        r(2, 1, A0, A0, 8),        // 9 rotr (Allegrex): not code
+    ]);
+    let d = Discovery::run(&x);
+    let entries: Vec<_> = d.entries.iter().map(|(&a, &o)| (a, o)).collect();
+    assert_eq!(entries, [(at(0), Origin::Entry), (at(2), Origin::Pointer)]);
+    assert_eq!(d.code.iter().copied().collect::<Vec<_>>(), (0..=4).map(at).collect::<Vec<_>>());
+    assert!(d.dead_ends.is_empty());
+}
+
 #[test]
 fn hazards_in_sequence_and_across_returns() {
     let x = program();

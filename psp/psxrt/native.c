@@ -686,14 +686,53 @@ static void fix_ra(Cpu *c)
  * instruction first (a resume point maps to its own host call). */
 static u32 interp(int mode);
 
+/* Where the interpreter is entered (psxrt.trace bit 8): per guest pc, entries and instructions
+ * run, for the log's "-- interp" line. A full table drops new pcs. */
+#define ENTRY_SLOTS 256
+static struct {
+    u32 pc, n, steps;
+} entries[ENTRY_SLOTS];
+
+static void entry_note(u32 pc, u32 steps)
+{
+    for (u32 i = (pc >> 2) * 2654435761u >> 24, k = 0; k < ENTRY_SLOTS; k++, i = (i + 1) % ENTRY_SLOTS)
+        if (!entries[i].n || entries[i].pc == pc) {
+            entries[i].pc = pc, entries[i].n++, entries[i].steps += steps;
+            return;
+        }
+}
+
+int native_entries_log(char *buf, int len)
+{
+    int n = snprintf(buf, (size_t)len, "-- interp (pc entries/steps):");
+    for (int top = 0; top < 10 && n < len; top++) {
+        int best = -1;
+        for (int i = 0; i < ENTRY_SLOTS; i++)
+            if (entries[i].n && (best < 0 || entries[i].steps > entries[best].steps))
+                best = i;
+        if (best < 0)
+            break;
+        n += snprintf(buf + n, (size_t)(len - n), " %08X %u/%u", (unsigned)entries[best].pc, (unsigned)entries[best].n,
+                      (unsigned)entries[best].steps);
+        entries[best].n = 0;
+    }
+    memset(entries, 0, sizeof entries);
+    return n < len ? n + snprintf(buf + n, (size_t)(len - n), "\n") : len;
+}
+
 static u32 run_guest(int mode)
 {
     static u32 n;
-    if (n++ % PROF_EVERY)
-        return interp(mode);
-    u32 t = sceKernelGetSystemTimeLow();
-    u32 h = interp(mode);
-    native_stats.us_interp += (sceKernelGetSystemTimeLow() - t) * PROF_EVERY - prof_bias;
+    u32 pc = P->cpu.pc, s0 = native_stats.steps, h;
+    if (n++ % PROF_EVERY) {
+        h = interp(mode);
+    } else {
+        u32 t = sceKernelGetSystemTimeLow();
+        h = interp(mode);
+        native_stats.us_interp += (sceKernelGetSystemTimeLow() - t) * PROF_EVERY - prof_bias;
+    }
+    if (P->trace & 256)
+        entry_note(pc, native_stats.steps - s0);
     return h;
 }
 
