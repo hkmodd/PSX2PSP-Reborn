@@ -1516,18 +1516,29 @@ static void busy_bench(Psx *psx)
         o[i].x = (float)(i & 511) + 0.5f, o[i].y = (float)(i >> 9) + 0.5f, o[i].z = 0;
     }
     u32 t3 = sceKernelGetSystemTimeLow();
+    /* the same through the cache and written back in lines: under the GE's load, single uncached
+     * stores may cost more than line fills and bursts (with the GE idle they cost half) */
+    o = (TexVtx *)fl.ring_c;
+    for (u32 i = 0; i < n; i++) {
+        o[i].u = (float)(i & 0xFF) + 0.5f, o[i].v = (float)(i >> 8 & 0xFF) + 0.5f;
+        o[i].c = 0xFF000000u | i;
+        o[i].x = (float)(i & 511) + 0.5f, o[i].y = (float)(i >> 9) + 0.5f, o[i].z = 0;
+    }
+    sceKernelDcacheWritebackRange(o, n * sizeof(TexVtx));
+    u32 t3c = sceKernelGetSystemTimeLow();
     ge_sync();
     u32 t4 = sceKernelGetSystemTimeLow();
+    sceKernelDcacheWritebackInvalidateRange(fl.ring_c, n * sizeof(TexVtx)); /* uncached from here on */
     ge_open();
     u32 t5 = sceKernelGetSystemTimeLow();
     for (int i = 0; i < 256; i++)
         sceGeListUpdateStallAddr(list_id, LIST_UNCACHED + list_stall);
     u32 t6 = sceKernelGetSystemTimeLow();
     ge_sync();
-    psx_log(psx, "ge busy %u us (from RAM): cache miss %u ns, 64 KB of vertices uncached %u us%s; stall move %u ns (%u)",
-            (unsigned)(t4 - t0), (unsigned)((t2 - t1) * 1000 / 512), (unsigned)(t3 - t2),
-            t4 - t3 < 20 ? " (the GE finished first)" : "", (unsigned)((t6 - t5) * 1000 / 256),
-            (unsigned)(sum & 1));
+    psx_log(psx, "ge busy %u us (from RAM): cache miss %u ns, 64 KB of vertices uncached %u us, cached and written back %u us%s;"
+            " stall move %u ns (%u)",
+            (unsigned)(t4 - t0), (unsigned)((t2 - t1) * 1000 / 512), (unsigned)(t3 - t2), (unsigned)(t3c - t3),
+            t4 - t3c < 20 ? " (the GE finished first)" : "", (unsigned)((t6 - t5) * 1000 / 256), (unsigned)(sum & 1));
 }
 
 void ge_init(Psx *psx, int compare)

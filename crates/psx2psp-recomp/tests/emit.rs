@@ -641,6 +641,52 @@ fn loads_and_stores_through_every_segment() {
     assert_eq!(io, [at(23), at(24), at(25)]);
 }
 
+#[test]
+fn a_group_crossing_the_2_mb_mirror_takes_the_checked_copy() {
+    let w = [
+        lui(A0, 0x8020),         // 0
+        addiu(A0, A0, -8),       // 1  a0 = 0x801FFFF8
+        addiu(T0, ZERO, 5),      // 2
+        mem(SW, T0, 0, A0),      // 3  group: 0x801FFFF8 ..
+        mem(SW, T0, 4, A0),      // 4
+        mem(SW, T0, 8, A0),      // 5  .. 0x80200000, the mirror of 0x80000000
+        mem(LW, T1, 8, A0),      // 6
+        lui(A1, 0x8000),         // 7
+        mem(LW, T2, 0, A1),      // 8  5
+        NOP,                     // 9
+        j(2, 10),                // 10 end
+        NOP,                     // 11
+    ];
+    let run = check(&w, 10, |_| {}, false);
+    assert!(run.t.runtime.is_empty(), "{:?}", run.t.runtime);
+}
+
+#[test]
+fn a_jump_into_a_group_lands_in_its_checked_copy() {
+    let w = [
+        lui(A0, 0x8002),             // 0
+        lui(T9, 0x8001),             // 1
+        ori(T9, T9, 0x18),           // 2  at(6)
+        mem(SW, T9, 0x10, A0),       // 3  group 3..7, base a0
+        addiu(T0, ZERO, 7),          // 4
+        mem(SW, T0, 0, A0),          // 5
+        addiu(T0, T0, 1),            // 6  entered again through the table
+        mem(SW, T0, 4, A0),          // 7
+        b(5, T1, ZERO, 8, 14),       // 8  bne t1,zero,end
+        addiu(T1, ZERO, 1),          // 9
+        mem(LW, T9, 0x10, A0),       // 10
+        NOP,                         // 11
+        r(0x08, T9, 0, 0, 0),        // 12 jr t9 (the discovery cannot know where)
+        NOP,                         // 13
+        j(2, 14),                    // 14 end
+        NOP,                         // 15
+    ];
+    let run = check(&w, 14, |_| {}, false);
+    assert!(run.t.runtime.is_empty(), "{:?}", run.t.runtime);
+    // Word 6 is translated twice: inside the group, and out of line where the table points.
+    assert!(run.t.host(at(6)).unwrap() > run.t.host(at(8)).unwrap());
+}
+
 /// `mfc2` (`rs` = 0), `cfc2` (2), `mtc2` (4), `ctc2` (6).
 const fn cop2(rs: u32, rt: u32, rd: u32) -> u32 {
     (0x12 << 26) | (rs << 21) | (rt << 16) | (rd << 11)
@@ -907,7 +953,9 @@ fn far_branches_are_relaxed() {
         b(4, T0, ZERO, 3, N + 6), // 3  beq t0,zero,out (forward, far)
         NOP,                   // 4
     ];
-    w.extend((0..N).map(|k| mem(SW, T0, 4 * k as i32 % 0x7FFC, A0))); // 5 ..
+    // Bases alternate (a0, zero: both RAM), so no two stores make a group and each keeps its
+    // own check: the code must stay long.
+    w.extend((0..N).map(|k| mem(SW, T0, 4 * k as i32 % 0x7FFC, if k % 2 == 0 { A0 } else { ZERO }))); // 5 ..
     w.extend([
         b(4, ZERO, ZERO, N + 5, 2), // N+5 b loop (backward, far)
         NOP,                        // N+6 out

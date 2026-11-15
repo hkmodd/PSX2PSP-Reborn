@@ -9,6 +9,10 @@
 //! * Loads and stores compute the guest address in `k1`. RAM (bit 23 clear) maps with one
 //!   `ins`; anything else takes an out-of-line path: the scratchpad is addressed from `k0`, and
 //!   I/O, BIOS and unmapped addresses become a host call that runs the access in the runtime.
+//!   Loads and stores that share a base with only plain words between them are one group: its
+//!   lowest and highest address are checked once (RAM, one 2 MB mirror) and each access is then
+//!   one host word; a failed check runs an out-of-line copy of the group, access by access.
+//!   Accesses are 70% of the main-pass code, which the I-cache refills (LEV01: -14% of it).
 //! * Calls are host calls (`jal` writes a host `ra`, `jr ra` returns natively). A `jal` outside
 //!   the image, `jr` and `jalr` go through the dispatch table.
 //! * GTE moves, `lwc2` and `swc2` work directly on the GTE registers at [`layout::GTE`] (but
@@ -57,6 +61,8 @@ const MAX_LOOP_COST: u32 = 1024;
 /// Cycles a read from PS1 RAM adds to its instruction: the bus access (DuckStation's
 /// `RAM_READ_TICKS`). Used by [`Em::loop_cost`].
 const RAM_READ: u32 = 6;
+/// Most guest words in one group of loads and stores ([`Em::run_from`]).
+const GROUP_MAX: usize = 64;
 
 /// Why the runtime handles a guest instruction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -182,6 +188,9 @@ mod enc {
     }
     pub const fn addiu(rt: u32, rs: u32, imm: u16) -> u32 {
         i(9, rs, rt, imm)
+    }
+    pub const fn sltiu(rt: u32, rs: u32, imm: u16) -> u32 {
+        i(0x0B, rs, rt, imm)
     }
     pub const fn andi(rt: u32, rs: u32, imm: u16) -> u32 {
         i(0xC, rs, rt, imm)
@@ -335,6 +344,12 @@ struct Em<'a> {
     oldest: usize,
     labels: usize,
     map: BTreeMap<u32, usize>,
+    /// Guest addresses whose translation is at a label (inside a [`Em::group`]'s out-of-line copy).
+    map_at: Vec<(u32, usize)>,
+    /// Every address something can transfer to directly ([`Em::targets`]).
+    targets: BTreeSet<u32>,
+    /// The main pass resumes here: the words before it were translated with a group.
+    skip_to: u32,
     runtime: BTreeMap<u32, Reason>,
     /// Out-of-line words written so far, and in how many blocks.
     cold: (usize, usize),
@@ -412,11 +427,18 @@ fn emit(
         oldest: 0,
         labels: 0,
         map: BTreeMap::new(),
+        map_at: Vec::new(),
+        targets: BTreeSet::new(),
+        skip_to: 0,
         runtime: BTreeMap::new(),
         cold: (0, 0),
     };
-    let targets = em.targets();
+    em.targets = em.targets();
+    let targets = em.targets.clone();
     for &a in d.code.iter().filter(|a| !d.delay_slots.contains_key(a)) {
+        if a < em.skip_to {
+            continue;
+        }
         em.far_flush();
         em.map.insert(a, em.out.w.len());
         match em.insn(a) {
@@ -584,6 +606,12 @@ impl Em<'_> {
         };
         if k.has_delay_slot() {
             return self.transfer(a, i, k);
+        }
+        if let Some((pcs, lo, hi)) = self.run_from(a) {
+            let c = self.group(&pcs, lo, hi);
+            self.out.append(c);
+            self.skip_to = pcs[pcs.len() - 1] + 4;
+            return Some(self.skip_to);
         }
         let (c, falls) = if self.hz.sites.contains_key(&a) {
             (self.resume(a, Reason::Hazard), false)
@@ -755,6 +783,100 @@ impl Em<'_> {
             _ => return None,
         }
         Some(c)
+    }
+
+    /// The loads and stores from `a` on that share a base register, with only plain copied words
+    /// between them (they leave `k1` alone): their addresses, `a` to the last of them, and the
+    /// lowest and highest offset, when there are at least two. None of them is a transfer target,
+    /// a hook or a hazard, nor writes the base before the last (a load into it ends the group).
+    fn run_from(&self, a: u32) -> Option<(Vec<u32>, i32, i32)> {
+        use Kind::*;
+        let mem = |k: Kind| matches!(k, Lb | Lh | Lwl | Lw | Lbu | Lhu | Lwr | Sb | Sh | Swl | Sw | Swr);
+        let ok = |p: u32| self.first(p) && !self.hz.sites.contains_key(&p) && !self.hooks.contains_key(&p);
+        let (i, k) = self.at(a)?;
+        let u = Uses::of(i, k);
+        if !mem(k) || !ok(a) || (u.read | u.write) & GUEST_K != 0 {
+            return None;
+        }
+        let base = i.rs();
+        let (mut lo, mut hi) = (i.simm() as i32, i.simm() as i32);
+        let (mut pcs, mut last) = (vec![a], 0);
+        let mut p = a;
+        while u.write & (1 << base) == 0 {
+            p += 4;
+            if !ok(p) || self.targets.contains(&p) {
+                break;
+            }
+            let Some((i, k)) = self.at(p) else { break };
+            let u = Uses::of(i, k);
+            if mem(k) && i.rs() == base && (u.read | u.write) & GUEST_K == 0 {
+                let o = i.simm() as i32;
+                // The out-of-line copy (with its accesses' own stubs) stays within branch range.
+                if hi.max(o) - lo.min(o) > 0x7FFF || pcs.len() >= GROUP_MAX {
+                    break;
+                }
+                (lo, hi) = (lo.min(o), hi.max(o));
+                pcs.push(p);
+                last = pcs.len() - 1;
+                if u.write & (1 << base) != 0 {
+                    break;
+                }
+            } else if simple(i, k).is_some() && u.write & (1 << base) == 0 {
+                pcs.push(p);
+            } else {
+                break;
+            }
+        }
+        pcs.truncate(last + 1);
+        (last > 0).then_some((pcs, lo, hi))
+    }
+
+    /// The group `pcs` of [`Em::run_from`] with one check of its base: when the addresses from
+    /// `lo` to `hi` past it are RAM in one 2 MB mirror, `k1` is set once and every load and store
+    /// is its own host word on it. Otherwise an out-of-line copy runs the group as
+    /// [`Em::access`] would; a jump into the group lands in that copy.
+    fn group(&mut self, pcs: &[u32], lo: i32, hi: i32) -> Code {
+        let a = pcs[0];
+        let rs = Insn(self.exe.word(a).unwrap_or(0)).rs() as u32;
+        let (cold, back) = (self.label(), self.label());
+        let mut c = Code::default();
+        if hi > lo {
+            // The last address's low 21 bits are below the span: the group crosses 2 MB.
+            c.push(addiu(K1R, rs, hi as u16));
+            c.push(ext(K1R, K1R, 0, 21));
+            c.push(sltiu(K1R, K1R, (hi - lo) as u16));
+            c.branch(bne(K1R, ZR), To::Label(cold), a);
+        }
+        c.push(addiu(K1R, rs, lo as u16));
+        c.push(sll(K1R, K1R, 8));
+        c.branch(bltz(K1R), To::Label(cold), a);
+        c.push(srl(K1R, K1R, 8));
+        c.push(ins(K1R, K0R, 21, 11));
+        let mut s = Code::default();
+        s.def(cold);
+        for &p in pcs {
+            let Some((i, k)) = self.at(p) else { continue };
+            if p != a {
+                let l = self.label();
+                s.def(l);
+                self.map_at.push((p, l));
+            }
+            match simple(i, k) {
+                Some(w) => {
+                    c.simple(w, p);
+                    s.simple(w, p);
+                }
+                None => {
+                    c.push((i.0 & 0xFC1F_0000) | (K1R << 21) | (i.simm() as i32 - lo) as u16 as u32);
+                    s.append(self.mem(p, i));
+                }
+            }
+        }
+        s.jump(2, To::Label(back), a);
+        s.push(NOP);
+        self.stub(s);
+        c.def(back);
+        c
     }
 
     /// `op` (base `k1`, offset 0) on the host address of the guest address of the load or store
@@ -1015,12 +1137,13 @@ impl Em<'_> {
     }
 
     fn finish(self, base: u32) -> Result<Translation, Fail> {
-        let Em { out, map, runtime, labels, cold, .. } = self;
+        let Em { out, mut map, map_at, runtime, labels, cold, .. } = self;
         let Code { mut w, fix, defs, pat } = out;
         let mut at = vec![usize::MAX; labels];
         for (l, i) in defs {
             at[l] = i;
         }
+        map.extend(map_at.into_iter().map(|(g, l)| (g, at[l])));
         debug_assert!(!at.contains(&usize::MAX), "label used but never placed");
         let host = |i: usize| base + 4 * i as u32;
         let mut far = Vec::new();
