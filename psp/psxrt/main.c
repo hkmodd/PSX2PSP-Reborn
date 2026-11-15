@@ -110,12 +110,16 @@ static void log_flush(void)
 }
 
 /* The stick's directory gets the file's size only when it is closed: a game switched off or hung
- * would leave an empty log. Closed and reopened every second for the first 20, then every 5th. */
+ * would leave an empty log. Closed and reopened every second for the first 20, then every 5th, and
+ * in any second that logged an event (a load, an Exec, a flush): a crash then loses at most the
+ * second it happens in, not the 5 before it (the S20a device crash left no line after CD_init). */
+static int log_event;
 static void log_keep(void)
 {
     static u32 n;
-    if (log_fd < 0 || (n++ >= 20 && n % 5))
+    if (log_fd < 0 || (n++ >= 20 && n % 5 && !log_event))
         return;
+    log_event = 0;
     sceIoClose(log_fd);
     log_fd = sceIoOpen(log_path, PSP_O_WRONLY | PSP_O_APPEND, 0777);
 }
@@ -123,6 +127,7 @@ static void log_keep(void)
 static void push_line(const char *s)
 {
     int n = (int)strlen(s);
+    log_event = 1;
     if (log_len + n + 1 > (int)sizeof log_buf)
         log_flush();
     if (n + 1 <= (int)sizeof log_buf) {
