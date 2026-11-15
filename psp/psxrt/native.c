@@ -770,9 +770,13 @@ static u32 interp(int mode)
             sync_time();
         if (P->cycles >= P->next_event)
             update();
+        u32 p = c->pc & 0x1FFFFFFFu;
         if (cpu_step(P) < 0)
             P->exiting = 2;
-        native_stats.steps++;
+        if (p == 0xA0 || p == 0xB0 || p == 0xC0)
+            native_stats.bios++;
+        else
+            native_stats.steps++;
     }
 }
 

@@ -127,6 +127,24 @@ fn discovery_follows_pointers_to_handlers() {
     assert!(d.dead_ends.is_empty());
 }
 
+/// A handler whose address the code builds (`lui`/`addiu`, stored as the next state) is found.
+#[test]
+fn discovery_follows_pointers_built_in_code() {
+    let x = exe(&[
+        i(0xF, ZERO, A1, (at(4) >> 16) as u16), // 0 lui a1,hi(h)
+        i(9, A1, A1, at(4) as u16),              // 1 addiu a1,a1,lo(h)
+        r(8, RA, 0, 0, 0),                       // 2 jr ra
+        i(0x2B, ZERO, A1, 0x100),                // 3 sw a1,0x100(zero)
+        i(9, ZERO, V0, 1),                       // 4 h: addiu v0,zero,1
+        j(2, 0),                                 // 5 j 0
+        NOP,                                     // 6
+    ]);
+    let d = Discovery::run(&x);
+    assert_eq!(d.entries.get(&at(4)), Some(&Origin::Pointer));
+    assert_eq!(d.code.len(), 7);
+    assert!(d.dead_ends.is_empty());
+}
+
 #[test]
 fn hazards_in_sequence_and_across_returns() {
     let x = program();

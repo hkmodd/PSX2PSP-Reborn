@@ -12,7 +12,8 @@ enum { IO_GPU, IO_DMA, IO_CD, IO_SPU, IO_TIMER, IO_IRQ, IO_MDEC, IO_PAD, IO_GTE,
 typedef struct NativeStats {
     u32 calls;  /* host calls (I/O, COP0, GTE, syscalls, polls) */
     u32 misses; /* dispatch-table misses */
-    u32 steps;  /* instructions interpreted */
+    u32 steps;  /* guest instructions interpreted */
+    u32 bios;   /* BIOS calls (vectors A0/B0/C0) served by the HLE on the interpreter's path */
     u32 loads;  /* translated executables loaded */
     u32 hashes; /* texts hashed to recognise an executable */
     u32 poll_skips; /* timer reads in a polling loop that let PS1 time pass */

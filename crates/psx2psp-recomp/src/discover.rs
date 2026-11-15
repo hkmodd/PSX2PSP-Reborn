@@ -110,9 +110,10 @@ pub enum Origin {
     /// Straight after a `jr ra` and its delay slot (and any zero padding), with a clean decode
     /// up to its own `jr ra`: a leaf reached only through a pointer built at run time.
     AfterReturn,
-    /// A word of the image points at it, it starts where a previous function ends (after a
-    /// `jr ra`, `j`, `b` or `jr` and its delay slot, and any zero padding), and every path from
-    /// it decodes: a handler in a table of function pointers.
+    /// A word of the image, or a constant the code builds, points at it; it starts where a
+    /// previous function ends (after a `jr ra`, `j`, `b` or `jr` and its delay slot, and any zero
+    /// padding), and every path from it decodes: a handler in a table of function pointers or
+    /// stored in a state variable.
     Pointer,
 }
 
@@ -314,12 +315,13 @@ impl Discovery {
         d.entries.insert(exe.pc0, Origin::Entry);
         d.explore(img, vec![exe.pc0]);
         let mut tried = HashSet::new();
-        let pointed: HashSet<u32> = (exe.text_addr..exe.text_end())
+        let mut pointed: HashSet<u32> = (exe.text_addr..exe.text_end())
             .step_by(4)
             .filter_map(|a| exe.word(a))
             .filter(|&w| w & 3 == 0 && exe.contains(w))
             .collect();
         loop {
+            pointed.extend(d.built_pointers(img));
             let mut changed = false;
             for a in (exe.text_addr..exe.text_end()).step_by(4) {
                 let w = exe.word(a).unwrap_or(0);
@@ -418,6 +420,19 @@ impl Discovery {
                 break;
             }
         }
+    }
+
+    /// Text addresses the discovered code builds with `lui` and `addiu`/`ori` (a handler stored
+    /// in a state variable, a callback passed as an argument).
+    fn built_pointers(&self, img: Image) -> Vec<u32> {
+        self.code
+            .iter()
+            .filter_map(|&a| match img.at(a)? {
+                (i, Kind::Addiu | Kind::Ori) if i.rs() != 0 => img.const_of(i.rt(), a.wrapping_add(4)),
+                _ => None,
+            })
+            .filter(|&c| c & 3 == 0 && img.0.contains(c))
+            .collect()
     }
 
     /// Every path the descent would take from `a` decodes and stays in the text.

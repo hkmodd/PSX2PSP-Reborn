@@ -799,8 +799,8 @@ static void frame(int show)
             }
             if (native) {
                 const NativeStats *s = &native_stats;
-                n += snprintf(line + n, sizeof line - (size_t)n, "-- native: %u calls, %u misses, %u steps, %u hashes, %u loads, %u poll skips (%u far, %u ra scans), %u hooks\n",(unsigned)(s->calls - n0.calls),
-                              (unsigned)(s->misses - n0.misses), (unsigned)(s->steps - n0.steps), (unsigned)(s->hashes - n0.hashes),
+                n += snprintf(line + n, sizeof line - (size_t)n, "-- native: %u calls, %u misses, %u steps, %u bios, %u hashes, %u loads, %u poll skips (%u far, %u ra scans), %u hooks\n",(unsigned)(s->calls - n0.calls),
+                              (unsigned)(s->misses - n0.misses), (unsigned)(s->steps - n0.steps), (unsigned)(s->bios - n0.bios), (unsigned)(s->hashes - n0.hashes),
                               (unsigned)s->loads, (unsigned)(s->poll_skips - n0.poll_skips), (unsigned)(s->poll_far - n0.poll_far),
                               (unsigned)(s->ra_scans - n0.ra_scans), (unsigned)(s->hooks - n0.hooks));
                 n += snprintf(line + n, sizeof line - (size_t)n,
