@@ -34,6 +34,8 @@ unsafe extern "C" {
     fn sim_display(s: *const Sim, out: *mut c_int);
     fn sim_status(s: *const Sim, out: *mut u32);
     fn sim_trace(s: *mut Sim, flags: c_int);
+    #[cfg(test)]
+    fn sim_poll_bound(s: *mut Sim, pc: u32, gpr: *const u32, raw: u32, room: u32) -> u32;
 }
 
 struct Disc {
@@ -294,4 +296,85 @@ fn main() -> ExitCode {
     }
     println!("[sim] {:.1} s wall, output in {}", started.elapsed().as_secs_f64(), a.out.display());
     code
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    extern "C" fn no_disc(_user: *mut c_void, _lba: u32, _raw: *mut u8) -> c_int {
+        -1
+    }
+
+    /// Sheep Dog 'n' Wolf (SLES_028.95): the wait for the next streamed frame, and GetRCnt.
+    const WAIT: (u32, [u32; 36]) = (
+        0x8010_1738,
+        [
+            0x27BDFFD8, 0xAFBF0018, 0xAFB10014, 0x3C02F200, 0xAFB00010, 0x34440001, 0x3405FFFF, 0x24062000,
+            0x0C0407E4, 0x3C100080, 0x3C02F200, 0x0C040819, 0x34440001, 0x3C02F200, 0x0C04080B, 0x34440001,
+            0x00408821, 0x3C02F200, 0x0C04080B, 0x34440001, 0x00511023, 0x28412711, 0x14200003, 0x00000000,
+            0x10000044, 0x00001021, 0x2610FFFF, 0x16000003, 0x00000000, 0x1000003F, 0x00001021, 0x27A50024,
+            0x0C040C4C, 0x27A40020, 0x1440FFEE, 0x00000000,
+        ],
+    );
+    const GET_RCNT: (u32, [u32; 14]) = (
+        0x8010_202C,
+        [
+            0x3083FFFF, 0x28620003, 0x10400008, 0x00031900, 0x3C028012, 0x8C4284F4, 0x00000000, 0x00621821,
+            0x94620000, 0x08040817, 0x00000000, 0x00001021, 0x03E00008, 0x00000000,
+        ],
+    );
+    const LHU: u32 = 0x8010_204C; // GetRCnt's read of the counter
+
+    /// poll_bound on `code` placed in RAM, with s1 = `t0` and ra = `ra`.
+    fn bound(code: &[(u32, &[u32])], ra: u32, t0: u32, pc: u32, raw: u32) -> u32 {
+        // SAFETY: the simulator lives for this call; RAM is RAM_SIZE bytes and every write is in it.
+        unsafe {
+            let s = sim_new(std::ptr::null_mut(), no_disc, 0, tty, log);
+            let ram = std::slice::from_raw_parts_mut(sim_ram(s), 0x20_0000);
+            for &(at, words) in code {
+                for (i, w) in words.iter().enumerate() {
+                    let p = (at & 0x1F_FFFF) as usize + 4 * i;
+                    ram[p..p + 4].copy_from_slice(&w.to_le_bytes());
+                }
+            }
+            let mut gpr = [0u32; 32];
+            gpr[17] = t0;
+            gpr[31] = ra;
+            let t = sim_poll_bound(s, pc, gpr.as_ptr(), raw, 0xFFFF - raw);
+            sim_free(s);
+            t
+        }
+    }
+
+    #[test]
+    fn the_stream_wait_jumps_to_its_timeout() {
+        let code: [(u32, &[u32]); 2] = [(WAIT.0, &WAIT.1), (GET_RCNT.0, &GET_RCNT.1)];
+        // GetRCnt() - t0 > 10000 leaves the loop: from 1100 with t0 = 1000, at 11001.
+        assert_eq!(bound(&code, 0x8010_1788, 1000, LHU, 1100), 9901);
+        // A timeout past the counter's wrap: up to the wrap.
+        assert_eq!(bound(&code, 0x8010_1788, 60000, LHU, 60100), 0xFFFF - 60100);
+        // At the timeout already: the comparison does not flip again before the wrap.
+        assert_eq!(bound(&code, 0x8010_1788, 1000, LHU, 12000), 0xFFFF - 12000);
+        // The read of t0 (kept in s1 across a call): one tick at a time.
+        assert_eq!(bound(&code, 0x8010_1778, 1000, LHU, 1100), 0);
+    }
+
+    #[test]
+    fn exact_values_and_delay_slots_move_one_tick() {
+        let at = 0x8001_0000;
+        let nop = 0u32;
+        // while (*cnt != v1);
+        let equal: [(u32, &[u32]); 1] = [(at - 4, &[nop, 0x9482_0000, nop, 0x1443_FFFD, nop])];
+        assert_eq!(bound(&equal, 0, 0, at, 100), 0);
+        // do { a = *cnt; b = *cnt; } while (a != b);  (VSync's stable read)
+        let pair: [(u32, &[u32]); 1] = [(at - 4, &[nop, 0x9482_0000, 0x9483_0000, nop, 0x1443_FFFC, nop])];
+        assert_eq!(bound(&pair, 0, 0, at, 100), 0);
+        // The read in a branch's delay slot.
+        let slot: [(u32, &[u32]); 1] = [(at - 4, &[0x1000_0003, 0x9482_0000, nop, 0x2842_0010, nop])];
+        assert_eq!(bound(&slot, 0, 0, at, 100), 0);
+        // The same comparison without the branch: x < 16 flips at 16.
+        let less: [(u32, &[u32]); 1] = [(at - 4, &[nop, 0x9482_0000, nop, 0x2842_0010, nop, 0x0000_1021])];
+        assert_eq!(bound(&less, 0, 0, at, 10), 6);
+    }
 }

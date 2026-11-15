@@ -94,6 +94,9 @@ int sim_frame(Sim *s)
 const u16 *sim_vram(const Sim *s) { return s->vram; }
 u8 *sim_ram(Sim *s) { return s->ram; }
 
+/* pollscan.c on the guest code in RAM (tests) */
+u32 sim_poll_bound(Sim *s, u32 pc, const u32 *gpr, u32 raw, u32 room) { return poll_bound(&s->psx, pc, gpr, raw, room); }
+
 void sim_pad(Sim *s, u16 buttons) { s->psx.sio.buttons[0] = buttons; }
 
 void sim_trace(Sim *s, int flags) { s->psx.trace = flags; }

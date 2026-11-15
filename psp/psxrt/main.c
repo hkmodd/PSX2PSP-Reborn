@@ -777,9 +777,10 @@ static void frame(void)
             }
             if (native) {
                 const NativeStats *s = &native_stats;
-                n += snprintf(line + n, sizeof line - (size_t)n, "-- native: %u calls, %u misses, %u steps, %u hashes, %u loads, %u poll skips, %u hooks\n",(unsigned)(s->calls - n0.calls),
+                n += snprintf(line + n, sizeof line - (size_t)n, "-- native: %u calls, %u misses, %u steps, %u hashes, %u loads, %u poll skips (%u far, %u ra scans), %u hooks\n",(unsigned)(s->calls - n0.calls),
                               (unsigned)(s->misses - n0.misses), (unsigned)(s->steps - n0.steps), (unsigned)(s->hashes - n0.hashes),
-                              (unsigned)s->loads, (unsigned)(s->poll_skips - n0.poll_skips), (unsigned)(s->hooks - n0.hooks));
+                              (unsigned)s->loads, (unsigned)(s->poll_skips - n0.poll_skips), (unsigned)(s->poll_far - n0.poll_far),
+                              (unsigned)(s->ra_scans - n0.ra_scans), (unsigned)(s->hooks - n0.hooks));
                 n += snprintf(line + n, sizeof line - (size_t)n,
                               "-- ms: interp %u io %u (draw %u mdec %u spu %u) update %u present %u (wait %u draw %u text %u rgb24 %u) sleep %u;"
                               " audio drops %u gaps %u trims %u peak %u/%u; vsync wait %u (%u ms) late %u (avg %u max %u us) skipped %u\n",

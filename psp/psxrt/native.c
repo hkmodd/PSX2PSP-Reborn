@@ -775,10 +775,54 @@ static int gte_fast(u32 insn)
  * time must not move between the two). From its fourth return less than POLL_GAP cycles after
  * the last, the clock moves on to one tick of the counter after that previous read, never past
  * the next device event: counts derive from the clock and no value is stepped over, so an
- * equality test still sees its value. */
+ * equality test still sees its value. When the code only compares the value's magnitude with a
+ * limit (pollscan.c, the streamed-frame wait of S21), the clock moves on to where that comparison
+ * flips, the counter's target or wrap, or the next device event, whichever comes first. */
 #define POLL_PAIR 16u
 #define POLL_GAP 2048u
-static void poll_skip(u32 pc, u32 addr)
+
+/* The guest return address that `ra` stands for. Translated calls write a host ra (the start of
+ * the translation of the word after the call's delay slot), calls from the interpreter into
+ * translated code STUB_GRET: found back in the table, or in gret. The search reads the whole text
+ * (about a millisecond for a level), so the last RA_SEEN answers are remembered, any ra in any
+ * entry (polling loops return to a few sites, which may alternate), a found one checked against
+ * the table again. 1 (no word can be read there) when it is host code that is not a return site. */
+#define RA_SEEN 16
+static u32 guest_ra(u32 ra)
+{
+    static u32 seen_h[RA_SEEN], seen_g[RA_SEEN], next;
+    if (ra == STUB_GRET)
+        return gret_top ? gret[(gret_top - 1) % GRET_DEPTH] : 1;
+    if (ra - code_lo >= code_hi - code_lo)
+        return ra;
+    int k = -1;
+    for (int i = 0; i < RA_SEEN && k < 0; i++)
+        if (seen_h[i] == ra)
+            k = i;
+    if (k >= 0 && (seen_g[k] == 1 || table[(seen_g[k] & (RAM_SIZE - 4)) >> 2] == ra))
+        return seen_g[k];
+    if (k < 0)
+        k = next++ % RA_SEEN;
+    u32 last_g = 0;
+    for (int i = 0; i < nimg && !last_g; i++) {
+        const Image *m = &img[i];
+        if (!m->installed || ra - m->e->host_base >= m->e->code_len)
+            continue;
+        const u32 *t = &table[m->text >> 2];
+        for (u32 j = 2; j < (m->e->text_size + 3) / 4; j++) {
+            u32 w = t[j] == ra ? ram_r32(P, 0x80000000u | (m->text + 4 * (j - 2))) : 0;
+            if (w >> 26 == 3 || (w >> 26 == 0 && (w & 63) == 9) || (w >> 26 == 1 && (w >> 20 & 1))) {
+                last_g = 0x80000000u | (m->text + 4 * j);
+                break;
+            }
+        }
+    }
+    native_stats.ra_scans++;
+    seen_h[k] = ra, seen_g[k] = last_g ? last_g : 1;
+    return seen_g[k];
+}
+
+static void poll_skip(u32 pc, u32 addr, const u32 *gpr)
 {
     static u32 hot, streak;
     static u64 hot_at, last_at;
@@ -799,6 +843,19 @@ static void poll_skip(u32 pc, u32 addr)
         return;
     }
     if (++streak >= 4 && tick > period && P->next_event > now) {
+        u32 g[32], room, raw = timer_poll_count(P, addr, &room);
+        for (int i = 0; i < 32; i++)
+            g[i] = gpr[i];
+        g[31] = guest_ra(g[31]);
+        u32 t = poll_bound(P, pc, g, raw, room);
+        if (t) {
+            u64 to = timer_tick_at(P, addr, t);
+            P->cycles = to < P->next_event ? to : P->next_event;
+            hot_at = last_at = P->cycles;
+            native_stats.poll_skips++;
+            native_stats.poll_far++;
+            return;
+        }
         u64 d = P->next_event - now, s = tick - period;
         P->cycles += d < s ? d : s;
         hot_at = last_at = P->cycles;
@@ -832,7 +889,7 @@ static int io_fast(u32 pc, u32 insn, u32 back, u32 *next)
     u32 t = timed ? sceKernelGetSystemTimeLow() : 0;
     if (op < 0x28) {
         if (kind == IO_TIMER)
-            poll_skip(pc, p);
+            poll_skip(pc, p, (const u32 *)ctx);
         u32 v = psx_read(P, a, size);
         if (op == 0x20)
             v = (u32)(s32)(s8)v;
@@ -1145,7 +1202,7 @@ u32 native_rt_call(const u32 *site)
     static u32 n;
     int kind = io_kind(c, insn), timed = !(n++ % PROF_EVERY);
     if (kind == IO_TIMER && insn >> 29 == 4) /* loads */
-        poll_skip(pc, (c->gpr[(insn >> 21) & 31] + (u32)(s32)(s16)insn) & 0x1FFFFFFFu);
+        poll_skip(pc, (c->gpr[(insn >> 21) & 31] + (u32)(s32)(s16)insn) & 0x1FFFFFFFu, c->gpr);
     u32 t = timed ? sceKernelGetSystemTimeLow() : 0;
     if (cpu_step(P) < 0)
         P->exiting = 2;

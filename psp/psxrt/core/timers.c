@@ -129,6 +129,23 @@ u32 timer_tick(Psx *psx, u32 addr)
     return cpt(psx, i) >> 16;
 }
 
+u32 timer_poll_count(Psx *psx, u32 addr, u32 *room)
+{
+    Timer *t = &psx->tmr.t[(addr >> 4) & 3];
+    sync(psx, (addr >> 4) & 3);
+    u32 per = period(t), r = per - 1 - t->count;
+    if (t->target < per && t->target > t->count && t->target - t->count < r)
+        r = t->target - t->count;
+    *room = r;
+    return t->count;
+}
+
+u64 timer_tick_at(Psx *psx, u32 addr, u32 ticks)
+{
+    int i = (addr >> 4) & 3;
+    return psx->tmr.t[i].base + (((u64)ticks * cpt(psx, i) + 0xFFFF) >> 16);
+}
+
 u32 timer_read(Psx *psx, u32 addr)
 {
     int i = (addr >> 4) & 3;

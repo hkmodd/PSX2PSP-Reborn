@@ -464,6 +464,18 @@ void timers_hblank_mode(Psx *psx);
 /* CPU cycles per tick of the counter at addr (a count register), 0 for other addresses or a
  * stopped counter: how far time may jump between two reads without the reader missing a value */
 u32 timer_tick(Psx *psx, u32 addr);
+/* For a time skip in a polling loop (a count register, a running counter): the count now, and in
+ * *room how many ticks it may advance before its target or its wrap (landing on either) */
+u32 timer_poll_count(Psx *psx, u32 addr, u32 *room);
+/* The cycle at which the counter at addr is `ticks` past the count timer_poll_count gave */
+u64 timer_tick_at(Psx *psx, u32 addr, u32 ticks);
+
+/* pollscan.c: how many ticks (1..room) a counter just read as `raw` by the load at pc may
+ * advance without changing what the code does with the value before the first comparison of
+ * its magnitude flips (landing on the flip), with gpr the guest registers at the load. 0 when the
+ * value is used otherwise (an equality test, a store, a second use): then no value may be
+ * stepped over. */
+u32 poll_bound(Psx *psx, u32 pc, const u32 *gpr, u32 raw, u32 room);
 
 /* cdrom.c */
 u8 cd_read(Psx *psx, int reg);

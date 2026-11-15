@@ -16,6 +16,8 @@ typedef struct NativeStats {
     u32 loads;  /* translated executables loaded */
     u32 hashes; /* texts hashed to recognise an executable */
     u32 poll_skips; /* timer reads in a polling loop that let PS1 time pass */
+    u32 poll_far;   /* of those, the ones past one tick (pollscan.c) */
+    u32 ra_scans;   /* searches of a host ra's guest return site (guest_ra) */
     u32 hooks;      /* recipes run (hooks.rs) */
     /* microseconds: in the interpreter (with what it calls), host-call instructions (device
      * I/O, DMA), device events (vblank, IRQs, guest callbacks), presenting, sleeping */

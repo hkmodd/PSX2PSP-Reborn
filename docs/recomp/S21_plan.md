@@ -1,7 +1,31 @@
 # S21 — Video FMV su PSP: dove va il tempo (piano, non codice)
 
-**Stato:** piano scritto il 2026-11-15 in attesa del test PSP di S20d. Da approvare dall'Host
-(GOAL §5 punto 2). Non si apre finché S20 non è chiusa sulla PSP.
+**Stato:** approvato dall'Host il 2026-11-15 («SEI TU che scegli COSA è GIUSTO
+architetturalmente fare / PROCEDI»), dopo il log PSP di S20d (`baseline_psp/README.md`).
+Si parte dal passo 2 (timer): è l'unica perdita con causa provata.
+
+**Passo 2, scelta architetturale.** Il controllo si fa nel runtime (`core/pollscan.c`), non nel
+traduttore. Il valore di GetRCnt arriva al confronto attraverso un `jr ra`: il traduttore vedrebbe
+solo `lhu` e ritorno, il runtime ha `ra` e i registri. Il codice letto è quello in RAM, quindi vale
+anche per il codice interpretato e per ogni gioco. Il salto atterra dove il confronto cambia
+(il timeout esce in orario), mai oltre il prossimo evento, il target o il giro del contatore.
+Test sul codice vero di SLES in `cargo test -p psx2psp-sim`.
+
+**Passo 2, il primo giro in PPSSPP: 0 salti lunghi.** Nel codice tradotto `ra` è un indirizzo
+host (il `jal` tradotto scrive il ritorno host, `emit.rs`), quindi `poll_bound` leggeva codice PS1
+a 0x096EBF5C. `guest_ra` in native.c lo riporta al pc guest. Cerca nella tabella la parola la cui
+traduzione inizia lì, preceduta di 8 byte da una call, e ricorda l'ultima risposta. Per
+STUB_GRET usa `gret`. La ricerca legge tutto il testo (~1 ms per un livello), quindi le risposte
+si ricordano in 16 voci associative. Con una cache indirizzata per ra, due siti caldi
+(0x0963E318, 0x09630718) cadevano nello stesso slot. Ogni lettura rifaceva la ricerca: timer
+2000 ms/s nel passaggio LEV05 → LOADER, velocità 6%. Ora le ricerche sono 0-15 al secondo
+(`ra scans` nel log).
+
+**Passo 2 in PPSSPP, intro FMV, 30 s:** letture timer 19 874 → ~7 500/s (60 → 13-17 ms/s), io
+327 → 275 ms/s, chiamate host 46k → 33k/s, ~600 salti al secondo, tutti lunghi. Velocità 100% e
+fps del video 14,1, invariati. Fixed check verde (EBOOT 2026-11-15T17:26:49): WHEEL, LEV01
+a 58,7 fps, livello 1 a 59,0 fps (100% di 58,9), timer 6 ms/s. Manca il log PSP: il bersaglio
+FMV ≥ 85% si misura lì.
 
 ## La premessa del GOAL non regge più
 
