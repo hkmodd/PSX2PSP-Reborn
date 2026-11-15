@@ -24,16 +24,23 @@
 #define K_STACK 0x8000DF00u   /* stack for chain functions */
 #define K_DCB 0x80007000u     /* device control blocks, 0x50 bytes each; names after them */
 #define DCB_SIZE 0x50u
-/* B0(5Bh) ChangeClearPad's "address": PsyQ libapi's _patch_pad takes the BIOS pad code from it,
- * EnablePAD at +0x884 and DisablePAD at +0x894 (called through pointers), and zeroes 11 words at
- * +0x594. Here both are returns and the zeroed words are free kernel RAM (0x7200-0x722B). */
-#define K_PADFN (0x80007200u - 0x594u)
+/* The pad driver as PsyQ's pad patches (libapi _patch_pad, send_pad, _remove_ChgclrPAD) reach
+ * it: B0 table entry 0x5B points here and they work at Sony's offsets from it. +0x884 and +0x894
+ * are the driver's start and stop, +0x7A0 sets the output (rumble) buffers: jumps to the magic
+ * addresses below. +0x594 (slot change on abort) and +0x62C (the handler's IRQ acknowledge) are
+ * code they overwrite with zeros: the second holds PAD_ACK words, and once they are gone the
+ * handler stops acknowledging the vblank. */
+#define K_PADDRV 0x80001000u
+#define PAD_ACK 0x0BADC0DEu
 
 /* magic BIOS ROM addresses, see bios_rom_entry() */
 #define M_RCNT_V(n) (0xBFC0FF20u + (n) * 8)
 #define M_RCNT_H(n) (0xBFC0FF24u + (n) * 8)
 #define M_PAD_V 0xBFC0FF40u
 #define M_PAD_H 0xBFC0FF44u
+#define M_PAD_START 0xBFC0FF48u
+#define M_PAD_STOP 0xBFC0FF4Cu
+#define M_PAD_OUT 0xBFC0FF50u
 
 enum { EV_FREE = 0, EV_DISABLED = 0x1000, EV_ENABLED = 0x2000, EV_READY = 0x4000 };
 enum { EVMODE_CALLBACK = 0x1000, EVMODE_READY = 0x2000 };
@@ -330,13 +337,44 @@ static void k_pad_h(Psx *psx)
 {
     pad_word(psx, psx->bios.pad_buf[0], 0);
     pad_word(psx, psx->bios.pad_buf[1], 1);
-    if (psx->bios.pad_clear)
+    /* the acknowledge is gone once _remove_ChgclrPAD zeroed it (a snapshot from before
+     * K_PADDRV existed has neither it nor the entries) */
+    if (psx->bios.pad_clear && (r32(psx, K_PADDRV + 0x62C) || !r32(psx, K_PADDRV + 0x884)))
         psx->i_stat &= ~1u;
     G[R_V0] = 0;
 }
 
+/* The pad handler in the vblank chain (priority 2), or out of it. */
+static void pad_start(Psx *psx)
+{
+    if (!psx->bios.pad_started) {
+        w32(psx, K_ENTRIES + 4 * 16 + 4, M_PAD_H);
+        w32(psx, K_ENTRIES + 4 * 16 + 8, M_PAD_V);
+        enq_int(psx, 2, K_ENTRIES + 4 * 16);
+        psx->bios.pad_started = 1;
+    }
+    psx->i_mask |= 1;
+}
+
+static void pad_stop(Psx *psx)
+{
+    if (psx->bios.pad_started) {
+        deq_int(psx, 2, K_ENTRIES + 4 * 16);
+        psx->bios.pad_started = 0;
+    }
+}
+
 int bios_rom_entry(Psx *psx, u32 pc)
 {
+    if (pc >= M_PAD_START && pc <= M_PAD_OUT) { /* the pad driver's own entries, see K_PADDRV */
+        if (pc == M_PAD_START)
+            pad_start(psx);
+        else if (pc == M_PAD_STOP)
+            pad_stop(psx);
+        G[R_V0] = 1;
+        psx->cpu.pc = G[R_RA];
+        return 1;
+    }
     if (pc == BIOS_EXEC_RET) { /* an Exec'd program returned */
         u32 h = psx->bios.exec_hdr;
         G[R_SP] = r32(psx, h + 0x28);
@@ -982,22 +1020,13 @@ static int call_b(Psx *psx, u32 fn)
         return 1;
     case 0x13: /* StartPAD */
     case 0x4B: /* StartCARD: the same PadCard handler, which reads the pads InitPAD set up */
-        if (!psx->bios.pad_started) {
-            w32(psx, K_ENTRIES + 4 * 16 + 4, M_PAD_H);
-            w32(psx, K_ENTRIES + 4 * 16 + 8, M_PAD_V);
-            enq_int(psx, 2, K_ENTRIES + 4 * 16);
-            psx->bios.pad_started = 1;
-        }
-        psx->i_mask |= 1;
+        pad_start(psx);
         psx->bios.pad_clear = 1;
         G[R_V0] = 1;
         return 1;
     case 0x14: /* StopPAD */
     case 0x4C: /* StopCARD: stops the pads too */
-        if (psx->bios.pad_started) {
-            deq_int(psx, 2, K_ENTRIES + 4 * 16);
-            psx->bios.pad_started = 0;
-        }
+        pad_stop(psx);
         G[R_V0] = 1;
         return 1;
     case 0x15: /* OutdatedPadInitAndStart(type, dst, ...) */
@@ -1119,10 +1148,19 @@ void bios_init(Psx *psx)
     w32(psx, 0x800000B0u, 0x3C080000u);
     w32(psx, 0x800000C0u, 0x3C080000u);
     w32(psx, 0x80000674u + 6 * 4, 0x00000C80u); /* C0 table: exception handler entry */
-    w32(psx, 0x80000874u + 0x5B * 4, K_PADFN);  /* B0 table: ChangeClearPad, for _patch_pad */
-    g_memset(psx, K_PADFN + 0x594u, 0, 0x884u - 0x594u + 0x18u);
-    w32(psx, K_PADFN + 0x884u, 0x03E00008u); /* EnablePAD: jr ra */
-    w32(psx, K_PADFN + 0x894u, 0x03E00008u); /* DisablePAD: jr ra */
+    /* the pad driver, see K_PADDRV: B0(5B) points at it, its entries jump to the magic ones */
+    g_memset(psx, K_PADDRV, 0, 0x8A0);
+    w32(psx, 0x80000874u + 0x5B * 4, K_PADDRV & 0x1FFFFFFFu);
+    static const struct { u32 off, magic; } pad_entry[] = {{0x884, M_PAD_START}, {0x894, M_PAD_STOP}, {0x7A0, M_PAD_OUT}};
+    for (u32 i = 0; i < sizeof pad_entry / sizeof *pad_entry; i++) {
+        u32 e = K_PADDRV + pad_entry[i].off, m = pad_entry[i].magic;
+        w32(psx, e, 0x3C080000u | m >> 16);              /* lui t0, hi */
+        w32(psx, e + 4, 0x35080000u | (m & 0xFFFF));     /* ori t0, t0, lo */
+        w32(psx, e + 8, 0x01000008u);                    /* jr t0 */
+        w32(psx, e + 12, 0);                             /* nop */
+    }
+    for (u32 i = 0; i < 9; i++)
+        w32(psx, K_PADDRV + 0x62C + 4 * i, PAD_ACK);
     /* root counter and vblank handlers, priority 1 */
     for (int n = 0; n < 4; n++) {
         u32 e = K_ENTRIES + 16 * (u32)n;
