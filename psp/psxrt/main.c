@@ -794,6 +794,13 @@ static void frame(void)
                               ms_of(s->us_vs_wait - n0.us_vs_wait), (unsigned)(s->vs_late - n0.vs_late),
                               (unsigned)((s->us_late - n0.us_late) / ((s->vs_late - n0.vs_late) | 1)), (unsigned)s->us_late_max,
                               (unsigned)(s->vs_adv - n0.vs_adv));
+                static u32 upd0[UPD_PARTS];
+                static const char *const upd_names[UPD_PARTS] = UPD_PART_NAMES;
+                n += snprintf(line + n, sizeof line - (size_t)n, "-- update (ms):");
+                for (int k = 0; k < UPD_PARTS; k++)
+                    n += snprintf(line + n, sizeof line - (size_t)n, " %s %u", upd_names[k], ms_of(psx.us_upd[k] - upd0[k])),
+                        upd0[k] = psx.us_upd[k];
+                n += snprintf(line + n, sizeof line - (size_t)n, "\n");
                 native_stats.us_late_max = 0;
                 us_pwait = us_pdraw = us_ptext = 0;
                 audio_drops = audio_gaps = audio_trims = audio_peak_in = audio_peak_out = 0;

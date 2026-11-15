@@ -22,7 +22,9 @@ EXE = re.compile(r"^native: (\S+?)(?:\.EXE)? at ([0-9A-F]{8})")
 STOP = re.compile(r"^STOP: (.*)")
 BENCH = re.compile(r"^-- bench (\d+) s at frame (\d+): speed (\d+)% vbl (\d+) fps ([\d.]+)")
 IO_PAIR = re.compile(r"(\w+) (\d+)/(\d+)")
+UPD_PAIR = re.compile(r"(\w+) (\d+)")
 MS_KEYS = ("interp", "io", "draw", "mdec", "spu", "update", "present", "sleep")
+UPD_KEYS = tuple("upd_" + k for k in ("vbl", "spu", "host", "timers", "dma", "cd", "sio"))
 
 
 def read(path):
@@ -44,6 +46,10 @@ def read(path):
             if line.startswith("-- io (n/ms):") and cur is not None:
                 for kind, _, ms in IO_PAIR.findall(line[13:]):
                     cur["io_" + kind] = int(ms)
+                continue
+            if line.startswith("-- update (ms):") and cur is not None:
+                for part, ms in UPD_PAIR.findall(line[15:]):
+                    cur["upd_" + part] = int(ms)
                 continue
             m = EXE.match(line)
             if m:
@@ -80,7 +86,7 @@ def summary(secs):
         for k in MS_KEYS:
             v = [s[k] for s in ss if k in s]
             r[k] = sum(v) / len(v) if v else 0
-        for k in {k for s in ss for k in s if k.startswith("io_")}:  # a kind not listed: 0 ms
+        for k in {k for s in ss for k in s if k.startswith(("io_", "upd_"))}:  # not listed: 0 ms
             r[k] = sum(s.get(k, 0) for s in ss) / len(ss)
         rows[scene] = r
     return rows
@@ -91,9 +97,14 @@ HEAD = "%-14s %4s %6s %6s %4s %5s" % ("scene", "s", "speed", "worst", "min", "fp
 
 
 def fmt(scene, r):
-    return "%-14s %4d %5.0f%% %5.0f%% %3d%% %5.1f" % (
+    row = "%-14s %4d %5.0f%% %5.0f%% %3d%% %5.1f" % (
         scene, r["n"], r["speed"], r["worst10"], r["min"], r["fps"]) + "".join(
         " %6.0f" % r[k] for k in MS_KEYS)
+    upd = [(k[4:], r[k]) for k in UPD_KEYS if k in r]
+    if upd:  # update's parts; host is the frontend's frame (present, sleep) run inside it
+        row += "\n%-14s update: %s (sum %.0f)" % ("", ", ".join("%s %.0f" % p for p in upd),
+                                                   sum(v for _, v in upd))
+    return row
 
 
 def main(argv):
@@ -127,7 +138,7 @@ def main(argv):
                 scene, x["speed"], y["speed"], y["speed"] - x["speed"], x["worst10"],
                 y["worst10"], y["worst10"] - x["worst10"], x["fps"], y["fps"]))
             moved = [(k, x.get(k, 0), y.get(k, 0)) for k in (*MS_KEYS, *sorted(
-                {k for k in (*x, *y) if k.startswith("io_")}))]
+                {k for k in (*x, *y) if k.startswith(("io_", "upd_"))}))]
             moved = ["%s %.0f->%.0f" % m for m in moved if abs(m[2] - m[1]) >= 10]
             if moved:
                 print("%-14s ms/s: %s" % ("", ", ".join(moved)))

@@ -587,16 +587,25 @@ void native_vsync(void)
     c_base = P->cycles;
 }
 
+/* Times one call in PROF_EVERY, and every vblank (rare, and the longest: the frame is
+ * presented and paced inside), with psx_update's parts (Psx.us_upd); the clock reads they add
+ * are taken off. */
 static void update(void)
 {
     static u32 n;
-    if (n++ % PROF_EVERY) {
+    u32 s = P->cycles >= P->next_vblank ? 1 : n++ % PROF_EVERY ? 0 : PROF_EVERY;
+    if (!s || P->prof_scale) { /* inside a timed one (a guest callback of the vblank): its part */
+        u32 s0 = P->prof_scale;
+        P->prof_scale = 0;
         psx_update(P);
+        P->prof_scale = s0;
         return;
     }
+    P->prof_scale = s, P->prof_bias = prof_bias * s / PROF_EVERY, P->prof_reads = 0;
     u32 t = sceKernelGetSystemTimeLow();
     psx_update(P);
-    native_stats.us_update += (sceKernelGetSystemTimeLow() - t) * PROF_EVERY - prof_bias;
+    native_stats.us_update += (sceKernelGetSystemTimeLow() - t) * s - (P->prof_reads + 1) * P->prof_bias;
+    P->prof_scale = 0;
 }
 
 /* At every entry from translated code: the cycles its loops spent join the count, and the

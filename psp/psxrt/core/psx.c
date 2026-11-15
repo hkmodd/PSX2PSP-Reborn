@@ -134,8 +134,20 @@ void psx_schedule(Psx *psx, u64 due)
         psx->next_event = due;
 }
 
+/* Ends part `k` of a profiled psx_update, begun at `t`: returns when the next one begins. */
+static u32 upd_mark(Psx *psx, int k, u32 t)
+{
+    u32 now = psx->host->usec(psx->host->user);
+    psx->us_upd[k] += (now - t) * psx->prof_scale - psx->prof_bias;
+    psx->prof_reads++;
+    return now;
+}
+
 void psx_update(Psx *psx)
 {
+    int prof = psx->prof_scale != 0;
+    u32 t = prof ? (psx->prof_reads++, psx->host->usec(psx->host->user)) : 0;
+#define MARK(k) if (prof) t = upd_mark(psx, k, t)
     if (psx->cycles >= psx->next_vblank) {
         psx->next_vblank += psx->frame_cycles;
         if (psx->next_vblank <= psx->cycles) /* the host fell behind: do not replay frames */
@@ -145,16 +157,24 @@ void psx_update(Psx *psx)
         gpu_vblank(psx);
         psx_raise(psx, IRQ_VBLANK);
         bios_vblank(psx);
+        MARK(UPD_VBL);
         spu_run(psx);
+        MARK(UPD_SPU);
         if (psx->host->vblank)
             psx->host->vblank(psx->host->user);
+        MARK(UPD_HOST);
     }
     psx->next_event = psx->next_vblank;
     timers_update(psx);
     psx_schedule(psx, timers_next(psx));
+    MARK(UPD_TIMERS);
     dma_update(psx);
+    MARK(UPD_DMA);
     cd_update(psx);
+    MARK(UPD_CD);
     sio_update(psx);
+    MARK(UPD_SIO);
+#undef MARK
 }
 
 void psx_log(Psx *psx, const char *fmt, ...)

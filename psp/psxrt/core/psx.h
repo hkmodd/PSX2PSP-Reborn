@@ -339,6 +339,11 @@ typedef struct Bios {
 /* ---- the machine ---- */
 typedef struct Psx Psx;
 
+/* The parts of psx_update, as profiled (Psx.us_upd): HOST is PsxHost.vblank (the frontend's
+ * frame: presenting, pacing) */
+enum { UPD_VBL, UPD_SPU, UPD_HOST, UPD_TIMERS, UPD_DMA, UPD_CD, UPD_SIO, UPD_PARTS };
+#define UPD_PART_NAMES {"vbl", "spu", "host", "timers", "dma", "cd", "sio"}
+
 struct Psx {
     Cpu cpu;
     Gte *gte;    /* gte_own, or where the host wants the registers (psxrt: translated code reads them) */
@@ -373,6 +378,10 @@ struct Psx {
      * the backend resumes at cpu.pc with the registers in cpu. */
     int redirect;
     int exiting;
+    /* Profile of psx_update, on the calls the backend sets prof_scale for (PsxHost.usec must be
+     * set): each part's microseconds times prof_scale, less prof_bias (what one clock read adds);
+     * prof_reads counts the clock reads made. */
+    u32 prof_scale, prof_bias, prof_reads, us_upd[UPD_PARTS];
     int trace; /* diagnostics: bit 0 BIOS calls, bit 1 CD commands, bit 2 DMA, bit 3 IRQ,
                 * bit 4 vblank, bit 5 SPU state and display flips, bit 6 XA sectors */
     char exe_name[64];

@@ -97,6 +97,7 @@ int snap_load(const char *path, Psx *psx, const DiscInfo *info, u32 *host_pc, u3
     psx->gte = gte, psx->ram = ram, psx->scratch = scratch, psx->spu.ram = spu_ram, psx->gpu.vram = vram, psx->gpu.renderer = renderer;
     psx->mdec.in = mdec_in, psx->mdec.in_cap = mdec_cap, psx->trace = trace, psx->host = host, psx->call = call, psx->ram_loaded = loaded;
     psx->gpu.us_draw = psx->spu.us_mix = psx->mdec.us_decode = 0; /* the profile counts from here */
+    memset(psx->us_upd, 0, sizeof psx->us_upd), psx->prof_scale = 0;
     bad = bad || get(fd, ram, RAM_SIZE) || get(fd, scratch, SCRATCH_SIZE) || get(fd, vram, VRAM_W * VRAM_H * 2) || get(fd, spu_ram, SPU_RAM_SIZE) ||
           get(fd, mdec_in, h.mdec_words * 4) || native_load(fd);
     sceIoClose(fd);

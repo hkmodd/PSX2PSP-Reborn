@@ -27,6 +27,15 @@ fps del video 14,1, invariati. Fixed check verde (EBOOT 2026-11-15T17:26:49): WH
 a 58,7 fps, livello 1 a 59,0 fps (100% di 58,9), timer 6 ms/s. Manca il log PSP: il bersaglio
 FMV ≥ 85% si misura lì.
 
+**Passo 1: `update` contiene il frame del frontend.** `psx_update` chiama `PsxHost.vblank` e lì
+`host_vblank` fa `frame()` (log e `present`) e `native_vsync()` (l'attesa del vsync). Quindi
+`update` include `present` e buona parte di `sleep`: i 266-333 ms della tabella sotto non sono
+tutti lavoro dei device. La riga `-- update (ms):` lo separa in vbl (gpu_vblank, bios_vblank),
+spu (spu_run), host (il frame del frontend), timers, dma, cd e sio (`Psx.us_upd`, psx.c).
+`update()` in native.c misura ogni vblank e una chiamata su `PROF_EVERY` delle altre. Toglie le
+letture del clock che le parti aggiungono. Una callback guest del vblank che rientra in `update`
+resta nella parte vbl. `psplog.py` stampa le parti sotto ogni scena.
+
 ## La premessa del GOAL non regge più
 
 GOAL.MD dice «S21: port dell'IDCT e della conversione colore su VFPU». **È già fatto (S15).** Il
