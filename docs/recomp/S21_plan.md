@@ -44,6 +44,20 @@ va quindi alzato (sotto). Il lavoro da fare è diverso.
      guest di S19. Se non vince, si toglie: non serve altro.
    - Timer: individuo offline chi legge il timer 15 000 volte al secondo (un poll del gioco in
      attesa del frame MDEC? native ha già i «poll skips») e perché S19 smetteva dopo l'inizio.
+   - **Causa trovata (834ec8a):** è il ciclo d'attesa del frame in streaming, SLES 0x80101738
+     (GetRCnt + StGetNext).
+   - **Regola, verificata offline sul codice di SLES (2026-11-15).** Un salto di più tick è
+     sicuro solo se:
+     - il valore letto finisce in `subu` e poi in `slt`/`sltu` (un limite), non in `beq`/`bne`.
+       Un'attesa di un valore preciso salterebbe il valore e aspetterebbe un giro intero del
+       contatore;
+     - il salto si ferma al prossimo target o giro del contatore letto. I cicli di timeout del
+       timer 2 (0x8010FC90, 0x80110838) contano i giri dal bit 0x200 di 0x1124, che si azzera alla
+       lettura. `timers_next` programma target e giro solo con l'IRQ attivo, quindi oggi
+       `next_event` non basta come limite.
+   - Il controllo si fa nel traduttore, statico: il valore va da `lhu` del timer a
+     `subu`/`slt`/`sltu`. Così il runtime riceve un flag per sito e non deve indovinare. È la
+     forma dell'idle-loop di psp-web-recomp.
    - Fix generale solo con la causa provata. Bersaglio: FMV ≥ S19 (85%) prima di ogni altra
      cosa.
 3. **Kernel VFPU dell'MDEC.** 2,2 us per blocco 8×8 di IDCT sono ~720 cicli a 333 MHz, molto
