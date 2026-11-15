@@ -64,16 +64,42 @@ static void changed(Psx *psx, u32 slot)
         psx->host->card_dirty(psx->host->user, (int)slot);
 }
 
+/* guest RAM for [a, a+n), NULL when it is not plain RAM */
+static u8 *ram_at(Psx *psx, u32 a, u32 n)
+{
+    u32 p = a & 0x1FFFFFFF;
+    return p < 0x800000 && (p & (RAM_SIZE - 1)) + n <= RAM_SIZE ? psx->ram + (p & (RAM_SIZE - 1)) : NULL;
+}
+
 static void from_guest(Psx *psx, u8 *dst, u32 src, u32 n)
 {
+    const u8 *m = ram_at(psx, src, n);
+    if (m) {
+        memcpy(dst, m, n);
+        return;
+    }
     for (u32 i = 0; i < n; i++)
         dst[i] = (u8)psx_read(psx, src + i, 1);
 }
 
 static void to_guest(Psx *psx, u32 dst, const u8 *src, u32 n)
 {
+    u8 *m = psx->cpu.sr & 0x10000 ? NULL : ram_at(psx, dst, n);
+    if (m) {
+        memcpy(m, src, n);
+        return;
+    }
     for (u32 i = 0; i < n; i++)
         psx_write(psx, dst + i, src[i], 1);
+}
+
+/* a guest string (the device path) */
+static void path_from_guest(Psx *psx, char *out, u32 a, u32 max)
+{
+    u32 i = 0;
+    while (i < max - 1 && (out[i] = (char)psx_read(psx, a + i, 1)))
+        i++;
+    out[i] = 0;
 }
 
 /* both completion events of a card operation */
@@ -178,8 +204,8 @@ static int f_open(Psx *psx, const char *path, u32 mode)
 
 static int f_io(Psx *psx, int op, u32 fd, u32 a1, u32 a2)
 {
-    if (fd < FD_FIRST || fd >= FD_COUNT || !psx->bios.fd[fd].used)
-        return 0;
+    if (fd < FD_FIRST || fd >= FD_COUNT || !psx->bios.fd[fd].used || psx->bios.fd[fd].slot > 1)
+        return 0; /* not a card's: a file on the disc (bios.c) */
     struct BiosFile *f = &psx->bios.fd[fd];
     u8 *c = image(psx, (u32)f->slot);
     switch (op) {
@@ -256,15 +282,17 @@ int card_call(Psx *psx, u32 vector, u32 fn)
 {
     u32 a0 = G[R_A0], a1 = G[R_A1], a2 = G[R_A2];
     int op = vector == 0xA0 && fn <= 4 ? (int)fn : vector == 0xB0 && fn >= 0x32 && fn <= 0x36 ? (int)fn - 0x32 : -1;
+    char path[40];
+    const char *name = "";
     if (op == 0) {
-        char path[40] = {0};
-        for (u32 i = 0; i < sizeof path - 1 && (path[i] = (char)psx_read(psx, a0 + i, 1)); i++)
-            ;
+        path_from_guest(psx, path, a0, sizeof path);
         return f_open(psx, path, a1);
     }
     if (op > 0)
         return f_io(psx, op, a0, a1, a2);
-    if (vector == 0xA0 && (fn == 0xAB || fn == 0xAC)) { /* _card_info / _card_load (chan) */
+    /* _card_info, _card_load, _card_write_test (A0 AB/AC/AF), _card_info (B0 4D): (chan) */
+    if ((vector == 0xA0 && (fn == 0xAB || fn == 0xAC || fn == 0xAF)) || (vector == 0xB0 && fn == 0x4D)) {
+        psx->bios.card_last_slot = (int)(a0 >> 4 & 0xF);
         done(psx, image(psx, a0 >> 4 & 0xF));
         G[R_V0] = 1;
         return 1;
@@ -274,11 +302,44 @@ int card_call(Psx *psx, u32 vector, u32 fn)
     if (fn == 0x41 || fn == 0x45) /* format, erase: rare */
         psx_log(psx, "card B(%X) %X", fn, a0);
     switch (fn) {
+    case 0x44: case 0x46: { /* rename(old, new), undelete(name) */
+        char to[40];
+        const char *to_name = "";
+        path_from_guest(psx, path, a0, sizeof path);
+        int slot = card_path(path, &name);
+        if (slot < 0)
+            return 0; /* on the disc: bios.c */
+        u8 *c = image(psx, (u32)slot);
+        u32 b = 0;
+        if (c && fn == 0x44) {
+            path_from_guest(psx, to, a1, sizeof to);
+            b = card_path(to, &to_name) == slot && !find(c, to_name) ? find(c, name) : 0;
+            if (b) {
+                u8 *d = dir(c, b);
+                size_t len = strlen(to_name);
+                memset(d + 0xA, 0, 21);
+                memcpy(d + 0xA, to_name, len < 20 ? len : 20);
+                checksum(d);
+            }
+        } else if (c && !find(c, name)) { /* a deleted chain under that name: 0xA1-0xA3 back to 0x51-0x53 */
+            for (u32 k = 1; k < 16 && !b; k++)
+                if (dir(c, k)[0] == (ST_FREE | 1) && !strncmp((const char *)dir(c, k) + 0xA, name, 21))
+                    b = k;
+            for (u32 k = b; k; k = next_block(dir(c, k))) {
+                u8 *d = dir(c, k);
+                if ((d[0] & 0xF0) != ST_FREE || !(d[0] & 3))
+                    break;
+                d[0] = (u8)(0x50 | (d[0] & 3));
+                checksum(d);
+            }
+        }
+        if (b)
+            changed(psx, (u32)slot);
+        G[R_V0] = b != 0;
+        return 1;
+    }
     case 0x41: { /* format("bu00:") */
-        char path[8] = {0};
-        const char *name = "";
-        for (u32 i = 0; i < 5; i++)
-            path[i] = (char)psx_read(psx, a0 + i, 1);
+        path_from_guest(psx, path, a0, 6);
         int slot = card_path(path, &name);
         u8 *c = slot < 0 ? NULL : image(psx, (u32)slot);
         if (c)
@@ -287,32 +348,29 @@ int card_call(Psx *psx, u32 vector, u32 fn)
         return 1;
     }
     case 0x42: { /* firstfile(pattern, direntry) */
-        char path[40] = {0};
-        const char *name = "";
-        for (u32 i = 0; i < sizeof path - 1 && (path[i] = (char)psx_read(psx, a0 + i, 1)); i++)
-            ;
+        path_from_guest(psx, path, a0, sizeof path);
         int slot = card_path(path, &name);
-        psx->bios.dirent_slot = slot < 0 ? 2 : slot;
+        if (slot < 0)
+            return 0; /* on the disc: bios.c */
+        psx->bios.dirent_slot = slot;
         psx->bios.dirent_pos = 1;
         size_t len = strlen(name), max = sizeof psx->bios.dirent_pattern - 1;
         memcpy(psx->bios.dirent_pattern, name, len < max ? len : max);
         psx->bios.dirent_pattern[len < max ? len : max] = 0;
-        G[R_V0] = slot < 0 ? 0 : next_match(psx, a1);
+        G[R_V0] = next_match(psx, a1);
         /* the BIOS reads the directory from the card here: games that get 0 wait for this event
          * to tell "no file" (IOE) from no card (TIMEOUT) */
-        if (slot >= 0)
-            bios_event(psx, HW_CARD, image(psx, (u32)slot) ? SP_IOE : SP_TIMEOUT);
+        bios_event(psx, HW_CARD, image(psx, (u32)slot) ? SP_IOE : SP_TIMEOUT);
         psx_log(psx, "card firstfile %s: %s", path, G[R_V0] ? "found" : "none");
         return 1;
     }
     case 0x43: /* nextfile(direntry) */
+        if (psx->bios.dirent_slot > 1)
+            return 0; /* a search on the disc: bios.c */
         G[R_V0] = next_match(psx, a0);
         return 1;
     case 0x45: { /* erase(name) */
-        char path[40] = {0};
-        const char *name = "";
-        for (u32 i = 0; i < sizeof path - 1 && (path[i] = (char)psx_read(psx, a0 + i, 1)); i++)
-            ;
+        path_from_guest(psx, path, a0, sizeof path);
         int slot = card_path(path, &name);
         u8 *c = slot < 0 ? NULL : image(psx, (u32)slot);
         u32 b = c ? find(c, name) : 0;
@@ -328,6 +386,7 @@ int card_call(Psx *psx, u32 vector, u32 fn)
     }
     case 0x4E: case 0x4F: { /* _card_write / _card_read (chan, sector, buf) */
         u8 *c = image(psx, a0 >> 4 & 0xF);
+        psx->bios.card_last_slot = (int)(a0 >> 4 & 0xF);
         if (c && a1 < CARD_SIZE / FRAME) {
             if (fn == 0x4F)
                 to_guest(psx, a2, c + a1 * FRAME, FRAME);

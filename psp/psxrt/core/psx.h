@@ -481,9 +481,17 @@ void card_format(u8 *card);
 int card_call(Psx *psx, u32 vector, u32 fn); /* 0: not a card call */
 void bios_exception(Psx *psx);       /* CPU took an exception (EPC, cause set) */
 void bios_vblank(Psx *psx);
-int bios_exec(Psx *psx, u32 header, u32 sp, u32 sp_size);
+int bios_exec(Psx *psx, u32 header, u32 param1, u32 param2); /* Exec: a0, a1 for the program */
 int bios_load_file(Psx *psx, const char *name, u32 header_dst);
 int iso_find(Psx *psx, const char *path, u32 *lba, u32 *size);
+
+/* Kernel RAM the HLE BIOS keeps its own state in, in guest RAM so snapshots carry it (Sony's
+ * kernel variables lie at 0x7460-0x891F: games leave the area alone). */
+#define K_LIBC 0x80007400u /* libc.c: the strtok buffer (0x100) and position */
+#define K_VARS 0x80007580u /* bios.c: its variables (0xA0) */
+
+/* libc.c: the A0 C library functions; 0 when `fn` is not one */
+int libc_call(Psx *psx, u32 fn);
 
 /* dma.c */
 u32 dma_read(Psx *psx, u32 addr);
