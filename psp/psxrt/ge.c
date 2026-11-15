@@ -145,6 +145,9 @@ static const ScePspIMatrix4 ps1_dither = {{-4, 0, -3, 1}, {2, -2, 3, -1}, {-3, 1
  * and drew it while the CPU waited (6-10 ms a frame). 1 KB is ~60 polygons, a few hundred
  * system calls a second. */
 #define STALL_STEP 1024
+/* S18b A/B: the step alternates every second between 1 KB and 8 KB, the "-- ge:" line says which:
+ * one system call every ~60 polygons against the GE drawing later in the frame. */
+static u32 stall_step = STALL_STEP;
 #define LIST_UNCACHED ((u8 *)((u32)list | 0x40000000u))
 static int list_id;
 static u32 list_stall; /* bytes the GE may run */
@@ -193,7 +196,7 @@ static void stall_to(u32 n)
 static void ge_kick(void)
 {
     u32 n = (u32)((u8 *)gu_list->current - (u8 *)gu_list->start); /* sceGuCheckList, inline */
-    if (n - list_stall >= STALL_STEP) {
+    if (n - list_stall >= stall_step) {
         ring_flush();
         stall_to(n);
     }
@@ -1546,7 +1549,7 @@ int ge_log(char *buf, int cap)
     int n = clampn(snprintf(buf, (size_t)cap,
                             "-- ge: tri %u+%u tex, rect %u+%u tex, fill %u, line %u (%u runs); sw tex15 %u texwin %u "
                             "copy %u+%u sw+%u null (%u kpx, %u from ge); pages %u cluts %u, readback %u (%u tiles, %u ms), upload %u "
-                            "(%u kpx), flush %u; bind %u tex %u clut, kick %u (%u ms), rd check %u; fast %u (%u setups %u ms, %u cached), slow tex %u big %u, flat %u, clipped %u; ring %s (wb %u ms)\n",
+                            "(%u kpx), flush %u; bind %u tex %u clut, kick %u (%u ms), rd check %u; fast %u (%u setups %u ms, %u cached), slow tex %u big %u, flat %u, clipped %u; ring %s (wb %u ms), step %u\n",
                             (unsigned)s->tris, (unsigned)s->ttris, (unsigned)s->rects, (unsigned)s->trects,
                             (unsigned)s->fills, (unsigned)s->lines, (unsigned)s->line_runs, (unsigned)s->sw_tex15,
                             (unsigned)s->sw_texwin,
@@ -1555,9 +1558,10 @@ int ge_log(char *buf, int cap)
                             (unsigned)(s->read_us / 1000), (unsigned)s->uploads, (unsigned)(s->upload_px / 1000),
                             (unsigned)s->flushes, (unsigned)s->bind_tex, (unsigned)s->bind_clut, (unsigned)s->kicks, (unsigned)(kick_us / 1000),
                             (unsigned)s->rd_checks, (unsigned)s->fast, (unsigned)s->fast_setups, (unsigned)((s32)s->setup_us < 0 ? 0 : s->setup_us / 1000), (unsigned)s->fast_hits, (unsigned)s->slow_tex, (unsigned)s->slow_big, (unsigned)s->flat, (unsigned)s->clipped,
-                            fl.cached ? "cached" : "uncached", (unsigned)(s->ring_wb_us / 1000)),
+                            fl.cached ? "cached" : "uncached", (unsigned)(s->ring_wb_us / 1000), (unsigned)stall_step),
                    cap);
     memset(&ge.s, 0, sizeof ge.s);
+    stall_step = stall_step == STALL_STEP ? 8 * STALL_STEP : STALL_STEP; /* from now on */
     if (ring_ab)
         fl.want = !fl.cached; /* from the next sync */
     if (ge.compare && n < cap - 1)
