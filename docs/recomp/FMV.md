@@ -43,3 +43,11 @@ The translation runs it as MIPS on the Allegrex, with every guest register kept 
 4. **Straight to the GE.** When the game's next step is a `LoadImage` of that buffer into VRAM, the macroblocks go into the GE's copy of VRAM directly. This one is game-shaped, so it comes last and only behind a check that the buffer is the one loaded.
 
 The 24-bit wait at `present` (103 ms/s) is a GE cost of its own. It is measured apart from the decoder.
+
+## 5. Step 2 done: `DecDCTvlc` runs in C (`vlc.c`)
+
+- **Found by signature.** `hooks.rs` matches the routine's 212 words, with the 14 `lui`/`addiu` words of its globals masked. It then checks that the globals are laid out as libpress lays them out (`save` = size+4, `end` = size+0x28, `tab2` = tab1+0x10000). The match is in three links of the disc, each at its own address: SLES_028.95 0x80111870, LOADER.EXE 0x8011DBA0, CREDITS.EXE 0x80021500. Any game that links this libpress gets the recipe.
+- **Bit-exact.** A host harness runs the guest code on a small R3000 interpreter and `vlc.c` side by side, on 40 frames of the intro. Both give the same output words, the same saved state, the same a0/a1, and the same instruction and memory-access counts. This also holds when `vlc.c` is cut into slices.
+- **Same PS1 time.** The recipe charges the cycles the guest code would have spent (ins + 2 × mem), so device timing does not move. It stops at a block's DC when an event is due, lets `update()` run, and goes back to the guest for an interrupt. On the re-entry it resumes where it stopped.
+- **PPSSPP intro bench** (42 s): 15 calls/s, one per FMV frame. The FMV runs at 100% speed, 14-15 fps. The `vlc` ms in the io line also counts the `update()` calls made inside the recipe.
+- **Next: step 1 on the device.** The `vlc` io kind is the device measurement. One PSP run gives the decoder's real share of the 304 ms of io.
