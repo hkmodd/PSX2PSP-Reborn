@@ -30,15 +30,15 @@
  * (the CD's sectors) would run ahead of the guest code that serves them. A 500 us alarm makes the budget negative, so
  * that loops enter the runtime and interrupts are taken there.
  *
- * Code written by CPU stores (decompressed or copied by the game) is checked at each I-cache
+ * Code written by CPU stores (decompressed or copied by the game) is measured at each I-cache
  * flush, which the R3000A needs before running it too: FlushCache, or the end of a cache
- * isolation. A 1 KB block whose translated words no longer sum as when its table entries were set
- * is DIRTY again; the rest of its executable stays native.
+ * isolation. 1 KB blocks whose translated words no longer sum as when their table entries were
+ * set are logged; they keep their translation.
  * While the cache is isolated (SR bit 16) the guest runs in the interpreter, whose stores do not
  * reach RAM; translated stores would.
  *
- * Limits: code stores change with no flush after them run their old translation, EPC holds host
- * addresses while translated code is interrupted, and GRET returns are LIFO.
+ * Limits: code CPU stores change runs its old translation (Sheep Dog's level immediates), EPC
+ * holds host addresses while translated code is interrupted, and GRET returns are LIFO.
  */
 #include "native.h"
 #include "vlc.h"
@@ -316,11 +316,11 @@ static int try_load(u32 pc, int miss)
     return 0;
 }
 
-static void on_ram_loaded(Psx *psx, u32 addr, u32 len);
-
-/* The I-cache was flushed: a block whose translated words CPU stores changed is checked again
- * before use, as if loaded over; the rest of its executable stays. The first flushes, and those
- * that find a change, are logged with their time. */
+/* The I-cache was flushed: blocks whose translated words CPU stores changed are counted and
+ * logged, and keep running their translation (S19 behaviour). Marking them DIRTY sent them to
+ * the interpreter for good: Sheep Dog sets addi/slti immediates of its 3D code at each level
+ * load, and the PSP ran its 3D at 9-12% (S20 log). The first flushes, and those that find a
+ * change, are logged with their time. */
 static void cache_flushed(void)
 {
     static u32 n;
@@ -330,10 +330,9 @@ static void cache_flushed(void)
         if (!blk_code[b])
             continue;
         code++;
-        if (blk_code_sum(b, &any) != blk_sum[b]) {
-            changed++;
-            on_ram_loaded(P, b << BLK_SHIFT, 1u << BLK_SHIFT);
-        }
+        u32 s = blk_code_sum(b, &any);
+        if (s != blk_sum[b])
+            changed++, blk_sum[b] = s;
     }
     if (n++ < 8 || changed)
         say("native: cache flush %u: %u of %u KB of code changed (%u us)", (unsigned)n, (unsigned)changed, (unsigned)code,
