@@ -354,7 +354,7 @@ static void update(void)
     }
     u32 t = sceKernelGetSystemTimeLow();
     psx_update(P);
-    native_stats.us_update += (sceKernelGetSystemTimeLow() - t) * PROF_EVERY;
+    native_stats.us_update += (sceKernelGetSystemTimeLow() - t) * PROF_EVERY - prof_bias;
 }
 
 /* At every entry from translated code: the cycles its loops spent join the count, and the
@@ -405,7 +405,7 @@ static u32 run_guest(int mode)
         return interp(mode);
     u32 t = sceKernelGetSystemTimeLow();
     u32 h = interp(mode);
-    native_stats.us_interp += (sceKernelGetSystemTimeLow() - t) * PROF_EVERY;
+    native_stats.us_interp += (sceKernelGetSystemTimeLow() - t) * PROF_EVERY - prof_bias;
     return h;
 }
 
@@ -594,7 +594,7 @@ static int io_fast(u32 pc, u32 insn, u32 back, u32 *next)
         psx_write(P, a, rt ? ctx[rt] : 0, size);
     P->cycles += 2;
     if (timed) {
-        t = (sceKernelGetSystemTimeLow() - t) * PROF_EVERY;
+        t = (sceKernelGetSystemTimeLow() - t) * PROF_EVERY - prof_bias;
         native_stats.us_io += t;
         native_stats.us_io_kind[kind] += t;
     }
@@ -754,7 +754,7 @@ static u32 hook(const u32 *site, u32 pc)
             return leave(c, run_guest(2));
         }
         if (timed) { /* the libpad recipes wait on the timer: their time is the timer's */
-            t = (sceKernelGetSystemTimeLow() - t) * PROF_EVERY;
+            t = (sceKernelGetSystemTimeLow() - t) * PROF_EVERY - prof_bias;
             native_stats.us_io += t;
             native_stats.us_io_kind[IO_TIMER] += t;
         }
@@ -767,12 +767,7 @@ static u32 hook(const u32 *site, u32 pc)
     return leave(c, run_guest(0));
 }
 
-/* GTE commands with their time (psxrt.trace bit 7): one in PROF_EVERY timed and scaled, less
- * what an empty timed interval costs (measured in native_init), so the clock's own syscalls,
- * which cost about as much as a command, are not counted. Wraps, but per-second differences
- * come out right. */
-static u32 gte_clock_cost;
-
+/* GTE commands with their time (psxrt.trace bit 7): one in PROF_EVERY timed and scaled. */
 void native_gte_prof(u32 cmd)
 {
     static u32 n;
@@ -782,17 +777,21 @@ void native_gte_prof(u32 cmd)
     }
     u32 t = sceKernelGetSystemTimeLow();
     native_gte_fast(cmd);
-    native_stats.us_io_kind[IO_GTEC] += (sceKernelGetSystemTimeLow() - t) * PROF_EVERY - gte_clock_cost;
+    native_stats.us_io_kind[IO_GTEC] += (sceKernelGetSystemTimeLow() - t) * PROF_EVERY - prof_bias;
 }
 
-static void gte_prof_init(void)
+/* What an empty timed interval costs, times PROF_EVERY: every sampled time (here, the core's
+ * draw) is less this, so the clock's own syscalls are not counted. On the PSP one costs about as
+ * much as a GPU state command. Sums of times wrap, but per-second differences come out right. */
+static void prof_init(void)
 {
     u32 sum = 0;
     for (int i = 0; i < 4096; i++) {
         u32 t = sceKernelGetSystemTimeLow();
         sum += sceKernelGetSystemTimeLow() - t;
     }
-    gte_clock_cost = sum * PROF_EVERY / 4096;
+    prof_bias = sum * PROF_EVERY / 4096;
+    psx_log(P, "profile: an empty timed interval costs %u ns", (unsigned)(sum * 1000 / 4096));
 }
 
 /* Host call at `site` (the address of its .word pc, .word insn): returns where to go on. */
@@ -848,7 +847,7 @@ u32 native_rt_call(const u32 *site)
     if (cpu_step(P) < 0)
         P->exiting = 2;
     if (timed) {
-        t = (sceKernelGetSystemTimeLow() - t) * PROF_EVERY;
+        t = (sceKernelGetSystemTimeLow() - t) * PROF_EVERY - prof_bias;
         native_stats.us_io += t;
         native_stats.us_io_kind[kind] += t;
     }
@@ -1035,8 +1034,8 @@ const char *native_init(Psx *psx, const DiscInfo *info)
     stub(STUB_CALL_RET, psxrt_call_ret);
     stub(STUB_GRET, psxrt_gret);
     stub(STUB_GTE_CMD, psxrt_gte_cmd);
+    prof_init();
     if (psx->trace & 128) {
-        gte_prof_init();
         stub(STUB_GTE_CMD, psxrt_gte_prof);
     }
     memset((void *)ctx, 0, 0x100);

@@ -341,6 +341,7 @@ static void vtx_col(Vtx *v, u32 w)
 }
 
 u32 gpu_slow_us; /* polygons past the renderer's fast lane, timed as execute() times them */
+u32 prof_bias;
 u32 gpu_writes;
 static int poly_slow;
 
@@ -563,7 +564,7 @@ static void execute(Psx *psx, const u32 *c, int n)
     }
     u32 t = h->usec(h->user);
     draw(psx, c, n);
-    t = (h->usec(h->user) - t) * 16;
+    t = (h->usec(h->user) - t) * 16 - prof_bias;
     psx->gpu.us_draw += t;
     psx->gpu.us_kind[k] += t;
     if (k == 0 && poly_slow)

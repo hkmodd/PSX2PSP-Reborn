@@ -126,7 +126,9 @@ static struct {
     u32 ring_wb;        /* cached: bytes written back, the GE may read them */
     int cached, want;   /* the ring is written through the cache; the mode after the next sync */
 } fl;
-static int ring_ab = 1; /* the mode changes every second, and the "-- ge:" line says which ran */
+/* 1: the mode changes every second, and the "-- ge:" line says which ran. The PSP wrote 64 KB of
+ * vertices in 326 us uncached, 700 us cached and written back (S16b): the ring stays uncached. */
+static int ring_ab = 0;
 static u32 fl_arena_off; /* words of the arena (below) used by the open list's blocks */
 
 /* The PS1 dither matrix, row = y & 3, column = x & 3; the GE adds it to 8-bit colours before
@@ -181,6 +183,19 @@ static void ge_kick(void)
 {
     u32 n = (u32)((u8 *)gu_list->current - (u8 *)gu_list->start); /* sceGuCheckList, inline */
     if (n - list_stall >= STALL_STEP) {
+        ring_flush();
+        list_stall = n;
+        sceGeListUpdateStallAddr(list_id, LIST_UNCACHED + n);
+        ge.s.kicks++;
+    }
+}
+
+void ge_run(void)
+{
+    if (!list_open)
+        return;
+    u32 n = (u32)((u8 *)gu_list->current - (u8 *)gu_list->start);
+    if (n != list_stall) {
         ring_flush();
         list_stall = n;
         sceGeListUpdateStallAddr(list_id, LIST_UNCACHED + n);
@@ -1405,8 +1420,11 @@ static int clampn(int n, int cap) { return n < 0 ? 0 : n >= cap ? cap - 1 : n; }
 /* Compare mode: the GE's copy against RAM's, then RAM's sent up so each second starts equal. */
 static int compare(char *buf, int cap)
 {
-    if (ge.psx->gpu.xfer == 1)
-        return 0; /* a transfer is half way: RAM is ahead */
+    const Gpu *g = &ge.psx->gpu;
+    if (g->xfer == 1) /* a transfer is half way: RAM is ahead */
+        return clampn(snprintf(buf, (size_t)cap, "-- ge: no comparison, a transfer to %d,%d %dx%d is at row %d\n",
+                               (int)g->xx, (int)g->xy, (int)g->xw, (int)g->xh, (int)g->xr),
+                      cap);
     begin();
     sceKernelDcacheWritebackInvalidateRange(ge.cmp, VRAM_W * VRAM_H * 2);
     sceGuCopyImage(GU_PSM_5551, 0, 0, VRAM_W, VRAM_H, VRAM_W, VRAM_PTR, 0, 0, VRAM_W, ge.cmp);

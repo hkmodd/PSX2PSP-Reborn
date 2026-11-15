@@ -94,6 +94,9 @@ static struct {
 
 static void halt(const char *why) __attribute__((noreturn));
 
+/* A second's microseconds as ms; a sampled sum less the clock's cost can come out just below 0. */
+static unsigned ms_of(u32 us) { return (s32)us < 0 ? 0 : us / 1000; }
+
 static void log_flush(void)
 {
     if (log_fd >= 0 && log_len)
@@ -456,14 +459,21 @@ static void *ge24(const Gpu *g, int w, int h)
     return (void *)(0x04000000u + GE_RGB24);
 }
 
-/* The PS1 display area: a 5551 texture of the GE's PS1 VRAM, or in 24-bit modes the GE's own
- * conversion (ge24) or a CPU one (present() has brought the GE's pixels into RAM). */
-static void draw_ps1(Psx *psx)
+/* The PS1 display area scaled to the screen: a 5551 texture of the GE's PS1 VRAM, or in 24-bit
+ * modes the GE's own conversion (ge24) or a CPU one (present() has brought the GE's pixels into
+ * RAM). It is drawn in 32-pixel columns: one 480x272 sprite walks whole texture lines, wider
+ * than the GE's 8 KB texture cache. 0: the display is off, nothing drawn. */
+typedef struct {
+    float u, v, x, y, z;
+} SliceVtx;
+#define SLICE_W 32
+
+static int draw_ps1(Psx *psx)
 {
     const Gpu *g = &psx->gpu;
     int w, h;
     if (!display_size(psx, &w, &h))
-        return;
+        return 0;
     if (display_ge24(psx, &w, &h)) {
         void *t = ge24(g, w, h);
         sceGuTexMode(GU_PSM_5650, 0, 0, 0);
@@ -484,11 +494,17 @@ static void draw_ps1(Psx *psx)
     sceGuTexFilter(GU_LINEAR, GU_LINEAR);
     sceGuTexFlush();
     sceGuEnable(GU_TEXTURE_2D);
-    Vertex *v = (Vertex *)sceGuGetMemory(2 * sizeof(Vertex));
-    v[0] = (Vertex){0, 0, 0, 0, 0};
-    v[1] = (Vertex){(u16)w, (u16)h, 480, 272, 0};
-    sceGuDrawArray(GU_SPRITES, GU_TEXTURE_16BIT | GU_VERTEX_16BIT | GU_TRANSFORM_2D, 2, 0, v);
+    const int n = (480 + SLICE_W - 1) / SLICE_W;
+    SliceVtx *v = (SliceVtx *)sceGuGetMemory(2 * n * sizeof(SliceVtx));
+    const float su = (float)w / 480.0f;
+    for (int i = 0; i < n; i++) {
+        int x0 = i * SLICE_W, x1 = x0 + SLICE_W > 480 ? 480 : x0 + SLICE_W;
+        v[2 * i] = (SliceVtx){(float)x0 * su, 0.0f, (float)x0, 0.0f, 0.0f};
+        v[2 * i + 1] = (SliceVtx){(float)x1 * su, (float)h, (float)x1, 272.0f, 0.0f};
+    }
+    sceGuDrawArray(GU_SPRITES, GU_TEXTURE_32BITF | GU_VERTEX_32BITF | GU_TRANSFORM_2D, 2 * n, 0, v);
     sceGuDisable(GU_TEXTURE_2D);
+    return 1;
 }
 
 /* Debugging: the PS1 display area as a 24-bit BMP, shotNNNNN.bmp beside the EBOOT. */
@@ -570,13 +586,39 @@ static void ram_dump(Psx *psx, u32 frame_no)
     say("ram %s", path);
 }
 
+/* The status line and the log lines over a finished picture, then that picture to the display. */
+static void show(const char *status, int all)
+{
+    u32 t = sceKernelGetSystemTimeLow();
+    pspDebugScreenSetBase((u32 *)(0x44000000u + (u32)draw_buf));
+    pspDebugScreenSetXY(0, 0);
+    pspDebugScreenSetTextColor(0xFF40FFFF);
+    pspDebugScreenPrintf("%-60s", status);
+    if (show_text || all) {
+        int n = all ? 32 : SHOWN;
+        pspDebugScreenSetTextColor(0xFFFFFFFF);
+        for (int i = 0; i < n; i++) {
+            pspDebugScreenSetXY(0, 34 - n + i);
+            pspDebugScreenPrintf("%-60s", lines[(line_head - n + i + LINES) % LINES]);
+        }
+    }
+    us_ptext += sceKernelGetSystemTimeLow() - t;
+    draw_buf = sceGuSwapBuffers();
+}
+
+/* The picture of frame N is drawn by the GE while the CPU runs frame N+1, and shown by the
+ * present of frame N+1 once its ge_sync has found the GE done: the CPU never waits for the blit
+ * (on the PSP 4-5 ms a frame), at the cost of one frame of latency. */
 static void present(Psx *psx, const char *status)
 {
-    int w, h, chk = 0;
+    static char pending[64]; /* the status of the picture the GE is drawing; "": none */
+    int w, h, chk = 0, now = !psx || !psx->gpu.renderer;
     u32 t0 = sceKernelGetSystemTimeLow();
-    ge_sync(); /* what the GE has still to draw of the frame: how far it is behind the CPU */
+    ge_sync(); /* what the GE has still to draw: the frame, and the last present's picture */
     u32 t1 = sceKernelGetSystemTimeLow();
     us_pwait += t1 - t0;
+    if (pending[0])
+        show(pending, 0), pending[0] = 0;
     if (psx && psx->gpu.renderer && display_24bit(psx) && display_size(psx, &w, &h)) {
         int ge = display_ge24(psx, &w, &h);
         ++g24_frames;
@@ -592,29 +634,21 @@ static void present(Psx *psx, const char *status)
     sceGuDisable(GU_STENCIL_TEST);
     sceGuDisable(GU_BLEND);
     sceGuDisable(GU_DITHER);
-    sceGuClearColor(0xFF000000);
-    sceGuClear(GU_COLOR_BUFFER_BIT);
-    if (psx)
-        draw_ps1(psx);
-    ge_sync();
-    if (chk)
-        g24_check(&psx->gpu, w, h);
-    u32 t2 = sceKernelGetSystemTimeLow();
-    us_pdraw += t2 - t1;
-    pspDebugScreenSetBase((u32 *)(0x44000000u + (u32)draw_buf));
-    pspDebugScreenSetXY(0, 0);
-    pspDebugScreenSetTextColor(0xFF40FFFF);
-    pspDebugScreenPrintf("%-60s", status);
-    if (show_text || !psx) {
-        int n = psx ? SHOWN : 32;
-        pspDebugScreenSetTextColor(0xFFFFFFFF);
-        for (int i = 0; i < n; i++) {
-            pspDebugScreenSetXY(0, 34 - n + i);
-            pspDebugScreenPrintf("%-60s", lines[(line_head - n + i + LINES) % LINES]);
-        }
+    if (!psx || !draw_ps1(psx)) {
+        sceGuClearColor(0xFF000000);
+        sceGuClear(GU_COLOR_BUFFER_BIT);
     }
-    us_ptext += sceKernelGetSystemTimeLow() - t2;
-    draw_buf = sceGuSwapBuffers();
+    if (now || chk) {
+        ge_sync();
+        if (chk)
+            g24_check(&psx->gpu, w, h);
+        us_pdraw += sceKernelGetSystemTimeLow() - t1;
+        show(status, !psx);
+        return;
+    }
+    ge_run();
+    snprintf(pending, sizeof pending, "%s", status[0] ? status : " ");
+    us_pdraw += sceKernelGetSystemTimeLow() - t1;
 }
 
 /* ---- pad: PSP bits equal PS1 bits except L/R (PSP 8/9, PS1 L1/R1 10/11); active low ---- */
@@ -703,14 +737,14 @@ static void frame(void)
                 n += snprintf(line + n, sizeof line - (size_t)n,
                               "-- ms: interp %u io %u (draw %u mdec %u spu %u) update %u present %u (wait %u draw %u text %u rgb24 %u) sleep %u;"
                               " audio drops %u gaps %u trims %u peak %u/%u; vsync wait %u (%u ms) late %u (avg %u max %u us) skipped %u\n",
-                              (unsigned)((s->us_interp - n0.us_interp) / 1000), (unsigned)((s->us_io - n0.us_io) / 1000),
-                              (unsigned)((psx.gpu.us_draw - draw0) / 1000), (unsigned)((psx.mdec.us_decode - mdec0) / 1000),
-                              (unsigned)((psx.spu.us_mix - spu0) / 1000),
-                              (unsigned)((s->us_update - n0.us_update) / 1000), (unsigned)((s->us_present - n0.us_present) / 1000),
-                              (unsigned)(us_pwait / 1000), (unsigned)(us_pdraw / 1000), (unsigned)(us_ptext / 1000),
-                              (unsigned)((us_rgb24 - rgb0) / 1000), (unsigned)((s->us_sleep - n0.us_sleep) / 1000),
+                              ms_of(s->us_interp - n0.us_interp), ms_of(s->us_io - n0.us_io),
+                              ms_of(psx.gpu.us_draw - draw0), ms_of(psx.mdec.us_decode - mdec0),
+                              ms_of(psx.spu.us_mix - spu0),
+                              ms_of(s->us_update - n0.us_update), ms_of(s->us_present - n0.us_present),
+                              ms_of(us_pwait), ms_of(us_pdraw), ms_of(us_ptext),
+                              ms_of(us_rgb24 - rgb0), ms_of(s->us_sleep - n0.us_sleep),
                               (unsigned)audio_drops, (unsigned)audio_gaps, (unsigned)audio_trims, (unsigned)audio_peak_in, (unsigned)audio_peak_out, (unsigned)(s->vs_wait - n0.vs_wait),
-                              (unsigned)((s->us_vs_wait - n0.us_vs_wait) / 1000), (unsigned)(s->vs_late - n0.vs_late),
+                              ms_of(s->us_vs_wait - n0.us_vs_wait), (unsigned)(s->vs_late - n0.vs_late),
                               (unsigned)((s->us_late - n0.us_late) / ((s->vs_late - n0.vs_late) | 1)), (unsigned)s->us_late_max,
                               (unsigned)(s->vs_adv - n0.vs_adv));
                 native_stats.us_late_max = 0;
@@ -721,7 +755,7 @@ static void frame(void)
                 for (int k = 0; k < IO_KINDS; k++)
                     if (s->n_io[k] != n0.n_io[k])
                         n += snprintf(line + n, sizeof line - (size_t)n, " %s %u/%u", io_names[k], (unsigned)(s->n_io[k] - n0.n_io[k]),
-                                      (unsigned)((s->us_io_kind[k] - n0.us_io_kind[k]) / 1000));
+                                      ms_of(s->us_io_kind[k] - n0.us_io_kind[k]));
                 n += snprintf(line + n, sizeof line - (size_t)n, "\n-- gte ops (hex/n):");
                 for (int k = 0; k < 64; k++)
                     if (s->n_gte[k] != n0.n_gte[k])
@@ -729,19 +763,19 @@ static void frame(void)
                 n += snprintf(line + n, sizeof line - (size_t)n, "\n");
                 if (bench_secs && ++bench_n > BENCH_SKIP) {
                     bench.speed += speed, bench.vbl += fps, bench.fps += game_fps;
-                    bench.interp += (s->us_interp - n0.us_interp) / 1000, bench.io += (s->us_io - n0.us_io) / 1000;
-                    bench.draw += (psx.gpu.us_draw - draw0) / 1000, bench.spu += (psx.spu.us_mix - spu0) / 1000;
-                    bench.timer += (s->us_io_kind[IO_TIMER] - n0.us_io_kind[IO_TIMER]) / 1000, bench.dma2 += psx.dma.us_run[2] / 1000;
-                    bench.update += (s->us_update - n0.us_update) / 1000, bench.present += (s->us_present - n0.us_present) / 1000;
-                    bench.sleep += (s->us_sleep - n0.us_sleep) / 1000;
+                    bench.interp += ms_of(s->us_interp - n0.us_interp), bench.io += ms_of(s->us_io - n0.us_io);
+                    bench.draw += ms_of(psx.gpu.us_draw - draw0), bench.spu += ms_of(psx.spu.us_mix - spu0);
+                    bench.timer += ms_of(s->us_io_kind[IO_TIMER] - n0.us_io_kind[IO_TIMER]), bench.dma2 += ms_of(psx.dma.us_run[2]);
+                    bench.update += ms_of(s->us_update - n0.us_update), bench.present += ms_of(s->us_present - n0.us_present);
+                    bench.sleep += ms_of(s->us_sleep - n0.us_sleep);
                 }
                 n0 = *s, draw0 = psx.gpu.us_draw, mdec0 = psx.mdec.us_decode, spu0 = psx.spu.us_mix, rgb0 = us_rgb24;
                 Gpu *g = &psx.gpu;
                 n += snprintf(line + n, sizeof line - (size_t)n,
                               "-- gpu: poly %u/%u (slow %u ms) line %u/%u rect %u/%u copy %u/%u fill %u/%u other %u/%u (n/ms), frags %u tested %u\n",
-                              (unsigned)g->n_kind[0], (unsigned)(g->us_kind[0] / 1000), (unsigned)(gpu_slow_us / 1000), (unsigned)g->n_kind[1], (unsigned)(g->us_kind[1] / 1000),
-                              (unsigned)g->n_kind[2], (unsigned)(g->us_kind[2] / 1000), (unsigned)g->n_kind[3], (unsigned)(g->us_kind[3] / 1000),
-                              (unsigned)g->n_kind[4], (unsigned)(g->us_kind[4] / 1000), (unsigned)g->n_kind[5], (unsigned)(g->us_kind[5] / 1000),
+                              (unsigned)g->n_kind[0], ms_of(g->us_kind[0]), ms_of(gpu_slow_us), (unsigned)g->n_kind[1], ms_of(g->us_kind[1]),
+                              (unsigned)g->n_kind[2], ms_of(g->us_kind[2]), (unsigned)g->n_kind[3], ms_of(g->us_kind[3]),
+                              (unsigned)g->n_kind[4], ms_of(g->us_kind[4]), (unsigned)g->n_kind[5], ms_of(g->us_kind[5]),
                               (unsigned)g->frags, (unsigned)g->tested);
                 memset(g->n_kind, 0, sizeof g->n_kind), memset(g->us_kind, 0, sizeof g->us_kind), g->frags = g->tested = 0;
                 gpu_slow_us = 0;
@@ -750,7 +784,7 @@ static void frame(void)
                 for (int ch = 0; ch < 7; ch++)
                     if (d->n_run[ch])
                         n += snprintf(line + n, sizeof line - (size_t)n, " ch%d %u/%u/%u", ch, (unsigned)d->n_run[ch],
-                                      (unsigned)(d->us_run[ch] / 1000), (unsigned)(d->words[ch] / 1000));
+                                      ms_of(d->us_run[ch]), ms_of(d->words[ch]));
                 n += snprintf(line + n, sizeof line - (size_t)n, "\n");
                 memset(d->n_run, 0, sizeof d->n_run), memset(d->us_run, 0, sizeof d->us_run), memset(d->words, 0, sizeof d->words);
             }

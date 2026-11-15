@@ -21,6 +21,8 @@ void ge_init(Psx *psx, int compare);
 void ge_open(void);
 /* Ends the display list and waits for the GE. */
 void ge_sync(void);
+/* Lets the GE run all of the open list now, without waiting; the list stays open. */
+void ge_run(void);
 /* Brings the GE's pixels of a PS1 VRAM rectangle into RAM. */
 void ge_read(int x, int y, int w, int h);
 /* A draw into PS1 VRAM that changes nothing, once per frame (ge.c says why). */
