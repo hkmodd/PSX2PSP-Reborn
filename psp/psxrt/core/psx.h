@@ -141,6 +141,10 @@ typedef struct Cdrom {
     u8 pending[2352];     /* sector waiting in q */
     u8 data[2340];
     int data_len, data_pos;
+    /* diagnostics: data sectors read, XA sectors sent to the SPU, sectors replaced while waiting
+     * in q, sectors delivered and replaced before the guest loaded them, BFRD loads */
+    u32 n_sect, n_xa, n_replaced, n_unread, n_loads;
+    int fresh; /* the delivered sector is not loaded yet */
     /* XA-ADPCM: decoded, resampled to 44100 Hz and queued for the SPU's CD input */
     s32 xa_prev[2][2];
     s16 xa_last[2];
@@ -227,6 +231,10 @@ typedef struct Gpu {
      * fragments shaded and pixels tested. The host reads and clears them. */
     u32 n_kind[6], us_kind[6], frags, tested;
     u32 flips; /* display area changes (GP1 0x05): the game's own frames; counts up, never cleared */
+    /* CPU->VRAM loads since the display went 24-bit (a movie's frames): the VRAM lines they wrote,
+     * one bit each, and the halfword columns [load_x0, load_x1). See gpu_picture(). */
+    u32 load_rows[16];
+    int load_x0, load_x1;
 } Gpu;
 
 /* A volume that is either fixed or sweeping (the voice volumes and the main volume). */
@@ -512,6 +520,9 @@ u32 gpu_gp0_pixels(Psx *psx, const u32 *w, u32 n);
 void gpu_gp1(Psx *psx, u32 v);
 void gpu_vblank(Psx *psx);
 int gpu_display_height(const Psx *psx);
+/* The part of a w x h display area that holds the picture: x0..x1, y0..y1 (exclusive), in display
+ * pixels. All of it, except in 24-bit modes where the loaded movie frames cover less. */
+void gpu_picture(const Psx *psx, int w, int h, int *x0, int *y0, int *x1, int *y1);
 
 /* spu.c */
 u16 spu_read(Psx *psx, u32 addr);

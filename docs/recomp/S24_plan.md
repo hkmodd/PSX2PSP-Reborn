@@ -63,3 +63,47 @@ Uno slot sbagliato non costa nulla: il runtime prende una traduzione solo se la 
 esattamente il file (hash). **Criterio:** Exoddus in PPSSPP, il log mostra `native: XX.OVL at
 8009FA40` e i passi dell'interprete in gioco scendono di almeno 10 volte rispetto a oggi.
 Sheep Dog: fixed check PASS.
+
+## Passo 4 — Filmati di Exoddus: costo dei cicli nel traduttore
+
+Il filmato del logo andava a 6 fps. Con i contatori dei settori CD (`-- cd sectors: data xa
+replaced unread loaded`) si vede che il gioco butta frame interi: il suo decoder arriva tardi e
+i settori consegnati vengono sostituiti prima che li legga (`unread` > 0).
+
+La causa è `Em::loop_cost`. Ogni back-edge addebitava tutte le word del ciclo, anche quelle
+che un branch in avanti dentro il ciclo salta. Il decoder (uno switch sulle lunghezze di codice)
+pagava tutti i casi a ogni passata: 2.5 volte il suo tempo PS1. Ora le word saltabili non sono
+addebitate. Un ciclo d'attesa contato (il timeout di `VSync`) non ha branch interni e paga
+tutto, come prima. Test: `back_edges_do_not_charge_what_a_pass_can_skip`.
+
+**Risultato in PPSSPP.** Il filmato passa da 6 a 14 fps con `unread` 0. Il bench di 60 s va da
+14.3 a 19.9 fps. Il codice era già tutto tradotto: il problema era il modello dei tempi, non il
+codice mancante.
+
+La prima versione addebitava 3 cicli a ogni load e store. Il ciclo d'attesa di `VSync` (32768
+passate da 14 word e 3 letture) costava così 22 cicli a passata, cioè 21 ms, e scadeva prima del
+vblank PAL da 20 ms. Il livello 1 di Sheep Dog girava senza pacing a 60-94 fps. Ora una lettura
+dalla RAM costa 1 + 6 cicli (`RAM_READ_TICKS` di DuckStation) e una scrittura 1: 32 cicli a
+passata, 31 ms. Test: `back_edges_charge_ram_reads_but_not_writes`. Il fixed check ora fallisce
+su un solo `VSync: timeout` nel livello e su fps sopra i vblank. Risultato: Sheep Dog 59.2 fps
+con 0 timeout; Exoddus filmato a 12-24 fps, bench 19.7, 0 timeout, `unread` 0.
+
+## Passo 5 — Filmati di Exoddus: la barra nera in fondo
+
+Nei filmati il display è 368x240 a 24 bit e i flip vanno a y=16 e y=272. Il trace dei
+trasferimenti (`trace & 32`, `gpu: load x,y wxh`) mostra che i frame del filmato arrivano con
+GP0 A0 a y=8 e y=264, 240 righe ciascuno. Le righe di display 248-255 e 504-511 quindi non sono
+mai scritte. Su un televisore cadono nell'overscan. Il present della PSP invece stira tutta l'area
+di display su 480x272, e quelle righe diventavano una banda nera.
+
+La correzione è nel modello del display, non nel gioco, e vale per ogni gioco. `gpu_picture()`
+ricorda le righe e le colonne VRAM caricate dalla CPU da quando il display è passato a 24 bit, e
+taglia i bordi dell'area di display che nessun caricamento copre. Il taglio vale solo se su
+ciascun asse resta entro 1/16: un letterbox voluto dal gioco è molto più largo e resta com'è.
+`draw_ps1()` stira solo quel rettangolo.
+
+Il passaggio dentro o fuori dai 24 bit (GP1 08) azzera le righe ricordate, perché è un nuovo
+filmato. Le schermate a 15 bit non cambiano.
+
+**Risultato in PPSSPP.** Nel secondo filmato (i Mudokon con i graffiti) la banda non c'è più;
+l'ha verificato l'Host a vista.

@@ -841,6 +841,41 @@ fn back_edges_charge_the_loop_cost() {
 }
 
 #[test]
+fn back_edges_do_not_charge_what_a_pass_can_skip() {
+    let w = [
+        addiu(T0, ZERO, 100),     // 0
+        addiu(T0, T0, -1),        // 1  loop
+        b(5, T1, ZERO, 2, 6),     // 2  bne t1,zero,6: a path that skips 4 and 5
+        NOP,                      // 3
+        addiu(T2, T2, 1),         // 4
+        addiu(T2, T2, 1),         // 5
+        b(5, T0, ZERO, 6, 1),     // 6  bne t0,zero,loop
+        NOP,                      // 7
+        NOP,                      // 8  end
+    ];
+    // 100 passes of words 1, 2, 3, 6 and 7 cost 500.
+    assert_eq!(check_budget(&w, 8, |c| c.gpr[T1 as usize] = 1, 500).log.polls, 0);
+    assert_eq!(check_budget(&w, 8, |c| c.gpr[T1 as usize] = 1, 499).log.polls, 1);
+}
+
+#[test]
+fn back_edges_charge_ram_reads_but_not_writes() {
+    let w = [
+        addiu(T0, ZERO, 100),     // 0
+        addiu(T0, T0, -1),        // 1  loop
+        mem(LW, T1, 0, ZERO),     // 2  a RAM read: 6 more cycles
+        NOP,                      // 3  load delay
+        mem(SW, T1, 4, ZERO),     // 4  a write goes to the write queue: none
+        b(5, T0, ZERO, 5, 1),     // 5  bne t0,zero,loop
+        NOP,                      // 6
+        NOP,                      // 7  end
+    ];
+    // 100 passes of 6 words and one read cost 1200.
+    assert_eq!(check_budget(&w, 7, |_| {}, 1200).log.polls, 0);
+    assert_eq!(check_budget(&w, 7, |_| {}, 1199).log.polls, 1);
+}
+
+#[test]
 fn delay_slot_that_is_also_a_target() {
     let w = [
         addiu(T0, ZERO, 2),       // 0

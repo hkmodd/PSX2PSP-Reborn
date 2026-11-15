@@ -59,8 +59,11 @@ static void deliver(Psx *psx)
     memcpy(cd->resp, r->b, r->n);
     cd->nresp = r->n, cd->rpos = 0;
     cd->irq_flags = (u8)((cd->irq_flags & ~7u) | r->irq);
-    if (r->sector)
+    if (r->sector) {
         memcpy(cd->sector, cd->pending, sizeof cd->sector);
+        cd->n_unread += (u32)cd->fresh;
+        cd->fresh = 1;
+    }
     memmove(cd->q, cd->q + 1, sizeof cd->q[0] * (size_t)(cd->nq - 1));
     cd->nq--;
     if (psx->trace & 2)
@@ -117,11 +120,14 @@ static void sector(Psx *psx)
         return; /* filtered out */
     if ((cd->mode & 0x40) && xa_audio) { /* XA-ADPCM: to the SPU, no INT1 */
         xa_sector(psx, raw);
+        cd->n_xa++;
         return;
     }
     memcpy(cd->pending, raw, sizeof raw);
+    cd->n_sect++;
     for (int i = 0; i < cd->nq; i++)
         if (cd->q[i].sector) {
+            cd->n_replaced++;
             if (psx->trace & 2)
                 psx_log(psx, "cd: sector %u replaces the waiting one", cd->pos - 1);
             return; /* the guest is behind: the newer sector replaces the waiting one */
@@ -350,6 +356,8 @@ void cd_write(Psx *psx, int reg, u8 v)
                 cd->data_len = raw ? 2340 : 2048;
                 memcpy(cd->data, cd->sector + (raw ? 12 : 24), (size_t)cd->data_len);
                 cd->data_pos = 0;
+                cd->n_loads += (u32)cd->fresh;
+                cd->fresh = 0;
             }
         } else
             cd->data_len = cd->data_pos = 0;

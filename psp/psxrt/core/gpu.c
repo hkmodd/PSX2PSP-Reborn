@@ -507,6 +507,25 @@ static void xfer_start(Psx *psx, const u32 *c, int dir)
     g->xw = ((c[2] - 1) & 0x3FF) + 1, g->xh = (((c[2] >> 16) - 1) & 0x1FF) + 1;
     g->xi = g->xr = 0;
     g->xfer = dir;
+    if (dir == 1 && (g->stat & 0x200000)) { /* a movie frame, or part of one: see gpu_picture() */
+        for (int i = 0; i < g->xh; i++) {
+            u32 r = (u32)(g->xy + i) & 511;
+            g->load_rows[r >> 5] |= 1u << (r & 31);
+        }
+        if (g->load_x1 <= g->load_x0)
+            g->load_x0 = g->xx, g->load_x1 = g->xx + g->xw;
+        if (g->xx < g->load_x0)
+            g->load_x0 = g->xx;
+        if (g->xx + g->xw > g->load_x1)
+            g->load_x1 = g->xx + g->xw;
+    }
+    if (psx->trace & 32) { /* where images land: logged when the row span or size changes */
+        static u32 last = ~0u;
+        u32 k = (u32)g->xy | (u32)g->xw << 9 | (u32)g->xh << 20 | (u32)dir << 30;
+        if (k != last)
+            psx_log(psx, "gpu: %s %d,%d %dx%d", dir == 1 ? "load" : "store", g->xx, g->xy, g->xw, g->xh);
+        last = k;
+    }
     /* reading VRAM, or writing it under the mask bits: the renderer's pixels first */
     if (dir == 2 || g->mask_check)
         sw_read(psx, g->xx, g->xy, g->xx + g->xw - 1, g->xy + g->xh - 1);
@@ -717,6 +736,36 @@ int gpu_display_height(const Psx *psx)
     return h;
 }
 
+/* A movie's frames can cover less than the display area: Exoddus loads its 240 lines at VRAM
+ * line 8 and shows lines 16-255, so the last 8 are never written. A TV hides such an edge in its
+ * overscan, but the PSP screen shows the whole display area, so it was a black band. Each side
+ * that the loads since the display went 24-bit leave uncovered is cut, as long as all that is cut
+ * on an axis stays within 1/16 of it: a letterbox the game means to show is far wider, and is
+ * kept instead of stretched. */
+void gpu_picture(const Psx *psx, int w, int h, int *x0, int *y0, int *x1, int *y1)
+{
+    const Gpu *g = &psx->gpu;
+    *x0 = *y0 = 0, *x1 = w, *y1 = h;
+    if (!(g->stat & 0x200000) || g->load_x1 <= g->load_x0)
+        return;
+    int a = -1, b = -1;
+    for (int r = 0; r < h; r++) {
+        u32 v = (u32)(g->disp_y + r) & 511;
+        if (g->load_rows[v >> 5] >> (v & 31) & 1) {
+            if (a < 0)
+                a = r;
+            b = r + 1;
+        }
+    }
+    if (a >= 0 && a + (h - b) <= h / 16)
+        *y0 = a, *y1 = b;
+    /* columns: 3 bytes a pixel, halfwords from the display's left edge */
+    int c = (g->load_x0 - g->disp_x) * 2 / 3, d = ((g->load_x1 - g->disp_x) * 2 + 2) / 3;
+    c = c < 0 ? 0 : c, d = d > w ? w : d;
+    if (c < d && c + (w - d) <= w / 16)
+        *x0 = c, *x1 = d;
+}
+
 void gpu_gp1(Psx *psx, u32 v)
 {
     Gpu *g = &psx->gpu;
@@ -755,6 +804,10 @@ void gpu_gp1(Psx *psx, u32 v)
     case 0x08:
         if (psx->trace & 32)
             psx_log(psx, "gpu: mode %02X", v & 0xFF);
+        if ((g->stat ^ (v & 0x10) << 17) & 0x200000) { /* into or out of 24-bit: a new movie */
+            memset(g->load_rows, 0, sizeof g->load_rows);
+            g->load_x0 = g->load_x1 = 0;
+        }
         g->stat = (g->stat & ~0x7F4000u) | ((v & 0x3F) << 17) | ((v & 0x40) << 10) | ((v & 0x80) << 7);
         psx_video_mode(psx);
         break;

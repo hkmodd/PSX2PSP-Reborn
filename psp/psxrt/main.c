@@ -551,11 +551,13 @@ static int draw_ps1(Psx *psx)
     sceGuEnable(GU_TEXTURE_2D);
     const int n = (480 + SLICE_W - 1) / SLICE_W;
     SliceVtx *v = (SliceVtx *)sceGuGetMemory(2 * n * sizeof(SliceVtx));
-    const float su = (float)w / 480.0f;
+    int px0, py0, px1, py1; /* the part of the display area that holds the picture */
+    gpu_picture(psx, w, h, &px0, &py0, &px1, &py1);
+    const float su = (float)(px1 - px0) / 480.0f;
     for (int i = 0; i < n; i++) {
         int x0 = i * SLICE_W, x1 = x0 + SLICE_W > 480 ? 480 : x0 + SLICE_W;
-        v[2 * i] = (SliceVtx){(float)x0 * su, 0.0f, (float)x0, 0.0f, 0.0f};
-        v[2 * i + 1] = (SliceVtx){(float)x1 * su, (float)h, (float)x1, 272.0f, 0.0f};
+        v[2 * i] = (SliceVtx){(float)px0 + (float)x0 * su, (float)py0, (float)x0, 0.0f, 0.0f};
+        v[2 * i + 1] = (SliceVtx){(float)px0 + (float)x1 * su, (float)py1, (float)x1, 272.0f, 0.0f};
     }
     sceGuDrawArray(GU_SPRITES, GU_TEXTURE_32BITF | GU_VERTEX_32BITF | GU_TRANSFORM_2D, 2 * n, 0, v);
     sceGuDisable(GU_TEXTURE_2D);
@@ -831,6 +833,12 @@ static void frame(int show)
                               (unsigned)((disc_stats.us_inflate[0] - d0.us_inflate[0]) / 1000),
                               (unsigned)((disc_stats.us_inflate[1] - d0.us_inflate[1]) / 1000));
                 d0 = disc_stats;
+                static u32 cs0[5];
+                const u32 cs[5] = {psx.cd.n_sect, psx.cd.n_xa, psx.cd.n_replaced, psx.cd.n_unread, psx.cd.n_loads};
+                n += snprintf(line + n, sizeof line - (size_t)n, "-- cd sectors: data %u xa %u replaced %u unread %u loaded %u\n",
+                              (unsigned)(cs[0] - cs0[0]), (unsigned)(cs[1] - cs0[1]), (unsigned)(cs[2] - cs0[2]),
+                              (unsigned)(cs[3] - cs0[3]), (unsigned)(cs[4] - cs0[4]));
+                memcpy(cs0, cs, sizeof cs0);
                 native_stats.us_late_max = 0;
                 us_pwait = us_pdraw = us_ptext = 0;
                 audio_drops = audio_gaps = audio_trims = audio_peak_in = audio_peak_out = 0;

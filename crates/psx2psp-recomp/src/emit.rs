@@ -52,8 +52,11 @@ const K1R: u32 = 27;
 const RA: u32 = 31;
 const GUEST_K: u32 = (1 << K0R) | (1 << K1R);
 const NOP: u32 = 0;
-/// Upper bound of a loop's charge ([`Em::loop_cost`]): a long body is mostly skipped paths.
+/// Upper bound of a loop's charge ([`Em::loop_cost`]).
 const MAX_LOOP_COST: u32 = 1024;
+/// Cycles a read from PS1 RAM adds to its instruction: the bus access (DuckStation's
+/// `RAM_READ_TICKS`). Used by [`Em::loop_cost`].
+const RAM_READ: u32 = 6;
 
 /// Why the runtime handles a guest instruction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -791,17 +794,35 @@ impl Em<'_> {
         c
     }
 
-    /// PS1 cycles charged for one pass of the loop `t..=a` (`a` the back-edge): its words, plus
-    /// two per memory access for the R3000A's load and store stalls. An estimate: what matters is
-    /// that a counted wait loop (PsyQ's `VSync` timeout) lasts as long as on the PS1.
+    /// PS1 cycles charged for one pass of the loop `t..=a` (`a` the back-edge): the words every
+    /// pass runs, plus [`RAM_READ`] for each read (writes go through the R3000A's write queue).
+    /// Words that a forward branch or jump inside the loop passes over are a path some passes
+    /// take, so they are not charged. Charging them made a decoder's pass (a switch over code
+    /// lengths) cost all its cases: Exoddus's movie decoder took 2.5 times its PS1 time and the
+    /// movies dropped frames.
+    ///
+    /// A counted wait loop must last as long as on the PS1. PsyQ's `VSync` gives each vblank it
+    /// waits for 32768 passes of 14 words and 3 reads, and prints "VSync: timeout" if they run
+    /// out first. At 32 cycles a pass that is 31 ms, against a 20 ms PAL frame. With 2 cycles a
+    /// read and the skipped words not charged it was 22 cycles, 21 ms: Sheep Dog's VSync timed
+    /// out every frame and the game ran unpaced.
     fn loop_cost(&self, t: u32, a: u32) -> u16 {
         use Kind::*;
+        let mut skipped = Vec::new();
+        for w in (t..a).step_by(4).filter(|w| self.d.code.contains(w)) {
+            let to = match self.at(w) {
+                Some((i, J)) => i.jump_target(w),
+                Some((i, Beq | Bne | Blez | Bgtz | Bltz | Bgez)) => i.branch_target(w),
+                _ => continue,
+            };
+            if to > w + 8 && to <= a {
+                skipped.push(w + 8..to);
+            }
+        }
         let mut cost = 0u32;
-        for w in (t..=a + 4).step_by(4).filter(|w| self.d.code.contains(w)) {
-            let mem = self.at(w).is_some_and(|(_, k)| {
-                matches!(k, Lb | Lh | Lwl | Lw | Lbu | Lhu | Lwr | Sb | Sh | Swl | Sw | Swr | Lwc2 | Swc2)
-            });
-            cost += if mem { 3 } else { 1 };
+        for w in (t..=a + 4).step_by(4).filter(|w| self.d.code.contains(w) && !skipped.iter().any(|r| r.contains(w))) {
+            let read = self.at(w).is_some_and(|(_, k)| matches!(k, Lb | Lh | Lwl | Lw | Lbu | Lhu | Lwr | Lwc2));
+            cost += if read { 1 + RAM_READ } else { 1 };
         }
         cost.clamp(1, MAX_LOOP_COST) as u16
     }
