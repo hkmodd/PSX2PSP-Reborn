@@ -125,6 +125,13 @@ pub fn repatch(host: u32, guest: u32) -> Option<u32> {
     (new & keep == host & keep).then_some(new)
 }
 
+/// Whether [`repatch`] can take a rewrite of `w` at all: an I-type ALU immediate (`addi` to
+/// `lui`) or a constant shift.
+pub fn patchable(w: u32) -> bool {
+    let op = w >> 26;
+    (8..=0xF).contains(&op) || (op == 0 && matches!(w & 0x3F, 0 | 2 | 3))
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum EmitError {
     #[error("guest {pc:#010x}: host branch needs {words} words, beyond the 16-bit range")]
@@ -343,13 +350,24 @@ pub fn translate(
     hz: &Hazards,
     base: u32,
 ) -> Result<Translation, EmitError> {
+    translate_with(exe, d, hz, base, &hooks::find(exe, d))
+}
+
+/// [`translate`] with the hooks given ([`hooks::find`] of another text: the runtime keeps the
+/// hooks of the text it translated when the game rewrites words of it).
+pub fn translate_with(
+    exe: &PsxExe,
+    d: &Discovery,
+    hz: &Hazards,
+    base: u32,
+    hooks: &BTreeMap<u32, Hook>,
+) -> Result<Translation, EmitError> {
     if base & 3 != 0 || (base ^ RT_CALL) & 0xF000_0000 != 0 {
         return Err(EmitError::Base(base));
     }
-    let hooks = hooks::find(exe, d);
     let mut long = BTreeSet::new();
     loop {
-        match emit(exe, d, hz, base, &long, &hooks) {
+        match emit(exe, d, hz, base, &long, hooks) {
             Ok(t) => return Ok(t),
             Err(Fail::Error(e)) => return Err(e),
             Err(Fail::Far(far)) => {

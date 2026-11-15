@@ -12,7 +12,7 @@ typedef struct CodeEntry {
     u32 table_off, table_stored; /* the raw table is one word per text word */
     char name[16];
     u32 head_hash; /* FNV-1a of the first HEAD_LEN bytes of the text */
-    u32 pad[2];
+    u32 patch_off, patch_groups; /* the patch table (native.c patch_group), 0 for none */
 } CodeEntry;
 
 typedef struct DiscInfo {

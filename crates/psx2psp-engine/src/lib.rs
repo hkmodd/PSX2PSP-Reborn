@@ -812,7 +812,9 @@ pub const NATIVE_RUNTIME: &[u8] = include_bytes!("../../../resources/psxrt.prx")
 ///   00:02:00, LBA 150), fewer in the last one; it is raw deflate, or the sectors as they are when
 ///   deflate would not be smaller (its length is then that of the raw data);
 /// - the translated code ([`native_code`]): for each executable its code and its dispatch-table
-///   slice, each deflated or stored the same way, then a directory of
+///   slice, each deflated or stored the same way, its patch table ([`native_code::patch_groups`]:
+///   one (offset from the table, stored length, raw length) triple per group, then the groups,
+///   each deflated or stored), then a directory of
 ///   [`NATIVE_CODE_ENTRY_LEN`]-byte entries ([`native_code_entry`]). None without code.
 pub const NATIVE_PSAR_MAGIC: [u8; 8] = *b"PSXRTDAT";
 pub const NATIVE_PSAR_VERSION: u32 = 4;
@@ -861,8 +863,8 @@ pub fn native_psar_header(disc_id: &str, title: &str, disc_sectors: u32, flags: 
 /// code offset, stored code length, table offset, stored table length (offsets from the start
 /// of DATA.PSAR; a stored length equal to the raw one means stored as is, the raw table length
 /// is the text size rounded up to words), file name NUL padded to 16 bytes, hash of the first
-/// [`native_code::HEAD_LEN`] bytes of the text, then zeros.
-pub fn native_code_entry(img: &native_code::CodeImage, code: (u32, u32), table: (u32, u32)) -> [u8; NATIVE_CODE_ENTRY_LEN] {
+/// [`native_code::HEAD_LEN`] bytes of the text, patch table offset and group count.
+pub fn native_code_entry(img: &native_code::CodeImage, code: (u32, u32), table: (u32, u32), patch: (u32, u32)) -> [u8; NATIVE_CODE_ENTRY_LEN] {
     let mut e = [0u8; NATIVE_CODE_ENTRY_LEN];
     let words = [img.text_addr, img.text_size, img.hash, img.host_base, img.code.len() as u32, code.0, code.1, table.0, table.1];
     for (i, v) in words.iter().enumerate() {
@@ -872,6 +874,8 @@ pub fn native_code_entry(img: &native_code::CodeImage, code: (u32, u32), table: 
     let n = name.len().min(15);
     e[0x24..0x24 + n].copy_from_slice(&name[..n]);
     e[0x34..0x38].copy_from_slice(&img.head_hash.to_le_bytes());
+    e[0x38..0x3C].copy_from_slice(&patch.0.to_le_bytes());
+    e[0x3C..0x40].copy_from_slice(&patch.1.to_le_bytes());
     e
 }
 
@@ -970,16 +974,27 @@ fn write_native_psar<W: Write + Seek>(
             let z = miniz_oxide::deflate::compress_to_vec(raw, level);
             if z.len() < raw.len() { z } else { raw.to_vec() }
         };
-        let blobs: Vec<(Vec<u8>, Vec<u8>)> = code.images.par_iter().map(|i| (pack(&i.code), pack(&i.table))).collect();
+        let blobs: Vec<(Vec<u8>, Vec<u8>, Vec<Vec<u8>>)> =
+            code.images.par_iter().map(|i| (pack(&i.code), pack(&i.table), i.patch.iter().map(|g| pack(g)).collect())).collect();
         let mut dir = Vec::with_capacity(code.images.len() * NATIVE_CODE_ENTRY_LEN);
-        for (i, (c, t)) in code.images.iter().zip(&blobs) {
+        for (i, (c, t, p)) in code.images.iter().zip(&blobs) {
             let code_at = (offset(pos)?, c.len() as u32);
             w.write_all(c)?;
             pos += c.len() as u64;
             let table_at = (offset(pos)?, t.len() as u32);
             w.write_all(t)?;
             pos += t.len() as u64;
-            dir.extend_from_slice(&native_code_entry(i, code_at, table_at));
+            let patch_at = (offset(pos)?, p.len() as u32);
+            let mut at = 12 * p.len() as u32;
+            for (g, raw) in p.iter().zip(&i.patch) {
+                w.write_all(&[at, g.len() as u32, raw.len() as u32].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+                at += g.len() as u32;
+            }
+            for g in p {
+                w.write_all(g)?;
+            }
+            pos += u64::from(at);
+            dir.extend_from_slice(&native_code_entry(i, code_at, table_at, patch_at));
         }
         let fields = [offset(pos)?, code.images.len() as u32, code.base, code.size];
         w.write_all(&dir)?;

@@ -42,6 +42,12 @@ dispatch table (one word per PS1 RAM word) with MISS.
   whichever shared its range). No match: the interpreter runs it. A MISS entry inside an
   executable whose slice is installed is code the translator did not find: interpreted, no
   hashing.
+* Code the game's own stores rewrite is checked at each I-cache flush (FlushCache, end of a
+  cache isolation), per 1 KB block of code words (translated words and their delay slots). A
+  block that changed only in immediates and shift amounts keeps its translation: the patch
+  table (below) gives every host word that copies each such instruction, and the runtime writes
+  the new immediate there (`addi` as `addiu`). Any other change, or a word that is not one plain
+  copy, sends the block to the interpreter (DIRTY).
 * Translated code enters the runtime through host calls (I/O, COP0, GTE, syscalls, resumes),
   dispatch misses and loop back-edges; the runtime interprets until an address with a
   translation and goes back there.
@@ -127,9 +133,9 @@ The index holds blocks + 1 offsets: block i is `index[i]..index[i+1]`. A block i
 or stored as is when deflate would not make it smaller (its length is then the raw length; only
 the last block may be shorter than 16 sectors).
 
-The blocks are followed by each translated executable's code and dispatch-table slice (one
-word per text word: a host address, or MISS), stored the same way, then the directory, 0x40
-bytes per executable (`CodeEntry` in `disc.h`):
+The blocks are followed by each translated executable's code, dispatch-table slice (one word
+per text word: a host address, or MISS) and patch table, stored the same way, then the
+directory, 0x40 bytes per executable (`CodeEntry` in `disc.h`).
 
 | Offset | Size | Field |
 |---|---|---|
@@ -144,7 +150,16 @@ bytes per executable (`CodeEntry` in `disc.h`):
 | 0x20 | 4 | stored length of the table slice |
 | 0x24 | 16 | file name on the disc, NUL padded |
 | 0x34 | 4 | FNV-1a 32 of the first 2048 bytes of the text (all of it when shorter): checked before the whole text, so data loaded over the address costs 2 KB of hashing, not the text size |
-| 0x38 | 8 | zero |
+| 0x38 | 4 | offset of the patch table (0: none) |
+| 0x3C | 4 | groups in the patch table |
+
+The patch table is one group per 4 KB of RAM from the 1 KB block of the text's first word: a
+(offset from the table, stored length, raw length) triple per group, then the groups, each
+deflated or stored. A group's words: 5 offsets (in words, from the group's start) where each
+1 KB block's entries start and the last ones end, then the entries, for each code word whose
+rewrite could be patched (an I-type ALU immediate or a constant shift): `index | n << 8`
+(`index` the word in its block), then `n` host addresses of its copies, or for `n` 0 the word as
+translated (any rewrite of it goes to the interpreter).
 
 ## Build
 

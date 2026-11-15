@@ -30,15 +30,19 @@
  * (the CD's sectors) would run ahead of the guest code that serves them. A 500 us alarm makes the budget negative, so
  * that loops enter the runtime and interrupts are taken there.
  *
- * Code written by CPU stores (decompressed or copied by the game) is measured at each I-cache
+ * Code written by CPU stores (decompressed or copied by the game) is checked at each I-cache
  * flush, which the R3000A needs before running it too: FlushCache, or the end of a cache
- * isolation. 1 KB blocks whose translated words no longer sum as when their table entries were
- * set are logged; they keep their translation.
+ * isolation. A 1 KB block whose code words (translated, or delay slots) no longer sum as when
+ * its table entries were set either changed only in immediates and shift amounts (Sheep Dog
+ * sets those of its 3D code at each level load), and the translator's patch table says where
+ * to write them in the host code (GOAL.MD S20d), or goes DIRTY for the interpreter.
  * While the cache is isolated (SR bit 16) the guest runs in the interpreter, whose stores do not
  * reach RAM; translated stores would.
  *
- * Limits: code CPU stores change runs its old translation (Sheep Dog's level immediates), EPC
- * holds host addresses while translated code is interrupted, and GRET returns are LIFO.
+ * Limits: code stores change with no flush after them run their old translation, as do direct
+ * host jumps into a block gone DIRTY and hooked library functions (emit.rs hooks) whose words
+ * the game rewrites; EPC holds host addresses while translated code is interrupted, and GRET
+ * returns are LIFO.
  */
 #include "native.h"
 #include "vlc.h"
@@ -119,6 +123,7 @@ typedef struct Image {
     u32 text; /* text address & 0x1FFFFC */
     int resident;  /* its code is at host_base */
     int installed; /* its table slice is in TABLE (resident, and no other slice loaded over it) */
+    int patched;   /* its code holds immediates the game rewrote: read again before reinstalling */
     u32 gen, checked; /* disc loads over its text; gen at the last check */
 } Image;
 
@@ -158,31 +163,181 @@ static u32 fnv1a(const u8 *p, u32 n)
     return h;
 }
 
-/* Code CPU stores change, seen at a cache flush: RAM in blocks of 1 KB, each with a sum of the
- * words the table translates there, as RAM held them when the block's entries were last set
- * (every change of the table sums its blocks again). Data and undiscovered words are left out:
- * an executable's text_size covers its data section too, which the game writes all the time. */
+/* Code CPU stores change, seen at a cache flush: RAM in blocks of 1 KB, each with two sums of
+ * its code words (those the table translates, and the delay slots after them), as RAM held them
+ * when the block's entries were last set (every change of the table sums its blocks again): the
+ * words, and their form (the words without the immediates and shift amounts a patch table can
+ * rewrite). Data and undiscovered words are left out: an executable's text_size covers its data
+ * section too, which the game writes all the time. */
 #define BLK_SHIFT 10
 #define BLKS (RAM_SIZE >> BLK_SHIFT)
-static u32 blk_sum[BLKS];
+static u32 blk_sum[BLKS], blk_form[BLKS];
 static u8 blk_code[BLKS]; /* the block has translated words: a flush checks it */
+static u8 blk_slot0[BLKS];
 
-static u32 blk_code_sum(u32 b, u8 *code)
+/* A rewrite of `w` a patch table can take: an I-type ALU immediate or a constant shift (emit.rs
+ * patchable). */
+static int patchable(u32 w)
+{
+    u32 op = w >> 26, f = w & 0x3F;
+    return (op >= 8 && op <= 0xF) || (op == 0 && (f == 0 || f == 2 || f == 3));
+}
+
+/* `w` without what a patch rewrites: its immediate (addi as addiu) or shift amount. */
+static u32 form(u32 w)
+{
+    if (!patchable(w))
+        return w;
+    if (!(w >> 26))
+        return w & ~(0x1Fu << 6);
+    return ((w >> 26) == 8 ? w | 1u << 26 : w) & 0xFFFF0000u;
+}
+
+/* An instruction with a delay slot: branches, jumps, COP branches. */
+static int has_slot(u32 w)
+{
+    u32 op = w >> 26, f = w & 0x3F;
+    return (op >= 1 && op <= 7) || (op == 0 && (f == 8 || f == 9)) || (op >= 0x10 && op <= 0x13 && ((w >> 21) & 0x1F) == 8);
+}
+
+/* The new host word for `guest` where the simple instruction translated to `host` is, if it is
+ * the same instruction with another immediate or shift amount: 1 and *out (emit.rs repatch). */
+static int repatch(u32 host, u32 guest, u32 *out)
+{
+    u32 nw = guest >> 26 == 8 ? guest | 1u << 26 : guest;
+    if (!patchable(nw) || form(nw) != form(host))
+        return 0;
+    *out = nw;
+    return 1;
+}
+
+/* `slot`: the block's first word is the delay slot of the word before, as when the sums were
+ * taken (blk_slot0): a block sent to the interpreter must not change the next one's sums. */
+static u32 blk_code_sum(u32 b, u8 *code, u32 *fsum, int slot)
 {
     const u32 *w = (const u32 *)(P->ram + (b << BLK_SHIFT)), *t = &table[b << (BLK_SHIFT - 2)];
-    u32 h = 0x811C9DC5u, len = code_hi - code_lo;
+    u32 h = 0x811C9DC5u, f = h, len = code_hi - code_lo;
     *code = 0;
-    for (u32 i = 0; i < 1u << (BLK_SHIFT - 2); i++)
-        if (t[i] - code_lo < len)
-            h = (h ^ w[i]) * 0x01000193u, *code = 1;
+    for (u32 i = 0; i < 1u << (BLK_SHIFT - 2); i++) {
+        int in = t[i] - code_lo < len;
+        if (in || slot)
+            h = (h ^ w[i]) * 0x01000193u, f = (f ^ form(w[i])) * 0x01000193u, *code = 1;
+        slot = in && has_slot(w[i]);
+    }
+    *fsum = f;
     return h;
 }
 
 /* The table entries of [a, a + len) of RAM changed: their blocks are summed again. */
 static void blk_resum(u32 a, u32 len)
 {
-    for (u32 b = a >> BLK_SHIFT, e = (a + len + (1u << BLK_SHIFT) - 1) >> BLK_SHIFT; b < e && b < BLKS; b++)
-        blk_sum[b] = blk_code_sum(b, &blk_code[b]);
+    for (u32 b = a >> BLK_SHIFT, e = (a + len + (1u << BLK_SHIFT) - 1) >> BLK_SHIFT; b < e && b < BLKS; b++) {
+        const u32 *w = (const u32 *)(P->ram + (b << BLK_SHIFT));
+        blk_slot0[b] = b && table[(b << (BLK_SHIFT - 2)) - 1] - code_lo < code_hi - code_lo && has_slot(w[-1]);
+        blk_sum[b] = blk_code_sum(b, &blk_code[b], &blk_form[b], blk_slot0[b]);
+    }
+}
+
+/* Patch tables (engine native_code::patch_groups): per executable, one group per PATCH_BLKS
+ * blocks from its text's first, read when a block of it changes. A group: PATCH_BLKS + 1 word
+ * offsets of each block's entries, then entries: `index | n << 8` (the word in its block), then
+ * n host addresses of its copies, or for n 0 the word as translated (any rewrite is DIRTY). */
+#define PATCH_BLKS 4u
+#define PATCH_MAX (32u * 1024u)
+static u32 pbuf[PATCH_MAX / 4];
+static const CodeEntry *pbuf_e;
+static u32 pbuf_g;
+
+static const u32 *patch_group(const CodeEntry *e, u32 g)
+{
+    if (pbuf_e == e && pbuf_g == g)
+        return pbuf;
+    u32 d[3]; /* offset from patch_off, stored length, raw length */
+    pbuf_e = NULL;
+    if (!e->patch_off || g >= e->patch_groups || disc_blob(e->patch_off + 12 * g, 12, d, 12) < 0 || d[2] > PATCH_MAX ||
+        d[2] < 4 * (PATCH_BLKS + 1) || (d[2] & 3) || disc_blob(e->patch_off + d[0], d[1], pbuf, d[2]) < 0)
+        return NULL;
+    for (u32 k = 0; k < PATCH_BLKS; k++)
+        if (pbuf[k] < PATCH_BLKS + 1 || pbuf[k] > pbuf[k + 1] || pbuf[k + 1] > d[2] / 4)
+            return NULL;
+    pbuf_e = e, pbuf_g = g;
+    return pbuf;
+}
+
+/* Whether `m`'s translation runs RAM word `o`: its table entry is in m's code, or it is the
+ * delay slot of a word whose entry is. */
+static int runs(const Image *m, u32 o)
+{
+    u32 lo = m->e->host_base, len = m->e->code_len, t = table[o >> 2];
+    if (t - lo < len)
+        return 1;
+    return o >= 4 && t - code_lo >= code_hi - code_lo && table[(o >> 2) - 1] - lo < len && has_slot(*(const u32 *)(P->ram + o - 4));
+}
+
+/* Block `b` of RAM in `m`'s translation: the host words its patch table gives for the
+ * immediates and shift amounts RAM holds, written when `write`. Their count, or -1 when a word
+ * `m` runs there cannot be patched (its form changed, or it is not one plain copy). */
+static u32 why[4]; /* the last refusal: kind (1 no group, 2 bad entry, 3 pinned, 4 host word, 5 host address) | word << 8, RAM's, expected, host address */
+static const CodeEntry *why_e;
+#define REFUSE(k, at, now, was) (why[0] = (k) | (at) << 8, why[1] = (now), why[2] = (was), -1)
+static int patch_block(Image *m, u32 b, int write)
+{
+    const CodeEntry *e = m->e;
+    u32 k = b - (m->text >> BLK_SHIFT), o = b << BLK_SHIFT;
+    const u32 *p = patch_group(e, k / PATCH_BLKS), *w = (const u32 *)(P->ram + o);
+    if (!p)
+        return REFUSE(1, 0, k, e->patch_groups);
+    int n = 0;
+    for (u32 i = p[k % PATCH_BLKS], end = p[k % PATCH_BLKS + 1]; i < end;) {
+        u32 at = p[i] & 0xFF, hosts = p[i] >> 8 & 0xFF, now = w[at];
+        if (++i + (hosts ? hosts : 1) > end)
+            return REFUSE(2, at, i, end);
+        if (!runs(m, o + 4 * at)) {
+            i += hosts ? hosts : 1;
+            continue;
+        }
+        if (!hosts) {
+            if (p[i++] != now)
+                return REFUSE(3, at, now, p[i - 1]);
+            continue;
+        }
+        for (u32 j = 0; j < hosts; j++, i++) {
+            u32 a = p[i], nw;
+            /* PPSSPP's JIT marks its blocks' first words in memory with op 0x1A (never Allegrex's):
+             * that word's form is the block's, which the block's form sum vouched for. */
+            u32 hw = a - e->host_base < e->code_len ? *(u32 *)a : 0;
+            if (hw >> 26 == 0x1A)
+                hw = form(now >> 26 == 8 ? now | 1u << 26 : now);
+            if (a - e->host_base >= e->code_len || (a & 3) || !repatch(hw, now, &nw))
+                return why[3] = a, REFUSE(a - e->host_base < e->code_len ? 4 : 5, at, now, a - e->host_base < e->code_len ? *(u32 *)a : 0);
+            if (nw != *(u32 *)a) {
+                n++;
+                if (write)
+                    *(u32 *)a = nw;
+            }
+        }
+    }
+    return n;
+}
+
+/* Block `b` changed in immediates and shift amounts only: the translations running it take
+ * RAM's, all or none. Host words written, or -1. */
+static int patch_rewrites(u32 b)
+{
+    u32 lo = b << BLK_SHIFT, hi = lo + (1u << BLK_SHIFT);
+    int n = 0;
+    for (int write = 0; write < 2; write++)
+        for (int i = 0; i < nimg; i++) {
+            Image *m = &img[i];
+            if (!m->resident || m->text >= hi || m->text + m->e->text_size <= lo)
+                continue;
+            int r = patch_block(m, b, write);
+            if (r < 0)
+                return why_e = m->e, -1;
+            if (write && r)
+                n += r, m->patched = 1;
+        }
+    return n;
 }
 
 static void flush_code(void)
@@ -257,15 +412,17 @@ static void evict(Image *m)
 static int load(Image *m)
 {
     const CodeEntry *e = m->e;
-    if (!m->resident) {
+    if (!m->resident || m->patched) {
         for (int i = 0; i < nimg; i++)
             if (&img[i] != m && img[i].resident && img[i].e->host_base == e->host_base)
                 evict(&img[i]);
         if (disc_blob(e->code_off, e->code_stored, (void *)e->host_base, e->code_len) < 0) {
             say("native: cannot read the code of %.16s", e->name);
+            m->resident = 0;
             return -1;
         }
         m->resident = 1;
+        m->patched = 0;
     }
     if (disc_blob(e->table_off, e->table_stored, &table[m->text >> 2], (e->text_size + 3) & ~3u) < 0) {
         say("native: cannot read the table of %.16s", e->name);
@@ -316,27 +473,46 @@ static int try_load(u32 pc, int miss)
     return 0;
 }
 
-/* The I-cache was flushed: blocks whose translated words CPU stores changed are counted and
- * logged, and keep running their translation (S19 behaviour). Marking them DIRTY sent them to
- * the interpreter for good: Sheep Dog sets addi/slti immediates of its 3D code at each level
- * load, and the PSP ran its 3D at 9-12% (S20 log). The first flushes, and those that find a
- * change, are logged with their time. */
+static void on_ram_loaded(Psx *psx, u32 addr, u32 len);
+
+/* The I-cache was flushed: a block whose code words CPU stores changed keeps its translation,
+ * patched, when only immediates and shift amounts changed; otherwise it is checked again before
+ * use, as if loaded over (DIRTY: the interpreter), and the rest of its executable stays. The
+ * first flushes, and those that find a change, are logged with their time. */
 static void cache_flushed(void)
 {
     static u32 n;
-    u32 t = sceKernelGetSystemTimeLow(), code = 0, changed = 0;
+    u32 t = sceKernelGetSystemTimeLow(), code = 0, changed = 0, words = 0, dirty = 0;
     u8 any;
     for (u32 b = 0; b < BLKS; b++) {
         if (!blk_code[b])
             continue;
         code++;
-        u32 s = blk_code_sum(b, &any);
-        if (s != blk_sum[b])
-            changed++, blk_sum[b] = s;
+        u32 f, s = blk_code_sum(b, &any, &f, blk_slot0[b]);
+        if (s == blk_sum[b])
+            continue;
+        changed++;
+        int r = f == blk_form[b] ? patch_rewrites(b) : -1;
+        if (r >= 0) {
+            words += (u32)r;
+            blk_sum[b] = s;
+            continue;
+        }
+        if (dirty++ < 4) {
+            if (f == blk_form[b])
+                say("native: %08X: code rewritten where the patch table cannot write (%.16s: %u at word %u: %08X, %08X at %08X): to the interpreter",
+                    (unsigned)(0x80000000u | b << BLK_SHIFT), why_e ? why_e->name : "?", (unsigned)(why[0] & 0xFF), (unsigned)(why[0] >> 8),
+                    (unsigned)why[1], (unsigned)why[2], (unsigned)why[3]);
+            else
+                say("native: %08X: code rewritten beyond immediates: to the interpreter", (unsigned)(0x80000000u | b << BLK_SHIFT));
+        }
+        on_ram_loaded(P, b << BLK_SHIFT, 1u << BLK_SHIFT);
     }
+    if (words)
+        flush_code();
     if (n++ < 8 || changed)
-        say("native: cache flush %u: %u of %u KB of code changed (%u us)", (unsigned)n, (unsigned)changed, (unsigned)code,
-            (unsigned)(sceKernelGetSystemTimeLow() - t));
+        say("native: cache flush %u: %u of %u KB of code changed, %u words patched, %u KB to the interpreter (%u us)", (unsigned)n,
+            (unsigned)changed, (unsigned)code, (unsigned)words, (unsigned)dirty, (unsigned)(sceKernelGetSystemTimeLow() - t));
 }
 
 /* PSX.ram_loaded: the translations of what was overwritten are checked again before use. `len` 0:
@@ -1146,7 +1322,7 @@ const char *native_init(Psx *psx, const DiscInfo *info)
         if (text >= RAM_SIZE * 4 || (text & 3) || (text & (RAM_SIZE - 1)) + e->text_size > RAM_SIZE || e->host_base < code_lo ||
             e->host_base + e->code_len > code_hi || (e->host_base & 3))
             return "DATA.PSAR code directory is out of range";
-        img[i] = (Image){e, text & (RAM_SIZE - 4), 0, 0, 0, ~0u};
+        img[i] = (Image){e, text & (RAM_SIZE - 4), 0, 0, 0, 0, ~0u};
     }
     nimg = (int)info->images;
     cpu_shift = info->cpu_shift > 8 ? 8 : info->cpu_shift;
@@ -1230,6 +1406,7 @@ int native_load(int fd)
     for (u32 i = 0; i < n; i++) {
         Image *m = &img[i];
         m->resident = (int)st[i][0], m->installed = (int)st[i][1], m->gen = st[i][2], m->checked = st[i][3];
+        m->patched = 0;
         if (m->resident && disc_blob(m->e->code_off, m->e->code_stored, (void *)m->e->host_base, m->e->code_len) < 0) {
             say("native: cannot read the code of %.16s", m->e->name);
             return -1;
@@ -1237,6 +1414,23 @@ int native_load(int fd)
         if (m->resident)
             say("native: %.16s at %08X (snapshot)", m->e->name, (unsigned)m->e->text_addr);
     }
+    /* The code read is the executable's: RAM's immediates go back in (or the block is DIRTY). */
+    u32 words = 0, dirty = 0;
+    for (u32 i = 0; i < n; i++) {
+        Image *m = &img[i];
+        for (u32 b = m->text >> BLK_SHIFT, e = (m->text + m->e->text_size - 1) >> BLK_SHIFT; m->resident && b <= e; b++) {
+            int r = patch_block(m, b, 0);
+            if (r < 0) {
+                dirty++;
+                on_ram_loaded(P, b << BLK_SHIFT, 1u << BLK_SHIFT);
+            } else if (r) {
+                words += (u32)patch_block(m, b, 1);
+                m->patched = 1;
+            }
+        }
+    }
+    if (words || dirty)
+        say("native: snapshot: %u words patched, %u KB to the interpreter", (unsigned)words, (unsigned)dirty);
     flush_code();
     return 0;
 }

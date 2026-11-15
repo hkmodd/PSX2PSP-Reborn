@@ -4,8 +4,9 @@
 //! have, bit for bit. The fresh translation keeps the first one's Discovery and Hazards, as the
 //! runtime does.
 
-use psx2psp_recomp::emit::repatch;
-use psx2psp_recomp::{Discovery, Hazards, PsxExe, Translation, translate};
+use psx2psp_recomp::emit::{patchable, repatch};
+use psx2psp_recomp::emit::translate_with;
+use psx2psp_recomp::{Discovery, Hazards, PsxExe, Translation, hooks, translate};
 
 const BASE: u32 = 0x8001_0000;
 const CODE: u32 = 0x08A0_0000;
@@ -195,4 +196,52 @@ fn real_rewrites_patch_to_a_fresh_translation() {
     assert!(patched > 0, "the dump has no rewrite of translated code");
     let t2 = translate(&x2, &d, &hz, CODE).unwrap();
     assert_eq!(t.words, t2.words);
+}
+
+/// Every patchable word of every PS-X EXE in `PSX2PSP_EXES` rewritten at once (immediate or shift
+/// amount flipped), the table applied: the result must be a fresh translation of the rewritten
+/// text, so that no copy of a word is missing from [`Translation::patch`] and nothing else in the
+/// translation depends on an immediate.
+/// `PSX2PSP_EXES=<dir> cargo test -p psx2psp-recomp --release --test patch -- --ignored --nocapture`
+#[test]
+#[ignore = "needs PSX2PSP_EXES"]
+fn every_patchable_word_of_real_executables_patches() {
+    let dir = std::env::var("PSX2PSP_EXES").expect("PSX2PSP_EXES");
+    let mut seen = 0;
+    for f in std::fs::read_dir(&dir).unwrap().flatten() {
+        let Ok(bytes) = std::fs::read(f.path()) else { continue };
+        let Ok(x) = PsxExe::parse(&bytes) else { continue };
+        let d = Discovery::run(&x);
+        let hz = Hazards::check(&x, &d);
+        let Ok(mut t) = translate(&x, &d, &hz, CODE) else { continue };
+        let mut x2 = x.clone();
+        let (mut words, mut copies) = (0, 0);
+        let pcs: Vec<u32> = t.patch.keys().copied().collect();
+        for pc in pcs {
+            let w = word(&x, pc);
+            if !patchable(w) {
+                continue;
+            }
+            let new = if w >> 26 == 0 { w ^ 0x15 << 6 } else { w ^ 0x5A5A };
+            set_word(&mut x2, pc, new);
+            match apply(&mut t, pc, new) {
+                Patched::Yes(n) => (words, copies) = (words + 1, copies + n),
+                got => panic!("{:?} {pc:08X}: {got:?}", f.file_name()),
+            }
+        }
+        let t2 = translate_with(&x2, &d, &hz, CODE, &hooks::find(&x, &d)).unwrap();
+        let diff = t.words.iter().zip(&t2.words).filter(|(a, b)| a != b).count();
+        println!("{:?}: {words} words at {copies} host words patched, {diff} host words differ", f.file_name());
+        if let Some((&g, &h)) = t.map.iter().zip(&t2.map).find(|(a, b)| a != b).map(|(a, _)| a) {
+            println!("  layout differs from guest {g:08X} (host {h:08X} / {:08X?})", t2.map.get(&g));
+            let g = t.map.range(..g).next_back().map_or(g, |(g, _)| *g);
+            for pc in (g.saturating_sub(16)..g + 32).step_by(4) {
+                println!("    {pc:08X} {:08X} -> {:08X}", word(&x, pc), word(&x2, pc));
+            }
+        }
+        assert_eq!(t.words.len(), t2.words.len());
+        assert_eq!(diff, 0, "{:?}", f.file_name());
+        seen += 1;
+    }
+    assert!(seen > 0, "no PS-X EXE in {dir}");
 }

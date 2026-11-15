@@ -7,10 +7,11 @@
 //! different addresses get disjoint regions, so a loader and the program it loads can be
 //! resident together. Nothing here knows a game: what is translated is what the disc holds.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::OnceLock;
 
-use psx2psp_recomp::{Discovery, Hazards, Hit, PsxExe, Signatures, layout, translate};
+use psx2psp_recomp::emit::patchable;
+use psx2psp_recomp::{Discovery, Hazards, Hit, PsxExe, Signatures, Translation, layout, translate};
 use rayon::prelude::*;
 
 /// Lowest host address translated code may take: below it are the runtime module, its heap and
@@ -43,6 +44,66 @@ pub struct CodeImage {
     pub table: Vec<u8>,
     /// Guest instructions the runtime executes for the translation (COP0, GTE, syscalls...).
     pub runtime_calls: usize,
+    /// Patch table ([`patch_groups`]): one group of little-endian words per
+    /// [`PATCH_GROUP_BLOCKS`] blocks of RAM from the text's first block.
+    pub patch: Vec<Vec<u8>>,
+}
+
+/// Bytes of RAM per block of the runtime's rewrite check (`psp/psxrt/native.c`, BLK_SHIFT).
+pub const PATCH_BLOCK: u32 = 1024;
+/// Blocks per group of the patch table.
+pub const PATCH_GROUP_BLOCKS: u32 = 4;
+/// Largest raw group the runtime reads (its buffer).
+pub const PATCH_GROUP_MAX: usize = 32 * 1024;
+
+/// The patch table of a translation (GOAL.MD S20d): for every word of the text that is code
+/// (discovered, or a delay slot) and whose rewrite [`patchable`] could take, where the runtime
+/// writes its new immediate or shift amount when the game rewrites it.
+///
+/// Group `g` covers RAM blocks `first + 4g ..` (`first`: the block of the text's first word).
+/// Its words: [`PATCH_GROUP_BLOCKS`] + 1 offsets (in words, from the group's start) where each
+/// block's entries start and the last one ends, then the entries. An entry is a word
+/// `index | n << 8` (`index`: the word's in its block), then either `n` host addresses (the
+/// copies to patch, [`Translation::patch`]) or, for `n` 0, the word as translated: it is not
+/// one plain copy (it uses `k0`/`k1`, say), and any rewrite sends its block to the interpreter.
+pub fn patch_groups(exe: &PsxExe, d: &Discovery, t: &Translation) -> Vec<Vec<u8>> {
+    let ram = exe.text_addr & 0x1F_FFFF;
+    let len = exe.text.len() as u32;
+    let first = ram / PATCH_BLOCK;
+    let blocks = (ram + len).div_ceil(PATCH_BLOCK) - first;
+    let mut code: BTreeSet<u32> = d.code.clone();
+    code.extend(d.delay_slots.keys());
+    let head = PATCH_GROUP_BLOCKS as usize + 1;
+    let group = |g: u32, pin: bool| {
+        let mut w = vec![0u32; head];
+        for k in 0..PATCH_GROUP_BLOCKS {
+            w[k as usize] = w.len() as u32;
+            let lo = (first + g * PATCH_GROUP_BLOCKS + k) * PATCH_BLOCK;
+            for o in (lo.max(ram)..(lo + PATCH_BLOCK).min(ram + len)).step_by(4) {
+                let pc = exe.text_addr + (o - ram);
+                let Some(word) = exe.word(pc).filter(|&x| code.contains(&pc) && patchable(x)) else { continue };
+                let index = (o - lo) / 4;
+                match t.patch.get(&pc).filter(|h| !pin && h.len() < 256) {
+                    Some(h) => {
+                        w.push(index | (h.len() as u32) << 8);
+                        w.extend(h);
+                    }
+                    None => w.extend([index, word]),
+                }
+            }
+        }
+        w[head - 1] = w.len() as u32;
+        w
+    };
+    (0..blocks.div_ceil(PATCH_GROUP_BLOCKS))
+        .map(|g| {
+            let mut w = group(g, false);
+            if w.len() * 4 > PATCH_GROUP_MAX {
+                w = group(g, true); // two words per code word: always fits
+            }
+            w.iter().flat_map(|x| x.to_le_bytes()).collect()
+        })
+        .collect()
 }
 
 /// All the translated code of a disc.
@@ -165,6 +226,7 @@ pub fn build(exes: Vec<(String, Vec<u8>)>) -> Result<CodePack, String> {
                 code: t.words.iter().flat_map(|w| w.to_le_bytes()).collect(),
                 table: table.iter().flat_map(|w| w.to_le_bytes()).collect(),
                 runtime_calls: t.runtime.len(),
+                patch: patch_groups(&p.exe, &p.disc, &t),
             })
         })
         .collect();
@@ -252,5 +314,31 @@ mod tests {
         assert_eq!(c.hash, fnv1a32(&[JR_RA.to_le_bytes(), [0; 4]].concat()));
         assert_eq!(c.head_hash, c.hash); // text shorter than HEAD_LEN
         assert!((0..3).all(|i| word(&a.table, i) == layout::MISS || (a.host_base..a.host_base + a.code.len() as u32).contains(&word(&a.table, i))));
+    }
+
+    #[test]
+    fn the_patch_table_lists_each_patchable_code_word_by_block() {
+        const ADDIU_K0_5: u32 = 0x241A_0005; // uses the guest's k0: not one plain copy
+        let text = [ADDIU_V0_1, ADDIU_K0_5, JR_RA, ADDIU_V0_1, 0x1234_5678];
+        let pack = build(vec![("P.EXE".into(), exe(0x8001_0FF8, &text))]).unwrap();
+        let p = &pack.images[0];
+        let x = PsxExe::parse(&exe(0x8001_0FF8, &text)).unwrap();
+        let d = Discovery::run(&x);
+        let t = translate(&x, &d, &Hazards::check(&x, &d), p.host_base).unwrap();
+        assert_eq!(p.patch.len(), 1, "RAM blocks 0x43-0x44: one group");
+        let g: Vec<u32> = p.patch[0].chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+        let h = |pc: u32| t.patch[&pc].clone();
+        let mut want = vec![5, 0, 0, 0, 0];
+        want.extend([0xFE | (h(0x8001_0FF8).len() as u32) << 8]);
+        want.extend(h(0x8001_0FF8));
+        want.extend([0xFF, ADDIU_K0_5]);
+        want[1] = want.len() as u32;
+        want.extend([1 | (h(0x8001_1004).len() as u32) << 8]); // the jr slot, in the next block
+        want.extend(h(0x8001_1004));
+        want[2] = want.len() as u32;
+        want[3] = want.len() as u32;
+        want[4] = want.len() as u32;
+        assert_eq!(g, want, "the data word after the slot is left out");
+        assert!(!t.patch.contains_key(&0x8001_0FFC));
     }
 }
