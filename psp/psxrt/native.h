@@ -5,8 +5,9 @@
 #include "disc.h"
 #include "psx.h"
 
-enum { IO_GPU, IO_DMA, IO_CD, IO_SPU, IO_TIMER, IO_IRQ, IO_MDEC, IO_PAD, IO_GTE, IO_GTEC, IO_COP0, IO_OTHER, IO_KINDS };
-#define IO_KIND_NAMES {"gpu", "dma", "cd", "spu", "timer", "irq", "mdec", "pad", "gte", "gtecmd", "cop0", "other"}
+/* IO_VLC: the DecDCTvlc recipe's calls and their time, all of it (not sampled) */
+enum { IO_GPU, IO_DMA, IO_CD, IO_SPU, IO_TIMER, IO_IRQ, IO_MDEC, IO_PAD, IO_GTE, IO_GTEC, IO_COP0, IO_OTHER, IO_VLC, IO_KINDS };
+#define IO_KIND_NAMES {"gpu", "dma", "cd", "spu", "timer", "irq", "mdec", "pad", "gte", "gtecmd", "cop0", "other", "vlc"}
 
 typedef struct NativeStats {
     u32 calls;  /* host calls (I/O, COP0, GTE, syscalls, polls) */

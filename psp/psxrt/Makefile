@@ -2,7 +2,7 @@
 # embeds:  make && cp psxrt.prx ../../resources/psxrt.prx
 TARGET = psxrt
 CORE = bios card cdrom cpu dma gpu gte mdec mem psx sio spu timers
-OBJS = main.o disc.o ge.o gte_fast.o native.o sas.o snap.o trampolines.o $(addprefix core/,$(addsuffix .o,$(CORE)))
+OBJS = main.o disc.o ge.o gte_fast.o native.o sas.o snap.o trampolines.o vlc.o $(addprefix core/,$(addsuffix .o,$(CORE)))
 
 # gte_fast.c: v1, a1-a3 and t0-t9 callee-saved, so psxrt_gte_cmd need not save them. No sibling
 # calls: their epilogue would restore a1-a3 over the arguments just set (the caller's a1 as cmd).

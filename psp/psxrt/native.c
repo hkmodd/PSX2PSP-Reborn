@@ -34,6 +34,7 @@
  * holds host addresses while translated code is interrupted, and GRET returns are LIFO.
  */
 #include "native.h"
+#include "vlc.h"
 
 #include <pspdisplay.h>
 #include <pspkernel.h>
@@ -631,7 +632,7 @@ static u32 leave(Cpu *c, u32 host)
 /* ---- recipes (crates/psx2psp-recomp/src/hooks.rs) ---- */
 
 #define HOOK 2u
-enum { HOOK_PAD_CHK_RC2_WAIT = 1, HOOK_PAD_SIO_ACK_WAIT = 2 };
+enum { HOOK_PAD_CHK_RC2_WAIT = 1, HOOK_PAD_SIO_ACK_WAIT = 2, HOOK_DEC_DCT_VLC = 3 };
 #define T2_COUNT 0x1F801120u
 #define T2_MODE 0x1F801124u
 #define T2_TARGET 0x1F801128u
@@ -729,6 +730,49 @@ static u32 hook_pad_ack(Cpu *c, const u32 *arg, u32 pc)
     }
 }
 
+/* libpress's `DecDCTvlc(bs, buf)` (hooks.rs DEC_DCT_VLC) in C (vlc.c): the same output and the
+ * same PS1 time as its code. It runs up to the next device event, a block at a time; when an
+ * interrupt is then due, the guest takes it at the routine's entry `pc` with the call's registers
+ * as they were, and the call coming back there goes on where it stopped. Returns to `ra`. */
+#define IN_RAM(a) (((a) & 0x1FFFFFFFu) < 0x800000u)
+static u32 hook_dct_vlc(Cpu *c, const u32 *arg, u32 pc)
+{
+    static Vlc r;
+    static u32 key[3], spent;
+    static int busy;
+    u32 *g = c->gpr;
+    const VlcVars v = { arg[0], arg[0] + 4, arg[0] + 0x28, arg[1], arg[1] + 0x10000 };
+    u32 t = sceKernelGetSystemTimeLow(), next;
+    if (!busy || key[0] != g[4] || key[1] != g[5] || key[2] != g[31]) {
+        vlc_start(P->ram, &v, &r, g[4], g[5]);
+        key[0] = g[4], key[1] = g[5], key[2] = g[31], spent = 0, busy = 1;
+        native_stats.n_io[IO_VLC]++;
+    }
+    for (;;) {
+        u64 left = P->next_event > P->cycles ? (P->next_event - P->cycles) << cpu_shift : 1;
+        int ret = vlc_run(P->ram, &v, &r, left < 0x40000000u ? (u32)left : 0x40000000u);
+        u32 now = r.ins + 2 * r.mem;
+        P->cycles += (now >> cpu_shift) - (spent >> cpu_shift);
+        spent = now;
+        if (ret >= 0) {
+            busy = 0;
+            g[2] = (u32)ret, g[4] = r.a0, g[5] = r.a1, g[6] = v.tab1, g[7] = v.tab2;
+            next = g[31];
+            break;
+        }
+        if (P->cycles >= P->next_event)
+            update();
+        if (psx_irq_pending(P)) {
+            next = pc;
+            break;
+        }
+    }
+    t = sceKernelGetSystemTimeLow() - t;
+    native_stats.us_io += t;
+    native_stats.us_io_kind[IO_VLC] += t;
+    return next;
+}
+
 /* A hook's host call: the recipe runs, then the guest goes on where it says (a guest address or a
  * host one), through the table. An unknown id runs the guest code instead. */
 static u32 hook(const u32 *site, u32 pc)
@@ -749,11 +793,18 @@ static u32 hook(const u32 *site, u32 pc)
         switch (site[1]) {
         case HOOK_PAD_CHK_RC2_WAIT: next = hook_pad_chk(c, site + 2); break;
         case HOOK_PAD_SIO_ACK_WAIT: next = hook_pad_ack(c, site + 2, pc); break;
+        case HOOK_DEC_DCT_VLC:
+            if (IN_RAM(c->gpr[5]) && (!c->gpr[4] || IN_RAM(c->gpr[4]))) {
+                next = hook_dct_vlc(c, site + 2, pc);
+                break;
+            }
+            /* fall through */
         default:
             jump(c, pc);
             return leave(c, run_guest(2));
         }
-        if (timed) { /* the libpad recipes wait on the timer: their time is the timer's */
+        if (timed && site[1] != HOOK_DEC_DCT_VLC) { /* the libpad recipes wait on the timer: their
+                                                      * time is the timer's (the VLC times itself) */
             t = (sceKernelGetSystemTimeLow() - t) * PROF_EVERY - prof_bias;
             native_stats.us_io += t;
             native_stats.us_io_kind[IO_TIMER] += t;

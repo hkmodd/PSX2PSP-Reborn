@@ -188,3 +188,19 @@ fn real_executables_have_no_hazards() {
     assert!(!paths.is_empty());
     assert_eq!(bad, 0, "load-delay hazards found");
 }
+
+/// The recipes (hooks.rs) found in each executable of `PSX2PSP_EXES`, by address.
+/// `PSX2PSP_EXES=<dir> cargo test -p psx2psp-recomp --test discover -- --ignored --nocapture`.
+#[test]
+#[ignore = "needs PSX2PSP_EXES"]
+fn real_executables_recipes() {
+    let dir = std::env::var("PSX2PSP_EXES").expect("PSX2PSP_EXES");
+    let mut paths: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).collect();
+    paths.sort();
+    for path in &paths {
+        let Ok(x) = PsxExe::parse(&std::fs::read(path).unwrap()) else { continue };
+        let d = Discovery::run(&x);
+        let h = psx2psp_recomp::hooks::find(&x, &d);
+        println!("{}: {:x?}", path.file_name().unwrap().to_string_lossy(), h);
+    }
+}
