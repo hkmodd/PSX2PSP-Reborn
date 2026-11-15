@@ -429,6 +429,25 @@ static void vf_check(Psx *psx)
     vf_state = far || rle_bad ? -1 : 1;
     psx_log(psx, "mdec: VFPU IDCT and colour %s, %u of %u channels differ by 1, %u by more; %u of 512 RLE blocks differ",
             vf_state > 0 ? "in use" : "refused", near, bytes, far, rle_bad);
+    /* What a macroblock costs, by part, on the last random blocks: the S19 device run spent
+     * ~48 us a macroblock in the intro movie */
+    const PsxHost *h = psx->host;
+    if (vf_state > 0 && h->usec) {
+        static u32 out[192];
+        u32 t0 = h->usec(h->user);
+        for (int i = 0; i < 64; i++)
+            for (int b = 0; b < 6; b++)
+                vf_idct(vf_coef[b], vf_left[b >= 2], vf_pix[b]);
+        u32 t1 = h->usec(h->user);
+        for (int i = 0; i < 64; i++)
+            vf_colour();
+        u32 t2 = h->usec(h->user);
+        for (int i = 0; i < 64; i++)
+            vf_pack(out, 2, 0, 0);
+        u32 t3 = h->usec(h->user);
+        psx_log(psx, "mdec: a macroblock costs %u ns of IDCT, %u ns of IDCT and colour, %u ns of 24-bit packing",
+                (t1 - t0) * 1000 / 64, (t2 - t1) * 1000 / 64, (t3 - t2) * 1000 / 64);
+    }
 }
 
 #define VF_HALF(n) (n = in[hp >> 1] >> ((hp & 1) << 4) & 0xFFFF, hp++)

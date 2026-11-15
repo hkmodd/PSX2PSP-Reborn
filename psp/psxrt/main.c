@@ -389,6 +389,18 @@ static int display_size(const Psx *psx, int *w, int *h)
 
 static int display_24bit(const Psx *psx) { return (psx->gpu.stat & 0x200000) && rgb24_tex; }
 
+/* convert24 for present: redone only when the display area moved or VRAM was written since, and
+ * at least once a second (a movie at 15 fps is shown at every vblank). force: always. */
+static const void *convert24_cached(const Gpu *g, int w, int h, int force)
+{
+    static u32 key = ~0u, pos, writes, age;
+    u32 k = (u32)w | (u32)h << 10, p = (u32)g->disp_x | (u32)g->disp_y << 16;
+    if (!force && k == key && p == pos && gpu_writes == writes && ++age < 60)
+        return rgb24_tex;
+    key = k, pos = p, writes = gpu_writes, age = 0;
+    return convert24(g, w, h);
+}
+
 /* 24-bit display on the GE, when the renderer holds PS1 VRAM: no readback, no CPU conversion.
  * Pixel x's channel c (R, G, B) is byte b = d + 3x + c of the line, d the line's start past a
  * 16-byte boundary. PS1 VRAM read as a 16-bit index texture (T16) gives halfword b >> 1, and CLUT
@@ -403,23 +415,27 @@ static int display_24bit(const Psx *psx) { return (psx->gpu.stat & 0x200000) && 
 static u32 g24_clut[256] __attribute__((aligned(64)));
 static Vertex g24_v[3 * 512 * 2] __attribute__((aligned(64)));
 static int g24_at[3][3], g24_key = -1, g24_bad, g24_frames;
+/* The 60th frame's check also times both conversions: on the real GE the 960 one-pixel columns
+ * cost far more than on PPSSPP's (the S19 device run waited 126-149 ms a second for the GE in the
+ * intro movie, where the CPU converts a frame in ~3.5 ms). The faster one is kept. */
+static int g24_cpu;
 
 static int display_ge24(const Psx *psx, int *w, int *h)
 {
     const Gpu *g = &psx->gpu;
-    return !g24_bad && g->renderer && display_24bit(psx) && display_size(psx, w, h) && *h <= 256 &&
+    return !g24_bad && !g24_cpu && g->renderer && display_24bit(psx) && display_size(psx, w, h) && *h <= 256 &&
            (g->disp_x & 7) * 2 + 3 * *w <= 1024 && g->disp_x * 2 + 3 * *w <= VRAM_W * 2;
 }
 
 /* GE_RGB24 converted from what is shown; the conversion is redone only when the display area
  * moved or VRAM was written since (a movie at 15 fps was converted at every vblank: on the real
  * GE its 960 one-pixel columns cost several ms), and at least once a second. */
-static void *ge24(const Gpu *g, int w, int h)
+static void *ge24(const Gpu *g, int w, int h, int force)
 {
     static u32 g24_pos, g24_writes, g24_age;
     int d = (g->disp_x & 7) * 2, key = w | h << 10 | d << 20;
     u32 pos = (u32)g->disp_x | (u32)g->disp_y << 16;
-    if (key == g24_key && pos == g24_pos && gpu_writes == g24_writes && ++g24_age < 60)
+    if (!force && key == g24_key && pos == g24_pos && gpu_writes == g24_writes && ++g24_age < 60)
         return (void *)(0x04000000u + GE_RGB24);
     g24_pos = pos, g24_writes = gpu_writes, g24_age = 0;
     if (key != g24_key) {
@@ -488,12 +504,12 @@ static int draw_ps1(Psx *psx)
     if (!display_size(psx, &w, &h))
         return 0;
     if (display_ge24(psx, &w, &h)) {
-        void *t = ge24(g, w, h);
+        void *t = ge24(g, w, h, 0);
         sceGuTexMode(GU_PSM_5650, 0, 0, 0);
         sceGuTexImage(0, 512, 256, 512, t);
     } else if (display_24bit(psx)) {
         sceGuTexMode(GU_PSM_8888, 0, 0, 0);
-        sceGuTexImage(0, 512, 512, 512, convert24(g, w, h));
+        sceGuTexImage(0, 512, 512, 512, convert24_cached(g, w, h, 0));
     } else if (!g->renderer) {
         const u16 *src = g->vram + g->disp_y * VRAM_W + (g->disp_x & ~7);
         sceKernelDcacheWritebackRange(src, (u32)h * VRAM_W * 2);
@@ -655,6 +671,18 @@ static void present(Psx *psx, const char *status)
         ge_sync();
         if (chk)
             g24_check(&psx->gpu, w, h);
+        if (chk && !g24_bad) { /* the GE's conversion on its own, then the CPU's */
+            u32 a = sceKernelGetSystemTimeLow();
+            ge_open();
+            ge24(&psx->gpu, w, h, 1);
+            ge_sync();
+            u32 b = sceKernelGetSystemTimeLow();
+            convert24(&psx->gpu, w, h);
+            u32 c = sceKernelGetSystemTimeLow();
+            g24_cpu = c - b < b - a;
+            say("rgb24: a frame converts in %u us on the GE, %u us on the CPU: the %s converts from now on", (unsigned)(b - a),
+                (unsigned)(c - b), g24_cpu ? "CPU" : "GE");
+        }
         us_pdraw += sceKernelGetSystemTimeLow() - t1;
         show(status, !psx);
         return;
