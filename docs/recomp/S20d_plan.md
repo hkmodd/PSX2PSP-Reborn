@@ -65,6 +65,19 @@ Va nel file della traduzione dentro l'EBOOT, divisa per blocco da 1 KB, e il run
 5. **Test PSP:** il 3D deve restare ≥ S20a e il log deve dire «N parole patchate, 0 blocchi
    all'interprete» a ogni livello.
 
+## Esito passi 1-2 (offline, 2026-11-15)
+
+- `emit.rs`: `Translation::patch` e `emit::repatch(host, guest)`. Nessuna serializzazione:
+  l'EBOOT è identico.
+- `tests/patch.rs`, test sintetico: ogni parola simple di un programma con slot di `jal`,
+  `j`, `jr ra`, `jr`, `beq`/`bne` e uno slot che è anche bersaglio di salto (due copie host).
+  Immediati e shift cambiati: T + tabella == T′ bit per bit.
+- Test con dati veri: LEV02.EXE con `sim/ram08100.bin` e `sim/ram05600.bin`.
+  - 110 parole di codice riscritte, tutte patchabili (120 parole host), 0 all'interprete.
+  - T + tabella == T′ bit per bit.
+  - Le altre 241-243 parole cambiate nel testo non sono codice raggiunto (dati).
+- Manca un dump RAM di WHEEL: la stessa prova va ripetuta lì prima del passo 5.
+
 ## Criterio di chiusura
 
 - Test 2 verde con dati veri: 0 differenze su WHEEL e LEV02.

@@ -101,6 +101,28 @@ pub struct Translation {
     pub map: BTreeMap<u32, u32>,
     /// Guest instructions handled by the runtime, and why.
     pub runtime: BTreeMap<u32, Reason>,
+    /// Guest instruction -> host addresses of the words that copy it ([`simple`] ones only: one
+    /// address, or two for a delay slot duplicated on both paths or also jumped to). When the
+    /// game rewrites such an instruction, [`repatch`] gives the new host word for each address.
+    pub patch: BTreeMap<u32, Vec<u32>>,
+}
+
+/// The host word for `guest` written where the simple instruction translated to `host` was, if
+/// it is the same instruction with another immediate or shift amount (Sheep Dog's level
+/// constants): same opcode and registers, so the code around it stays valid. `None`: the code
+/// must be translated again or interpreted.
+pub fn repatch(host: u32, guest: u32) -> Option<u32> {
+    let op = guest >> 26;
+    let new = match op {
+        8 => guest | 1 << 26, // addi -> addiu, as `simple` does
+        _ => guest,
+    };
+    let keep = match op {
+        8..=0xF => 0xFFFF_0000,                                     // immediates: op, rs, rt
+        0 if matches!(guest & 0x3F, 0 | 2 | 3) => !(0x1F << 6), // sll/srl/sra: all but sa
+        _ => !0,
+    };
+    (new & keep == host & keep).then_some(new)
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -242,10 +264,17 @@ struct Code {
     fix: Vec<(usize, Fx, To, u32)>,
     /// Label -> word index.
     defs: Vec<(usize, usize)>,
+    /// Word index -> guest pc of the simple instruction it copies.
+    pat: Vec<(usize, u32)>,
 }
 
 impl Code {
     fn push(&mut self, w: u32) {
+        self.w.push(w);
+    }
+    /// The host word `w` that copies the simple guest instruction at `pc`.
+    fn simple(&mut self, w: u32, pc: u32) {
+        self.pat.push((self.w.len(), pc));
         self.w.push(w);
     }
     fn branch(&mut self, w: u32, to: To, pc: u32) {
@@ -265,6 +294,7 @@ impl Code {
         self.w.extend(o.w);
         self.fix.extend(o.fix.into_iter().map(|(a, f, t, p)| (a + b, f, t, p)));
         self.defs.extend(o.defs.into_iter().map(|(l, a)| (l, a + b)));
+        self.pat.extend(o.pat.into_iter().map(|(a, p)| (a + b, p)));
     }
     /// Host call for the guest instruction `word` at `pc` (`pc | RESUME` to hand over).
     fn host_call(&mut self, pc: u32, word: u32) {
@@ -529,7 +559,7 @@ impl Em<'_> {
         use Kind::*;
         if let Some(w) = simple(i, k) {
             let mut c = Code::default();
-            c.push(w);
+            c.simple(w, pc);
             return (c, true);
         }
         let u = Uses::of(i, k);
@@ -766,6 +796,15 @@ impl Em<'_> {
         o.push(lw(K1R, k0_off(layout::TABLE), K1R));
     }
 
+    /// The host delay slot after a transfer: the guest slot's simple word, or a `nop` when its
+    /// code went before the transfer.
+    fn slot_word(&mut self, simple_slot: Option<u32>, s: u32) {
+        match simple_slot {
+            Some(w) => self.out.simple(w, s),
+            None => self.out.push(NOP),
+        }
+    }
+
     /// A branch or jump at `a` and its delay slot.
     fn transfer(&mut self, a: u32, i: Insn, k: Kind) -> Option<u32> {
         use Kind::*;
@@ -810,7 +849,7 @@ impl Em<'_> {
             Jr if i.rs() == RA as usize => {
                 if let Some(w) = simple_slot {
                     self.out.push(jr(RA));
-                    self.out.push(w);
+                    self.out.simple(w, s);
                 } else if clobbers {
                     self.out.push(sw(RA, k0_off(layout::CTX + ctx::JUMP), K0R));
                     let c = slot(self);
@@ -832,7 +871,7 @@ impl Em<'_> {
                 if let Some(w) = simple_slot {
                     self.dispatch(rs);
                     self.out.push(fin);
-                    self.out.push(w);
+                    self.out.simple(w, s);
                 } else if !clobbers {
                     let c = slot(self);
                     self.out.append(c);
@@ -865,7 +904,7 @@ impl Em<'_> {
                     self.dispatch(K1R);
                     self.out.push(jalr(RA, K1R));
                 }
-                self.out.push(simple_slot.unwrap_or(NOP));
+                self.slot_word(simple_slot, s);
                 Some(a + 8)
             }
             _ => {
@@ -885,14 +924,14 @@ impl Em<'_> {
                         self.out.append(c);
                     }
                     self.out.jump(2, To::Guest(t), a);
-                    self.out.push(simple_slot.unwrap_or(NOP));
+                    self.slot_word(simple_slot, s);
                     return None;
                 }
                 let word = i.0;
                 if let Some(w) = simple_slot {
                     let to = self.near(a, t);
                     self.out.branch(word, to, a);
-                    self.out.push(w);
+                    self.out.simple(w, s);
                 } else if !clobbers {
                     let c = slot(self);
                     self.out.append(c);
@@ -919,7 +958,7 @@ impl Em<'_> {
 
     fn finish(self, base: u32) -> Result<Translation, Fail> {
         let Em { out, map, runtime, labels, .. } = self;
-        let Code { mut w, fix, defs } = out;
+        let Code { mut w, fix, defs, pat } = out;
         let mut at = vec![usize::MAX; labels];
         for (l, i) in defs {
             at[l] = i;
@@ -951,11 +990,16 @@ impl Em<'_> {
         if !far.is_empty() {
             return Err(Fail::Far(far));
         }
+        let mut patch: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+        for (i, pc) in pat {
+            patch.entry(pc).or_default().push(host(i));
+        }
         Ok(Translation {
             base,
             words: w,
             map: map.into_iter().map(|(g, i)| (g, host(i))).collect(),
             runtime,
+            patch,
         })
     }
 }
