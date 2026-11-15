@@ -7,7 +7,7 @@
  * software on RAM's copy. The two copies are kept in step per 64x32 tile: `newer` marks tiles the GE drew since RAM
  * last saw them, `read` brings all of VRAM back (one block transfer) before the CPU reads one of
  * those, `wrote` sends the CPU's pixels up as textured sprites. Textures come from RAM's copy:
- * 4/8-bit pages are copied into a cache of T4/T8 textures, CLUTs are converted into the list.
+ * 4/8-bit pages are copied into a cache of T4/T8 textures, CLUTs are converted into a pool.
  * The list is built in a GU_SEND context and enqueued when it opens; the GE runs behind it up to
  * a stall address moved every STALL_STEP bytes, not after every draw as GU_DIRECT would.
  */
@@ -45,7 +45,7 @@ typedef struct {
 #define TEX_VTX (GU_TEXTURE_32BITF | GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_2D)
 
 typedef struct {
-    u32 tris, ttris, rects, trects, fills, lines, line_runs, sw_tex15, sw_texwin, sw_copy, pages, cluts;
+    u32 tris, ttris, rects, trects, fills, lines, line_runs, sw_tex15, sw_texwin, sw_copy, pages, cluts, clut_tmp;
     u32 readbacks, read_tiles, read_us, uploads, upload_px, flushes;
     u32 ge_copy, null_copy, copy_px, copy_from_ge; /* copies: on the GE, onto themselves, pixels, read from the GE */
     u32 bind_tex, bind_clut, kicks, rd_checks;     /* textures and CLUTs sent, stall moves, readback checks */
@@ -62,12 +62,23 @@ typedef struct {
     u32 key, stamp; /* key 0: empty; stamp: the page's tile generations, summed */
     u32 used, age;  /* used: the list (ge.syncs) that last drew with it */
     u32 epoch;      /* ge.epoch when the stamp was last found current */
+    u32 ver;        /* bumped whenever data is written: what was built on it is stale */
     u8 *data;
 } Page;
 
-/* Games switch CLUTs per model, and models are drawn interleaved in depth order. */
-#define CLUT_BITS 5
+/* Games switch CLUTs per model, and models are drawn interleaved in depth order. A converted CLUT
+ * is kept across lists in a slot of the pool, two ways per set, as long as its tiles' stamp holds
+ * (S19: the device rebuilt every CLUT once per list, ~600 a second). */
+#define CLUT_BITS 7
 #define CLUT_SLOTS (1 << CLUT_BITS)
+typedef struct {
+    u32 key, stamp; /* key 0: empty; stamp: the CLUT's tile generations, summed */
+    u32 used, age;  /* used: the list (ge.syncs) that last loaded it */
+    u32 epoch;      /* ge.epoch when the stamp was last found current */
+    u32 ver;        /* bumped whenever the slot is written */
+    int flags;      /* clut()'s */
+} ClutSlot;
+static u32 __attribute__((aligned(64))) clut_pool[CLUT_SLOTS][256];
 
 static unsigned int __attribute__((aligned(64))) list[LIST_BYTES / 4];
 static int list_open, state_valid;
@@ -97,11 +108,8 @@ static struct {
     u32 epoch;       /* bumped whenever any tile's generation changes */
     Page *last_page; /* the page last used, current as of last_epoch */
     u32 last_epoch;
-    struct {
-        u32 key, stamp, syncs, epoch;
-        const u32 *ptr;
-        int flags;
-    } cluts[CLUT_SLOTS]; /* CLUTs converted into the list `syncs`, by a hash of their key */
+    ClutSlot cluts[CLUT_SLOTS]; /* by a hash of their key; the data in clut_pool */
+    int clut_slot;              /* the slot clut() last returned; -1: a CLUT in the list */
     GeStats s;
 } ge;
 
@@ -130,7 +138,6 @@ static struct {
 /* 1: the mode changes every second, and the "-- ge:" line says which ran. The PSP wrote 64 KB of
  * vertices in 326 us uncached, 700 us cached and written back (S16b): the ring stays uncached. */
 static int ring_ab = 0;
-static u32 fl_arena_off; /* words of the arena (below) used by the open list's blocks */
 
 /* The PS1 dither matrix, row = y & 3, column = x & 3; the GE adds it to 8-bit colours before
  * they are cut to 5 bits, as the PS1 does. */
@@ -143,10 +150,9 @@ static const ScePspIMatrix4 ps1_dither = {{-4, 0, -3, 1}, {2, -2, 3, -1}, {-3, 1
  * queued here with its stall at the start. pspgu writes it through the uncached mirror.
  * A frame of level 1 is ~20 KB of list: with a 16 KB step the real GE got its work at present()
  * and drew it while the CPU waited (6-10 ms a frame). 1 KB is ~60 polygons, a few hundred
- * system calls a second. */
-#define STALL_STEP 1024
-/* S18b A/B: the step alternates every second between 1 KB and 8 KB, the "-- ge:" line says which:
- * one system call every ~60 polygons against the GE drawing later in the frame. */
+ * system calls a second. The S18c device run alternated 1 KB and 8 KB every second: the moves
+ * cost under 1 ms a second either way, and a polygon ~0.5 us less with 8 KB. */
+#define STALL_STEP (8 * 1024)
 static u32 stall_step = STALL_STEP;
 #define LIST_UNCACHED ((u8 *)((u32)list | 0x40000000u))
 static int list_id;
@@ -222,7 +228,6 @@ void ge_sync(void)
         sceGuSync(0, 0);
         list_open = 0;
         ge.syncs++;
-        fl_arena_off = 0; /* the GE is done with its blocks */
     }
     state_valid = 0;
     fl.valid = 0, fl.ring_off = fl.ring_wb = 0; /* the GE is done with the ring */
@@ -665,7 +670,7 @@ static const u8 *page(const GpuPrim *p)
                 memcpy(o + a, row, (size_t)(hw - a) * 2);
         }
         sceKernelDcacheWritebackRange(s->data, (u32)(256 * hw * 2));
-        s->key = key, s->stamp = st;
+        s->key = key, s->stamp = st, s->ver++;
         if (ge.tex_sent == s->data)
             ge.tex_sent = NULL;
         ge.s.pages++;
@@ -675,18 +680,22 @@ static const u8 *page(const GpuPrim *p)
     return s->data;
 }
 
-/* The CLUT as 8888 in the list, its alpha saying what the texel means: 0 for 0x0000 (not
- * drawn), 0x80 with STP set, 0xFF otherwise. flags: 1 some texels without STP, 2 some with. */
+/* The CLUT as 8888, its alpha saying what the texel means: 0 for 0x0000 (not drawn), 0x80 with
+ * STP set, 0xFF otherwise. flags: 1 some texels without STP, 2 some with. From its pool slot while
+ * the stamp holds; a slot the open list loads from is never written, the CLUT goes into the list
+ * instead (ge.clut_slot -1). */
 static const u32 *clut(const GpuPrim *p, int *flags)
 {
     int n = p->depth ? 256 : 16;
     u32 key = 1 + (p->clut_x / 16 | p->clut_y << 6 | p->depth << 15);
-    __typeof__(ge.cluts[0]) *e = &ge.cluts[(key * 2654435761u) >> (32 - CLUT_BITS)];
-    int same = e->key == key && e->syncs == ge.syncs;
-    u32 st = same && e->epoch == ge.epoch ? e->stamp : stamp((s32)p->clut_x, (s32)p->clut_y, n, 1);
-    e->epoch = ge.epoch;
-    if (!same || e->stamp != st) {
-        u32 *c = (u32 *)(((u32)sceGuGetMemory(n * 4 + 16) + 15) & ~15u);
+    ClutSlot *e = &ge.cluts[(key * 2654435761u) >> (32 - CLUT_BITS) & ~1u], *o = e + 1;
+    if (e->key != key && (o->key == key || (o->used != ge.syncs && (e->used == ge.syncs || o->age < e->age))))
+        e = o;
+    e->age = ++ge.ages;
+    u32 st = e->key == key && e->epoch == ge.epoch ? e->stamp : stamp((s32)p->clut_x, (s32)p->clut_y, n, 1);
+    if (e->key != key || e->stamp != st) {
+        int tmp = e->used == ge.syncs;
+        u32 *c = tmp ? (u32 *)(((u32)sceGuGetMemory(n * 4 + 16) + 15) & ~15u) : clut_pool[e - ge.cluts];
         const u16 *row = ge.psx->gpu.vram + p->clut_y * VRAM_W;
         int f = 0;
         for (int i = 0; i < n; i++) {
@@ -695,11 +704,45 @@ static const u32 *clut(const GpuPrim *p, int *flags)
             f |= !t ? 0 : t & 0x8000 ? 2 : 1;
             c[i] = a << 24 | (t >> 10 & 31) << 19 | (t >> 5 & 31) << 11 | (t & 31) << 3;
         }
-        e->key = key, e->stamp = st, e->syncs = ge.syncs, e->ptr = c, e->flags = f;
+        if (tmp) {
+            ge.s.clut_tmp++;
+            ge.clut_slot = -1;
+            *flags = f;
+            return c;
+        }
+        sceKernelDcacheWritebackRange(c, (u32)n * 4);
+        if (ge.clut_sent == c)
+            ge.clut_sent = NULL;
+        e->key = key, e->stamp = st, e->flags = f, e->ver++;
         ge.s.cluts++;
     }
+    e->epoch = ge.epoch, e->used = ge.syncs;
+    ge.clut_slot = (int)(e - ge.cluts);
     *flags = e->flags;
-    return e->ptr;
+    return clut_pool[ge.clut_slot];
+}
+
+/* A page slot, or a CLUT slot, still holds RAM's copy of its key's pixels. */
+static int page_current(Page *s)
+{
+    u32 k = s->key - 1;
+    if (s->epoch != ge.epoch) {
+        if (stamp((s32)(k & 15) * 64, (s32)(k >> 4 & 1) * 256, k >> 5 ? 128 : 64, 256) != s->stamp)
+            return 0;
+        s->epoch = ge.epoch;
+    }
+    return 1;
+}
+
+static int clut_current(ClutSlot *c)
+{
+    u32 k = c->key - 1;
+    if (c->epoch != ge.epoch) {
+        if (stamp((s32)(k & 63) * 16, (s32)(k >> 6 & 511), k >> 15 ? 256 : 16, 1) != c->stamp)
+            return 0;
+        c->epoch = ge.epoch;
+    }
+    return 1;
 }
 
 static void bind(const GpuPrim *p, const u8 *pg, const u32 *cl)
@@ -1053,17 +1096,22 @@ static int rd_copy(void *self, s32 sx, s32 sy, s32 dx, s32 dy, s32 w, s32 h, int
 /* ---- the polygon fast lane ---- */
 
 /* A key's state as a block of GE words, sent from unknown so that they alone set it, with what
- * prim_begin found for it. The blocks live in an arena the GE calls into, written while a list is
- * open and kept until it has run (the CLUTs they load live in that list too): a key seen again in
- * the same list, with no tile changed or, under its page and CLUT, turned newer, is a CALL. */
-#define FL_BITS 7
-#define FL_WORDS 48
-#define FL_ARENA (64 * 1024)
+ * prim_begin found for it. Each entry has its own block in an arena the GE calls into: a key seen
+ * again, with nothing turned newer under its page and CLUT, is a CALL. A kept entry (untextured,
+ * or its CLUT in the pool) outlives the list: its page slot and CLUT slot must still hold what it
+ * was built with (their ver) and be current (their stamps). The others load a CLUT from the list
+ * they were built in, and last as long as it and the epoch. The block is written only while no
+ * open list calls it (blk). S19: the device built every key again in every list, ~1.5k a second. */
+#define FL_BITS 8
+#define FL_SLOT 64 /* words: a block is at most ~30 */
+#define FL_ARENA ((1 << FL_BITS) * FL_SLOT * 4)
 typedef struct {
     u32 k0, k1, a0, a1, syncs, epoch, nver;
-    int flags, two, n1, n2, slot;
-    u32 use; /* fl_uses when last found */
-    u32 call[2]; /* BASE and CALL of its block */
+    int flags, two, n1, n2, slot, cslot, keep;
+    u32 pver, cver; /* the page slot's and the CLUT slot's ver it was built with */
+    u32 blk;        /* the list that last called its block */
+    u32 use;        /* fl_uses when last found */
+    u32 call[2];    /* BASE and CALL of its block */
     u32 pass1[8], pass2[8];
 } FlEntry;
 static FlEntry fl_cache[1 << FL_BITS];
@@ -1079,6 +1127,21 @@ static int fl_newer(u32 tp, u32 clut)
            newer((s32)(clut & 0x3F) * 16, (s32)(clut >> 6 & 0x1FF), d ? 256 : 16, 1);
 }
 
+/* A kept entry's page slot and CLUT slot still hold what it was built with, and are current. */
+static int fl_current(FlEntry *e)
+{
+    if (!(e->k0 & 1))
+        return 1;
+    if (ge.pages[e->slot].ver != e->pver || ge.cluts[e->cslot].ver != e->cver)
+        return 0;
+    if (e->epoch != ge.epoch) {
+        if (!page_current(&ge.pages[e->slot]) || !clut_current(&ge.cluts[e->cslot]))
+            return 0;
+        e->epoch = ge.epoch;
+    }
+    return 1;
+}
+
 /* A pass's state, sent from unknown so that its words alone set it, and kept. */
 static void fl_capture(u32 *dst, int *n, int func, int ref, int mode, int check, int set)
 {
@@ -1092,8 +1155,8 @@ static void fl_capture(u32 *dst, int *n, int func, int ref, int mode, int check,
         dst[i] = s[i];
 }
 
-/* A new key: its state words, as polygon() and tex_draw() would send them, into a block of the
- * arena when it has room (else into the list, and the entry is used this once). */
+/* A new key: its state words, as polygon() and tex_draw() would send them, into the entry's block
+ * (into the list when the open list still calls the block, and the entry is used this once). */
 static void fl_miss(FlEntry *e, u32 cmd, u32 clut, s32 x1, s32 y1, s32 x2, s32 y2)
 {
     const Gpu *g = &ge.psx->gpu;
@@ -1104,20 +1167,23 @@ static void fl_miss(FlEntry *e, u32 cmd, u32 clut, s32 x1, s32 y1, s32 x2, s32 y
     p.dither = (g->stat & 0x200) && (gour || (p.textured && !p.raw));
     int flags = prim_begin(&p);
     e->k0 = fl.k0, e->k1 = fl.k1, e->a0 = fl.a0, e->a1 = fl.a1;
-    e->flags = flags, e->two = 0, e->slot = -1;
+    e->flags = flags, e->two = 0, e->slot = e->cslot = -1, e->keep = !p.textured;
+    if (p.textured) { /* prim_begin's page() and clut() */
+        e->slot = (int)(ge.last_page - ge.pages), e->pver = ge.last_page->ver;
+        e->cslot = ge.clut_slot, e->keep = ge.clut_slot >= 0;
+        e->cver = e->keep ? ge.cluts[ge.clut_slot].ver : 0;
+    }
     if (flags) {
         const u8 *pg = ge.tex_sent;
         const u32 *cl = ge.clut_sent;
         unsigned int *l = gu_list->current;
-        int arena = fl_arena_off + FL_WORDS + 16 <= FL_ARENA / 4;
+        int arena = e->blk != ge.syncs; /* prim_begin may have run the list */
         if (arena)
-            gu_list->current = FL_ARENA_UNCACHED + fl_arena_off;
+            gu_list->current = FL_ARENA_UNCACHED + (e - fl_cache) * FL_SLOT;
         unsigned int *s = gu_list->current;
         fl_forget();
-        if (p.textured) {
+        if (p.textured)
             bind(&p, pg, cl);
-            e->slot = (int)((pg - ge.pages[0].data) / PAGE_BYTES);
-        }
         prim_state(&p, x1, y1, x2, y2);
         if (!p.textured)
             tex_mode(0);
@@ -1140,11 +1206,11 @@ static void fl_miss(FlEntry *e, u32 cmd, u32 clut, s32 x1, s32 y1, s32 x2, s32 y
         sceGuSendCommandi(0x12, p.textured ? TEX_VTX : GE_VTX); /* VTYPE */
         if (arena) {
             sceGuSendCommandi(0x0B, 0); /* RET */
-            fl_arena_off += (u32)(gu_list->current - s);
             e->call[0] = 0x10000000u | ((u32)s >> 8 & 0xF0000);
             e->call[1] = 0x0A000000u | ((u32)s & 0xFFFFFF);
             l[0] = e->call[0], l[1] = e->call[1];
             gu_list->current = l + 2;
+            e->blk = ge.syncs;
         } else
             e->k0 = ~0u, e->call[0] = 0; /* used this once, never found */
     }
@@ -1167,16 +1233,22 @@ static void fl_setup(u32 cmd, u32 clut)
     e->use = ++fl_uses;
     if (area(&x1, &y1, &x2, &y2)) {
         begin(); /* first: running the list ends its blocks */
-        if (e->k0 == fl.k0 && e->k1 == fl.k1 && e->a0 == fl.a0 && e->a1 == fl.a1 && e->syncs == ge.syncs &&
-            e->epoch == ge.epoch && (e->nver == ge.nver || !(fl.k0 & 1) || !fl_newer(ge.psx->gpu.texpage, clut))) {
-            e->nver = ge.nver;
+        if (e->k0 == fl.k0 && e->k1 == fl.k1 && e->a0 == fl.a0 && e->a1 == fl.a1 &&
+            (e->keep ? fl_current(e) : e->syncs == ge.syncs && e->epoch == ge.epoch) &&
+            (e->nver == ge.nver || !(fl.k0 & 1) || !fl_newer(ge.psx->gpu.texpage, clut))) {
+            e->nver = ge.nver, e->syncs = ge.syncs;
+            if (e->slot >= 0) { /* the open list draws with them: neither is written until it has run */
+                Page *s = &ge.pages[e->slot];
+                s->used = ge.syncs, s->age = ++ge.ages;
+                if (e->cslot >= 0)
+                    ge.cluts[e->cslot].used = ge.syncs;
+            }
             if (e->flags) {
                 unsigned int *l = gu_list->current;
                 l[0] = e->call[0], l[1] = e->call[1];
                 gu_list->current = l + 2;
                 fl.dirty = 1;
-                if (e->slot >= 0)
-                    ge.pages[e->slot].age = ++ge.ages;
+                e->blk = ge.syncs;
             }
             ge.s.fast_hits++;
         } else
@@ -1548,20 +1620,19 @@ int ge_log(char *buf, int cap)
     u32 kb = s->kicks * prof_bias / 16, kick_us = s->kick_us > kb ? s->kick_us - kb : 0; /* less one clock read each */
     int n = clampn(snprintf(buf, (size_t)cap,
                             "-- ge: tri %u+%u tex, rect %u+%u tex, fill %u, line %u (%u runs); sw tex15 %u texwin %u "
-                            "copy %u+%u sw+%u null (%u kpx, %u from ge); pages %u cluts %u, readback %u (%u tiles, %u ms), upload %u "
+                            "copy %u+%u sw+%u null (%u kpx, %u from ge); pages %u cluts %u+%u in list, readback %u (%u tiles, %u ms), upload %u "
                             "(%u kpx), flush %u; bind %u tex %u clut, kick %u (%u ms), rd check %u; fast %u (%u setups %u ms, %u cached), slow tex %u big %u, flat %u, clipped %u; ring %s (wb %u ms), step %u\n",
                             (unsigned)s->tris, (unsigned)s->ttris, (unsigned)s->rects, (unsigned)s->trects,
                             (unsigned)s->fills, (unsigned)s->lines, (unsigned)s->line_runs, (unsigned)s->sw_tex15,
                             (unsigned)s->sw_texwin,
                             (unsigned)s->ge_copy, (unsigned)s->sw_copy, (unsigned)s->null_copy, (unsigned)(s->copy_px / 1000), (unsigned)s->copy_from_ge,
-                            (unsigned)s->pages, (unsigned)s->cluts, (unsigned)s->readbacks, (unsigned)s->read_tiles,
+                            (unsigned)s->pages, (unsigned)s->cluts, (unsigned)s->clut_tmp, (unsigned)s->readbacks, (unsigned)s->read_tiles,
                             (unsigned)(s->read_us / 1000), (unsigned)s->uploads, (unsigned)(s->upload_px / 1000),
                             (unsigned)s->flushes, (unsigned)s->bind_tex, (unsigned)s->bind_clut, (unsigned)s->kicks, (unsigned)(kick_us / 1000),
                             (unsigned)s->rd_checks, (unsigned)s->fast, (unsigned)s->fast_setups, (unsigned)((s32)s->setup_us < 0 ? 0 : s->setup_us / 1000), (unsigned)s->fast_hits, (unsigned)s->slow_tex, (unsigned)s->slow_big, (unsigned)s->flat, (unsigned)s->clipped,
                             fl.cached ? "cached" : "uncached", (unsigned)(s->ring_wb_us / 1000), (unsigned)stall_step),
                    cap);
     memset(&ge.s, 0, sizeof ge.s);
-    stall_step = stall_step == STALL_STEP ? 8 * STALL_STEP : STALL_STEP; /* from now on */
     if (ring_ab)
         fl.want = !fl.cached; /* from the next sync */
     if (ge.compare && n < cap - 1)
