@@ -14,6 +14,7 @@ not the mean (GOAL.MD §5).
 |---|---|---|
 | `s19_98fae2f.log` | S19, psxrt built 2026-11-15 00:54 UTC | boot, intro, WHEEL, save load, LOADER, INTRO, LEV01 (64 s) |
 | `s20a_b066913.log` | S20a | boot, intro, WHEEL, save load, then switched off at WHEEL → LOADER |
+| `s20d_90602b5.log` | S20d (patch table in the EBOOT, VLC timing fix 4950d4b) | boot, intro, WHEEL, save load, LOADER, INTRO, LEV01 (125 s) |
 
 ## S20a against S19
 
@@ -75,6 +76,27 @@ every FMV second.
     step.
 - **A general fix needs a rule that tells the two kinds of loop apart.** That is a `native.c`
   change, so it goes to the Host first.
+
+## S20d against S19 (`s20d_vs_s19.txt`)
+
+| scene | S19 | S20d | |
+|---|---|---|---|
+| intro FMV | 85% (worst 75%) | 74% (worst 68%) | **−11**: io_timer 22→70, io_dma 304→346, io_vlc 0→36, update 333→264 |
+| WHEEL 3D (worst 10%) | 61% | 59% | about equal; the means (92 / 74%) differ by the menu seconds |
+| LOADER | 99% | 97% | |
+| INTRO | 89% (worst 68%) | 83% (worst 67%) | |
+| LEV01 | 91% (worst 74%) | **97% (worst 91%)** | +6 / +16, 125 s of play |
+
+- **The WHEEL → LOADER stop of S20a did not happen again.** The run went on to LEV01. The cause of
+  the S20a stop is not proven: S20d fixed it, or it was not a crash.
+- **The log ends like S19's:** no end line, last event `CD_init:addr=800a7318`, LEV01 at 95-98%
+  until the last second. Likely switched off by hand.
+- **The VLC recipe stays.** The C decoder alone costs 36 ms/s (`io_vlc`), the guest's
+  `DecDCTvlc` cost about 69 (`update` 333 → 264).
+- **The rest of the FMV loss is the timer poll (+48 ms/s) and DMA (+42).** The poll is the
+  streamed-frame wait above, the first target of `docs/recomp/S21_plan.md` step 2.
+
+S20 is closed for LEV01, LOADER and WHEEL; the intro FMV stays below S19 and goes to S21.
 
 ## Still to record (S20c proper)
 
