@@ -1260,6 +1260,46 @@ static void prof_init(void)
     psx_log(P, "profile: an empty timed interval costs %u ns", (unsigned)(sum * 1000 / 4096));
 }
 
+/* Where the guest's PS1 cycles go: a poll runs where the budget ran out, so the cycles since the
+ * last poll are put on its loop (the guest pc of the back-edge). Ranked by native_hot_log. */
+#define HOT_SLOTS 2048
+static struct { u32 pc; u64 cycles; } hots[HOT_SLOTS];
+static u64 hot_last, hot_lost;
+
+static void hot(u32 pc)
+{
+    u64 w = hot_last ? P->cycles - hot_last : 0;
+    hot_last = P->cycles;
+    for (u32 i = (pc >> 2) * 2654435761u >> 21, k = 0; k < 16; k++, i = (i + 1) % HOT_SLOTS)
+        if (!hots[i].pc || hots[i].pc == pc) {
+            hots[i].pc = pc, hots[i].cycles += w;
+            return;
+        }
+    hot_lost += w;
+}
+
+int native_hot_log(char *buf, int len)
+{
+    u64 all = hot_lost;
+    for (int i = 0; i < HOT_SLOTS; i++)
+        all += hots[i].cycles;
+    int n = snprintf(buf, (size_t)len, "-- hot loops (pc, 1/10000 of %u Mcycles, lost %u):", (unsigned)(all >> 20),
+                     (unsigned)(hot_lost >> 20));
+    for (int top = 0; top < 48 && n < len - 24 && all; top++) {
+        int best = -1;
+        for (int i = 0; i < HOT_SLOTS; i++)
+            if (hots[i].cycles && (best < 0 || hots[i].cycles > hots[best].cycles))
+                best = i;
+        if (best < 0)
+            break;
+        n += snprintf(buf + n, (size_t)(len - n), " %08X %u", (unsigned)hots[best].pc, (unsigned)(hots[best].cycles * 10000 / all));
+        hots[best].cycles = 0;
+    }
+    memset(hots, 0, sizeof hots);
+    hot_lost = 0;
+    return n < len ? n + snprintf(buf + n, (size_t)(len - n), "\n") : len;
+}
+
 /* Host call at `site` (the address of its .word pc, .word insn): returns where to go on. */
 u32 native_rt_call(const u32 *site)
 {
@@ -1290,6 +1330,7 @@ u32 native_rt_call(const u32 *site)
             update();
     }
     if (insn == POLL) {
+        hot(pc);
         if (!psx_irq_pending(P))
             return leave(c, back);
         cpu_exception(P, 0, back, 0);

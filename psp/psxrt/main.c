@@ -914,8 +914,11 @@ static void frame(int show)
             log_flush();
             sceIoWrite(log_fd, line, n);
             log_keep();
-            if (bench_secs && bench_n > BENCH_SKIP && k >= bench_secs)
+            if (bench_secs && bench_n > BENCH_SKIP && k >= bench_secs) {
+                char hot[1024];
+                sceIoWrite(log_fd, hot, native_hot_log(hot, sizeof hot));
                 halt("bench done");
+            }
         }
     }
     if (!status[0])

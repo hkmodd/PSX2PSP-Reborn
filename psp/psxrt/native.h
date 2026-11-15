@@ -60,5 +60,8 @@ int native_load(int fd);
 /* The ten guest pcs where the interpreter ran most instructions since the last call (psxrt.trace
  * bit 8), as one log line into `buf`; clears the counts. Its length. */
 int native_entries_log(char *buf, int len);
+/* The guest loops that took most PS1 cycles since the last call (sampled at the budget polls), as
+ * one log line into `buf`; clears the counts. Its length. */
+int native_hot_log(char *buf, int len);
 
 #endif
