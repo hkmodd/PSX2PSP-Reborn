@@ -76,7 +76,9 @@ Va nel file della traduzione dentro l'EBOOT, divisa per blocco da 1 KB, e il run
   - 110 parole di codice riscritte, tutte patchabili (120 parole host), 0 all'interprete.
   - T + tabella == T′ bit per bit.
   - Le altre 241-243 parole cambiate nel testo non sono codice raggiunto (dati).
-- Manca un dump RAM di WHEEL: la stessa prova va ripetuta lì prima del passo 5.
+- WHEEL.EXE con `simw/ram03000.bin` (sim senza input, frame 3000): stesse 110 parole, tutte
+  patchabili (120 parole host), T + tabella == T′ bit per bit. Le stesse funzioni 3D sono in
+  entrambi gli exe.
 
 ## Criterio di chiusura
 
