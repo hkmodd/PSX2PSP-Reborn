@@ -14,6 +14,7 @@ pub mod hooks;
 pub mod insn;
 pub mod interp;
 pub mod layout;
+pub mod overlay;
 pub mod psyq;
 
 pub use discover::{Body, DeadEnd, Discovery, Flow, JumpReg, Origin};

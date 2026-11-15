@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::OnceLock;
 
 use psx2psp_recomp::emit::patchable;
-use psx2psp_recomp::{Discovery, Hazards, Hit, PsxExe, Signatures, Translation, layout, translate};
+use psx2psp_recomp::{Discovery, Hazards, Hit, PsxExe, Signatures, Translation, layout, overlay, translate};
 use rayon::prelude::*;
 
 /// Lowest host address translated code may take: below it are the runtime module, its heap and
@@ -47,6 +47,8 @@ pub struct CodeImage {
     /// Patch table ([`patch_groups`]): one group of little-endian words per
     /// [`PATCH_GROUP_BLOCKS`] blocks of RAM from the text's first block.
     pub patch: Vec<Vec<u8>>,
+    /// A file without a PS-X EXE header, placed by [`overlay::locate_all`].
+    pub overlay: bool,
 }
 
 /// Bytes of RAM per block of the runtime's rewrite check (`psp/psxrt/native.c`, BLK_SHIFT).
@@ -114,7 +116,7 @@ pub struct CodePack {
     /// Bytes from `base` to the end of the highest region.
     pub size: u32,
     pub images: Vec<CodeImage>,
-    /// Executables left to the runtime's interpreter, and why.
+    /// Executables and overlays left to the runtime's interpreter, and why.
     pub skipped: Vec<(String, String)>,
 }
 
@@ -130,14 +132,24 @@ struct Parsed {
     name: String,
     exe: PsxExe,
     hash: u32,
+    overlay: bool,
     disc: Discovery,
     hz: Hazards,
 }
 
-/// Translates `exes` (file name, file bytes); files that are not a PS-X EXE are ignored,
-/// duplicates (same address and text) are translated once. Fails only when the code does not
-/// fit between [`CODE_FLOOR`] and the PS1 RAM.
-pub fn build(exes: Vec<(String, Vec<u8>)>) -> Result<CodePack, String> {
+/// Most images the runtime takes (`psp/psxrt/native.c`, MAX_IMAGES).
+pub const MAX_IMAGES: usize = 256;
+/// Largest disc file looked at as an overlay: the PS1 RAM above the kernel area.
+pub const OVERLAY_MAX: u32 = 0x1F_0000;
+
+/// Translates `exes` (file name, file bytes) and the files of `overlays` that
+/// [`overlay::locate_all`] places (S24): executables the guest loads by name, overlays it reads
+/// to an address of its own. Files of `exes` that are not a PS-X EXE are reported as skipped,
+/// files of `overlays` that are not code are ignored; duplicates (same address and text) are
+/// translated once. Overlays never make the build fail: past [`MAX_IMAGES`], or when the code
+/// would not fit, they are left to the interpreter (the largest group first). Fails only when
+/// the executables alone do not fit between [`CODE_FLOOR`] and the PS1 RAM.
+pub fn build(exes: Vec<(String, Vec<u8>)>, overlays: Vec<(String, Vec<u8>)>) -> Result<CodePack, String> {
     let mut pack = CodePack::default();
     let mut seen = HashSet::new();
     let mut parsed = Vec::new();
@@ -155,15 +167,27 @@ pub fn build(exes: Vec<(String, Vec<u8>)>) -> Result<CodePack, String> {
         }
         let hash = fnv1a32(&exe.text);
         if seen.insert((exe.text_addr, exe.text.len(), hash)) {
-            parsed.push((name, exe, hash));
+            parsed.push((name, exe, hash, false));
+        }
+    }
+    let at = overlay::locate_all(&overlays.iter().map(|(_, b)| b.as_slice()).collect::<Vec<_>>());
+    for ((name, bytes), at) in overlays.into_iter().zip(at) {
+        let Some(exe) = at.and_then(|(base, _)| overlay::as_exe(&bytes, base)) else { continue };
+        if parsed.len() >= MAX_IMAGES {
+            pack.skipped.push((name, format!("overlay at {:#010x}: more than {MAX_IMAGES} images", exe.text_addr)));
+            continue;
+        }
+        let hash = fnv1a32(&exe.text);
+        if seen.insert((exe.text_addr, exe.text.len(), hash)) {
+            parsed.push((name, exe, hash, true));
         }
     }
     let parsed: Vec<Parsed> = parsed
         .into_par_iter()
-        .map(|(name, exe, hash)| {
+        .map(|(name, exe, hash, overlay)| {
             let disc = Discovery::run(&exe);
             let hz = Hazards::check(&exe, &disc);
-            Parsed { name, exe, hash, disc, hz }
+            Parsed { name, exe, hash, overlay, disc, hz }
         })
         .collect();
 
@@ -172,30 +196,43 @@ pub fn build(exes: Vec<(String, Vec<u8>)>) -> Result<CodePack, String> {
         .par_iter()
         .map(|p| translate(&p.exe, &p.disc, &p.hz, PROVISIONAL).map(|t| t.words.len() as u32 * 4).map_err(|e| e.to_string()))
         .collect();
-    let mut groups: BTreeMap<u32, u32> = BTreeMap::new();
+    // Group: region size, and whether an executable is in it.
+    let mut groups: BTreeMap<u32, (u32, bool)> = BTreeMap::new();
     let mut ok = Vec::new();
     for (p, size) in parsed.into_iter().zip(sizes) {
         match size {
             Ok(n) => {
                 let g = groups.entry(p.exe.text_addr).or_default();
-                *g = (*g).max(n.next_multiple_of(ALIGN));
+                g.0 = g.0.max(n.next_multiple_of(ALIGN));
+                g.1 |= !p.overlay;
                 ok.push((p, n));
             }
             Err(e) => pack.skipped.push((p.name, e)),
         }
     }
+    let base_for = |groups: &BTreeMap<u32, (u32, bool)>| {
+        let total: u32 = groups.values().map(|g| g.0).sum();
+        (total, layout::RAM.checked_sub(total).map(|b| b & !0xFFFF).filter(|&b| b >= CODE_FLOOR))
+    };
+    while base_for(&groups).1.is_none() {
+        let Some((&at, &(size, _))) = groups.iter().filter(|(_, g)| !g.1).max_by_key(|(_, g)| g.0) else { break };
+        groups.remove(&at);
+        for (p, _) in ok.iter().filter(|(p, _)| p.exe.text_addr == at) {
+            pack.skipped.push((p.name.clone(), format!("overlay at {at:#010x}: its {size} B of code do not fit")));
+        }
+        ok.retain(|(p, _)| p.exe.text_addr != at);
+    }
     if ok.is_empty() {
         return Ok(pack);
     }
-    let total: u32 = groups.values().sum();
-    let base = layout::RAM.checked_sub(total).map(|b| b & !0xFFFF).filter(|&b| b >= CODE_FLOOR);
-    let Some(base) = base else {
+    let Some(base) = base_for(&groups).1 else {
+        let total = base_for(&groups).0;
         return Err(format!("translated code needs {total} bytes, more than the {} below the PS1 RAM", layout::RAM - CODE_FLOOR));
     };
     let mut at = base;
-    for size in groups.values_mut() {
-        let len = *size;
-        *size = at;
+    for g in groups.values_mut() {
+        let len = g.0;
+        g.0 = at;
         at += len;
     }
     pack.base = base;
@@ -204,7 +241,7 @@ pub fn build(exes: Vec<(String, Vec<u8>)>) -> Result<CodePack, String> {
     let images: Vec<Result<CodeImage, String>> = ok
         .into_par_iter()
         .map(|(p, len)| {
-            let host_base = groups[&p.exe.text_addr];
+            let host_base = groups[&p.exe.text_addr].0;
             let t = translate(&p.exe, &p.disc, &p.hz, host_base).map_err(|e| e.to_string())?;
             if t.words.len() as u32 * 4 != len {
                 return Err(format!("translation at {host_base:#010x} is {} words, {} at first", t.words.len(), len / 4));
@@ -227,6 +264,7 @@ pub fn build(exes: Vec<(String, Vec<u8>)>) -> Result<CodePack, String> {
                 table: table.iter().flat_map(|w| w.to_le_bytes()).collect(),
                 runtime_calls: t.runtime.len(),
                 patch: patch_groups(&p.exe, &p.disc, &t),
+                overlay: p.overlay,
             })
         })
         .collect();
@@ -290,13 +328,16 @@ mod tests {
 
     #[test]
     fn executables_at_one_address_share_a_region_below_the_ram() {
-        let pack = build(vec![
+        let pack = build(
+            vec![
             ("A.EXE".into(), exe(0x8001_0000, &[ADDIU_V0_1, JR_RA, 0])),
             ("B.EXE".into(), exe(0x8001_0000, &[JR_RA, ADDIU_V0_1, 0, 0])),
             ("C.EXE".into(), exe(0x8010_0000, &[JR_RA, 0])),
             ("A2.EXE".into(), exe(0x8001_0000, &[ADDIU_V0_1, JR_RA, 0])),
             ("NOTES.TXT".into(), b"hello".to_vec()),
-        ])
+            ],
+            vec![],
+        )
         .unwrap();
         assert_eq!(pack.images.len(), 3, "the copy of A is translated once");
         assert_eq!(pack.skipped.len(), 1);
@@ -320,7 +361,7 @@ mod tests {
     fn the_patch_table_lists_each_patchable_code_word_by_block() {
         const ADDIU_K0_5: u32 = 0x241A_0005; // uses the guest's k0: not one plain copy
         let text = [ADDIU_V0_1, ADDIU_K0_5, JR_RA, ADDIU_V0_1, 0x1234_5678];
-        let pack = build(vec![("P.EXE".into(), exe(0x8001_0FF8, &text))]).unwrap();
+        let pack = build(vec![("P.EXE".into(), exe(0x8001_0FF8, &text))], vec![]).unwrap();
         let p = &pack.images[0];
         let x = PsxExe::parse(&exe(0x8001_0FF8, &text)).unwrap();
         let d = Discovery::run(&x);
@@ -340,5 +381,36 @@ mod tests {
         want[4] = want.len() as u32;
         assert_eq!(g, want, "the data word after the slot is left out");
         assert!(!t.patch.contains_key(&0x8001_0FFC));
+    }
+
+    /// An overlay for `base`: functions (`addiu sp,sp,-8; jr ra; addiu sp,sp,8`) at word offsets
+    /// that form a Golomb ruler (every shift but 0 lines up at most one call with one function),
+    /// and a caller that `jal`s each of them.
+    fn overlay(base: u32) -> Vec<u8> {
+        const AT: [u32; 8] = [0, 4, 16, 36, 60, 88, 128, 136];
+        let mut w = vec![0u32; 0x200];
+        for (k, &at) in AT.iter().enumerate() {
+            w[at as usize..at as usize + 3].copy_from_slice(&[0x27BD_FFF8, JR_RA, 0x27BD_0008]);
+            w[200 + 2 * k] = 0x0C00_0000 | (base + 4 * at) >> 2 & 0x03FF_FFFF;
+        }
+        w[216] = JR_RA;
+        w.iter().flat_map(|x| x.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn overlays_are_translated_at_the_address_their_calls_name() {
+        let pack = build(
+            vec![("MAIN.EXE".into(), exe(0x8001_0000, &[ADDIU_V0_1, JR_RA, 0]))],
+            vec![("LEVEL.OVL".into(), overlay(0x800A_0000)), ("LEVEL.DAT".into(), vec![0x5A; 0x800])],
+        )
+        .unwrap();
+        assert!(pack.skipped.is_empty(), "{:?}", pack.skipped);
+        let [m, o] = &pack.images[..] else { panic!("{:?}", pack.images.iter().map(|i| &i.name).collect::<Vec<_>>()) };
+        assert_eq!((m.name.as_str(), m.overlay), ("MAIN.EXE", false));
+        assert_eq!((o.name.as_str(), o.overlay, o.text_addr, o.text_size), ("LEVEL.OVL", true, 0x800A_0000, 0x800));
+        assert_eq!(o.hash, fnv1a32(&overlay(0x800A_0000)));
+        assert!(o.host_base >= m.host_base + m.code.len() as u32, "disjoint regions");
+        let word = |i: usize| u32::from_le_bytes(o.table[4 * i..4 * i + 4].try_into().unwrap());
+        assert_ne!(word(36), layout::MISS, "each function is translated");
     }
 }

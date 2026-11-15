@@ -896,6 +896,24 @@ pub fn disc_executables(img: &DiscImage, patches: &[&dyn ImagePatch]) -> Vec<(St
     out
 }
 
+/// The files of the disc that could be overlays (S24): not a PS-X EXE, and from 0x800 to
+/// [`native_code::OVERLAY_MAX`] bytes. Which of them are code, and where, is
+/// [`native_code::build`]'s to find.
+pub fn disc_overlay_files(img: &DiscImage, patches: &[&dyn ImagePatch]) -> Vec<(String, Vec<u8>)> {
+    let Ok(files) = img.iso_files() else { return Vec::new() };
+    let mut rd = img.reader();
+    let mut out = Vec::new();
+    for f in files.iter().filter(|f| (0x800..=native_code::OVERLAY_MAX).contains(&f.size)) {
+        if img.read_file(&mut rd, f, 8).is_ok_and(|h| h == b"PS-X EXE") {
+            continue;
+        }
+        if let Ok(bytes) = read_patched_file(img, &mut rd, f, patches) {
+            out.push((f.path.rsplit('/').next().unwrap_or(&f.path).to_string(), bytes));
+        }
+    }
+    out
+}
+
 /// An ISO9660 file of Mode 1 or Mode 2 Form 1 sectors, with `patches` applied to each sector.
 fn read_patched_file(img: &DiscImage, rd: &mut psx2psp_core::disc::DiscReader, f: &psx2psp_core::IsoFile, patches: &[&dyn ImagePatch]) -> psx2psp_core::Result<Vec<u8>> {
     let len = f.size as usize;
@@ -1080,14 +1098,15 @@ pub fn convert_native(req: &ConvertRequest, monitor: &dyn Monitor) -> Result<Con
         .collect();
     let exes = disc_executables(&img, &patches);
     let found = exes.len();
-    let code = native_code::build(exes).map_err(EngineError::Input)?;
+    let code = native_code::build(exes, disc_overlay_files(&img, &patches)).map_err(EngineError::Input)?;
     for (name, why) in &code.skipped {
         monitor.log(&format!("Native: {name} left to the interpreter: {why}"));
     }
     let code_bytes: usize = code.images.iter().map(|i| i.code.len()).sum();
+    let overlays = code.images.iter().filter(|i| i.overlay).count();
     monitor.log(&format!(
-        "Native: {} of {found} executables translated, {code_bytes} B of code in {} B at {:#010x}",
-        code.images.len(),
+        "Native: {} of {found} executables and {overlays} overlays translated, {code_bytes} B of code in {} B at {:#010x}",
+        code.images.len() - overlays,
         code.size,
         code.base
     ));

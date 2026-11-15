@@ -245,3 +245,44 @@ fn real_executables_recipes() {
         println!("{}: {:x?}", path.file_name().unwrap().to_string_lossy(), h);
     }
 }
+/// Load address, discovery and translated size of every file of `PSX2PSP_OVLS` taken as an
+/// overlay (`overlay::locate_all`): `PSX2PSP_OVLS=<dir> cargo test -p psx2psp-recomp --release
+/// --test discover real_overlays -- --ignored --nocapture`.
+#[test]
+#[ignore = "needs PSX2PSP_OVLS"]
+fn real_overlays() {
+    use psx2psp_recomp::overlay;
+    let dir = std::env::var("PSX2PSP_OVLS").expect("PSX2PSP_OVLS");
+    let mut paths: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).collect();
+    paths.sort();
+    println!("file | bytes | base | votes | funcs | code% | invalid stops | jr unresolved | hazards | host bytes");
+    let (mut found, mut code, mut host_max) = (0, 0usize, BTreeMap::<u32, usize>::new());
+    let files: Vec<Vec<u8>> = paths.iter().map(|p| std::fs::read(p).unwrap()).collect();
+    let bases = overlay::locate_all(&files.iter().map(|f| f.as_slice()).collect::<Vec<_>>());
+    for ((path, bytes), at) in paths.iter().zip(&files).zip(bases) {
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        let Some((base, votes)) = at else {
+            println!("{name} | {} | - |", bytes.len());
+            continue;
+        };
+        let x = overlay::as_exe(bytes, base).unwrap();
+        let d = Discovery::run(&x);
+        let h = Hazards::check(&x, &d);
+        let invalid = d.dead_ends.values().filter(|e| matches!(e, DeadEnd::Invalid(_))).count();
+        let unresolved = d.jumps.values().filter(|j| matches!(j, JumpReg::Unresolved(_))).count();
+        let host = psx2psp_recomp::translate(&x, &d, &h, 0x0880_0000).map(|t| t.words.len() * 4).unwrap_or(0);
+        println!(
+            "{name} | {} | {base:08x} | {votes} | {} | {:.1} | {invalid} | {unresolved} | {} | {host}",
+            bytes.len(),
+            d.entries.len(),
+            400.0 * d.code.len() as f64 / x.text.len() as f64,
+            h.sites.len()
+        );
+        found += 1;
+        code += 4 * d.code.len();
+        let m = host_max.entry(base).or_default();
+        *m = (*m).max(host);
+    }
+    println!("TOTAL {found} of {} located, {code} B of code; largest translation per base: {host_max:x?}", paths.len());
+    assert!(!paths.is_empty());
+}
