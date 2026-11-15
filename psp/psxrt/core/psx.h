@@ -65,6 +65,8 @@ typedef struct PsxHost {
     void (*card_dirty)(void *user, int slot);
     /* Optional microsecond clock for profiling (Gpu.us_draw); NULL: not measured. */
     u32 (*usec)(void *user);
+    /* Optional: called as a GPU DMA starts (end 0) and ends (end 1), to profile it apart. */
+    void (*gpu_dma)(void *user, int end);
 } PsxHost;
 
 /* ---- CPU state, shared by the interpreter and the translated code's context ---- */

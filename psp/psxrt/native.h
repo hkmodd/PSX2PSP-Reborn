@@ -26,9 +26,9 @@ typedef struct NativeStats {
     /* host-call instructions by what they touch (IO_KIND_NAMES): count and microseconds */
     u32 n_io[IO_KINDS], us_io_kind[IO_KINDS];
     u32 n_gte[64]; /* GTE commands by opcode */
-    /* PS1 vblanks that waited for the PSP's, came after it, forgiven (PS1 time slowed), not
-     * presented (catching up); waited us */
-    u32 vs_wait, vs_late, vs_adv, vs_drop, us_vs_wait, us_late, us_late_max;
+    /* PS1 vblanks that waited for the PSP's, came after it, forgiven (PS1 time slowed), owed
+     * (the next one comes early); waited us */
+    u32 vs_wait, vs_late, vs_adv, vs_short, us_vs_wait, us_late, us_late_max;
 } NativeStats;
 
 extern NativeStats native_stats;
@@ -43,8 +43,8 @@ void native_run(u32 host_pc) __attribute__((noreturn));
 /* Called at each PS1 vblank once its frame is presented: paces PS1 frames to the PSP display. */
 void native_vsync(void);
 /* Called at each PS1 vblank before its frame is presented: a frame early for its PSP vblank
- * waits for it; one after its PSP vblank returns 0: it is not presented. */
-int native_vsync_early(void);
+ * waits for it. */
+void native_vsync_early(void);
 /* Provided by the runtime: stops with a message; does not return. */
 void runtime_halt(const char *why) __attribute__((noreturn));
 

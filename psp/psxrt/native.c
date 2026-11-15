@@ -139,6 +139,7 @@ static u32 code_lo, code_hi;
 static u32 cpu_shift; /* DiscInfo.cpu_shift, at most 8 */
 static Psx *P;
 static u64 t_base, c_base;
+static u64 stall_to; /* an owed vblank's CPU stall: the cycle count update() brings the devices to */
 static u64 t_lock;     /* when the PSP vblank v_lock started, on native_vsync's grid */
 static u32 v_lock, vc; /* vc: the PSP vblank count at the last PS1 vblank */
 
@@ -577,8 +578,14 @@ static void sync_time(void)
  * When this frame made its vblank (or came before it: the runtime does not sleep inside a
  * frame), the next one starts at its slot, slept to if still ahead; when
  * it did not, the next one's slot is still the one after this one's: up to OWE_MAX vblanks are
- * owed, and the frames after run unslept and unshown (native_vsync_early) until they catch up.
- * Beyond that PS1 time slows down. The FMV lost 13 vblanks a second when a late frame's slot
+ * owed, beyond that PS1 time slows down. For an owed vblank the CPU stalls to VS_SHORT PS1 cycles
+ * before it: PS1 time keeps up with the PSP's, and a game that counts vblanks moves as far as on
+ * time, at fewer frames. The stall moves the cycle count, so the timers, the CD and the SPU see the
+ * whole frame pass too (vblanks VS_SHORT apart alone made the CD's vblank-counted timeouts expire
+ * 8 times early: with a late PSP the level fell into disc errors). (Before, the late frames ran on at one vblank each
+ * and went unshown: on the PSP the level ran at 55% speed showing 11 pictures a second, against
+ * 90% and 40 with the old over-charged loops, which made frames span vblanks.)
+ * The FMV lost 13 vblanks a second when a late frame's slot
  * moved to the vblank that passed, while its light frames slept 110 ms (S21). The vblanks' times come from a grid, a
  * frame of 1001/60 ms from one seen at boot, kept inside what the count says at each call: vblank
  * v has come, v + 1 has not. sceDisplayWaitVblankStart is not used: called close to a vblank,
@@ -587,8 +594,8 @@ static void sync_time(void)
 #define VS_MARGIN 6000u
 /* Vblanks owed at most: with the margin, 39.4 ms behind, inside BEHIND_MAX */
 #define OWE_MAX 2u
-/* Frames in a row left unshown at most while catching up */
-#define DROP_MAX 2u
+/* PS1 cycles run to an owed vblank after the stall: 1/8 of a frame */
+#define VS_SHORT (P->frame_cycles / 8)
 void native_vsync(void)
 {
     u32 v = sceDisplayGetVcount();
@@ -616,35 +623,53 @@ void native_vsync(void)
             native_stats.vs_adv += v - vc - OWE_MAX, vc = v - OWE_MAX;
         vc += s;
         t_base = t_lock + VS_US(vc - v_lock) - VS_MARGIN;
+        /* the next slot has passed too: the CPU stalls to VS_SHORT before its vblank (psx_update
+         * has moved next_vblank a frame on already; update() runs the stall, event by event) */
+        if ((s32)(v - vc) >= 0 && P->cycles + VS_SHORT < P->next_vblank)
+            stall_to = P->next_vblank - VS_SHORT, native_stats.vs_short++;
     }
     c_base = P->cycles;
 }
 
 /* Before the frame is presented: one that came before its PSP vblank (vc) waits for it, or its
- * swap would replace the last frame's before that one was shown. One after it is not shown
- * (0), its time goes to catching up; but no more than DROP_MAX in a row. */
-int native_vsync_early(void)
+ * swap would replace the last frame's before that one was shown. */
+void native_vsync_early(void)
 {
-    static u32 drops;
     u32 v = sceDisplayGetVcount();
-    if ((s32)(v - vc) > 0 && drops < DROP_MAX)
-        return drops++, native_stats.vs_drop++, 0;
-    drops = 0;
     if ((s32)(vc - v) <= 0)
-        return 1;
+        return;
     u64 now = sceKernelGetSystemTimeWide(), t = t_lock + VS_US(vc - v_lock);
     if (t > now) {
         u32 dt = (u32)(t - now);
         sceKernelDelayThread(dt);
         native_stats.us_sleep += dt, native_stats.us_vs_wait += dt;
     }
-    return 1;
 }
 
 /* Times one call in PROF_EVERY, and every vblank (rare, and the longest: the frame is
  * presented and paced inside), with psx_update's parts (Psx.us_upd); the clock reads they add
  * are taken off. */
+static void update_once(void);
+/* psx_update, then the stall native_vsync asked for: the guest runs no code while the devices
+ * go through their events in order up to stall_to (one jump made the CD lose interrupts: the
+ * boot hung in CD_init). */
 static void update(void)
+{
+    update_once();
+    if (stall_to > P->cycles) /* native_vsync's c_base is after the stall, as for a frame on time */
+        c_base += stall_to - P->cycles;
+    for (int k = 0; stall_to > P->cycles; k++) {
+        u64 to = stall_to < P->next_event && k < 1024 ? stall_to : P->next_event;
+        if (k >= 1024 || to <= P->cycles)
+            to = stall_to;
+        P->cycles = to;
+        if (P->cycles >= P->next_event)
+            psx_update(P);
+    }
+    stall_to = 0;
+}
+
+static void update_once(void)
 {
     static u32 n;
     u32 s = P->cycles >= P->next_vblank ? 1 : n++ % PROF_EVERY ? 0 : PROF_EVERY;

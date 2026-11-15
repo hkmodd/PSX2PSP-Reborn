@@ -68,7 +68,11 @@ static void run(Psx *psx, int ch)
 {
     const PsxHost *h = psx->host;
     u32 t = h->usec ? h->usec(h->user) : 0;
+    if (ch == 2 && h->gpu_dma)
+        h->gpu_dma(h->user, 0);
     transfer(psx, ch);
+    if (ch == 2 && h->gpu_dma)
+        h->gpu_dma(h->user, 1);
     if (h->usec)
         psx->dma.us_run[ch] += h->usec(h->user) - t;
     psx->dma.n_run[ch]++;

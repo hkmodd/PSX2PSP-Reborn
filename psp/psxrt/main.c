@@ -63,6 +63,8 @@ static SceUID log_fd = -1;
 static char log_path[256]; /* reopened to append: only a close updates the size on the stick */
 static int trace_bits; /* from psxrt.trace beside the EBOOT */
 static int cpu_override = -1; /* from psxrt.cpu beside the EBOOT */
+/* psxrt.slow beside the EBOOT: us slept at each game frame, to test pacing when the PSP is late */
+static u32 slow_us, slow_flips;
 /* psxrt.prof beside the EBOOT: the Allegrex profiler's counters once a second (pspsdk's
  * PspDebugProfilerRegs, 20 words at 0xBC400000: 0 enable, then the counts), through KUBridge
  * (kubridge.S), which needs ARK-4 */
@@ -75,6 +77,24 @@ static void prof_clear(void)
 {
     for (int k = 1; k < 20; k++)
         kuKernelPokew(PROF_REG(k), 0);
+}
+
+/* The counters' share of the GPU DMAs (the PS1 display lists walked into GE commands): cpu ck,
+ * memory stall, i_miss, d_miss. A DMA runs on the CPU thread, never across the log's clear. */
+static const u8 gd_reg[4] = {2, 4, 13, 14};
+static u32 gd_at[4], gd_sum[4];
+static void host_gpu_dma(void *user, int end)
+{
+    (void)user;
+    if (!prof_on)
+        return;
+    for (int k = 0; k < 4; k++) {
+        u32 r = kuKernelPeekw(PROF_REG(gd_reg[k]));
+        if (end)
+            gd_sum[k] += r - gd_at[k];
+        else
+            gd_at[k] = r;
+    }
 }
 /* psxrt.spu beside the EBOOT: "cpu" (0) the SPU mixes every voice; "both" (2) sceSasCore plays
  * its voices beside the SPU, for the level comparison; otherwise (1) sceSasCore plays them */
@@ -212,6 +232,14 @@ static void open_log(const char *eboot)
         sceIoRead(fd, num, sizeof num - 1);
         sceIoClose(fd);
         cpu_override = (int)strtol(num, NULL, 10);
+    }
+    snprintf(slash + 1, sizeof path - (size_t)(slash + 1 - path), "psxrt.slow");
+    fd = sceIoOpen(path, PSP_O_RDONLY, 0);
+    if (fd >= 0) {
+        char num[16] = {0};
+        sceIoRead(fd, num, sizeof num - 1);
+        sceIoClose(fd);
+        slow_us = (u32)strtoul(num, NULL, 10);
     }
     snprintf(slash + 1, sizeof path - (size_t)(slash + 1 - path), "psxrt.prof");
     fd = sceIoOpen(path, PSP_O_RDONLY, 0);
@@ -759,9 +787,8 @@ static u32 watch_word(u32 a)
     return v;
 }
 
-/* Pad, status line, picture (unless `show` is 0: a frame late for its PSP vblank, the GE only
- * runs on); once per second the speed (and native counters) to the log. */
-static void frame(int show)
+/* Pad, status line, picture; once per second the speed (and native counters) to the log. */
+static void frame(void)
 {
     static u64 t0;
     static u64 c0;
@@ -807,7 +834,7 @@ static void frame(int show)
                               (unsigned)(s->ra_scans - n0.ra_scans), (unsigned)(s->hooks - n0.hooks));
                 n += snprintf(line + n, sizeof line - (size_t)n,
                               "-- ms: interp %u io %u (draw %u mdec %u spu %u) update %u present %u (wait %u draw %u text %u rgb24 %u) sleep %u;"
-                              " audio drops %u gaps %u trims %u peak %u/%u; vsync wait %u (%u ms) late %u (avg %u max %u us) skipped %u dropped %u\n",
+                              " audio drops %u gaps %u trims %u peak %u/%u; vsync wait %u (%u ms) late %u (avg %u max %u us) skipped %u short %u\n",
                               ms_of(s->us_interp - n0.us_interp), ms_of(s->us_io - n0.us_io),
                               ms_of(psx.gpu.us_draw - draw0), ms_of(psx.mdec.us_decode - mdec0),
                               ms_of(psx.spu.us_mix - spu0),
@@ -817,7 +844,7 @@ static void frame(int show)
                               (unsigned)audio_drops, (unsigned)audio_gaps, (unsigned)audio_trims, (unsigned)audio_peak_in, (unsigned)audio_peak_out, (unsigned)(s->vs_wait - n0.vs_wait),
                               ms_of(s->us_vs_wait - n0.us_vs_wait), (unsigned)(s->vs_late - n0.vs_late),
                               (unsigned)((s->us_late - n0.us_late) / ((s->vs_late - n0.vs_late) | 1)), (unsigned)s->us_late_max,
-                              (unsigned)(s->vs_adv - n0.vs_adv), (unsigned)(s->vs_drop - n0.vs_drop));
+                              (unsigned)(s->vs_adv - n0.vs_adv), (unsigned)(s->vs_short - n0.vs_short));
                 static u32 upd0[UPD_PARTS];
                 static const char *const upd_names[UPD_PARTS] = UPD_PART_NAMES;
                 n += snprintf(line + n, sizeof line - (size_t)n, "-- update (ms):");
@@ -895,11 +922,13 @@ static void frame(int show)
                 prof_clear();
                 n += snprintf(line + n, sizeof line - (size_t)n,
                               "-- cpu (k): on %u ck %u stall %u memory %u copz %u vfpu %u sleep %u bus %u uncached %u/%u"
-                              " cached %u/%u i_miss %u d_miss %u wb %u\n",
+                              " cached %u/%u i_miss %u d_miss %u wb %u; gpu dma ck %u memory %u i_miss %u d_miss %u\n",
                               (unsigned)r[0], (unsigned)(r[2] / 1000), (unsigned)(r[3] / 1000), (unsigned)(r[4] / 1000),
                               (unsigned)(r[5] / 1000), (unsigned)(r[6] / 1000), (unsigned)(r[7] / 1000), (unsigned)(r[8] / 1000),
                               (unsigned)(r[9] / 1000), (unsigned)(r[10] / 1000), (unsigned)(r[11] / 1000), (unsigned)(r[12] / 1000),
-                              (unsigned)(r[13] / 1000), (unsigned)(r[14] / 1000), (unsigned)(r[15] / 1000));
+                              (unsigned)(r[13] / 1000), (unsigned)(r[14] / 1000), (unsigned)(r[15] / 1000), (unsigned)(gd_sum[0] / 1000),
+                              (unsigned)(gd_sum[1] / 1000), (unsigned)(gd_sum[2] / 1000), (unsigned)(gd_sum[3] / 1000));
+                memset(gd_sum, 0, sizeof gd_sum);
             }
             n += ge_log(line + n, (int)sizeof line - n);
             u32 k = bench_n - BENCH_SKIP;
@@ -923,10 +952,6 @@ static void frame(int show)
     }
     if (!status[0])
         snprintf(status, sizeof status, "booting");
-    if (!show) {
-        ge_run();
-        return;
-    }
     u32 tp = sceKernelGetSystemTimeLow();
     present(&psx, status);
     native_stats.us_present += sceKernelGetSystemTimeLow() - tp;
@@ -1077,7 +1102,10 @@ static void host_vblank(void *user)
         if ((shot_at[i] & 0x7FFFFFFFu) == frames)
             (shot_at[i] >> 31 ? ram_dump : shot)(&psx, frames);
     if (native) {
-        frame(native_vsync_early());
+        if (slow_us && psx.gpu.flips != slow_flips) /* debugging: a slower CPU, per game frame */
+            slow_flips = psx.gpu.flips, sceKernelDelayThread(slow_us);
+        native_vsync_early();
+        frame();
         native_vsync();
     }
 }
@@ -1178,6 +1206,7 @@ int main(int argc, char **argv)
     host.log = host_log;
     host.vblank = host_vblank;
     host.usec = host_usec;
+    host.gpu_dma = host_gpu_dma;
     host.audio = host_audio;
     int ath = sceKernelCreateThread("psxrt audio", audio_thread, 0x12, 0x2000, PSP_THREAD_ATTR_USER, NULL);
     if (ath >= 0)
@@ -1241,7 +1270,7 @@ int main(int argc, char **argv)
             cpu_run(&psx, psx.cycles + 4096);
         if (psx.exiting)
             halt(psx.exiting == 2 ? "the interpreter hit a fatal error" : "the game exited");
-        frame(1);
+        frame();
     }
     return 0;
 }
