@@ -873,7 +873,9 @@ static int call_a(Psx *psx, u32 fn)
     case 0x43: /* Exec */
         bios_exec(psx, a0, a1, a2);
         return 2;
-    case 0x44: /* FlushCache */
+    case 0x44: /* FlushCache: code stores wrote may run from here */
+        if (psx->ram_loaded)
+            psx->ram_loaded(psx, 0, 0);
         return 1;
     case 0x49: /* GPU_cw */
         gpu_gp0(psx, a0);

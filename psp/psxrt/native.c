@@ -30,8 +30,15 @@
  * (the CD's sectors) would run ahead of the guest code that serves them. A 500 us alarm makes the budget negative, so
  * that loops enter the runtime and interrupts are taken there.
  *
- * Limits: code written by CPU stores (decompressed or copied by the game) is not tracked, EPC
- * holds host addresses while translated code is interrupted, and GRET returns are LIFO.
+ * Code written by CPU stores (decompressed or copied by the game) is checked at each I-cache
+ * flush, which the R3000A needs before running it too: FlushCache, or the end of a cache
+ * isolation. A 1 KB block whose translated words no longer sum as when its table entries were set
+ * is DIRTY again; the rest of its executable stays native.
+ * While the cache is isolated (SR bit 16) the guest runs in the interpreter, whose stores do not
+ * reach RAM; translated stores would.
+ *
+ * Limits: code stores change with no flush after them run their old translation, EPC holds host
+ * addresses while translated code is interrupted, and GRET returns are LIFO.
  */
 #include "native.h"
 
@@ -150,6 +157,33 @@ static u32 fnv1a(const u8 *p, u32 n)
     return h;
 }
 
+/* Code CPU stores change, seen at a cache flush: RAM in blocks of 1 KB, each with a sum of the
+ * words the table translates there, as RAM held them when the block's entries were last set
+ * (every change of the table sums its blocks again). Data and undiscovered words are left out:
+ * an executable's text_size covers its data section too, which the game writes all the time. */
+#define BLK_SHIFT 10
+#define BLKS (RAM_SIZE >> BLK_SHIFT)
+static u32 blk_sum[BLKS];
+static u8 blk_code[BLKS]; /* the block has translated words: a flush checks it */
+
+static u32 blk_code_sum(u32 b, u8 *code)
+{
+    const u32 *w = (const u32 *)(P->ram + (b << BLK_SHIFT)), *t = &table[b << (BLK_SHIFT - 2)];
+    u32 h = 0x811C9DC5u, len = code_hi - code_lo;
+    *code = 0;
+    for (u32 i = 0; i < 1u << (BLK_SHIFT - 2); i++)
+        if (t[i] - code_lo < len)
+            h = (h ^ w[i]) * 0x01000193u, *code = 1;
+    return h;
+}
+
+/* The table entries of [a, a + len) of RAM changed: their blocks are summed again. */
+static void blk_resum(u32 a, u32 len)
+{
+    for (u32 b = a >> BLK_SHIFT, e = (a + len + (1u << BLK_SHIFT) - 1) >> BLK_SHIFT; b < e && b < BLKS; b++)
+        blk_sum[b] = blk_code_sum(b, &blk_code[b]);
+}
+
 static void flush_code(void)
 {
     sceKernelDcacheWritebackInvalidateAll();
@@ -215,6 +249,7 @@ static void evict(Image *m)
         if (*t >= lo && *t < hi)
             *t = STUB_MISS;
     }
+    blk_resum(m->text, e->text_size);
     m->resident = m->installed = 0;
 }
 
@@ -241,6 +276,7 @@ static int load(Image *m)
             img[i].installed = 0;
     m->installed = 1;
     m->checked = m->gen;
+    blk_resum(m->text, e->text_size);
     flush_code();
     native_stats.loads++;
     say("native: %.16s at %08X (%u B of code)", e->name, (unsigned)e->text_addr, (unsigned)e->code_len);
@@ -279,15 +315,45 @@ static int try_load(u32 pc, int miss)
     return 0;
 }
 
-/* PSX.ram_loaded: the translations of what was overwritten are checked again before use. */
+static void on_ram_loaded(Psx *psx, u32 addr, u32 len);
+
+/* The I-cache was flushed: a block whose translated words CPU stores changed is checked again
+ * before use, as if loaded over; the rest of its executable stays. The first flushes, and those
+ * that find a change, are logged with their time. */
+static void cache_flushed(void)
+{
+    static u32 n;
+    u32 t = sceKernelGetSystemTimeLow(), code = 0, changed = 0;
+    u8 any;
+    for (u32 b = 0; b < BLKS; b++) {
+        if (!blk_code[b])
+            continue;
+        code++;
+        if (blk_code_sum(b, &any) != blk_sum[b]) {
+            changed++;
+            on_ram_loaded(P, b << BLK_SHIFT, 1u << BLK_SHIFT);
+        }
+    }
+    if (n++ < 8 || changed)
+        say("native: cache flush %u: %u of %u KB of code changed (%u us)", (unsigned)n, (unsigned)changed, (unsigned)code,
+            (unsigned)(sceKernelGetSystemTimeLow() - t));
+}
+
+/* PSX.ram_loaded: the translations of what was overwritten are checked again before use. `len` 0:
+ * the I-cache was flushed. */
 static void on_ram_loaded(Psx *psx, u32 addr, u32 len)
 {
     (void)psx;
+    if (!len) {
+        cache_flushed();
+        return;
+    }
     u32 a = addr & (RAM_SIZE - 4), end = a + ((len + 3) & ~3u);
     if (end > RAM_SIZE)
         end = RAM_SIZE;
     for (u32 x = a; x < end; x += 4)
         table[x >> 2] = STUB_DIRTY;
+    blk_resum(a, end - a);
     for (int i = 0; i < nimg; i++)
         if (a < img[i].text + img[i].e->text_size && img[i].text < end)
             img[i].gen++;
@@ -411,6 +477,7 @@ static u32 run_guest(int mode)
 
 static u32 interp(int mode)
 {
+    static int isolated; /* the cache was isolated since the last return to translated code */
     Cpu *c = &P->cpu;
     for (u32 n = 0;; n++) {
         if (P->exiting)
@@ -421,13 +488,20 @@ static u32 interp(int mode)
                 jump(c, gret[--gret_top % GRET_DEPTH]);
                 continue;
             }
-            u32 h = host_of(pc);
-            if (!h && try_load(pc, mode == 1))
-                h = host_of(pc);
-            if (h) {
-                finish_load(c);
-                fix_ra(c);
-                return h;
+            /* Cache isolated: only the interpreter keeps stores out of RAM. Its end is a flush. */
+            if (c->sr & 0x10000) {
+                isolated = 1;
+            } else {
+                if (isolated)
+                    isolated = 0, cache_flushed();
+                u32 h = host_of(pc);
+                if (!h && try_load(pc, mode == 1))
+                    h = host_of(pc);
+                if (h) {
+                    finish_load(c);
+                    fix_ra(c);
+                    return h;
+                }
             }
         }
         mode = 0;
@@ -1028,6 +1102,7 @@ const char *native_init(Psx *psx, const DiscInfo *info)
     gte_fast_psx = psx;
     for (u32 i = 0; i < TABLE_WORDS; i++)
         table[i] = STUB_MISS;
+    blk_resum(0, RAM_SIZE);
     stub(STUB_RT_CALL, psxrt_rt_call);
     stub(STUB_MISS, psxrt_miss);
     stub(STUB_DIRTY, psxrt_miss);
@@ -1098,6 +1173,7 @@ int native_load(int fd)
         sceIoRead(fd, table, TABLE_WORDS * 4) != (int)(TABLE_WORDS * 4))
         return -1;
     sceKernelDcacheWritebackInvalidateAll();
+    blk_resum(0, RAM_SIZE); /* RAM and the table are the snapshot's already */
     for (u32 i = 0; i < n; i++) {
         Image *m = &img[i];
         m->resident = (int)st[i][0], m->installed = (int)st[i][1], m->gen = st[i][2], m->checked = st[i][3];
