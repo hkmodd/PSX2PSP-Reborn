@@ -46,6 +46,36 @@ loss is the timer polling (+37), DMA (+36) and MDEC (+21). These come with S20's
 The next psxrt counts the update time only in `update`, so `io_vlc` becomes the decoder alone.
 The next PSP run then answers whether the recipe should stay.
 
+### Who reads the timer 15 000 times a second (offline, 2026-11-15)
+
+A count of timer reads by guest pc in the simulator (interpreter, intro FMV; the probe was
+removed afterwards) gives one loop: SLES_028.95 0x80101738, the wait for the next streamed frame.
+
+    SetRCnt(RCntCnt1, 0xFFFF, 0x2000); StartRCnt(RCntCnt1); t0 = GetRCnt(RCntCnt1)
+    do { if (GetRCnt(RCntCnt1) - t0 > 10000) return 0;   /* hblank timeout */
+         if (!--n) return 0; }                            /* n = 0x800000 */
+    while (StGetNext(&addr, &head));                      /* 0x80103130: ring slot 1/2 -> 4 */
+
+GetRCnt is 0x8010202C (`lhu` of the counter at 0x8010204C). It makes ~90% of the timer reads in
+every FMV second.
+
+- **The loop waits on the CD.** It spins until the next frame's sectors are in the ring. Every
+  emulated microsecond the frame's decode does not use is spent here, one timer read per
+  iteration.
+- **Rates.**
+  - PPSSPP, with the same native code: 22 000 reads per emulated second.
+  - PSP S20a: 15 000 at 73%, the same rate.
+  - PSP S19: 4-5 000 at 85%, because the guest's DecDCTvlc used the time that is now spent
+    waiting.
+- **The reads cost nothing on the PS1, but a lot on the PSP.** Each iteration costs ~4 us
+  (59 ms / 15 000) and moves emulated time by at most one hblank tick.
+  - `poll_skip` advances to the next tick and never further, so that loops counting tick edges
+    stay exact.
+  - This loop only compares a difference with 10 000, so it could advance to `next_event` in one
+    step.
+- **A general fix needs a rule that tells the two kinds of loop apart.** That is a `native.c`
+  change, so it goes to the Host first.
+
 ## Still to record (S20c proper)
 
 Three 60 s benches (`psxrt.bench` holding `60` beside the EBOOT) on one build: the intro FMV from
