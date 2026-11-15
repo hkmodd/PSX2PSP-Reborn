@@ -151,8 +151,11 @@ static const ScePspIMatrix4 ps1_dither = {{-4, 0, -3, 1}, {2, -2, 3, -1}, {-3, 1
  * A frame of level 1 is ~20 KB of list: with a 16 KB step the real GE got its work at present()
  * and drew it while the CPU waited (6-10 ms a frame). 1 KB is ~60 polygons, a few hundred
  * system calls a second. The S18c device run alternated 1 KB and 8 KB every second: the moves
- * cost under 1 ms a second either way, and a polygon ~0.5 us less with 8 KB. */
-#define STALL_STEP (8 * 1024)
+ * cost under 1 ms a second either way. In the 3D scene the speed was the same with both, and the
+ * GE wait in present() was 10-15 ms/s with 1 KB, 22 with 8 KB. S19 made the list ~30% shorter, so
+ * with 8 KB the GE got its first block later still: the wait went to 41-43 ms/s and the speed to
+ * 62% from 65%. Back to 1 KB. */
+#define STALL_STEP (1 * 1024)
 static u32 stall_step = STALL_STEP;
 #define LIST_UNCACHED ((u8 *)((u32)list | 0x40000000u))
 static int list_id;
