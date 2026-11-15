@@ -1,0 +1,5 @@
+scene             s  speed  worst  min   fps interp     io   draw   mdec    spu update present  sleep
+SLES_028.95       4   100%    97%  97%   0.0    365    114      0      0     56    171     20    560
+SLES_028.95/fmv   62    73%    68%  68%   9.9     14    498      0    177     83    266     87    114
+WHEEL            28    77%    60%  60%  28.1      8    288    196      0     30    111     34    180
+end: no end line: switched off or crashed after f4299; last event: CD_init:addr=800813a8

@@ -1,0 +1,896 @@
+PSX2PSP native runtime (psxrt) - S4, built Nov 15 2026 02:29:01
+clock 333 MHz (0)
+EBOOT ms0:/PSP/GAME/Sheepnative/EBOOT.PBP
+disc SLES02895 "Sheep, Dog 'n' Wolf": 269241 sectors, 16828 blocks
+native: 18 executables, code at 091E0000-097F5100
+card ms0:/PSP/GAME/Sheepnative/card0.mcr: loaded
+sceSasCore plays the SPU's voices
+PAL60: a PAL picture at 60 Hz
+ge: 64 KB of vertices in 325 us uncached, 634 us cached and written back
+cpu: clock read 566 ns, cache miss 332 ns (0)
+ge busy 24162 us (from RAM): cache miss 300 ns, 64 KB of vertices uncached 1220 us; stall move 539 ns (0)
+ge: 32 texture page slots, 512 KB vertex ring
+GE renderer
+profile: an empty timed interval costs 590 ns
+native: GTE NCLIP/AVSZ/RTPS/RTPT/MVMVA/GPF in asm, 0 of 69632 checks differ
+video mode PAL60
+boot cdrom:\SLES_028.95;1 (PAL) pc 80101B2C sp 801FFFF0
+native: SLES_028.95 at 80100000 (682884 B of code)
+ResetGraph:jtb=8011a928,env=8011a970
+video mode NTSC
+CD_init:addr=80118878
+native: cache flush 1: 0 of 98 KB of code changed (2502 us)
+-- f 60 pc 097246A4 97% 59 vbl 0 fps
+-- native: 14251 calls, 720 misses, 1114 steps, 1 hashes, 1 loads, 114 poll skips, 614 hooks
+-- ms: interp 1446 io 85 (draw 0 mdec 0 spu 111) update 150 present 19 (wait 3 draw 16 text 12 rgb24 0) sleep 587; audio drops 0 gaps 1 trims 0 peak 0/0; vsync wait 6 (2 ms) late 5 (avg 8810 max 16077 us) skipped 7
+-- io (n/ms): gpu 177/0 dma 1784/60 cd 187/0 spu 2247/5 timer 3268/12 irq 3384/3 pad 3344/2 cop0 4/0 other 408/0
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 0/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch4 197/28/50
+-- sas: voices 000000 on 48 adopted 0 back 48 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 949 lost 0 pages 613 (live 549) errors 0 (last 00000000 op 0) retries 0; grains 2 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 0 (0 kpx), flush 0; bind 0 tex 0 clut, kick 60 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+video mode PAL60
+CD_init:addr=80118878
+CD_init:addr=80118878
+mdec: scale table standard, fast IDCT
+mdec: VFPU IDCT and colour in use, 0 of 49152 channels differ by 1, 0 by more; 0 of 512 RLE blocks differ
+mdec: a macroblock costs 13109 ns of IDCT, 27609 ns of IDCT and colour, 5718 ns of 24-bit packing
+-- f 115 pc 096EE7CC 89% 53 vbl 2 fps
+-- native: 27133 calls, 312 misses, 312 steps, 0 hashes, 1 loads, 6360 poll skips, 608 hooks
+-- ms: interp 6 io 147 (draw 0 mdec 82 spu 110) update 127 present 34 (wait 17 draw 16 text 12 rgb24 0) sleep 471; audio drops 0 gaps 3 trims 0 peak 0/0; vsync wait 1 (0 ms) late 6 (avg 8007 max 15439 us) skipped 5
+-- io (n/ms): gpu 4161/3 dma 2050/91 cd 1378/2 spu 20/0 timer 13767/41 irq 2985/2 mdec 12/0 pad 3410/3 other 224/0 vlc 3/2
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 4/0 other 132/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 5/1/5 ch1 60/90/184 ch2 65/20/184 ch3 63/10/16
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 4, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 62 (369 kpx), flush 0; bind 0 tex 0 clut, kick 61 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+rgb24 on the GE: 0 of 81920 pixels (0 not black) differ
+rgb24: a frame converts in 11725 us on the GE, 3971 us on the CPU: the CPU converts from now on
+-- f 163 pc 096EE7CC 76% 45 vbl 11 fps
+-- native: 38362 calls, 464 misses, 464 steps, 0 hashes, 1 loads, 12088 poll skips, 545 hooks
+-- ms: interp 11 io 408 (draw 1 mdec 173 spu 89) update 794 present 130 (wait 84 draw 45 text 10 rgb24 8) sleep 180; audio drops 0 gaps 16 trims 0 peak 0/0; vsync wait 1 (0 ms) late 23 (avg 4275 max 10188 us) skipped 15
+-- io (n/ms): gpu 2706/4 dma 6744/314 cd 2625/4 timer 17750/64 irq 5558/6 mdec 24/0 pad 2976/2 other 735/0 vlc 12/10
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 480/1 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 12/7/23 ch1 240/203/737 ch2 240/81/737 ch3 210/35/53
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 1 (256 tiles, 2 ms), upload 240 (1474 kpx), flush 0; bind 0 tex 0 clut, kick 71 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 210 pc 80111870 77% 46 vbl 10 fps
+-- native: 36409 calls, 437 misses, 437 steps, 0 hashes, 1 loads, 11377 poll skips, 539 hooks
+-- ms: interp 14 io 452 (draw 0 mdec 166 spu 88) update 218 present 92 (wait 26 draw 66 text 9 rgb24 52) sleep 111; audio drops 0 gaps 20 trims 0 peak 15498/15492; vsync wait 4 (3 ms) late 22 (avg 6817 max 16577 us) skipped 16
+-- io (n/ms): gpu 2498/5 dma 6399/321 cd 2625/7 timer 16774/64 irq 5243/6 mdec 22/0 pad 2914/3 other 735/0 vlc 12/41
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 440/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 11/12/40 ch1 220/194/675 ch2 220/76/675 ch3 210/38/53
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 220 (1351 kpx), flush 0; bind 0 tex 0 clut, kick 69 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 252 pc 096EE7CC 70% 41 vbl 10 fps
+-- native: 32899 calls, 412 misses, 412 steps, 0 hashes, 1 loads, 9568 poll skips, 475 hooks
+-- ms: interp 11 io 469 (draw 0 mdec 177 spu 78) update 242 present 89 (wait 24 draw 65 text 8 rgb24 52) sleep 117; audio drops 0 gaps 18 trims 0 peak 10721/10701; vsync wait 0 (0 ms) late 21 (avg 6226 max 15373 us) skipped 18
+-- io (n/ms): gpu 2472/4 dma 6074/306 cd 2300/5 timer 14507/59 irq 4951/8 mdec 22/0 pad 2542/3 other 644/0 vlc 10/82
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 440/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 11/24/77 ch1 220/204/675 ch2 220/75/675 ch3 184/32/47
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 220 (1351 kpx), flush 0; bind 0 tex 0 clut, kick 64 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 298 pc 096EE7B8 73% 43 vbl 11 fps
+-- native: 36229 calls, 455 misses, 455 steps, 0 hashes, 1 loads, 10510 poll skips, 536 hooks
+-- ms: interp 14 io 520 (draw 1 mdec 190 spu 87) update 245 present 83 (wait 24 draw 58 text 9 rgb24 44) sleep 88; audio drops 0 gaps 22 trims 0 peak 7178/8465; vsync wait 2 (3 ms) late 23 (avg 6993 max 15137 us) skipped 15
+-- io (n/ms): gpu 2700/6 dma 6672/353 cd 2550/6 timer 15967/60 irq 5462/7 mdec 24/0 pad 2852/3 other 714/0 vlc 12/81
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 480/1 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 12/25/79 ch1 240/220/737 ch2 240/81/737 ch3 204/38/52
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 240 (1474 kpx), flush 0; bind 0 tex 0 clut, kick 70 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 342 pc 096EE7CC 73% 43 vbl 10 fps
+-- native: 34018 calls, 419 misses, 419 steps, 0 hashes, 1 loads, 10035 poll skips, 509 hooks
+-- ms: interp 16 io 382 (draw 0 mdec 177 spu 85) update 235 present 113 (wait 27 draw 85 text 9 rgb24 72) sleep 83; audio drops 0 gaps 28 trims 0 peak 18695/17726; vsync wait 1 (1 ms) late 27 (avg 7695 max 16106 us) skipped 18
+-- io (n/ms): gpu 2482/5 dma 6200/238 cd 2425/4 timer 15195/67 irq 5054/7 mdec 22/0 pad 2728/3 other 679/0 vlc 11/55
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 440/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 11/24/76 ch1 220/205/675 ch2 220/77/675 ch3 194/34/49
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 220 (1351 kpx), flush 0; bind 0 tex 0 clut, kick 66 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 387 pc 096EE7CC 75% 44 vbl 10 fps
+-- native: 34449 calls, 428 misses, 428 steps, 0 hashes, 1 loads, 10069 poll skips, 522 hooks
+-- ms: interp 12 io 511 (draw 1 mdec 176 spu 85) update 280 present 82 (wait 24 draw 57 text 9 rgb24 44) sleep 74; audio drops 0 gaps 21 trims 0 peak 13268/18695; vsync wait 2 (1 ms) late 24 (avg 8855 max 16574 us) skipped 15
+-- io (n/ms): gpu 2488/5 dma 6273/345 cd 2500/7 timer 15274/61 irq 5136/7 mdec 22/0 pad 2790/6 other 700/0 vlc 11/76
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 440/1 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 11/25/82 ch1 220/203/675 ch2 220/75/675 ch3 200/36/51
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 220 (1351 kpx), flush 0; bind 0 tex 0 clut, kick 67 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 430 pc 096EE7CC 71% 42 vbl 10 fps
+-- native: 32954 calls, 417 misses, 417 steps, 0 hashes, 1 loads, 9281 poll skips, 501 hooks
+-- ms: interp 10 io 532 (draw 0 mdec 179 spu 80) update 298 present 82 (wait 24 draw 57 text 9 rgb24 45) sleep 115; audio drops 0 gaps 24 trims 0 peak 13450/13448; vsync wait 2 (1 ms) late 19 (avg 6542 max 13791 us) skipped 18
+-- io (n/ms): gpu 2476/5 dma 6133/366 cd 2350/6 timer 14299/59 irq 5023/7 mdec 22/0 pad 2666/3 other 658/0 vlc 11/81
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 440/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 11/30/92 ch1 220/207/675 ch2 220/73/675 ch3 188/33/48
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 220 (1351 kpx), flush 0; bind 0 tex 0 clut, kick 65 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 472 pc 096EE7CC 69% 41 vbl 10 fps
+-- native: 32273 calls, 411 misses, 411 steps, 0 hashes, 1 loads, 9013 poll skips, 466 hooks
+-- ms: interp 13 io 470 (draw 1 mdec 179 spu 79) update 197 present 84 (wait 22 draw 61 text 9 rgb24 48) sleep 121; audio drops 0 gaps 26 trims 0 peak 24912/24843; vsync wait 1 (1 ms) late 20 (avg 5570 max 16129 us) skipped 18
+-- io (n/ms): gpu 2474/6 dma 6110/315 cd 2325/6 timer 13865/54 irq 4939/6 mdec 22/0 pad 2480/5 other 651/0 vlc 11/74
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 440/1 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 11/27/89 ch1 220/206/675 ch2 220/74/675 ch3 186/33/47
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 220 (1351 kpx), flush 0; bind 0 tex 0 clut, kick 64 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 517 pc 096EE7CC 75% 44 vbl 10 fps
+-- native: 34043 calls, 428 misses, 428 steps, 0 hashes, 1 loads, 9783 poll skips, 512 hooks
+-- ms: interp 15 io 467 (draw 0 mdec 176 spu 86) update 230 present 92 (wait 26 draw 66 text 10 rgb24 52) sleep 77; audio drops 0 gaps 17 trims 0 peak 20166/20131; vsync wait 1 (0 ms) late 25 (avg 8573 max 16008 us) skipped 17
+-- io (n/ms): gpu 2488/5 dma 6280/301 cd 2500/5 timer 14908/58 irq 5124/7 mdec 22/0 pad 2728/3 other 700/1 vlc 11/84
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 440/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 11/26/84 ch1 220/203/675 ch2 220/74/675 ch3 200/37/51
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 220 (1351 kpx), flush 0; bind 0 tex 0 clut, kick 67 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 560 pc 096EE7CC 72% 42 vbl 10 fps
+-- native: 32897 calls, 418 misses, 418 steps, 0 hashes, 1 loads, 9228 poll skips, 501 hooks
+-- ms: interp 12 io 502 (draw 0 mdec 178 spu 80) update 437 present 94 (wait 24 draw 69 text 9 rgb24 56) sleep 100; audio drops 0 gaps 19 trims 0 peak 8093/8093; vsync wait 0 (0 ms) late 24 (avg 6444 max 16441 us) skipped 17
+-- io (n/ms): gpu 2476/6 dma 6135/350 cd 2350/5 timer 14263/58 irq 5029/7 mdec 22/0 pad 2666/4 other 658/2 vlc 11/66
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 440/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 11/27/85 ch1 220/205/675 ch2 220/75/675 ch3 188/33/48
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 220 (1351 kpx), flush 0; bind 0 tex 0 clut, kick 65 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 606 pc 096EE7B8 77% 45 vbl 11 fps
+-- native: 35925 calls, 445 misses, 445 steps, 0 hashes, 1 loads, 10673 poll skips, 521 hooks
+-- ms: interp 15 io 494 (draw 0 mdec 179 spu 85) update 271 present 86 (wait 24 draw 62 text 9 rgb24 48) sleep 110; audio drops 0 gaps 18 trims 0 peak 0/0; vsync wait 1 (0 ms) late 22 (avg 8010 max 16429 us) skipped 13
+-- io (n/ms): gpu 2612/5 dma 6557/353 cd 2575/5 timer 16006/61 irq 5328/9 mdec 24/0 pad 2790/3 other 721/1 vlc 12/54
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 462/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 12/18/57 ch1 232/207/712 ch2 231/78/709 ch3 206/37/52
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 231 (1419 kpx), flush 0; bind 0 tex 0 clut, kick 69 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 653 pc 096EE7CC 78% 46 vbl 10 fps
+-- native: 36677 calls, 445 misses, 445 steps, 0 hashes, 1 loads, 11336 poll skips, 531 hooks
+-- ms: interp 11 io 370 (draw 1 mdec 171 spu 88) update 83 present 93 (wait 26 draw 66 text 9 rgb24 52) sleep 121; audio drops 0 gaps 19 trims 0 peak 8669/8655; vsync wait 0 (0 ms) late 23 (avg 8471 max 16194 us) skipped 15
+-- io (n/ms): gpu 2584/4 dma 6498/256 cd 2575/9 timer 16781/63 irq 5344/8 mdec 22/0 pad 2914/3 other 721/0 vlc 11/23
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 458/1 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 11/13/40 ch1 228/199/700 ch2 229/78/703 ch3 206/37/52
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 229 (1406 kpx), flush 0; bind 0 tex 0 clut, kick 70 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 699 pc 096EE7CC 76% 45 vbl 11 fps
+-- native: 36552 calls, 454 misses, 454 steps, 0 hashes, 1 loads, 10905 poll skips, 532 hooks
+-- ms: interp 15 io 626 (draw 0 mdec 181 spu 86) update 309 present 88 (wait 26 draw 62 text 9 rgb24 48) sleep 106; audio drops 0 gaps 20 trims 0 peak 4833/4805; vsync wait 6 (5 ms) late 22 (avg 6969 max 15533 us) skipped 14
+-- io (n/ms): gpu 2698/6 dma 6650/473 cd 2525/6 timer 16349/72 irq 5455/7 mdec 24/0 pad 2852/6 other 707/0 vlc 12/53
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 480/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 12/16/46 ch1 240/211/737 ch2 240/81/737 ch3 202/37/51
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 240 (1474 kpx), flush 0; bind 0 tex 0 clut, kick 70 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 744 pc 096EE7CC 75% 44 vbl 10 fps
+-- native: 35118 calls, 427 misses, 427 steps, 0 hashes, 1 loads, 10697 poll skips, 511 hooks
+-- ms: interp 14 io 435 (draw 0 mdec 167 spu 86) update 203 present 95 (wait 24 draw 70 text 9 rgb24 56) sleep 135; audio drops 0 gaps 24 trims 0 peak 6165/6165; vsync wait 0 (0 ms) late 23 (avg 7018 max 16107 us) skipped 16
+-- io (n/ms): gpu 2488/5 dma 6277/325 cd 2500/5 timer 15934/62 irq 5127/6 mdec 22/0 pad 2790/3 other 700/0 vlc 11/25
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 440/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 11/14/44 ch1 220/194/675 ch2 220/74/675 ch3 200/35/51
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 220 (1351 kpx), flush 0; bind 0 tex 0 clut, kick 67 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 791 pc 096EE7B8 79% 46 vbl 11 fps
+-- native: 37034 calls, 459 misses, 459 steps, 0 hashes, 1 loads, 11059 poll skips, 547 hooks
+-- ms: interp 14 io 656 (draw 0 mdec 183 spu 91) update 455 present 93 (wait 26 draw 66 text 10 rgb24 52) sleep 75; audio drops 0 gaps 15 trims 0 peak 5530/5523; vsync wait 3 (2 ms) late 26 (avg 7755 max 15798 us) skipped 13
+-- io (n/ms): gpu 2704/5 dma 6720/511 cd 2600/9 timer 16600/62 irq 5508/8 mdec 24/0 pad 2914/6 other 728/0 vlc 12/51
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 480/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 12/16/50 ch1 240/214/737 ch2 240/82/737 ch3 208/38/53
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 240 (1474 kpx), flush 0; bind 0 tex 0 clut, kick 71 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 836 pc 096EE7CC 74% 44 vbl 11 fps
+-- native: 35791 calls, 447 misses, 447 steps, 0 hashes, 1 loads, 10520 poll skips, 512 hooks
+-- ms: interp 14 io 508 (draw 0 mdec 183 spu 84) update 195 present 95 (wait 24 draw 70 text 10 rgb24 56) sleep 109; audio drops 0 gaps 19 trims 0 peak 3513/3509; vsync wait 1 (2 ms) late 23 (avg 8505 max 16199 us) skipped 14
+-- io (n/ms): gpu 2694/6 dma 6600/366 cd 2475/8 timer 15861/66 irq 5374/6 mdec 24/0 pad 2728/5 other 693/0 vlc 12/47
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 480/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 12/16/51 ch1 240/214/737 ch2 240/80/737 ch3 198/36/50
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 240 (1474 kpx), flush 0; bind 0 tex 0 clut, kick 69 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 884 pc 096EE7CC 79% 47 vbl 11 fps
+-- native: 37613 calls, 463 misses, 463 steps, 0 hashes, 1 loads, 11295 poll skips, 555 hooks
+-- ms: interp 14 io 473 (draw 0 mdec 184 spu 91) update 197 present 92 (wait 26 draw 66 text 10 rgb24 52) sleep 77; audio drops 0 gaps 14 trims 0 peak 3017/3015; vsync wait 1 (2 ms) late 27 (avg 7930 max 16211 us) skipped 13
+-- io (n/ms): gpu 2710/4 dma 6792/327 cd 2675/6 timer 16925/74 irq 5558/7 mdec 24/0 pad 2976/4 other 749/0 vlc 12/47
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 480/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 12/16/51 ch1 240/213/737 ch2 240/81/737 ch3 214/38/54
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 240 (1474 kpx), flush 0; bind 0 tex 0 clut, kick 72 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 931 pc 096EE7CC 76% 45 vbl 11 fps
+-- native: 37018 calls, 458 misses, 458 steps, 0 hashes, 1 loads, 11088 poll skips, 539 hooks
+-- ms: interp 17 io 546 (draw 1 mdec 184 spu 89) update 237 present 97 (wait 26 draw 70 text 9 rgb24 56) sleep 111; audio drops 0 gaps 20 trims 0 peak 1910/1910; vsync wait 4 (4 ms) late 24 (avg 7819 max 15885 us) skipped 15
+-- io (n/ms): gpu 2702/5 dma 6699/408 cd 2575/3 timer 16624/70 irq 5497/7 mdec 24/0 pad 2914/3 other 721/0 vlc 12/46
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 480/1 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 12/15/50 ch1 240/214/737 ch2 240/81/737 ch3 206/37/52
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 240 (1474 kpx), flush 0; bind 0 tex 0 clut, kick 71 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 979 pc 096EE7CC 80% 47 vbl 11 fps
+-- native: 38224 calls, 466 misses, 466 steps, 0 hashes, 1 loads, 11879 poll skips, 545 hooks
+-- ms: interp 12 io 489 (draw 1 mdec 178 spu 91) update 266 present 88 (wait 26 draw 62 text 10 rgb24 47) sleep 120; audio drops 0 gaps 21 trims 0 peak 821/821; vsync wait 3 (1 ms) late 23 (avg 6656 max 15008 us) skipped 13
+-- io (n/ms): gpu 2708/5 dma 6770/344 cd 2650/4 timer 17522/94 irq 5576/7 mdec 24/0 pad 2976/5 other 742/0 vlc 12/27
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 480/1 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 12/10/31 ch1 240/208/737 ch2 240/82/737 ch3 212/38/54
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 240 (1474 kpx), flush 0; bind 0 tex 0 clut, kick 72 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+CD_init:addr=80118878
+-- f 1029 pc 096EE7CC 82% 48 vbl 9 fps
+-- native: 40829 calls, 461 misses, 461 steps, 0 hashes, 1 loads, 12509 poll skips, 561 hooks
+-- ms: interp 15 io 447 (draw 1 mdec 149 spu 94) update 215 present 90 (wait 22 draw 66 text 10 rgb24 52) sleep 185; audio drops 0 gaps 16 trims 0 peak 0/0; vsync wait 0 (0 ms) late 21 (avg 7467 max 15193 us) skipped 11
+-- io (n/ms): gpu 4084/6 dma 5922/337 cd 2839/6 spu 16/0 timer 19804/73 irq 5221/7 mdec 26/0 pad 3100/3 other 680/0 vlc 11/10
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 400/1 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 12/7/23 ch1 200/174/614 ch2 200/68/614 ch3 193/36/49
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 200 (1228 kpx), flush 0; bind 0 tex 0 clut, kick 70 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 1074 pc 096EE7CC 75% 44 vbl 10 fps
+-- native: 34130 calls, 427 misses, 427 steps, 0 hashes, 1 loads, 9853 poll skips, 528 hooks
+-- ms: interp 12 io 479 (draw 0 mdec 180 spu 85) update 370 present 88 (wait 26 draw 62 text 9 rgb24 48) sleep 92; audio drops 0 gaps 23 trims 0 peak 0/0; vsync wait 6 (9 ms) late 22 (avg 7849 max 16238 us) skipped 16
+-- io (n/ms): gpu 2486/5 dma 6250/299 cd 2475/7 timer 15029/66 irq 5128/7 mdec 22/0 pad 2790/3 other 693/0 vlc 11/89
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 440/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 11/28/90 ch1 220/207/675 ch2 220/73/675 ch3 198/35/50
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 220 (1351 kpx), flush 0; bind 0 tex 0 clut, kick 67 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 1120 pc 80111870 76% 45 vbl 10 fps
+-- native: 34293 calls, 434 misses, 434 steps, 0 hashes, 1 loads, 9626 poll skips, 541 hooks
+-- ms: interp 14 io 545 (draw 0 mdec 181 spu 87) update 265 present 82 (wait 24 draw 58 text 9 rgb24 44) sleep 73; audio drops 0 gaps 16 trims 0 peak 0/0; vsync wait 1 (0 ms) late 25 (avg 7258 max 15915 us) skipped 15
+-- io (n/ms): gpu 2494/6 dma 6355/362 cd 2575/7 timer 14878/54 irq 5204/8 mdec 22/0 pad 2852/5 other 721/0 vlc 12/99
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 440/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 11/33/102 ch1 220/208/675 ch2 220/74/675 ch3 206/37/52
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 220 (1351 kpx), flush 0; bind 0 tex 0 clut, kick 68 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 1161 pc 096EE7CC 68% 40 vbl 10 fps
+-- native: 31731 calls, 408 misses, 408 steps, 0 hashes, 1 loads, 8654 poll skips, 481 hooks
+-- ms: interp 13 io 593 (draw 1 mdec 184 spu 78) update 193 present 89 (wait 24 draw 65 text 9 rgb24 52) sleep 114; audio drops 0 gaps 23 trims 0 peak 0/0; vsync wait 4 (5 ms) late 19 (avg 6440 max 15531 us) skipped 19
+-- io (n/ms): gpu 2468/5 dma 6028/407 cd 2250/7 timer 13538/57 irq 4918/6 mdec 22/0 pad 2542/4 other 630/0 vlc 10/104
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 440/1 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 11/33/107 ch1 220/211/675 ch2 220/74/675 ch3 180/31/46
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 220 (1351 kpx), flush 0; bind 0 tex 0 clut, kick 63 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 1207 pc 096EE7CC 74% 44 vbl 11 fps
+-- native: 35045 calls, 453 misses, 453 steps, 0 hashes, 1 loads, 9587 poll skips, 533 hooks
+-- ms: interp 16 io 496 (draw 1 mdec 200 spu 86) update 68 present 86 (wait 24 draw 62 text 9 rgb24 48) sleep 84; audio drops 0 gaps 20 trims 0 peak 0/0; vsync wait 1 (2 ms) late 23 (avg 7230 max 16535 us) skipped 15
+-- io (n/ms): gpu 2698/4 dma 6650/310 cd 2525/5 timer 14932/60 irq 5434/12 mdec 24/0 pad 2790/4 other 707/2 vlc 12/96
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 480/1 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 12/36/115 ch1 240/230/737 ch2 240/81/737 ch3 202/36/51
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 240 (1474 kpx), flush 0; bind 0 tex 0 clut, kick 70 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 1251 pc 096EE7CC 70% 41 vbl 10 fps
+-- native: 33176 calls, 421 misses, 421 steps, 0 hashes, 1 loads, 9273 poll skips, 505 hooks
+-- ms: interp 14 io 487 (draw 0 mdec 183 spu 82) update 82 present 91 (wait 24 draw 66 text 9 rgb24 52) sleep 135; audio drops 0 gaps 22 trims 0 peak 0/0; vsync wait 5 (3 ms) late 21 (avg 5120 max 16113 us) skipped 19
+-- io (n/ms): gpu 2482/4 dma 6203/313 cd 2425/5 timer 14328/59 irq 5059/8 mdec 22/0 pad 2666/3 other 679/0 vlc 11/91
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 440/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 11/32/105 ch1 220/210/675 ch2 220/74/675 ch3 194/34/49
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 220 (1351 kpx), flush 0; bind 0 tex 0 clut, kick 66 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 1297 pc 096EE7CC 76% 45 vbl 10 fps
+-- native: 34454 calls, 434 misses, 434 steps, 0 hashes, 1 loads, 9779 poll skips, 544 hooks
+-- ms: interp 17 io 670 (draw 2 mdec 183 spu 85) update 376 present 88 (wait 26 draw 61 text 9 rgb24 47) sleep 74; audio drops 0 gaps 19 trims 0 peak 0/0; vsync wait 3 (4 ms) late 21 (avg 8772 max 16346 us) skipped 16
+-- io (n/ms): gpu 2494/4 dma 6345/494 cd 2575/7 timer 15028/58 irq 5198/7 mdec 22/0 pad 2852/5 other 721/0 vlc 11/93
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 440/2 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 11/33/105 ch1 220/211/675 ch2 220/74/675 ch3 206/38/52
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 220 (1351 kpx), flush 0; bind 0 tex 0 clut, kick 68 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 1339 pc 096EE7CC 69% 41 vbl 10 fps
+-- native: 32205 calls, 415 misses, 415 steps, 0 hashes, 1 loads, 8746 poll skips, 497 hooks
+-- ms: interp 10 io 488 (draw 1 mdec 183 spu 80) update 484 present 90 (wait 24 draw 65 text 9 rgb24 52) sleep 124; audio drops 0 gaps 25 trims 0 peak 0/0; vsync wait 3 (2 ms) late 19 (avg 5527 max 13494 us) skipped 19
+-- io (n/ms): gpu 2474/4 dma 6106/326 cd 2325/4 timer 13703/52 irq 4990/8 mdec 22/1 pad 2604/5 other 651/0 vlc 11/83
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 440/1 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 11/33/105 ch1 220/211/675 ch2 220/74/675 ch3 186/33/47
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 220 (1351 kpx), flush 0; bind 0 tex 0 clut, kick 64 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 1383 pc 096EE7CC 73% 43 vbl 10 fps
+-- native: 33265 calls, 426 misses, 426 steps, 0 hashes, 1 loads, 9264 poll skips, 523 hooks
+-- ms: interp 15 io 585 (draw 0 mdec 184 spu 82) update 92 present 86 (wait 24 draw 61 text 9 rgb24 48) sleep 86; audio drops 0 gaps 17 trims 0 peak 0/0; vsync wait 4 (7 ms) late 21 (avg 8194 max 16258 us) skipped 16
+-- io (n/ms): gpu 2482/5 dma 6201/399 cd 2425/10 timer 14359/50 irq 5101/10 mdec 22/0 pad 2728/3 other 679/0 vlc 11/103
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 440/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 11/32/105 ch1 220/211/675 ch2 220/74/675 ch3 194/35/49
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 220 (1351 kpx), flush 0; bind 0 tex 0 clut, kick 66 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 1428 pc 096EE7B8 74% 44 vbl 10 fps
+-- native: 33640 calls, 428 misses, 428 steps, 0 hashes, 1 loads, 9387 poll skips, 532 hooks
+-- ms: interp 11 io 614 (draw 0 mdec 183 spu 84) update 186 present 90 (wait 24 draw 65 text 9 rgb24 52) sleep 77; audio drops 0 gaps 19 trims 0 peak 0/0; vsync wait 1 (0 ms) late 23 (avg 8069 max 16362 us) skipped 16
+-- io (n/ms): gpu 2486/7 dma 6257/440 cd 2475/7 timer 14559/58 irq 5138/8 mdec 22/0 pad 2790/6 other 693/0 vlc 12/84
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 440/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 11/34/107 ch1 220/210/675 ch2 220/74/675 ch3 198/35/50
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 220 (1351 kpx), flush 0; bind 0 tex 0 clut, kick 67 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 1470 pc 096EE7CC 70% 41 vbl 10 fps
+-- native: 32227 calls, 412 misses, 412 steps, 0 hashes, 1 loads, 8865 poll skips, 495 hooks
+-- ms: interp 13 io 580 (draw 0 mdec 181 spu 78) update 267 present 81 (wait 24 draw 57 text 9 rgb24 44) sleep 115; audio drops 0 gaps 21 trims 0 peak 0/0; vsync wait 2 (3 ms) late 18 (avg 4893 max 15915 us) skipped 18
+-- io (n/ms): gpu 2472/4 dma 6079/402 cd 2300/4 timer 13797/50 irq 4964/6 mdec 22/0 pad 2604/5 other 644/0 vlc 10/105
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 440/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 11/32/103 ch1 220/208/675 ch2 220/75/675 ch3 184/33/47
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 220 (1351 kpx), flush 0; bind 0 tex 0 clut, kick 64 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 1517 pc 096EE7CC 78% 46 vbl 11 fps
+-- native: 37125 calls, 457 misses, 457 steps, 0 hashes, 1 loads, 11121 poll skips, 538 hooks
+-- ms: interp 15 io 625 (draw 1 mdec 183 spu 89) update 375 present 92 (wait 26 draw 66 text 9 rgb24 52) sleep 95; audio drops 0 gaps 18 trims 0 peak 0/0; vsync wait 0 (0 ms) late 24 (avg 7363 max 15116 us) skipped 13
+-- io (n/ms): gpu 2704/6 dma 6720/487 cd 2600/5 timer 16689/70 irq 5496/9 mdec 24/0 pad 2914/5 other 728/0 vlc 12/38
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 480/1 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 12/18/56 ch1 240/213/737 ch2 240/81/737 ch3 208/38/53
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 240 (1474 kpx), flush 0; bind 0 tex 0 clut, kick 71 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+CD_init:addr=80118878
+-- f 1567 pc 096EE7CC 83% 49 vbl 10 fps
+-- native: 40290 calls, 460 misses, 460 steps, 0 hashes, 1 loads, 11990 poll skips, 574 hooks
+-- ms: interp 17 io 378 (draw 0 mdec 154 spu 92) update 374 present 80 (wait 20 draw 59 text 10 rgb24 44) sleep 147; audio drops 0 gaps 14 trims 0 peak 17557/17439; vsync wait 0 (0 ms) late 21 (avg 7588 max 15977 us) skipped 9
+-- io (n/ms): gpu 4091/5 dma 5922/243 cd 2839/5 spu 16/0 timer 19249/69 irq 5237/9 mdec 26/0 pad 3100/4 other 680/1 vlc 11/39
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 400/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 12/16/48 ch1 200/180/614 ch2 200/68/614 ch3 193/35/49
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 200 (1228 kpx), flush 0; bind 0 tex 0 clut, kick 70 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 1608 pc 096EE7CC 68% 40 vbl 9 fps
+-- native: 30715 calls, 388 misses, 388 steps, 0 hashes, 1 loads, 8595 poll skips, 483 hooks
+-- ms: interp 11 io 465 (draw 0 mdec 167 spu 77) update 35 present 90 (wait 24 draw 65 text 8 rgb24 52) sleep 128; audio drops 0 gaps 22 trims 0 peak 24410/24267; vsync wait 2 (1 ms) late 18 (avg 3987 max 13622 us) skipped 21
+-- io (n/ms): gpu 2262/5 dma 5705/313 cd 2275/9 timer 13319/46 irq 4665/6 mdec 20/0 pad 2542/3 other 637/0 vlc 10/79
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 400/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 10/32/104 ch1 200/193/614 ch2 200/68/614 ch3 182/33/46
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 200 (1228 kpx), flush 0; bind 0 tex 0 clut, kick 61 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 1649 pc 096EE7CC 68% 40 vbl 10 fps
+-- native: 31483 calls, 409 misses, 409 steps, 0 hashes, 1 loads, 8435 poll skips, 486 hooks
+-- ms: interp 14 io 613 (draw 0 mdec 183 spu 75) update 450 present 75 (wait 22 draw 53 text 8 rgb24 40) sleep 132; audio drops 0 gaps 25 trims 0 peak 9355/8569; vsync wait 4 (7 ms) late 16 (avg 4245 max 16236 us) skipped 18
+-- io (n/ms): gpu 2440/5 dma 6015/446 cd 2275/5 timer 13282/54 irq 4909/6 mdec 22/0 pad 2542/3 other 637/0 vlc 11/91
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 434/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 11/35/112 ch1 218/209/669 ch2 217/71/666 ch3 182/32/46
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 217 (1333 kpx), flush 0; bind 0 tex 0 clut, kick 63 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 1694 pc 096EE7CC 75% 44 vbl 10 fps
+-- native: 33819 calls, 429 misses, 429 steps, 0 hashes, 1 loads, 9460 poll skips, 531 hooks
+-- ms: interp 12 io 541 (draw 0 mdec 187 spu 86) update 292 present 90 (wait 24 draw 65 text 9 rgb24 52) sleep 61; audio drops 0 gaps 20 trims 0 peak 22187/22167; vsync wait 0 (0 ms) late 26 (avg 7782 max 16525 us) skipped 15
+-- io (n/ms): gpu 2516/4 dma 6293/364 cd 2475/6 timer 14660/62 irq 5163/12 mdec 22/0 pad 2790/4 other 693/0 vlc 11/85
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 446/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 11/36/112 ch1 222/215/681 ch2 223/75/685 ch3 198/36/50
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 223 (1370 kpx), flush 0; bind 0 tex 0 clut, kick 67 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 1737 pc 096EE7CC 69% 41 vbl 10 fps
+-- native: 32673 calls, 418 misses, 418 steps, 0 hashes, 1 loads, 8909 poll skips, 509 hooks
+-- ms: interp 15 io 600 (draw 0 mdec 185 spu 82) update 412 present 93 (wait 24 draw 69 text 9 rgb24 56) sleep 125; audio drops 0 gaps 19 trims 0 peak 26724/26724; vsync wait 3 (4 ms) late 21 (avg 4987 max 16410 us) skipped 20
+-- io (n/ms): gpu 2480/4 dma 6178/425 cd 2400/5 timer 13945/57 irq 5031/8 mdec 22/0 pad 2666/3 other 672/0 vlc 11/93
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 440/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 11/35/113 ch1 220/212/675 ch2 220/75/675 ch3 192/34/49
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 220 (1351 kpx), flush 0; bind 0 tex 0 clut, kick 65 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 1782 pc 096EE7CC 74% 44 vbl 10 fps
+-- native: 33597 calls, 426 misses, 426 steps, 0 hashes, 1 loads, 9432 poll skips, 535 hooks
+-- ms: interp 14 io 516 (draw 0 mdec 184 spu 85) update 321 present 92 (wait 26 draw 65 text 9 rgb24 52) sleep 70; audio drops 0 gaps 18 trims 0 peak 11962/11956; vsync wait 3 (7 ms) late 23 (avg 8657 max 16045 us) skipped 17
+-- io (n/ms): gpu 2484/5 dma 6224/337 cd 2450/3 timer 14581/54 irq 5115/8 mdec 22/0 pad 2790/3 other 686/1 vlc 11/103
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 440/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 11/35/113 ch1 220/211/675 ch2 220/74/675 ch3 196/35/50
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 220 (1351 kpx), flush 0; bind 0 tex 0 clut, kick 67 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 1824 pc 096EE7CC 69% 41 vbl 10 fps
+-- native: 32146 calls, 415 misses, 415 steps, 0 hashes, 1 loads, 8704 poll skips, 495 hooks
+-- ms: interp 16 io 485 (draw 1 mdec 185 spu 78) update 252 present 84 (wait 22 draw 62 text 9 rgb24 48) sleep 109; audio drops 0 gaps 25 trims 0 peak 24360/24285; vsync wait 3 (3 ms) late 23 (avg 4936 max 15994 us) skipped 18
+-- io (n/ms): gpu 2474/4 dma 6106/320 cd 2325/4 timer 13665/53 irq 4992/6 mdec 22/0 pad 2604/3 other 651/0 vlc 11/91
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 440/1 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 11/34/111 ch1 220/211/675 ch2 220/75/675 ch3 186/33/47
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 220 (1351 kpx), flush 0; bind 0 tex 0 clut, kick 64 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 1867 pc 80111870 72% 42 vbl 9 fps
+-- native: 31700 calls, 400 misses, 400 steps, 0 hashes, 1 loads, 8923 poll skips, 508 hooks
+-- ms: interp 16 io 452 (draw 0 mdec 170 spu 81) update 212 present 85 (wait 24 draw 61 text 9 rgb24 48) sleep 119; audio drops 0 gaps 22 trims 0 peak 15827/16886; vsync wait 3 (1 ms) late 21 (avg 6531 max 16148 us) skipped 19
+-- io (n/ms): gpu 2272/4 dma 5831/295 cd 2400/6 timer 13784/50 irq 4790/6 mdec 20/0 pad 2666/6 other 672/0 vlc 11/81
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 400/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 10/32/104 ch1 200/194/614 ch2 200/68/614 ch3 192/36/49
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 200 (1228 kpx), flush 0; bind 0 tex 0 clut, kick 63 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 1909 pc 096EE7CC 70% 41 vbl 10 fps
+-- native: 32149 calls, 412 misses, 412 steps, 0 hashes, 1 loads, 8805 poll skips, 495 hooks
+-- ms: interp 11 io 553 (draw 2 mdec 185 spu 80) update 250 present 94 (wait 24 draw 70 text 9 rgb24 56) sleep 87; audio drops 0 gaps 21 trims 0 peak 12285/10111; vsync wait 3 (2 ms) late 24 (avg 6105 max 16251 us) skipped 18
+-- io (n/ms): gpu 2472/5 dma 6076/386 cd 2300/4 timer 13757/55 irq 4964/7 mdec 22/0 pad 2604/4 other 644/0 vlc 10/89
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 440/2 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 11/36/114 ch1 220/211/675 ch2 220/76/675 ch3 184/33/47
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 220 (1351 kpx), flush 0; bind 0 tex 0 clut, kick 64 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 1950 pc 096EE7CC 68% 40 vbl 10 fps
+-- native: 31593 calls, 411 misses, 411 steps, 0 hashes, 1 loads, 8408 poll skips, 487 hooks
+-- ms: interp 16 io 445 (draw 0 mdec 185 spu 75) update 145 present 75 (wait 22 draw 53 text 8 rgb24 40) sleep 122; audio drops 0 gaps 21 trims 0 peak 26720/26528; vsync wait 3 (7 ms) late 17 (avg 5769 max 15665 us) skipped 17
+-- io (n/ms): gpu 2470/5 dma 6058/276 cd 2275/5 timer 13272/50 irq 4943/7 mdec 22/0 pad 2542/2 other 637/0 vlc 11/95
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 440/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 11/35/113 ch1 220/212/675 ch2 220/74/675 ch3 182/33/46
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 220 (1351 kpx), flush 0; bind 0 tex 0 clut, kick 63 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 1995 pc 096EE7CC 74% 44 vbl 10 fps
+-- native: 33682 calls, 426 misses, 426 steps, 0 hashes, 1 loads, 9446 poll skips, 533 hooks
+-- ms: interp 15 io 476 (draw 1 mdec 185 spu 85) update 310 present 87 (wait 25 draw 62 text 9 rgb24 48) sleep 82; audio drops 0 gaps 16 trims 0 peak 10682/10682; vsync wait 1 (1 ms) late 25 (avg 8045 max 15637 us) skipped 16
+-- io (n/ms): gpu 2486/4 dma 6250/303 cd 2475/7 timer 14610/63 irq 5120/8 mdec 22/0 pad 2790/4 other 693/0 vlc 11/84
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 440/1 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 11/36/114 ch1 220/212/675 ch2 220/74/675 ch3 198/37/50
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 220 (1351 kpx), flush 0; bind 0 tex 0 clut, kick 67 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 2037 pc 096EE7B8 70% 41 vbl 9 fps
+-- native: 31256 calls, 394 misses, 394 steps, 0 hashes, 1 loads, 8810 poll skips, 494 hooks
+-- ms: interp 15 io 402 (draw 0 mdec 168 spu 80) update 270 present 84 (wait 22 draw 61 text 9 rgb24 48) sleep 136; audio drops 0 gaps 22 trims 0 peak 17419/16223; vsync wait 5 (6 ms) late 17 (avg 3673 max 12254 us) skipped 21
+-- io (n/ms): gpu 2266/3 dma 5761/240 cd 2325/6 timer 13594/55 irq 4728/7 mdec 20/1 pad 2604/3 other 651/0 vlc 11/83
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 400/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 10/31/102 ch1 200/193/614 ch2 200/66/614 ch3 186/34/47
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 200 (1228 kpx), flush 0; bind 0 tex 0 clut, kick 62 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 2080 pc 096EE7CC 72% 42 vbl 10 fps
+-- native: 32624 calls, 417 misses, 417 steps, 0 hashes, 1 loads, 9035 poll skips, 496 hooks
+-- ms: interp 11 io 483 (draw 0 mdec 185 spu 81) update 147 present 85 (wait 24 draw 61 text 9 rgb24 48) sleep 83; audio drops 0 gaps 20 trims 0 peak 24369/24318; vsync wait 1 (2 ms) late 22 (avg 7030 max 16536 us) skipped 17
+-- io (n/ms): gpu 2478/4 dma 6149/311 cd 2375/6 timer 13999/56 irq 5005/6 mdec 22/0 pad 2604/3 other 665/0 vlc 10/93
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 440/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 11/35/113 ch1 220/212/675 ch2 220/74/675 ch3 190/35/48
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 220 (1351 kpx), flush 0; bind 0 tex 0 clut, kick 65 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 2121 pc 096EE7CC 68% 40 vbl 10 fps
+-- native: 31442 calls, 409 misses, 409 steps, 0 hashes, 1 loads, 8373 poll skips, 489 hooks
+-- ms: interp 12 io 605 (draw 0 mdec 185 spu 76) update 429 present 88 (wait 22 draw 65 text 8 rgb24 52) sleep 107; audio drops 0 gaps 22 trims 0 peak 10137/8591; vsync wait 3 (3 ms) late 17 (avg 5169 max 16463 us) skipped 17
+-- io (n/ms): gpu 2468/4 dma 6034/445 cd 2250/4 timer 13237/52 irq 4925/6 mdec 22/0 pad 2542/4 other 630/0 vlc 11/86
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 440/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 11/36/115 ch1 220/212/675 ch2 220/75/675 ch3 180/33/46
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 220 (1351 kpx), flush 0; bind 0 tex 0 clut, kick 63 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 2165 pc 096EE7CC 71% 42 vbl 10 fps
+-- native: 33196 calls, 421 misses, 421 steps, 0 hashes, 1 loads, 9172 poll skips, 520 hooks
+-- ms: interp 17 io 487 (draw 0 mdec 184 spu 83) update 269 present 86 (wait 24 draw 61 text 9 rgb24 48) sleep 102; audio drops 0 gaps 22 trims 0 peak 22631/22316; vsync wait 3 (3 ms) late 19 (avg 6689 max 16563 us) skipped 18
+-- io (n/ms): gpu 2484/4 dma 6226/318 cd 2450/6 timer 14268/59 irq 5070/6 mdec 22/0 pad 2728/3 other 686/0 vlc 11/87
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 440/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 11/35/114 ch1 220/212/675 ch2 220/74/675 ch3 196/35/50
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 220 (1351 kpx), flush 0; bind 0 tex 0 clut, kick 66 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 2209 pc 096EE7CC 73% 43 vbl 10 fps
+-- native: 33174 calls, 422 misses, 422 steps, 0 hashes, 1 loads, 9157 poll skips, 518 hooks
+-- ms: interp 14 io 540 (draw 1 mdec 186 spu 84) update 81 present 101 (wait 26 draw 74 text 9 rgb24 60) sleep 59; audio drops 0 gaps 18 trims 0 peak 26930/26930; vsync wait 1 (0 ms) late 26 (avg 6975 max 16588 us) skipped 18
+-- io (n/ms): gpu 2484/4 dma 6227/365 cd 2450/8 timer 14272/58 irq 5080/12 mdec 22/0 pad 2728/4 other 686/0 vlc 11/83
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 440/1 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 11/36/115 ch1 220/212/675 ch2 220/75/675 ch3 196/36/50
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 220 (1351 kpx), flush 0; bind 0 tex 0 clut, kick 66 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 2251 pc 096EE7CC 68% 40 vbl 10 fps
+-- native: 32061 calls, 416 misses, 416 steps, 0 hashes, 1 loads, 8662 poll skips, 498 hooks
+-- ms: interp 13 io 526 (draw 0 mdec 185 spu 78) update 257 present 79 (wait 22 draw 56 text 8 rgb24 44) sleep 127; audio drops 0 gaps 23 trims 0 peak 10742/10411; vsync wait 4 (6 ms) late 19 (avg 5636 max 15837 us) skipped 18
+-- io (n/ms): gpu 2472/4 dma 6083/356 cd 2300/7 timer 13604/54 irq 4995/7 mdec 22/0 pad 2604/3 other 644/0 vlc 11/91
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 440/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 11/34/114 ch1 220/212/675 ch2 220/74/675 ch3 184/33/47
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 220 (1351 kpx), flush 0; bind 0 tex 0 clut, kick 64 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 2296 pc 096EE7CC 74% 44 vbl 10 fps
+-- native: 33563 calls, 427 misses, 427 steps, 0 hashes, 1 loads, 9340 poll skips, 530 hooks
+-- ms: interp 14 io 455 (draw 1 mdec 188 spu 85) update 242 present 91 (wait 25 draw 66 text 9 rgb24 52) sleep 70; audio drops 0 gaps 24 trims 0 peak 24440/24223; vsync wait 1 (0 ms) late 27 (avg 6725 max 16512 us) skipped 17
+-- io (n/ms): gpu 2486/4 dma 6250/285 cd 2475/5 timer 14500/61 irq 5127/7 mdec 22/0 pad 2790/3 other 693/0 vlc 11/86
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 440/1 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 11/37/118 ch1 220/215/675 ch2 220/75/675 ch3 198/35/50
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 220 (1351 kpx), flush 0; bind 0 tex 0 clut, kick 67 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 2339 pc 096EE7CC 69% 41 vbl 10 fps
+-- native: 32710 calls, 421 misses, 421 steps, 0 hashes, 1 loads, 8906 poll skips, 508 hooks
+-- ms: interp 16 io 511 (draw 0 mdec 185 spu 81) update 231 present 81 (wait 23 draw 57 text 9 rgb24 44) sleep 123; audio drops 0 gaps 23 trims 0 peak 15840/16811; vsync wait 4 (6 ms) late 16 (avg 5474 max 16560 us) skipped 18
+-- io (n/ms): gpu 2480/6 dma 6179/332 cd 2400/6 timer 13932/55 irq 5054/7 mdec 22/0 pad 2666/7 other 672/0 vlc 11/95
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 440/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 11/35/114 ch1 220/212/675 ch2 220/73/675 ch3 192/34/49
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 220 (1351 kpx), flush 0; bind 0 tex 0 clut, kick 65 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 2383 pc 096EE7CC 73% 43 vbl 10 fps
+-- native: 33096 calls, 422 misses, 422 steps, 0 hashes, 1 loads, 9200 poll skips, 507 hooks
+-- ms: interp 14 io 587 (draw 0 mdec 185 spu 84) update 92 present 82 (wait 24 draw 57 text 9 rgb24 44) sleep 91; audio drops 0 gaps 16 trims 0 peak 16261/13895; vsync wait 1 (0 ms) late 22 (avg 6518 max 15579 us) skipped 17
+-- io (n/ms): gpu 2482/5 dma 6203/417 cd 2425/9 timer 14241/55 irq 5064/6 mdec 22/0 pad 2666/5 other 679/1 vlc 11/86
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 440/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 11/36/113 ch1 220/212/675 ch2 220/74/675 ch3 194/35/49
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 220 (1351 kpx), flush 0; bind 0 tex 0 clut, kick 66 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 2424 pc 096EE7CC 68% 40 vbl 9 fps
+-- native: 30654 calls, 389 misses, 389 steps, 0 hashes, 1 loads, 8526 poll skips, 485 hooks
+-- ms: interp 14 io 410 (draw 1 mdec 169 spu 75) update 149 present 89 (wait 24 draw 64 text 8 rgb24 52) sleep 137; audio drops 0 gaps 24 trims 0 peak 26594/26594; vsync wait 2 (4 ms) late 18 (avg 3918 max 12963 us) skipped 21
+-- io (n/ms): gpu 2262/3 dma 5706/246 cd 2275/7 timer 13239/62 irq 4669/5 mdec 20/0 pad 2542/3 other 637/0 vlc 10/80
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 400/1 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 10/33/107 ch1 200/194/614 ch2 200/67/614 ch3 182/32/46
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 200 (1228 kpx), flush 0; bind 0 tex 0 clut, kick 61 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 2467 pc 096EE7CC 71% 42 vbl 10 fps
+-- native: 32443 calls, 417 misses, 417 steps, 0 hashes, 1 loads, 8918 poll skips, 499 hooks
+-- ms: interp 14 io 504 (draw 0 mdec 185 spu 82) update 436 present 85 (wait 24 draw 60 text 9 rgb24 48) sleep 83; audio drops 0 gaps 20 trims 0 peak 13972/13972; vsync wait 2 (3 ms) late 23 (avg 8869 max 16477 us) skipped 17
+-- io (n/ms): gpu 2476/5 dma 6131/338 cd 2350/4 timer 13871/57 irq 5007/7 mdec 22/0 pad 2604/3 other 658/0 vlc 11/88
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 440/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 11/35/114 ch1 220/213/675 ch2 220/76/675 ch3 188/34/48
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 220 (1351 kpx), flush 0; bind 0 tex 0 clut, kick 65 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 2511 pc 096EE7CC 73% 43 vbl 10 fps
+-- native: 33164 calls, 424 misses, 424 steps, 0 hashes, 1 loads, 9185 poll skips, 520 hooks
+-- ms: interp 16 io 479 (draw 0 mdec 185 spu 84) update 155 present 86 (wait 24 draw 61 text 9 rgb24 48) sleep 72; audio drops 0 gaps 21 trims 0 peak 13852/13852; vsync wait 1 (0 ms) late 26 (avg 7272 max 16476 us) skipped 17
+-- io (n/ms): gpu 2482/4 dma 6202/317 cd 2425/5 timer 14281/57 irq 5086/6 mdec 22/0 pad 2728/3 other 679/0 vlc 11/84
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 440/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 11/36/114 ch1 220/211/675 ch2 220/75/675 ch3 194/36/49
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 220 (1351 kpx), flush 0; bind 0 tex 0 clut, kick 66 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 2552 pc 096EE7CC 68% 40 vbl 10 fps
+-- native: 31612 calls, 413 misses, 413 steps, 0 hashes, 1 loads, 8399 poll skips, 488 hooks
+-- ms: interp 14 io 501 (draw 0 mdec 185 spu 76) update 319 present 75 (wait 22 draw 53 text 8 rgb24 40) sleep 118; audio drops 0 gaps 21 trims 0 peak 3052/3150; vsync wait 5 (8 ms) late 17 (avg 5426 max 16302 us) skipped 17
+-- io (n/ms): gpu 2470/4 dma 6057/322 cd 2275/6 timer 13266/51 irq 4957/9 mdec 22/0 pad 2542/3 other 637/0 vlc 11/104
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 440/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 11/35/115 ch1 220/211/675 ch2 220/74/675 ch3 182/33/46
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 220 (1351 kpx), flush 0; bind 0 tex 0 clut, kick 63 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 2594 pc 096EE7CC 70% 41 vbl 9 fps
+-- native: 31448 calls, 393 misses, 393 steps, 0 hashes, 1 loads, 9013 poll skips, 492 hooks
+-- ms: interp 16 io 516 (draw 0 mdec 169 spu 78) update 432 present 90 (wait 24 draw 65 text 8 rgb24 53) sleep 148; audio drops 0 gaps 26 trims 0 peak 31528/31510; vsync wait 0 (0 ms) late 18 (avg 4510 max 14508 us) skipped 21
+-- io (n/ms): gpu 2266/4 dma 5757/366 cd 2325/6 timer 13795/57 irq 4717/5 mdec 20/0 pad 2604/5 other 651/0 vlc 10/68
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 400/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 10/32/100 ch1 200/193/614 ch2 200/68/614 ch3 186/33/47
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 200 (1228 kpx), flush 0; bind 0 tex 0 clut, kick 62 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 2640 pc 096EE7CC 75% 44 vbl 11 fps
+-- native: 35572 calls, 457 misses, 457 steps, 0 hashes, 1 loads, 9887 poll skips, 540 hooks
+-- ms: interp 21 io 478 (draw 1 mdec 199 spu 86) update 209 present 82 (wait 24 draw 58 text 10 rgb24 44) sleep 63; audio drops 0 gaps 21 trims 0 peak 0/0; vsync wait 4 (5 ms) late 22 (avg 7996 max 16365 us) skipped 14
+-- io (n/ms): gpu 2700/5 dma 6679/301 cd 2550/7 timer 15300/59 irq 5476/8 mdec 24/0 pad 2852/3 other 714/0 vlc 12/92
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 480/1 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 12/35/112 ch1 240/228/737 ch2 240/80/737 ch3 204/37/52
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 240 (1474 kpx), flush 0; bind 0 tex 0 clut, kick 70 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 2684 pc 096EE7CC 71% 42 vbl 10 fps
+-- native: 33047 calls, 424 misses, 424 steps, 0 hashes, 1 loads, 9146 poll skips, 509 hooks
+-- ms: interp 12 io 498 (draw 0 mdec 188 spu 84) update 361 present 86 (wait 24 draw 61 text 9 rgb24 48) sleep 85; audio drops 0 gaps 17 trims 0 peak 0/0; vsync wait 2 (2 ms) late 21 (avg 7135 max 15119 us) skipped 18
+-- io (n/ms): gpu 2482/4 dma 6201/318 cd 2425/5 timer 14194/55 irq 5078/7 mdec 22/0 pad 2666/3 other 679/0 vlc 11/103
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 440/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 11/39/124 ch1 220/215/675 ch2 220/74/675 ch3 194/34/49
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 220 (1351 kpx), flush 0; bind 0 tex 0 clut, kick 66 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 2726 pc 096EE7B8 70% 41 vbl 10 fps
+-- native: 32255 calls, 411 misses, 411 steps, 0 hashes, 1 loads, 8963 poll skips, 493 hooks
+-- ms: interp 14 io 483 (draw 0 mdec 183 spu 77) update 250 present 89 (wait 24 draw 65 text 8 rgb24 52) sleep 95; audio drops 0 gaps 21 trims 0 peak 0/0; vsync wait 4 (3 ms) late 21 (avg 7265 max 16113 us) skipped 18
+-- io (n/ms): gpu 2452/4 dma 6057/325 cd 2300/7 spu 2/0 timer 13903/57 irq 4947/6 mdec 22/0 pad 2604/3 other 644/0 vlc 11/77
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 436/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 11/32/106 ch1 219/210/672 ch2 218/75/669 ch3 184/34/47
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 218 (1339 kpx), flush 0; bind 0 tex 0 clut, kick 64 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 2770 pc 096EE7CC 73% 43 vbl 10 fps
+-- native: 33960 calls, 424 misses, 424 steps, 0 hashes, 1 loads, 9774 poll skips, 512 hooks
+-- ms: interp 12 io 516 (draw 0 mdec 181 spu 83) update 264 present 93 (wait 24 draw 68 text 9 rgb24 55) sleep 94; audio drops 0 gaps 17 trims 0 peak 0/0; vsync wait 2 (2 ms) late 23 (avg 7292 max 14697 us) skipped 16
+-- io (n/ms): gpu 2504/5 dma 6253/369 cd 2450/5 spu 22/0 timer 14929/58 irq 5103/7 mdec 22/0 pad 2728/4 other 686/0 vlc 11/64
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 444/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 11/30/92 ch1 221/209/678 ch2 222/76/681 ch3 196/35/50
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 222 (1363 kpx), flush 0; bind 0 tex 0 clut, kick 66 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 2822 pc 097246A4 86% 51 vbl 4 fps
+-- native: 30379 calls, 553 misses, 753 steps, 0 hashes, 1 loads, 6225 poll skips, 576 hooks
+-- ms: interp 9 io 308 (draw 0 mdec 82 spu 73) update 330 present 58 (wait 12 draw 45 text 10 rgb24 28) sleep 349; audio drops 0 gaps 11 trims 0 peak 0/0; vsync wait 6 (8 ms) late 12 (avg 6537 max 16179 us) skipped 11
+-- io (n/ms): gpu 4047/4 dma 4377/180 cd 1423/4 spu 856/11 timer 12992/49 irq 3870/5 mdec 8/0 pad 3162/3 other 539/0 vlc 5/50
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 4/0 other 192/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 4/15/50 ch1 92/92/249 ch2 96/27/249 ch3 100/17/25 ch4 100/14/25
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 4, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 1 (256 tiles, 2 ms), upload 92 (499 kpx), flush 0; bind 0 tex 0 clut, kick 62 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 2882 pc 097246A4 100% 59 vbl 0 fps
+-- native: 7905 calls, 120 misses, 120 steps, 0 hashes, 1 loads, 0 poll skips, 660 hooks
+-- ms: interp 0 io 15 (draw 0 mdec 0 spu 38) update 74 present 20 (wait 3 draw 16 text 12 rgb24 0) sleep 712; audio drops 0 gaps 0 trims 0 peak 0/0; vsync wait 12 (6 ms) late 1 (avg 1215 max 1215 us) skipped 0
+-- io (n/ms): timer 3187/9 irq 1680/1 pad 3720/4
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 0/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords):
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 0 (0 kpx), flush 0; bind 0 tex 0 clut, kick 60 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+ResetGraph:jtb=8011a928,env=8011a970
+-- f 2942 pc 09723AA0 100% 59 vbl 0 fps
+-- native: 66532 calls, 298 misses, 298 steps, 0 hashes, 1 loads, 14454 poll skips, 650 hooks
+-- ms: interp 5 io 194 (draw 0 mdec 0 spu 38) update 118 present 22 (wait 3 draw 18 text 13 rgb24 0) sleep 470; audio drops 0 gaps 0 trims 0 peak 0/0; vsync wait 19 (9 ms) late 2 (avg 5721 max 14574 us) skipped 0
+-- io (n/ms): gpu 15246/15 dma 9072/62 cd 2902/6 timer 33272/99 irq 3002/5 pad 3658/3 other 766/2
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 53/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch3 254/43/65
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 26 (0 kpx), flush 0; bind 0 tex 0 clut, kick 60 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 3002 pc 09785338 101% 59 vbl 0 fps
+-- native: 62456 calls, 242 misses, 242 steps, 0 hashes, 1 loads, 13331 poll skips, 640 hooks
+-- ms: interp 9 io 160 (draw 0 mdec 0 spu 39) update 341 present 21 (wait 3 draw 17 text 12 rgb24 0) sleep 473; audio drops 0 gaps 0 trims 0 peak 0/0; vsync wait 19 (12 ms) late 2 (avg 2903 max 8344 us) skipped 0
+-- io (n/ms): gpu 14033/19 dma 9000/38 cd 2678/4 timer 30836/90 irq 2869/3 pad 3596/3 other 756/0
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 54/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch3 252/41/64
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 27 (0 kpx), flush 0; bind 0 tex 0 clut, kick 60 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+ResetGraph:jtb=8011a928,env=8011a970
+native: cache flush 2: 0 of 98 KB of code changed (2551 us)
+Exec SLES_028.95 pc 80010100 sp 00000001
+native: WHEEL.EXE at 80010100 (3436936 B of code)
+ResetGraph:jtb=800828c8,env=80082910
+native: cache flush 3: 133 of 539 KB of code changed (13600 us)
+CD_init:addr=800813a8
+-- f 3038 pc 094B96FC 60% 35 vbl 0 fps
+-- native: 21828 calls, 111 misses, 185 steps, 16 hashes, 2 loads, 5798 poll skips, 77 hooks
+-- ms: interp 45 io 43 (draw 0 mdec 0 spu 24) update 35 present 12 (wait 1 draw 10 text 7 rgb24 0) sleep 294; audio drops 0 gaps 3 trims 0 peak 0/0; vsync wait 4 (2 ms) late 7 (avg 7041 max 15763 us) skipped 24
+-- io (n/ms): gpu 6030/3 dma 468/0 cd 959/1 spu 205/0 timer 12450/36 irq 850/0 mdec 6/0 pad 434/0 cop0 6/0 other 83/0
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 8/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch0 2/0/0 ch2 1/0/0 ch3 12/1/2 ch6 8/1/16
+-- sas: voices 000000 on 24 adopted 0 back 24 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 269 lost 0 pages 101 (live 37) errors 0 (last 00000000 op 0) retries 0; grains 1 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 0 (0 kpx), flush 0; bind 0 tex 0 clut, kick 36 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+native: cache flush 4: 0 of 539 KB of code changed (13441 us)
+-- f 3099 pc 094BA200 101% 60 vbl 0 fps
+-- native: 21856 calls, 205 misses, 205 steps, 0 hashes, 2 loads, 1001 poll skips, 0 hooks
+-- ms: interp 5 io 71 (draw 0 mdec 0 spu 39) update 115 present 21 (wait 3 draw 18 text 13 rgb24 0) sleep 539; audio drops 0 gaps 0 trims 0 peak 0/0; vsync wait 26 (11 ms) late 4 (avg 4319 max 11600 us) skipped 0
+-- io (n/ms): gpu 2059/4 dma 9316/47 cd 3180/5 timer 3529/10 irq 1628/1 cop0 2/0 other 802/0
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 50/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch3 260/43/66 ch6 4/0/8
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 25 (0 kpx), flush 0; bind 0 tex 0 clut, kick 61 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 3157 pc 094BA200 97% 57 vbl 0 fps
+-- native: 28415 calls, 1207 misses, 1216 steps, 0 hashes, 2 loads, 50 poll skips, 0 hooks
+-- ms: interp 8 io 50 (draw 0 mdec 0 spu 38) update 124 present 47 (wait 30 draw 16 text 12 rgb24 0) sleep 532; audio drops 0 gaps 0 trims 0 peak 0/0; vsync wait 19 (10 ms) late 6 (avg 6408 max 14074 us) skipped 2
+-- io (n/ms): gpu 917/2 dma 20431/33 cd 2408/4 spu 72/1 timer 1174/4 irq 1539/2 other 503/0
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 60/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch2 8/4/90 ch3 148/24/38 ch4 9/4/8
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 30 (180 kpx), flush 0; bind 0 tex 0 clut, kick 58 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 3217 pc 094BA200 100% 59 vbl 0 fps
+-- native: 13871 calls, 2614 misses, 2625 steps, 0 hashes, 2 loads, 78 poll skips, 0 hooks
+-- ms: interp 14 io 61 (draw 0 mdec 0 spu 41) update 244 present 21 (wait 3 draw 17 text 12 rgb24 0) sleep 560; audio drops 0 gaps 0 trims 0 peak 0/0; vsync wait 18 (10 ms) late 3 (avg 5277 max 13570 us) skipped 0
+-- io (n/ms): gpu 1155/1 dma 4495/29 cd 2962/5 spu 88/16 timer 1380/3 irq 1969/3 other 462/0
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 0/0 fill 0/0 other 80/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch3 122/20/31 ch4 11/9/19
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+0 sw+0 null (0 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 40 (0 kpx), flush 0; bind 0 tex 0 clut, kick 60 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+native: cache flush 5: 0 of 539 KB of code changed (13703 us)
+native: cache flush 6: 0 of 539 KB of code changed (13309 us)
+native: cache flush 7: 0 of 539 KB of code changed (13680 us)
+-- f 3276 pc 094BA200 99% 58 vbl 0 fps
+-- native: 12867 calls, 175 misses, 204 steps, 14 hashes, 2 loads, 125 poll skips, 196 hooks
+-- ms: interp 3 io 39 (draw 0 mdec 0 spu 38) update 152 present 22 (wait 4 draw 17 text 13 rgb24 0) sleep 587; audio drops 0 gaps 0 trims 0 peak 0/0; vsync wait 15 (8 ms) late 3 (avg 6363 max 14959 us) skipped 1
+-- io (n/ms): gpu 1119/5 dma 4629/19 cd 1540/3 timer 1952/8 irq 1459/1 pad 988/0 cop0 5/0 other 407/0
+-- gte ops (hex/n):
+-- gpu: poly 0/0 (slow 0 ms) line 0/0 rect 0/0 copy 1/0 fill 0/0 other 102/0 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch2 1/0/0 ch3 128/21/32
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 0+0 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+1 sw+0 null (1 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 52 (1 kpx), flush 0; bind 0 tex 0 clut, kick 59 (0 ms), rd check 0; fast 0 (0 setups 0 ms, 0 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 3320 pc 093BE33C 72% 43 vbl 21 fps
+-- native: 11025 calls, 171 misses, 646 steps, 0 hashes, 2 loads, 114 poll skips, 485 hooks
+-- ms: interp 4 io 577 (draw 341 mdec 0 spu 29) update 196 present 24 (wait 12 draw 12 text 9 rgb24 0) sleep 134; audio drops 0 gaps 21 trims 0 peak 0/0; vsync wait 1 (0 ms) late 27 (avg 6522 max 16384 us) skipped 16
+-- io (n/ms): gpu 586/1 dma 977/556 cd 1569/2 timer 3066/12 irq 2405/2 pad 2728/2 gte 1/0 gtecmd 3384/0 cop0 20/0 other 46/0
+-- gte ops (hex/n): 0C/1 10/1131 28/139 2A/2113
+-- gpu: poly 36275/317 (slow 0 ms) line 0/0 rect 0/0 copy 88/11 fill 2/0 other 7195/12 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch2 68/382/405 ch6 44/6/90
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 36683+22224 tex, rect 0+0 tex, fill 2, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+44 sw+44 null (22 kpx, 0 from ge); pages 26 cluts 22+0 in list, readback 0 (0 tiles, 0 ms), upload 44 (22 kpx), flush 0; bind 637 tex 642 clut, kick 707 (1 ms), rd check 313; fast 34843 (16690 setups 80 ms, 16236 cached), slow tex 0 big 0, flat 1316, clipped 1049; ring uncached (wb 0 ms), step 1024
+-- f 3360 pc 0930B248 66% 39 vbl 26 fps
+-- native: 11477 calls, 194 misses, 794 steps, 0 hashes, 2 loads, 108 poll skips, 440 hooks
+-- ms: interp 4 io 556 (draw 406 mdec 0 spu 26) update 122 present 22 (wait 9 draw 11 text 8 rgb24 0) sleep 0; audio drops 0 gaps 32 trims 0 peak 0/0; vsync wait 0 (0 ms) late 38 (avg 8089 max 16118 us) skipped 20
+-- io (n/ms): gpu 661/1 dma 1188/537 cd 1910/2 timer 2909/10 irq 2523/2 pad 2480/2 gtecmd 4148/0 cop0 23/0 other 54/0
+-- gte ops (hex/n): 10/1373 28/162 2A/2613
+-- gpu: poly 43956/388 (slow 0 ms) line 0/0 rect 0/0 copy 108/3 fill 0/0 other 8387/14 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch2 81/457/492 ch6 54/8/110
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 44192+27240 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+54 sw+54 null (27 kpx, 0 from ge); pages 27 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 54 (27 kpx), flush 0; bind 662 tex 662 clut, kick 848 (1 ms), rd check 312; fast 42283 (20093 setups 74 ms, 19642 cached), slow tex 0 big 0, flat 1542, clipped 1337; ring uncached (wb 0 ms), step 1024
+-- f 3401 pc 09324F10 66% 39 vbl 27 fps
+-- native: 11853 calls, 204 misses, 804 steps, 0 hashes, 2 loads, 112 poll skips, 452 hooks
+-- ms: interp 8 io 1045 (draw 390 mdec 0 spu 27) update 7 present 21 (wait 8 draw 12 text 8 rgb24 0) sleep 0; audio drops 0 gaps 36 trims 0 peak 0/0; vsync wait 0 (0 ms) late 38 (avg 7319 max 16550 us) skipped 21
+-- io (n/ms): gpu 684/1 dma 1232/1025 cd 1944/2 timer 2996/10 irq 2643/2 pad 2542/2 gtecmd 4352/0 cop0 24/0 other 56/0
+-- gte ops (hex/n): 10/1425 28/168 2A/2759
+-- gpu: poly 44013/369 (slow 0 ms) line 0/0 rect 0/0 copy 111/7 fill 0/0 other 7995/13 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch2 84/451/494 ch6 56/8/115
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 43986+27058 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+55 sw+56 null (28 kpx, 0 from ge); pages 28 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 55 (28 kpx), flush 0; bind 624 tex 624 clut, kick 840 (1 ms), rd check 284; fast 42407 (19674 setups 81 ms, 19318 cached), slow tex 0 big 0, flat 1437, clipped 1321; ring uncached (wb 0 ms), step 1024
+-- f 3441 pc 0930B248 66% 39 vbl 26 fps
+-- native: 11608 calls, 199 misses, 774 steps, 0 hashes, 2 loads, 108 poll skips, 441 hooks
+-- ms: interp 5 io 280 (draw 357 mdec 0 spu 26) update 71 present 18 (wait 6 draw 11 text 8 rgb24 0) sleep 0; audio drops 0 gaps 32 trims 0 peak 0/0; vsync wait 0 (0 ms) late 35 (avg 7521 max 15544 us) skipped 21
+-- io (n/ms): gpu 659/1 dma 1186/257 cd 1897/2 timer 2917/14 irq 2580/2 pad 2480/2 gtecmd 4985/0 cop0 24/0 other 54/0
+-- gte ops (hex/n): 10/2100 28/162 2A/2723
+-- gpu: poly 40380/331 (slow 0 ms) line 0/0 rect 0/0 copy 108/9 fill 0/0 other 7002/16 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch2 81/405/455 ch6 54/8/110
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 39374+24473 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+54 sw+54 null (27 kpx, 0 from ge); pages 27 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 54 (27 kpx), flush 0; bind 577 tex 577 clut, kick 760 (1 ms), rd check 266; fast 38773 (17392 setups 66 ms, 17021 cached), slow tex 0 big 0, flat 1175, clipped 1165; ring uncached (wb 0 ms), step 1024
+-- f 3482 pc 09312654 68% 40 vbl 27 fps
+-- native: 11994 calls, 204 misses, 812 steps, 0 hashes, 2 loads, 112 poll skips, 451 hooks
+-- ms: interp 5 io 243 (draw 321 mdec 0 spu 26) update 26 present 22 (wait 10 draw 12 text 9 rgb24 0) sleep 0; audio drops 0 gaps 32 trims 0 peak 0/0; vsync wait 0 (0 ms) late 37 (avg 7015 max 14758 us) skipped 20
+-- io (n/ms): gpu 689/1 dma 1233/221 cd 1965/3 timer 2995/12 irq 2633/3 pad 2542/2 gtecmd 5712/0 cop0 24/0 other 56/0
+-- gte ops (hex/n): 10/2559 28/168 2A/2985
+-- gpu: poly 37433/298 (slow 0 ms) line 0/0 rect 0/0 copy 111/6 fill 0/0 other 6562/15 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch2 84/370/429 ch6 56/8/115
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 33912+22952 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+55 sw+56 null (28 kpx, 0 from ge); pages 28 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 55 (28 kpx), flush 0; bind 548 tex 547 clut, kick 698 (1 ms), rd check 245; fast 35389 (15061 setups 69 ms, 14691 cached), slow tex 0 big 0, flat 1018, clipped 1468; ring uncached (wb 0 ms), step 1024
+-- f 3521 pc 0934A940 64% 38 vbl 28 fps
+-- native: 11715 calls, 195 misses, 762 steps, 0 hashes, 2 loads, 116 poll skips, 429 hooks
+-- ms: interp 6 io 624 (draw 308 mdec 0 spu 26) update 87 present 20 (wait 9 draw 11 text 8 rgb24 0) sleep 0; audio drops 0 gaps 35 trims 0 peak 0/0; vsync wait 0 (0 ms) late 39 (avg 8427 max 16251 us) skipped 21
+-- io (n/ms): gpu 699/1 dma 1278/605 cd 1842/1 timer 2911/11 irq 2569/2 pad 2418/2 gtecmd 5096/0 cop0 23/0 other 58/0
+-- gte ops (hex/n): 10/2009 28/174 2A/2913
+-- gpu: poly 36251/292 (slow 0 ms) line 0/0 rect 0/0 copy 116/4 fill 0/0 other 6652/12 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch2 87/365/421 ch6 58/8/119
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 31387+23102 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+58 sw+58 null (29 kpx, 0 from ge); pages 29 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 58 (29 kpx), flush 0; bind 680 tex 687 clut, kick 697 (1 ms), rd check 307; fast 34416 (14200 setups 59 ms, 13793 cached), slow tex 0 big 0, flat 956, clipped 1593; ring uncached (wb 0 ms), step 1024
+-- f 3559 pc 09348D40 63% 37 vbl 27 fps
+-- native: 11472 calls, 194 misses, 769 steps, 0 hashes, 2 loads, 110 poll skips, 418 hooks
+-- ms: interp 5 io 419 (draw 300 mdec 0 spu 24) update 61 present 21 (wait 10 draw 11 text 8 rgb24 0) sleep 0; audio drops 0 gaps 32 trims 0 peak 0/0; vsync wait 0 (0 ms) late 38 (avg 8394 max 15096 us) skipped 22
+-- io (n/ms): gpu 679/1 dma 1219/397 cd 1829/2 timer 2821/12 irq 2506/2 pad 2356/3 gtecmd 4639/0 cop0 22/0 other 56/0
+-- gte ops (hex/n): 10/1591 28/168 2A/2880
+-- gpu: poly 33507/284 (slow 0 ms) line 0/0 rect 0/0 copy 111/4 fill 0/0 other 6327/11 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch2 84/340/392 ch6 56/8/115
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 28664+21466 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+55 sw+56 null (28 kpx, 0 from ge); pages 28 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 55 (28 kpx), flush 0; bind 667 tex 668 clut, kick 661 (1 ms), rd check 294; fast 31977 (13235 setups 81 ms, 12726 cached), slow tex 0 big 0, flat 771, clipped 1783; ring uncached (wb 0 ms), step 1024
+-- f 3597 pc 0930DE98 63% 37 vbl 27 fps
+-- native: 11345 calls, 188 misses, 738 steps, 0 hashes, 2 loads, 111 poll skips, 407 hooks
+-- ms: interp 6 io 599 (draw 281 mdec 0 spu 24) update 66 present 26 (wait 14 draw 11 text 8 rgb24 0) sleep 0; audio drops 0 gaps 36 trims 0 peak 0/0; vsync wait 0 (0 ms) late 37 (avg 8410 max 16432 us) skipped 22
+-- io (n/ms): gpu 678/0 dma 1218/580 cd 1816/2 timer 2776/11 irq 2459/2 pad 2294/2 gtecmd 4472/0 cop0 23/0 other 56/0
+-- gte ops (hex/n): 10/1481 28/168 2A/2823
+-- gpu: poly 32995/265 (slow 0 ms) line 0/0 rect 0/0 copy 112/6 fill 0/0 other 6252/10 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch2 84/333/387 ch6 56/8/115
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 27903+21311 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+56 sw+56 null (28 kpx, 0 from ge); pages 29 cluts 1+0 in list, readback 0 (0 tiles, 0 ms), upload 56 (28 kpx), flush 0; bind 674 tex 674 clut, kick 648 (1 ms), rd check 295; fast 31402 (12854 setups 80 ms, 12446 cached), slow tex 0 big 0, flat 888, clipped 1904; ring uncached (wb 0 ms), step 1024
+-- f 3635 pc 0930B248 62% 37 vbl 27 fps
+-- native: 11512 calls, 195 misses, 770 steps, 0 hashes, 2 loads, 109 poll skips, 418 hooks
+-- ms: interp 8 io 401 (draw 302 mdec 0 spu 24) update 48 present 23 (wait 11 draw 11 text 9 rgb24 0) sleep 0; audio drops 0 gaps 31 trims 0 peak 0/0; vsync wait 0 (0 ms) late 37 (avg 7677 max 16518 us) skipped 23
+-- io (n/ms): gpu 677/0 dma 1217/381 cd 1829/2 timer 2834/12 irq 2518/2 pad 2356/2 gtecmd 4472/0 cop0 22/0 other 56/0
+-- gte ops (hex/n): 10/1473 28/168 2A/2831
+-- gpu: poly 33022/285 (slow 0 ms) line 0/0 rect 0/0 copy 112/4 fill 0/0 other 6468/12 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch2 84/335/388 ch6 56/7/115
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 27896+21617 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+56 sw+56 null (28 kpx, 0 from ge); pages 28 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 56 (28 kpx), flush 0; bind 674 tex 674 clut, kick 654 (1 ms), rd check 295; fast 31481 (12810 setups 59 ms, 12403 cached), slow tex 0 big 0, flat 841, clipped 1904; ring uncached (wb 0 ms), step 1024
+-- f 3673 pc 0934CA00 62% 37 vbl 27 fps
+-- native: 11415 calls, 188 misses, 738 steps, 0 hashes, 2 loads, 109 poll skips, 419 hooks
+-- ms: interp 9 io 214 (draw 312 mdec 0 spu 25) update 70 present 24 (wait 12 draw 11 text 8 rgb24 0) sleep 0; audio drops 0 gaps 36 trims 0 peak 0/0; vsync wait 0 (0 ms) late 37 (avg 8080 max 16266 us) skipped 23
+-- io (n/ms): gpu 678/1 dma 1190/194 cd 1816/2 timer 2827/11 irq 2465/2 pad 2356/2 gtecmd 4452/0 cop0 23/0 other 56/0
+-- gte ops (hex/n): 10/1484 28/168 2A/2800
+-- gpu: poly 32956/294 (slow 0 ms) line 0/0 rect 0/0 copy 111/7 fill 0/0 other 6467/11 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch2 84/334/387 ch6 56/7/115
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 27832+21644 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+55 sw+56 null (28 kpx, 0 from ge); pages 28 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 55 (28 kpx), flush 0; bind 672 tex 672 clut, kick 653 (1 ms), rd check 294; fast 31444 (12824 setups 48 ms, 12418 cached), slow tex 0 big 0, flat 812, clipped 1904; ring uncached (wb 0 ms), step 1024
+-- f 3712 pc 09348D40 64% 38 vbl 27 fps
+-- native: 11710 calls, 200 misses, 775 steps, 0 hashes, 2 loads, 110 poll skips, 429 hooks
+-- ms: interp 5 io 405 (draw 307 mdec 0 spu 25) update 40 present 23 (wait 12 draw 11 text 8 rgb24 0) sleep 0; audio drops 0 gaps 31 trims 0 peak 0/0; vsync wait 0 (0 ms) late 38 (avg 8246 max 16498 us) skipped 23
+-- io (n/ms): gpu 680/0 dma 1218/385 cd 1863/2 timer 2892/11 irq 2579/2 pad 2418/2 gtecmd 4430/0 cop0 23/0 other 56/0
+-- gte ops (hex/n): 10/1475 28/168 2A/2787
+-- gpu: poly 32964/289 (slow 0 ms) line 0/0 rect 0/0 copy 112/4 fill 0/0 other 6468/13 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch2 84/335/388 ch6 56/7/115
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 27815+21634 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+56 sw+56 null (28 kpx, 0 from ge); pages 28 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 56 (28 kpx), flush 0; bind 672 tex 672 clut, kick 654 (1 ms), rd check 294; fast 31417 (12829 setups 46 ms, 12423 cached), slow tex 0 big 0, flat 847, clipped 1904; ring uncached (wb 0 ms), step 1024
+-- f 3750 pc 0930B248 63% 37 vbl 27 fps
+-- native: 11432 calls, 190 misses, 740 steps, 0 hashes, 2 loads, 112 poll skips, 419 hooks
+-- ms: interp 7 io 222 (draw 284 mdec 0 spu 24) update 28 present 24 (wait 13 draw 11 text 8 rgb24 0) sleep 0; audio drops 0 gaps 33 trims 0 peak 0/0; vsync wait 0 (0 ms) late 37 (avg 8498 max 15982 us) skipped 22
+-- io (n/ms): gpu 676/1 dma 1232/201 cd 1782/1 timer 2826/13 irq 2496/2 pad 2356/2 gtecmd 4437/0 cop0 22/0 other 56/0
+-- gte ops (hex/n): 10/1458 28/168 2A/2811
+-- gpu: poly 32992/267 (slow 0 ms) line 0/0 rect 0/0 copy 111/5 fill 0/0 other 6467/11 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch2 84/335/388 ch6 56/7/115
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 27865+21606 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+55 sw+56 null (28 kpx, 0 from ge); pages 28 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 55 (28 kpx), flush 0; bind 672 tex 672 clut, kick 652 (1 ms), rd check 294; fast 31452 (12858 setups 65 ms, 12436 cached), slow tex 0 big 0, flat 836, clipped 1904; ring uncached (wb 0 ms), step 1024
+-- f 3788 pc 09311730 63% 37 vbl 27 fps
+-- native: 11493 calls, 191 misses, 766 steps, 0 hashes, 2 loads, 112 poll skips, 418 hooks
+-- ms: interp 4 io 408 (draw 304 mdec 0 spu 24) update 34 present 26 (wait 15 draw 11 text 8 rgb24 0) sleep 0; audio drops 0 gaps 36 trims 0 peak 0/0; vsync wait 0 (0 ms) late 37 (avg 8318 max 15962 us) skipped 22
+-- io (n/ms): gpu 678/1 dma 1232/387 cd 1829/2 timer 2818/11 irq 2487/4 pad 2356/2 gtecmd 4447/0 cop0 22/0 other 56/0
+-- gte ops (hex/n): 10/1475 28/168 2A/2804
+-- gpu: poly 32911/284 (slow 0 ms) line 0/0 rect 0/0 copy 112/7 fill 0/0 other 6452/12 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch2 84/335/387 ch6 56/7/115
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 27699+21648 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+56 sw+56 null (28 kpx, 0 from ge); pages 28 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 56 (28 kpx), flush 0; bind 666 tex 666 clut, kick 648 (1 ms), rd check 294; fast 31394 (12907 setups 75 ms, 12463 cached), slow tex 0 big 0, flat 821, clipped 1907; ring uncached (wb 0 ms), step 1024
+-- f 3825 pc 0934A940 60% 36 vbl 27 fps
+-- native: 11399 calls, 184 misses, 717 steps, 0 hashes, 2 loads, 111 poll skips, 408 hooks
+-- ms: interp 5 io 283 (draw 218 mdec 0 spu 24) update 24 present 21 (wait 10 draw 10 text 8 rgb24 0) sleep 0; audio drops 0 gaps 36 trims 0 peak 0/0; vsync wait 0 (0 ms) late 36 (avg 8443 max 16208 us) skipped 25
+-- io (n/ms): gpu 675/0 dma 1231/261 cd 1756/1 timer 2775/13 irq 2435/3 pad 2294/1 gtecmd 8595/0 cop0 22/0 other 56/0
+-- gte ops (hex/n): 10/6497 11/16 28/168 2A/1914
+-- gpu: poly 26699/204 (slow 0 ms) line 0/0 rect 0/0 copy 111/8 fill 0/0 other 4018/5 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch2 84/253/324 ch6 56/7/115
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 18876+15647 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+55 sw+56 null (28 kpx, 0 from ge); pages 28 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 55 (28 kpx), flush 0; bind 591 tex 600 clut, kick 455 (0 ms), rd check 277; fast 21624 (8667 setups 49 ms, 8309 cached), slow tex 0 big 0, flat 927, clipped 2138; ring uncached (wb 0 ms), step 1024
+-- f 3881 pc 094BA200 93% 55 vbl 55 fps
+-- native: 16918 calls, 248 misses, 1065 steps, 0 hashes, 2 loads, 260 poll skips, 616 hooks
+-- ms: interp 11 io 93 (draw 67 mdec 0 spu 36) update 206 present 63 (wait 47 draw 16 text 12 rgb24 0) sleep 269; audio drops 0 gaps 9 trims 0 peak 0/0; vsync wait 0 (0 ms) late 21 (avg 7204 max 15038 us) skipped 6
+-- io (n/ms): gpu 1353/2 dma 1768/64 cd 2652/2 timer 4575/16 irq 3402/4 pad 3472/3 gtecmd 4525/0 cop0 33/0 other 112/0
+-- gte ops (hex/n): 10/3813 11/376 28/336
+-- gpu: poly 6722/53 (slow 0 ms) line 0/0 rect 0/0 copy 223/12 fill 0/0 other 1587/1 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch2 168/103/212 ch6 112/15/230
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 3244+6694 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+111 sw+112 null (56 kpx, 0 from ge); pages 22 cluts 8+0 in list, readback 0 (0 tiles, 0 ms), upload 111 (56 kpx), flush 0; bind 257 tex 288 clut, kick 135 (0 ms), rd check 135; fast 5826 (1099 setups 24 ms, 955 cached), slow tex 0 big 0, flat 64, clipped 864; ring uncached (wb 0 ms), step 1024
+-- f 3941 pc 094BA200 100% 59 vbl 59 fps
+-- native: 17975 calls, 264 misses, 1164 steps, 0 hashes, 2 loads, 300 poll skips, 661 hooks
+-- ms: interp 7 io 195 (draw 26 mdec 0 spu 38) update 167 present 89 (wait 71 draw 17 text 12 rgb24 0) sleep 436; audio drops 0 gaps 0 trims 0 peak 0/0; vsync wait 0 (0 ms) late 1 (avg 2212 max 2212 us) skipped 0
+-- io (n/ms): gpu 1488/2 dma 1886/164 cd 2882/3 timer 4986/17 irq 3602/3 pad 3720/3 gtecmd 360/0 cop0 35/0 other 120/0
+-- gte ops (hex/n): 28/360
+-- gpu: poly 2820/14 (slow 0 ms) line 0/0 rect 0/0 copy 240/10 fill 0/0 other 1440/1 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch2 180/57/185 ch6 120/16/246
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 120+5520 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+120 sw+120 null (60 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 120 (60 kpx), flush 0; bind 0 tex 0 clut, kick 60 (0 ms), rd check 0; fast 2820 (180 setups 2 ms, 180 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+card firstfile bu00:*: found
+card firstfile bu00:BESLES-02895: found
+-- f 4001 pc 094BA200 100% 59 vbl 59 fps
+-- native: 17850 calls, 291 misses, 1166 steps, 0 hashes, 2 loads, 298 poll skips, 661 hooks
+-- ms: interp 9 io 109 (draw 30 mdec 0 spu 38) update 189 present 89 (wait 71 draw 17 text 12 rgb24 0) sleep 446; audio drops 0 gaps 0 trims 0 peak 0/0; vsync wait 3 (0 ms) late 1 (avg 1181 max 1181 us) skipped 0
+-- io (n/ms): gpu 1474/1 dma 1874/78 cd 2835/3 timer 4942/19 irq 3598/2 pad 3720/3 gtecmd 360/0 cop0 35/0 other 120/0
+-- gte ops (hex/n): 28/360
+-- gpu: poly 2760/17 (slow 0 ms) line 0/0 rect 0/0 copy 239/11 fill 0/0 other 1439/1 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch2 180/57/184 ch6 120/16/246
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 120+5400 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+119 sw+120 null (60 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 119 (60 kpx), flush 0; bind 0 tex 0 clut, kick 60 (0 ms), rd check 0; fast 2760 (180 setups 3 ms, 180 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 4061 pc 094BA200 100% 59 vbl 59 fps
+-- native: 17920 calls, 270 misses, 1145 steps, 0 hashes, 2 loads, 301 poll skips, 660 hooks
+-- ms: interp 8 io 182 (draw 26 mdec 0 spu 39) update 287 present 89 (wait 72 draw 17 text 12 rgb24 0) sleep 442; audio drops 0 gaps 0 trims 0 peak 0/0; vsync wait 2 (0 ms) late 1 (avg 3311 max 3311 us) skipped 0
+-- io (n/ms): gpu 1476/4 dma 1874/145 cd 2869/3 timer 4947/21 irq 3616/3 pad 3720/3 gtecmd 360/0 cop0 36/0 other 120/0
+-- gte ops (hex/n): 28/360
+-- gpu: poly 2580/14 (slow 0 ms) line 0/0 rect 0/0 copy 239/10 fill 0/0 other 1439/1 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch2 180/55/183 ch6 120/15/246
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 120+5040 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+119 sw+120 null (60 kpx, 0 from ge); pages 0 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 119 (60 kpx), flush 0; bind 0 tex 0 clut, kick 60 (0 ms), rd check 0; fast 2580 (180 setups 2 ms, 180 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+card open bu00:BESLES-02895 mode 1: fd 2
+card read fd 2: 512 of 512 B at 0 (size 8192)
+card close fd 2
+-- f 4122 pc 094BA200 101% 60 vbl 60 fps
+-- native: 18113 calls, 288 misses, 1231 steps, 0 hashes, 2 loads, 306 poll skips, 671 hooks
+-- ms: interp 8 io 110 (draw 138 mdec 0 spu 40) update 111 present 48 (wait 30 draw 18 text 13 rgb24 0) sleep 414; audio drops 0 gaps 0 trims 0 peak 0/31745; vsync wait 14 (4 ms) late 3 (avg 8530 max 16595 us) skipped 0
+-- io (n/ms): gpu 1491/2 dma 1898/71 cd 2882/4 spu 12/2 timer 5017/18 irq 3625/5 pad 3782/3 gtecmd 366/0 cop0 35/0 other 122/0
+-- gte ops (hex/n): 28/366
+-- gpu: poly 2628/19 (slow 0 ms) line 344/116 rect 0/0 copy 243/0 fill 0/0 other 2543/1 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch2 183/105/189 ch6 122/16/250
+-- sas: voices 000000 on 1 adopted 0 back 1 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 112 lost 0 pages 106 (live 42) errors 0 (last 00000000 op 0) retries 0; grains 16 4 ms
+-- ge: tri 122+5134 tex, rect 0+0 tex, fill 0, line 688 (688 runs); sw tex15 0 texwin 0 copy 0+121 sw+122 null (61 kpx, 0 from ge); pages 1 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 121 (61 kpx), flush 0; bind 22 tex 22 clut, kick 110 (0 ms), rd check 7; fast 2628 (441 setups 19 ms, 427 cached), slow tex 0 big 0, flat 0, clipped 0; ring uncached (wb 0 ms), step 1024
+-- f 4176 pc 0930DE98 89% 52 vbl 52 fps
+-- native: 16464 calls, 245 misses, 1089 steps, 0 hashes, 2 loads, 248 poll skips, 596 hooks
+-- ms: interp 8 io 307 (draw 92 mdec 0 spu 36) update 224 present 44 (wait 28 draw 15 text 11 rgb24 0) sleep 214; audio drops 0 gaps 7 trims 0 peak 0/31632; vsync wait 4 (1 ms) late 21 (avg 8227 max 16526 us) skipped 6
+-- io (n/ms): gpu 1303/2 dma 1746/269 cd 2592/3 spu 12/4 timer 4410/17 irq 3303/3 pad 3348/5 gtecmd 5964/0 cop0 32/0 other 108/0
+-- gte ops (hex/n): 10/5280 11/360 28/324
+-- gpu: poly 8474/63 (slow 0 ms) line 120/15 rect 0/0 copy 215/11 fill 0/0 other 2079/1 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch2 162/127/225 ch6 108/15/221
+-- sas: voices 000000 on 1 adopted 0 back 1 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 6 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 16 4 ms
+-- ge: tri 4283+8258 tex, rect 0+0 tex, fill 0, line 240 (240 runs); sw tex15 0 texwin 0 copy 0+107 sw+108 null (54 kpx, 0 from ge); pages 22 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 107 (54 kpx), flush 0; bind 236 tex 266 clut, kick 176 (0 ms), rd check 133; fast 7329 (1396 setups 11 ms, 1263 cached), slow tex 0 big 0, flat 132, clipped 1092; ring uncached (wb 0 ms), step 1024
+-- f 4213 pc 09348D40 61% 36 vbl 27 fps
+-- native: 11385 calls, 187 misses, 712 steps, 0 hashes, 2 loads, 112 poll skips, 407 hooks
+-- ms: interp 5 io 31 (draw 216 mdec 0 spu 23) update 41 present 21 (wait 9 draw 11 text 8 rgb24 0) sleep 0; audio drops 0 gaps 35 trims 0 peak 0/0; vsync wait 0 (0 ms) late 36 (avg 7701 max 16330 us) skipped 24
+-- io (n/ms): gpu 674/1 dma 1232/11 cd 1735/2 timer 2761/11 irq 2463/2 pad 2294/1 gtecmd 7530/0 cop0 22/0 other 56/0
+-- gte ops (hex/n): 10/5239 11/8 28/168 2A/2115
+-- gpu: poly 28180/206 (slow 0 ms) line 0/0 rect 0/0 copy 111/2 fill 0/0 other 4404/6 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch2 84/268/338 ch6 56/8/115
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 20325+16439 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+55 sw+56 null (28 kpx, 0 from ge); pages 28 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 55 (28 kpx), flush 0; bind 607 tex 616 clut, kick 491 (0 ms), rd check 281; fast 23115 (9558 setups 42 ms, 9217 cached), slow tex 0 big 0, flat 1034, clipped 2102; ring uncached (wb 0 ms), step 1024
+-- f 4252 pc 09348D40 63% 38 vbl 27 fps
+-- native: 11723 calls, 195 misses, 770 steps, 0 hashes, 2 loads, 113 poll skips, 431 hooks
+-- ms: interp 4 io 403 (draw 286 mdec 0 spu 25) update 65 present 30 (wait 18 draw 11 text 8 rgb24 0) sleep 0; audio drops 0 gaps 38 trims 0 peak 0/0; vsync wait 0 (0 ms) late 38 (avg 8025 max 16535 us) skipped 22
+-- io (n/ms): gpu 680/1 dma 1232/384 cd 1863/2 timer 2888/10 irq 2543/2 pad 2418/2 gtecmd 4385/0 cop0 23/0 other 56/0
+-- gte ops (hex/n): 10/1457 28/168 2A/2760
+-- gpu: poly 32035/268 (slow 0 ms) line 0/0 rect 0/0 copy 112/6 fill 0/0 other 6326/11 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch2 84/329/379 ch6 56/7/115
+-- sas: voices 000000 on 0 adopted 0 back 0 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 0 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 0 0 ms
+-- ge: tri 26541+21151 tex, rect 0+0 tex, fill 0, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+56 sw+56 null (28 kpx, 0 from ge); pages 28 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 56 (28 kpx), flush 0; bind 720 tex 720 clut, kick 641 (0 ms), rd check 318; fast 30502 (12694 setups 56 ms, 12306 cached), slow tex 0 big 0, flat 805, clipped 2002; ring uncached (wb 0 ms), step 1024
+CD_init:addr=800813a8
+-- f 4299 pc 094B95FC 78% 46 vbl 17 fps
+-- native: 34694 calls, 209 misses, 584 steps, 0 hashes, 2 loads, 5631 poll skips, 518 hooks
+-- ms: interp 5 io 89 (draw 180 mdec 0 spu 32) update 271 present 29 (wait 15 draw 13 text 10 rgb24 0) sleep 161; audio drops 0 gaps 23 trims 0 peak 0/0; vsync wait 6 (3 ms) late 28 (avg 8434 max 16473 us) skipped 15
+-- io (n/ms): gpu 6220/3 dma 5721/24 cd 2400/4 spu 168/1 timer 14682/49 irq 2808/2 pad 2914/2 gtecmd 2784/0 cop0 15/0 other 309/0
+-- gte ops (hex/n): 10/936 28/102 2A/1746
+-- gpu: poly 20556/165 (slow 0 ms) line 0/0 rect 0/0 copy 72/7 fill 2/0 other 4072/7 (n/ms), frags 0 tested 0
+-- dma (n/ms/kwords): ch2 56/212/243 ch3 90/14/23 ch6 36/5/73
+-- sas: voices 000000 on 24 adopted 0 back 24 refused pmon 0 noise 0 reverb 0 loop 0 busy 0; cmds 168 lost 0 pages 0 (live 0) errors 0 (last 00000000 op 0) retries 0; grains 3 0 ms
+-- ge: tri 17010+13608 tex, rect 0+0 tex, fill 2, line 0 (0 runs); sw tex15 0 texwin 0 copy 0+36 sw+36 null (18 kpx, 0 from ge); pages 18 cluts 0+0 in list, readback 0 (0 tiles, 0 ms), upload 36 (18 kpx), flush 0; bind 468 tex 468 clut, kick 434 (0 ms), rd check 207; fast 19566 (8154 setups 34 ms, 7902 cached), slow tex 0 big 0, flat 522, clipped 1287; ring uncached (wb 0 ms), step 1024
