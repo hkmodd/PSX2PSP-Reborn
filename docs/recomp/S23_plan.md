@@ -1,6 +1,7 @@
 # S23 — Codice tradotto e I-cache della PSP (piano, non codice)
 
-**Stato:** da approvare (GOAL §4.2). S21 resta aperto: aspetta il log PSP dell'EBOOT e43b795.
+**Stato:** passo 0 e passo 1 fatti offline; aspettano il log PSP. Il log PSP dell'EBOOT e43b795
+è arrivato: FMV 73 → 80%. S21 resta aperto (passo 2c, pacing a debito).
 S22 (SPU sul ME) non parte da qui: spu.c e sceSas sono di S1.
 
 ## Da dove si parte: i numeri del log PSP di S21 passo 2
@@ -73,6 +74,13 @@ del flusso caldo e le parole totali, prima e dopo. Senza questo numero non si co
 Per un accesso lo stub è circa il doppio del percorso caldo. Quanto pesa sul totale dipende da
 quanti load e store ha il codice, ed è quello che il test misura. Correttezza:
 `cargo test -p psx2psp-recomp` e il fixed check PPSSPP.
+
+**Fatto (offline).** Il codice freddo è il 66% delle parole host di ogni eseguibile (stub degli
+accessi, chiamate host, poll, salti lunghi). Prima un blocco freddo ogni ~82 parole calde, ora uno
+ogni ~2930 (11,7 KB, `cold words / cold blocks` nel test `real_executables_translate`). Rapporto
+host/guest invariato (7,68 su LEV02). Test e oracolo verdi, fixed check verde a 59,1 fps. Il
+profiler hardware (passo 0b) è nel runtime: `psxrt.prof` accanto all'EBOOT, via KUBridge di ARK-4
+(`kubridge.S`), riga `-- cpu (k)` nel log.
 
 ## Passo 2 — Ordine per frequenza (solo se il passo 1 non basta)
 

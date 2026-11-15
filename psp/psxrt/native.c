@@ -560,13 +560,19 @@ static void sync_time(void)
  * VS_MARGIN before the vblank after this one's: its swap lands there however its work jitters.
  * When this frame made its vblank (or came before it: the runtime does not sleep inside a
  * frame), the next one starts at its slot, slept to if still ahead; when
- * it did not, it shows a vblank late and the next starts at the slot of the vblank that passed
- * (the frames after then run unslept until they catch up). The vblanks' times come from a grid, a
+ * it did not, the next one's slot is still the one after this one's: up to OWE_MAX vblanks are
+ * owed, and the frames after run unslept and unshown (native_vsync_early) until they catch up.
+ * Beyond that PS1 time slows down. The FMV lost 13 vblanks a second when a late frame's slot
+ * moved to the vblank that passed, while its light frames slept 110 ms (S21). The vblanks' times come from a grid, a
  * frame of 1001/60 ms from one seen at boot, kept inside what the count says at each call: vblank
  * v has come, v + 1 has not. sceDisplayWaitVblankStart is not used: called close to a vblank,
  * PPSSPP's waits for the next. */
 #define VS_US(n) ((u64)(n) * 50050u / 3u) /* n frames of 16683.3 us */
 #define VS_MARGIN 6000u
+/* Vblanks owed at most: with the margin, 39.4 ms behind, inside BEHIND_MAX */
+#define OWE_MAX 2u
+/* Frames in a row left unshown at most while catching up */
+#define DROP_MAX 2u
 void native_vsync(void)
 {
     u32 v = sceDisplayGetVcount();
@@ -586,27 +592,36 @@ void native_vsync(void)
         }
     } else {
         u32 late = (u32)(now - t_v);
-        native_stats.vs_late++, native_stats.us_late += late, native_stats.vs_adv += v - vc - 1;
+        native_stats.vs_late++, native_stats.us_late += late;
         if (late > native_stats.us_late_max)
             native_stats.us_late_max = late;
-        t_base = t_v - VS_MARGIN, vc = v;
+        if (v - vc > OWE_MAX) /* forgiven: PS1 time slows down */
+            native_stats.vs_adv += v - vc - OWE_MAX, vc = v - OWE_MAX;
+        vc++;
+        t_base = t_lock + VS_US(vc - v_lock) - VS_MARGIN;
     }
     c_base = P->cycles;
 }
 
 /* Before the frame is presented: one that came before its PSP vblank (vc) waits for it, or its
- * swap would replace the last frame's before that one was shown. */
-void native_vsync_early(void)
+ * swap would replace the last frame's before that one was shown. One after it is not shown
+ * (0), its time goes to catching up; but no more than DROP_MAX in a row. */
+int native_vsync_early(void)
 {
+    static u32 drops;
     u32 v = sceDisplayGetVcount();
+    if ((s32)(v - vc) > 0 && drops < DROP_MAX)
+        return drops++, native_stats.vs_drop++, 0;
+    drops = 0;
     if ((s32)(vc - v) <= 0)
-        return;
+        return 1;
     u64 now = sceKernelGetSystemTimeWide(), t = t_lock + VS_US(vc - v_lock);
     if (t > now) {
         u32 dt = (u32)(t - now);
         sceKernelDelayThread(dt);
         native_stats.us_sleep += dt, native_stats.us_vs_wait += dt;
     }
+    return 1;
 }
 
 /* Times one call in PROF_EVERY, and every vblank (rare, and the longest: the frame is

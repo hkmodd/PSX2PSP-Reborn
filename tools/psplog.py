@@ -3,8 +3,11 @@
 
 A scene is the executable that ran the second ("native: LEV01.EXE at ..."); seconds with MDEC
 work are kept apart as "<exe>/fmv". For each scene: seconds, speed (mean, worst 10%, min), fps,
-and the ms/s of the runtime's parts. The end says how the run stopped: a bench line, a halt, or
-nothing (switched off or crashed), with the last event logged before it.
+and the ms/s of the runtime's parts. "code" is the rest of the second: translated code, and
+whatever no part covers (draw, mdec and spu are inside io; update's host part, the frontend's
+frame, is counted once). Logs older than update's parts count that frame twice, so their code
+is low. The end says how the run stopped: a bench line, a halt, or nothing (switched off or
+crashed), with the last event logged before it.
 
     python -I tools/psplog.py LOG              table by scene
     python -I tools/psplog.py LOG --csv OUT    also every second as CSV
@@ -24,6 +27,8 @@ BENCH = re.compile(r"^-- bench (\d+) s at frame (\d+): speed (\d+)% vbl (\d+) fp
 IO_PAIR = re.compile(r"(\w+) (\d+)/(\d+)")
 UPD_PAIR = re.compile(r"(\w+) (\d+)")
 MS_KEYS = ("interp", "io", "draw", "mdec", "spu", "update", "present", "sleep")
+# code: the rest of the second, not in any measured part: translated code, mostly
+COLS = (*MS_KEYS, "code")
 UPD_KEYS = tuple("upd_" + k for k in ("vbl", "spu", "host", "timers", "dma", "cd", "sio"))
 
 
@@ -66,6 +71,9 @@ def read(path):
                 last_event = line
     for s in secs:
         s["scene"] = s["exe"] + ("/fmv" if s.get("mdec", 0) > 0 else "")
+        if "interp" in s:  # update holds the frontend's frame (upd_host: present, vsync wait)
+            parts = ("interp", "io", "update", "present", "sleep")
+            s["code"] = max(0, 1000 - sum(s[k] for k in parts) + s.get("upd_host", 0))
     if not end:
         end = "no end line: switched off or crashed after f%s; last event: %s" % (
             secs[-1]["frame"] if secs else "?", last_event)
@@ -83,7 +91,7 @@ def summary(secs):
         worst = sp[: max(1, len(sp) // 10)]
         r = {"n": len(ss), "speed": sum(sp) / len(sp), "worst10": sum(worst) / len(worst),
              "min": sp[0], "fps": sum(s["fps"] for s in ss) / len(ss)}
-        for k in MS_KEYS:
+        for k in COLS:
             v = [s[k] for s in ss if k in s]
             r[k] = sum(v) / len(v) if v else 0
         for k in {k for s in ss for k in s if k.startswith(("io_", "upd_"))}:  # not listed: 0 ms
@@ -93,13 +101,13 @@ def summary(secs):
 
 
 HEAD = "%-14s %4s %6s %6s %4s %5s" % ("scene", "s", "speed", "worst", "min", "fps") + "".join(
-    " %6s" % k for k in MS_KEYS)
+    " %6s" % k for k in COLS)
 
 
 def fmt(scene, r):
     row = "%-14s %4d %5.0f%% %5.0f%% %3d%% %5.1f" % (
         scene, r["n"], r["speed"], r["worst10"], r["min"], r["fps"]) + "".join(
-        " %6.0f" % r[k] for k in MS_KEYS)
+        " %6.0f" % r[k] for k in COLS)
     upd = [(k[4:], r[k]) for k in UPD_KEYS if k in r]
     if upd:  # update's parts; host is the frontend's frame (present, sleep) run inside it
         row += "\n%-14s update: %s (sum %.0f)" % ("", ", ".join("%s %.0f" % p for p in upd),
@@ -120,7 +128,7 @@ def main(argv):
         print("end:", end)
         if csv_out:
             with open(csv_out, "w", newline="") as fh:
-                w = csv.DictWriter(fh, ["frame", "scene", "pc", "speed", "vbl", "fps", *MS_KEYS],
+                w = csv.DictWriter(fh, ["frame", "scene", "pc", "speed", "vbl", "fps", *COLS],
                                    extrasaction="ignore")
                 w.writeheader()
                 w.writerows(secs)
@@ -137,7 +145,7 @@ def main(argv):
             print("%-14s %4.0f->%3.0f%% %+4.0f %4.0f->%3.0f%% %+4.0f %5.1f->%4.1f" % (
                 scene, x["speed"], y["speed"], y["speed"] - x["speed"], x["worst10"],
                 y["worst10"], y["worst10"] - x["worst10"], x["fps"], y["fps"]))
-            moved = [(k, x.get(k, 0), y.get(k, 0)) for k in (*MS_KEYS, *sorted(
+            moved = [(k, x.get(k, 0), y.get(k, 0)) for k in (*COLS, *sorted(
                 {k for k in (*x, *y) if k.startswith(("io_", "upd_"))}))]
             moved = ["%s %.0f->%.0f" % m for m in moved if abs(m[2] - m[1]) >= 10]
             if moved:

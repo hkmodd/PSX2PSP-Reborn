@@ -927,7 +927,7 @@ fn real_executables_translate() {
     let dir = std::env::var("PSX2PSP_EXES").expect("PSX2PSP_EXES");
     let mut paths: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).collect();
     paths.sort();
-    println!("exe | guest code bytes | host bytes | ratio | runtime calls | interpreter hand-overs");
+    println!("exe | guest code bytes | host bytes | ratio | runtime calls | interpreter hand-overs | cold words | cold blocks | hot words per block");
     let mut total = BTreeMap::<Reason, usize>::new();
     let (mut guest, mut host) = (0usize, 0usize);
     for path in &paths {
@@ -942,10 +942,13 @@ fn real_executables_translate() {
             if r.resumes() { resume += 1 } else { exec += 1 }
         }
         println!(
-            "{} | {g} | {} | {:.2} | {exec} | {resume}",
+            "{} | {g} | {} | {:.2} | {exec} | {resume} | {:.0}% | {} | {:.0}",
             path.file_name().unwrap().to_string_lossy(),
             4 * t.words.len(),
             (4 * t.words.len()) as f64 / g as f64,
+            100.0 * t.cold.0 as f64 / t.words.len() as f64,
+            t.cold.1,
+            (t.words.len() - t.cold.0) as f64 / t.cold.1.max(1) as f64,
         );
         guest += g;
         host += 4 * t.words.len();

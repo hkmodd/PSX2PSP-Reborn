@@ -32,7 +32,15 @@ typedef struct DiscInfo {
 /* DiscInfo.flags: a PAL picture runs at 60 vblanks a second (patch database `pal60`). */
 #define DISC_PAL60 1u
 
-/* Opens the EBOOT at `path` and checks its DATA.PSAR. NULL, or what is wrong. */
+/* Disc blocks since boot: inflated by the CPU thread, inflated ahead by the worker (and how many
+ * of those the CPU thread had to wait for). */
+typedef struct DiscStats {
+    u32 loads, prefetched, waited;
+} DiscStats;
+extern DiscStats disc_stats;
+
+/* Opens the EBOOT at `path` and checks its DATA.PSAR, and starts the read-ahead worker. NULL, or
+ * what is wrong. */
 const char *disc_open(const char *path, DiscInfo *info);
 /* PsxHost.read_sector: 0, or -1 outside the image or on a read error (reported to disc_log). */
 int disc_read_sector(void *user, u32 lba, u8 *raw);

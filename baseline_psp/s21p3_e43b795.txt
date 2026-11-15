@@ -1,0 +1,16 @@
+scene             s  speed  worst  min   fps interp     io   draw   mdec    spu update present  sleep   code
+SLES_028.95       3    99%    96%  96%   0.0    513    255      0      0     62    512     20    398    172
+               update: vbl 0, spu 64, host 437, timers 5, dma 1, cd 1, sio 0 (sum 509)
+SLES_028.95/fmv   46    80%    76%  75%  10.5     15    459      0    167     93    439     93    132    118
+               update: vbl 0, spu 98, host 243, timers 8, dma 3, cd 81, sio 1 (sum 434)
+WHEEL            44    75%    59%  54%  30.3     50    290    225      0     30    260     30    146    442
+               update: vbl 0, spu 34, host 191, timers 4, dma 1, cd 26, sio 0 (sum 256)
+LOADER            4    98%    93%  93%   0.0      8    354      0      0     38    513     20    266    164
+               update: vbl 0, spu 45, host 306, timers 4, dma 1, cd 152, sio 0 (sum 509)
+LOADER/fmv        2    91%    86%  86%   0.0      6    371      0     58     36    531     24    262    119
+               update: vbl 0, spu 42, host 313, timers 4, dma 1, cd 167, sio 0 (sum 528)
+INTRO            18    84%    50%  50%  14.7      9    249    155      0     39    353     22    244    404
+               update: vbl 0, spu 37, host 280, timers 3, dma 1, cd 29, sio 0 (sum 350)
+LEV01           112    91%    83%  53%  38.5     12    243    136      0     47    231     23     73    526
+               update: vbl 0, spu 35, host 109, timers 5, dma 1, cd 77, sio 0 (sum 227)
+end: no end line: switched off or crashed after f11790; last event: CD_init:addr=800a7318

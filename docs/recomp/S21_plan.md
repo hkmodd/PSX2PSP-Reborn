@@ -77,6 +77,36 @@ Il resto di un macroblocco sulla PSP (log di step 2: IDCT 13,3 µs, colore 14,5,
 lavoro di istruzioni, senza uno spreco provato. Il prossimo intervento si sceglie con le parti di
 `update` del log 2b.
 
+**Passi 2b + 3 sulla PSP (`baseline_psp/s21p3_e43b795.log`): FMV 73 → 80%, worst 67 → 76%.**
+- ch0 25 → 4 ms/s. ch2 80 ms per 737 kparole, di cui upload al GE solo 12: ~68 ms sono la
+  scrittura dei pixel nella VRAM emulata.
+- WHEEL 85 → 75% e LEV01 98 → 91% sono un altro mix di scene, non una regressione: sugli stessi
+  secondi (WHEEL fps < 45: 64,3 → 63,8%; menu: 100 → 98,9%).
+- **La perdita dell'FMV è nel pacing, non nel lavoro.** Ogni secondo di FMV: ~16 frame in ritardo
+  (in media 6,5 ms), 13 vblank "saltati" (`skipped`), 20 attese del vsync per ~110 ms. Un frame
+  in ritardo di 2+ vblank spostava lo slot del successivo al vblank appena passato: il debito si
+  perdeva (13 × 16,7 = 217 ms), mentre i frame leggeri dopo dormivano.
+
+**Passo 2c, pacing a debito.** `native_vsync` tiene il debito fino a `OWE_MAX` = 2 vblank (39,4 ms
+con il margine, dentro `BEHIND_MAX`); oltre, PS1 rallenta come prima. Un frame finito dopo il suo
+vblank PSP non viene presentato (`native_vsync_early` → 0, il GE prosegue con `ge_run`): il suo
+tempo va al recupero, al massimo `DROP_MAX` = 2 di fila. Il log conta i frame non mostrati
+(`dropped`). Stima: i ~110 ms di sleep e i ~2 ms di present per frame saltato coprono gran parte
+dei 217 ms, FMV ~88-90%.
+
+**Passo 4, lettura anticipata del disco (`disc.c`).** Nel log e43b795 `upd_cd` vale in media
+81 ms/s con picchi di 184 ms/s. È il tempo di seek, lettura e inflate di un blocco da 16 settori,
+tutto sul thread della CPU. Dopo un blocco servito, un thread `psxrt disc` legge e decomprime il
+successivo in un terzo slot della cache, con il suo fd e il suo `z_stream`. La sua priorità
+(0x30) è sotto quella del thread della CPU (0x20), quindi gira solo mentre quello dorme:
+`sceKernelDelayThread` del vsync e `sceGuSync`. Non c'è spin. Se la CPU chiede il blocco in volo,
+aspetta il semaforo. Se il worker fallisce, il blocco si ricarica inline, con il messaggio nel
+log. La riga `-- disc blocks: inline N ahead N (waited N)` dice quanti blocchi sono usciti dal
+frame.
+- Effetto atteso: FMV e caricamenti, dove c'è sleep e streaming. In INTRO lo sleep è 47 ms/s e il
+  guadagno sarà minore.
+- La memoria cresce di ~75 KB in partizione (slot + zbuf) e ~40 KB di heap zlib.
+
 ## La premessa del GOAL non regge più
 
 GOAL.MD dice «S21: port dell'IDCT e della conversione colore su VFPU». **È già fatto (S15).** Il

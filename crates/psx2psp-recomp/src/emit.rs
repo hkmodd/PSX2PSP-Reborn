@@ -105,6 +105,9 @@ pub struct Translation {
     /// address, or two for a delay slot duplicated on both paths or also jumped to). When the
     /// game rewrites such an instruction, [`repatch`] gives the new host word for each address.
     pub patch: BTreeMap<u32, Vec<u32>>,
+    /// Words of out-of-line code (slow paths, interrupt checks, host calls, long jumps), and the
+    /// number of blocks they are written in between the main-pass code.
+    pub cold: (usize, usize),
 }
 
 /// The host word for `guest` written where the simple instruction translated to `host` was, if
@@ -313,9 +316,11 @@ impl Code {
     }
 }
 
-/// Stubs are placed after the next unconditional transfer, or jumped over once the oldest
-/// pending one could fall out of branch range.
+/// Stubs are cold: a block of them goes after an unconditional transfer once the code since the
+/// oldest pending one reaches [`COLD_BLOCK`], so the main-pass code stays dense in the I-cache.
+/// They are jumped over where they are once the oldest could fall out of branch range.
 const FLUSH_WORDS: usize = 0x4000;
+const COLD_BLOCK: usize = FLUSH_WORDS / 2;
 
 struct Em<'a> {
     exe: &'a PsxExe,
@@ -328,6 +333,8 @@ struct Em<'a> {
     labels: usize,
     map: BTreeMap<u32, usize>,
     runtime: BTreeMap<u32, Reason>,
+    /// Out-of-line words written so far, and in how many blocks.
+    cold: (usize, usize),
     /// Conditional branches whose guest target is beyond 16 bits in host code.
     long: &'a BTreeSet<u32>,
     hooks: &'a BTreeMap<u32, Hook>,
@@ -403,6 +410,7 @@ fn emit(
         labels: 0,
         map: BTreeMap::new(),
         runtime: BTreeMap::new(),
+        cold: (0, 0),
     };
     let targets = em.targets();
     for &a in d.code.iter().filter(|a| !d.delay_slots.contains_key(a)) {
@@ -413,9 +421,9 @@ fn emit(
             Some(n) => {
                 let c = em.resume(n, Reason::Unreached);
                 em.out.append(c);
-                em.flush();
+                em.run_end();
             }
-            None => em.flush(),
+            None => em.run_end(),
         }
     }
     // Delay slots that are also jumped to get a copy of their own.
@@ -438,7 +446,7 @@ fn emit(
             _ => em.resume(s, Reason::Invalid),
         };
         em.out.append(c);
-        em.flush();
+        em.run_end();
     }
     em.flush();
     em.finish(base)
@@ -514,10 +522,21 @@ impl Em<'_> {
     }
 
     fn flush(&mut self) {
+        if !self.stubs.is_empty() {
+            self.cold.0 += self.stub_words;
+            self.cold.1 += 1;
+        }
         for s in std::mem::take(&mut self.stubs) {
             self.out.append(s);
         }
         self.stub_words = 0;
+    }
+
+    /// After an unconditional transfer: the pending stubs go here if their block is full.
+    fn run_end(&mut self) {
+        if !self.stubs.is_empty() && self.out.w.len() - self.oldest + self.stub_words > COLD_BLOCK {
+            self.flush();
+        }
     }
 
     fn far_flush(&mut self) {
@@ -975,7 +994,7 @@ impl Em<'_> {
     }
 
     fn finish(self, base: u32) -> Result<Translation, Fail> {
-        let Em { out, map, runtime, labels, .. } = self;
+        let Em { out, map, runtime, labels, cold, .. } = self;
         let Code { mut w, fix, defs, pat } = out;
         let mut at = vec![usize::MAX; labels];
         for (l, i) in defs {
@@ -1018,6 +1037,7 @@ impl Em<'_> {
             map: map.into_iter().map(|(g, i)| (g, host(i))).collect(),
             runtime,
             patch,
+            cold,
         })
     }
 }

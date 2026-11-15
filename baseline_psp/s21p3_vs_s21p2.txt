@@ -1,0 +1,17 @@
+scene                  speed     worst 10%           fps
+SLES_028.95      98-> 99%   +1   94-> 96%   +2   0.0-> 0.0
+               ms/s: io 170->255, update 183->512, sleep 497->398, code 70->172, io_timer 102->170, upd_host 0->437, upd_spu 0->64
+SLES_028.95/fmv   73-> 80%   +6   67-> 76%   +9   9.6->10.5
+               ms/s: io 444->459, update 290->439, sleep 174->132, code 50->118, io_timer 41->53, upd_cd 0->81, upd_host 0->243, upd_spu 0->98
+WHEEL            85-> 75%  -10   62-> 59%   -3  42.3->30.3
+               ms/s: interp 22->50, io 239->290, draw 157->225, update 138->260, sleep 249->146, code 341->442, io_dma 203->250, upd_cd 0->26, upd_host 0->191, upd_spu 0->34
+LOADER           96-> 98%   +2   90-> 93%   +3   0.0-> 0.0
+               ms/s: io 288->354, update 174->513, sleep 296->266, code 216->164, io_timer 214->264, upd_cd 0->152, upd_host 0->306, upd_spu 0->45
+LOADER/fmv       90-> 91%   +2   89-> 86%   -3   0.0-> 0.0
+               ms/s: io 500->371, update 190->531, sleep 311->262, code 85->119, io_dma 278->108, io_timer 176->208, upd_cd 0->167, upd_host 0->313, upd_spu 0->42
+INTRO            82-> 84%   +3   71-> 50%  -21  29.4->14.7
+               ms/s: io 320->249, draw 227->155, update 114->353, sleep 47->244, code 490->404, io_dma 276->196, io_timer 18->30, upd_cd 0->29, upd_host 0->280, upd_spu 0->37
+LEV01            98-> 91%   -7   87-> 83%   -4  14.3->38.5
+               ms/s: io 146->243, draw 95->136, update 176->231, sleep 286->73, code 367->526, io_dma 111->185, io_spu 8->18, upd_cd 0->77, upd_host 0->109, upd_spu 0->35
+base end: no end line: switched off or crashed after f17723; last event: CD_init:addr=800a7318
+log end:  no end line: switched off or crashed after f11790; last event: CD_init:addr=800a7318

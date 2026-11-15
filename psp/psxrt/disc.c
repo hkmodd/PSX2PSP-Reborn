@@ -1,14 +1,19 @@
 /*
  * psxrt: the PS1 disc, read from DATA.PSAR of the runtime's own EBOOT. The converter stores the
  * image as blocks of 16 raw sectors, each raw deflate or stored, behind an index of offsets
- * (README.md, "DATA.PSAR"). Two inflated blocks are kept: a CD reads sequentially, and a seek
- * back to the block before (file headers, XA interleave) does not inflate again. After the
- * blocks come the translated executables (native.c), read with disc_blob().
+ * (README.md, "DATA.PSAR"). Three inflated blocks are kept: a CD reads sequentially, and a seek
+ * back to the block before (file headers, XA interleave) does not inflate again. After a block
+ * is served, a worker thread reads and inflates the next one into the third slot, with its own
+ * file and zlib stream. Its priority is below the CPU thread's, so it runs while that one sleeps
+ * (vsync waits, GE syncs): the inflate leaves the frame. If the CPU thread needs the block in
+ * flight it waits for it. After the blocks come the translated executables (native.c), read with
+ * disc_blob().
  */
 #include "disc.h"
 
 #include <pspiofilemgr.h>
 #include <pspsysmem.h>
+#include <pspthreadman.h>
 #include <stdio.h>
 #include <string.h>
 #include <zlib.h>
@@ -20,6 +25,9 @@
 #define RAW 2352
 #define BLOCK_LEN (BLOCK_SECTORS * RAW)
 #define PREGAP 150
+#define SLOTS 3
+/* below the CPU thread (0x20): the worker takes the time that one sleeps */
+#define PREFETCH_PRIORITY 0x30
 
 typedef struct {
     char magic[8];
@@ -39,14 +47,26 @@ typedef struct {
     u8 data[BLOCK_LEN];
 } Cached;
 
-static SceUID fd = -1;
-static u32 psar;   /* file offset of DATA.PSAR */
-static u32 sectors;
+/* A file and a zlib stream: one for the CPU thread, one for the worker. */
+typedef struct {
+    SceUID fd;
+    u8 *zbuf;
+    z_stream zs;
+    int quiet; /* the worker does not log: a block it fails is loaded again, and reported, inline */
+} Reader;
+
+DiscStats disc_stats;
+static Reader rd = {.fd = -1}, pf_rd = {.fd = -1, .quiet = 1};
+static u32 psar; /* file offset of DATA.PSAR */
+static u32 sectors, blocks;
 static u32 *offsets; /* blocks + 1 offsets */
 static Cached *cache;
-static u8 *zbuf;
 static u32 clock;
-static z_stream zs;
+/* The worker's request. `pf_slot` is the worker's while `pf_busy`; `pf_done` is signalled when
+ * block `pf_block` is in it (its `block` stays -1 on a failure). Only the CPU thread sets these. */
+static SceUID pf_req = -1, pf_done = -1;
+static Cached *pf_slot;
+static u32 pf_block, pf_busy;
 
 static void *alloc(const char *name, u32 size)
 {
@@ -54,38 +74,67 @@ static void *alloc(const char *name, u32 size)
     return uid < 0 ? NULL : sceKernelGetBlockHeadAddr(uid);
 }
 
-static int read_at(u32 off, void *dst, u32 len)
+static int read_at(Reader *r, u32 off, void *dst, u32 len)
 {
-    return sceIoLseek32(fd, (int)(psar + off), PSP_SEEK_SET) == (int)(psar + off) && sceIoRead(fd, dst, len) == (int)len;
+    return sceIoLseek32(r->fd, (int)(psar + off), PSP_SEEK_SET) == (int)(psar + off) && sceIoRead(r->fd, dst, len) == (int)len;
+}
+
+static const char *reader_open(Reader *r, const char *path)
+{
+    r->fd = sceIoOpen(path, PSP_O_RDONLY, 0);
+    if (r->fd < 0)
+        return "cannot open the EBOOT";
+    r->zbuf = alloc("psxrt zbuf", BLOCK_LEN);
+    if (!r->zbuf)
+        return "out of memory";
+    return inflateInit2(&r->zs, -15) != Z_OK ? "zlib init failed" : NULL;
+}
+
+static int load(Reader *r, Cached *c, u32 b);
+
+static int prefetch_thread(SceSize args, void *argp)
+{
+    (void)args, (void)argp;
+    while (sceKernelWaitSema(pf_req, 1, NULL) >= 0) {
+        load(&pf_rd, pf_slot, pf_block);
+        sceKernelSignalSema(pf_done, 1);
+    }
+    return 0;
 }
 
 const char *disc_open(const char *path, DiscInfo *info)
 {
     u32 pbp[10];
     Header h;
-    fd = sceIoOpen(path, PSP_O_RDONLY, 0);
-    if (fd < 0)
-        return "cannot open the EBOOT";
-    if (sceIoRead(fd, pbp, sizeof pbp) != (int)sizeof pbp || pbp[0] != 0x50425000u)
+    const char *err = reader_open(&rd, path);
+    if (err)
+        return err;
+    if (sceIoRead(rd.fd, pbp, sizeof pbp) != (int)sizeof pbp || pbp[0] != 0x50425000u)
         return "not a PBP";
     psar = pbp[9];
-    if (!read_at(0, &h, sizeof h) || memcmp(h.magic, MAGIC, 8))
+    if (!read_at(&rd, 0, &h, sizeof h) || memcmp(h.magic, MAGIC, 8))
         return "DATA.PSAR is not psxrt's";
     if (h.version != VERSION || h.header_len != HEADER_LEN || h.block_sectors != BLOCK_SECTORS)
         return "DATA.PSAR version mismatch: rebuild the EBOOT";
     if (!h.sectors || h.blocks != (h.sectors + BLOCK_SECTORS - 1) / BLOCK_SECTORS)
         return "DATA.PSAR has no disc";
     offsets = alloc("psxrt index", (h.blocks + 1) * 4);
-    cache = alloc("psxrt cache", 2 * sizeof(Cached));
-    zbuf = alloc("psxrt zbuf", BLOCK_LEN);
-    if (!offsets || !cache || !zbuf)
+    cache = alloc("psxrt cache", SLOTS * sizeof(Cached));
+    if (!offsets || !cache)
         return "out of memory";
-    if (!read_at(h.index_offset, offsets, (h.blocks + 1) * 4))
+    if (!read_at(&rd, h.index_offset, offsets, (h.blocks + 1) * 4))
         return "cannot read the disc index";
-    if (inflateInit2(&zs, -15) != Z_OK)
-        return "zlib init failed";
-    cache[0].block = cache[1].block = -1;
-    sectors = h.sectors;
+    for (int k = 0; k < SLOTS; k++)
+        cache[k].block = -1, cache[k].used = 0;
+    sectors = h.sectors, blocks = h.blocks;
+    /* without the worker the disc still reads, inline */
+    if (!reader_open(&pf_rd, path)) {
+        pf_req = sceKernelCreateSema("psxrt pf req", 0, 0, 1, NULL);
+        pf_done = sceKernelCreateSema("psxrt pf done", 0, 0, 1, NULL);
+        SceUID th = sceKernelCreateThread("psxrt disc", prefetch_thread, PREFETCH_PRIORITY, 0x2000, PSP_THREAD_ATTR_USER, NULL);
+        if (pf_req < 0 || pf_done < 0 || th < 0 || sceKernelStartThread(th, 0, NULL) < 0)
+            pf_req = -1;
+    }
     memcpy(info->disc_id, h.disc_id, sizeof info->disc_id);
     memcpy(info->title, h.title, sizeof info->title);
     info->disc_id[sizeof info->disc_id - 1] = 0;
@@ -103,7 +152,7 @@ const char *disc_open(const char *path, DiscInfo *info)
         if (h.images > 256 || sizeof(CodeEntry) != 0x40)
             return "DATA.PSAR code directory is damaged";
         info->dir = alloc("psxrt code dir", len);
-        if (!info->dir || !read_at(h.dir_offset, info->dir, len))
+        if (!info->dir || !read_at(&rd, h.dir_offset, info->dir, len))
             return "cannot read the code directory";
         info->images = h.images;
     }
@@ -113,61 +162,84 @@ const char *disc_open(const char *path, DiscInfo *info)
 int disc_blob(u32 off, u32 stored, void *dst, u32 raw_len)
 {
     if (stored == raw_len)
-        return read_at(off, dst, raw_len) ? 0 : -1;
-    if (stored > raw_len || inflateReset(&zs) != Z_OK)
+        return read_at(&rd, off, dst, raw_len) ? 0 : -1;
+    if (stored > raw_len || inflateReset(&rd.zs) != Z_OK)
         return -1;
-    zs.next_out = dst, zs.avail_out = raw_len;
+    rd.zs.next_out = dst, rd.zs.avail_out = raw_len;
     int r = Z_OK;
     for (u32 done = 0; done < stored;) {
         u32 n = stored - done < BLOCK_LEN ? stored - done : BLOCK_LEN;
-        if (!read_at(off + done, zbuf, n))
+        if (!read_at(&rd, off + done, rd.zbuf, n))
             return -1;
         done += n;
-        zs.next_in = zbuf, zs.avail_in = n;
-        r = inflate(&zs, done == stored ? Z_FINISH : Z_NO_FLUSH);
+        rd.zs.next_in = rd.zbuf, rd.zs.avail_in = n;
+        r = inflate(&rd.zs, done == stored ? Z_FINISH : Z_NO_FLUSH);
         if (r != Z_OK && r != Z_STREAM_END)
             break;
     }
-    return r == Z_STREAM_END && !zs.avail_out ? 0 : -1;
+    return r == Z_STREAM_END && !rd.zs.avail_out ? 0 : -1;
 }
 
-static void fail(u32 b, const char *what, int code)
+static void fail(Reader *r, u32 b, const char *what, int code)
 {
     char line[80];
+    if (r->quiet)
+        return;
     snprintf(line, sizeof line, "disc block %u: %s (%d)", (unsigned)b, what, code);
     disc_log(line);
 }
 
-static int load(Cached *c, u32 b)
+static int load(Reader *r, Cached *c, u32 b)
 {
     u32 off = offsets[b], len = offsets[b + 1] - offsets[b];
     u32 n = sectors - b * BLOCK_SECTORS;
     u32 raw_len = (n < BLOCK_SECTORS ? n : BLOCK_SECTORS) * RAW;
     c->block = -1;
     if (offsets[b + 1] < off || len > raw_len) {
-        fail(b, "bad index", 0);
+        fail(r, b, "bad index", 0);
         return -1;
     }
     if (len == raw_len) {
-        if (!read_at(off, c->data, len))
+        if (!read_at(r, off, c->data, len))
             goto io;
     } else {
-        if (!read_at(off, zbuf, len))
+        if (!read_at(r, off, r->zbuf, len))
             goto io;
-        inflateReset(&zs);
-        zs.next_in = zbuf, zs.avail_in = len;
-        zs.next_out = c->data, zs.avail_out = raw_len;
-        int r = inflate(&zs, Z_FINISH);
-        if (r != Z_STREAM_END || zs.avail_out) {
-            fail(b, "inflate failed", r);
+        inflateReset(&r->zs);
+        r->zs.next_in = r->zbuf, r->zs.avail_in = len;
+        r->zs.next_out = c->data, r->zs.avail_out = raw_len;
+        int z = inflate(&r->zs, Z_FINISH);
+        if (z != Z_STREAM_END || r->zs.avail_out) {
+            fail(r, b, "inflate failed", z);
             return -1;
         }
     }
     c->block = (int)b;
     return 0;
 io:
-    fail(b, "read error", 0);
+    fail(r, b, "read error", 0);
     return -1;
+}
+
+/* The slot holding block `b` (the worker's only once it is done), or NULL. */
+static Cached *find(int b)
+{
+    for (int k = 0; k < SLOTS; k++)
+        if (cache[k].block == b && !(pf_busy && &cache[k] == pf_slot))
+            return &cache[k];
+    return NULL;
+}
+
+/* The least recently used slot that is neither `keep` nor the worker's. */
+static Cached *victim(const Cached *keep)
+{
+    Cached *v = NULL;
+    for (int k = 0; k < SLOTS; k++) {
+        Cached *c = &cache[k];
+        if (c != keep && !(pf_busy && c == pf_slot) && (!v || c->used < v->used))
+            v = c;
+    }
+    return v;
 }
 
 int disc_read_sector(void *user, u32 lba, u8 *raw)
@@ -176,13 +248,35 @@ int disc_read_sector(void *user, u32 lba, u8 *raw)
     if (lba < PREGAP || lba - PREGAP >= sectors)
         return -1;
     u32 s = lba - PREGAP, b = s / BLOCK_SECTORS;
-    Cached *c = cache[0].block == (int)b ? &cache[0] : cache[1].block == (int)b ? &cache[1] : NULL;
+    if (pf_busy) { /* collected if done; the block in flight is waited for */
+        int done = sceKernelPollSema(pf_done, 1) >= 0;
+        if (!done && pf_block == b) {
+            SceUInt t = 200000; /* a block takes a few ms: the worker never holds the CPU thread */
+            int r = sceKernelWaitSema(pf_done, 1, &t);
+            done = r >= 0, disc_stats.waited += done;
+            if (!done) { /* its slot stays out of use; the disc reads inline from here */
+                char line[96];
+                snprintf(line, sizeof line, "disc: read-ahead of block %u not done (%08X): off", (unsigned)b, (unsigned)r);
+                disc_log(line);
+                pf_req = -1;
+            }
+        }
+        if (done)
+            pf_busy = 0, disc_stats.prefetched += pf_slot->block >= 0;
+    }
+    Cached *c = find((int)b);
     if (!c) {
-        c = cache[0].used <= cache[1].used ? &cache[0] : &cache[1];
-        if (load(c, b) < 0)
+        c = victim(NULL);
+        disc_stats.loads++;
+        if (load(&rd, c, b) < 0)
             return -1;
     }
     c->used = ++clock;
     memcpy(raw, c->data + (s % BLOCK_SECTORS) * RAW, RAW);
+    if (pf_req >= 0 && !pf_busy && b + 1 < blocks && !find((int)b + 1)) {
+        /* as recent as `c`: a miss before b + 1 is asked for does not evict it */
+        pf_slot = victim(c), pf_slot->block = -1, pf_slot->used = clock, pf_block = b + 1, pf_busy = 1;
+        sceKernelSignalSema(pf_req, 1);
+    }
     return 0;
 }
