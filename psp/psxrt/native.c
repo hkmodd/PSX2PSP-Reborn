@@ -833,8 +833,11 @@ static u32 hook_dct_vlc(Cpu *c, const u32 *arg, u32 pc)
             next = g[31];
             break;
         }
-        if (P->cycles >= P->next_event)
+        if (P->cycles >= P->next_event) { /* the devices' time is update's, not the VLC's */
+            u32 u = sceKernelGetSystemTimeLow();
             update();
+            t += sceKernelGetSystemTimeLow() - u;
+        }
         if (psx_irq_pending(P)) {
             next = pc;
             break;
