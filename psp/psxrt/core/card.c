@@ -206,6 +206,7 @@ static int f_io(Psx *psx, int op, u32 fd, u32 a1, u32 a2)
                 from_guest(psx, p, a1 + done_n, run);
             done_n += run;
         }
+        psx_log(psx, "card %s fd %u: %u of %u B at %d (size %d)%s", op == 2 ? "read" : "write", (unsigned)fd, (unsigned)n, (unsigned)a2, f->pos, f->size, f->async ? ", async" : "");
         f->pos += (int)n;
         if (op == 3 && n)
             changed(psx, (u32)f->slot);
@@ -217,6 +218,7 @@ static int f_io(Psx *psx, int op, u32 fd, u32 a1, u32 a2)
         return 1;
     }
     case 4: /* close */
+        psx_log(psx, "card close fd %u", (unsigned)fd);
         f->used = 0;
         G[R_V0] = fd;
         return 1;
@@ -296,6 +298,7 @@ int card_call(Psx *psx, u32 vector, u32 fn)
         memcpy(psx->bios.dirent_pattern, name, len < max ? len : max);
         psx->bios.dirent_pattern[len < max ? len : max] = 0;
         G[R_V0] = slot < 0 ? 0 : next_match(psx, a1);
+        psx_log(psx, "card firstfile %s: %s", path, G[R_V0] ? "found" : "none");
         return 1;
     }
     case 0x43: /* nextfile(direntry) */
