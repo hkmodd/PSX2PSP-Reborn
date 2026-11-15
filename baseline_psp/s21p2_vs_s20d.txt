@@ -1,0 +1,17 @@
+scene                  speed     worst 10%           fps
+SLES_028.95      98-> 98%   -0   94-> 94%   +0   0.0-> 0.0
+               ms/s: interp 391->518, io 108->170, update 142->183, sleep 552->497, io_dma 25->44, io_timer 57->102
+SLES_028.95/fmv   74-> 73%   -0   68-> 67%   -1   9.7-> 9.6
+               ms/s: io 482->444, update 264->290, sleep 106->174, io_timer 70->41
+WHEEL            74-> 85%  +11   59-> 62%   +3  29.6->42.3
+               ms/s: interp 6->22, io 300->239, draw 240->157, update 117->138, sleep 140->249, io_dma 274->203, io_timer 13->23
+LOADER           97-> 96%   -2   90-> 90%   +0   0.0-> 0.0
+               ms/s: interp 106->6, io 186->288, update 120->174, sleep 404->296, io_dma 49->38, io_timer 105->214
+LOADER/fmv       92-> 90%   -2   89-> 89%   +0   0.0-> 0.0
+               ms/s: io 224->500, sleep 367->311, io_dma 94->278, io_timer 78->176
+INTRO            83-> 82%   -1   67-> 71%   +4  34.8->29.4
+               ms/s: draw 255->227, update 126->114, sleep 27->47
+LEV01            97-> 98%   +1   91-> 87%   -4  23.9->14.3
+               ms/s: io 254->146, draw 196->95, sleep 61->286, io_dma 214->111
+base end: no end line: switched off or crashed after f21390; last event: CD_init:addr=800a7318
+log end:  no end line: switched off or crashed after f17723; last event: CD_init:addr=800a7318

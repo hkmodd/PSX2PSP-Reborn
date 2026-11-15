@@ -40,6 +40,9 @@ const char *native_init(Psx *psx, const DiscInfo *info);
 void native_run(u32 host_pc) __attribute__((noreturn));
 /* Called at each PS1 vblank once its frame is presented: paces PS1 frames to the PSP display. */
 void native_vsync(void);
+/* Called at each PS1 vblank before its frame is presented: a frame early for its PSP vblank
+ * waits for it. */
+void native_vsync_early(void);
 /* Provided by the runtime: stops with a message; does not return. */
 void runtime_halt(const char *why) __attribute__((noreturn));
 

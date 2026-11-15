@@ -1017,6 +1017,7 @@ static void host_vblank(void *user)
         if ((shot_at[i] & 0x7FFFFFFFu) == frames)
             (shot_at[i] >> 31 ? ram_dump : shot)(&psx, frames);
     if (native) {
+        native_vsync_early();
         frame();
         native_vsync();
     }

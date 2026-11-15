@@ -24,8 +24,8 @@
  * PS1 time runs at one PS1 frame per PSP display frame (59.94 Hz), and each PS1 vblank waits for
  * the PSP's (native_vsync), so that every game frame is shown once: PS1 time is the PSP's,
  * scaled by the frame lengths (+0.2% for NTSC, +0.9% for PAL60).
- * When the count runs ahead of that clock (checked at every host call and every 256
- * interpreted instructions) the runtime sleeps; when it falls behind by more than BEHIND_MAX,
+ * When the count runs more than a frame ahead of that clock (checked at every host call and every
+ * 256 interpreted instructions) the runtime sleeps; when it falls behind by more than BEHIND_MAX,
  * the clock is moved back instead: PS1 time slows down with the host, it never jumps, or devices
  * (the CD's sectors) would run ahead of the guest code that serves them. A 500 us alarm makes the budget negative, so
  * that loops enter the runtime and interrupts are taken there.
@@ -84,7 +84,11 @@
 #define RESUME 1u
 #define POLL 0u /* host-call word of an interrupt poll */
 #define ALARM_US 500
-#define AHEAD_MAX (PSX_CLOCK / 500) /* 2 ms */
+/* Lead allowed inside a frame before the runtime sleeps: a frame, past the 2 ms beyond it.
+ * native_vsync paces every PS1 vblank, so the lead never gets that far; a sleep in mid-frame
+ * would only delay the frame's later work. The FMV slept 130-190 ms/s there (its CD waits) while
+ * its decode missed 16 PSP vblanks a second (S21). */
+#define AHEAD_MAX (P->frame_cycles + PSX_CLOCK / 500)
 /* Lateness kept before PS1 time slows down: two PAL frames, so that a slow frame's lateness is
  * paid back by the next vsync wait instead of being slept through. */
 #define BEHIND_MAX (PSX_CLOCK / 25)
@@ -554,7 +558,8 @@ static void sync_time(void)
 
 /* At each PS1 vblank, its frame presented, the next PS1 frame is given the PSP frame up to
  * VS_MARGIN before the vblank after this one's: its swap lands there however its work jitters.
- * When this frame made its vblank, the next one starts at its slot, slept to if still ahead; when
+ * When this frame made its vblank (or came before it: the runtime does not sleep inside a
+ * frame), the next one starts at its slot, slept to if still ahead; when
  * it did not, it shows a vblank late and the next starts at the slot of the vblank that passed
  * (the frames after then run unslept until they catch up). The vblanks' times come from a grid, a
  * frame of 1001/60 ms from one seen at boot, kept inside what the count says at each call: vblank
@@ -570,6 +575,8 @@ void native_vsync(void)
         t_lock -= t_v - now, t_v = now;
     else if (now - t_v > VS_US(1))
         t_lock += now - t_v - VS_US(1), t_v = now - VS_US(1);
+    if ((s32)(vc - v) > 0) /* early (no sleep inside a frame): made vblank vc, still to come */
+        t_v += VS_US(vc - v), v = vc;
     if (v == vc) {
         t_base = t_v + VS_US(1) - VS_MARGIN, vc = v + 1;
         if (t_base > now) {
@@ -585,6 +592,21 @@ void native_vsync(void)
         t_base = t_v - VS_MARGIN, vc = v;
     }
     c_base = P->cycles;
+}
+
+/* Before the frame is presented: one that came before its PSP vblank (vc) waits for it, or its
+ * swap would replace the last frame's before that one was shown. */
+void native_vsync_early(void)
+{
+    u32 v = sceDisplayGetVcount();
+    if ((s32)(vc - v) <= 0)
+        return;
+    u64 now = sceKernelGetSystemTimeWide(), t = t_lock + VS_US(vc - v_lock);
+    if (t > now) {
+        u32 dt = (u32)(t - now);
+        sceKernelDelayThread(dt);
+        native_stats.us_sleep += dt, native_stats.us_vs_wait += dt;
+    }
 }
 
 /* Times one call in PROF_EVERY, and every vblank (rare, and the longest: the frame is

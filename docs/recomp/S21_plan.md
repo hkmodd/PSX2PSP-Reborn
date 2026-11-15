@@ -36,6 +36,20 @@ spu (spu_run), host (il frame del frontend), timers, dma, cd e sio (`Psx.us_upd`
 letture del clock che le parti aggiungono. Una callback guest del vblank che rientra in `update`
 resta nella parte vbl. `psplog.py` stampa le parti sotto ogni scena.
 
+**Passo 2 sulla PSP (`baseline_psp/s21p2_3f6b45d.log`): FMV 74 → 73%, niente.** Il polling
+risparmiato diventa sleep (timer 70 → 41, sleep 106 → 174 ms/s). Quello sleep non è l'attesa del
+vsync (0-2 al secondo, ~0 ms): è `sync_time`, che dormiva appena PS1 era 2 ms avanti dentro un
+frame. Intanto la decodifica salta 16 vblank PSP al secondo (43 vblank PS1 + 16 = 59,9).
+Correzione (passo 2b):
+- dentro un frame PS1 può stare avanti fino a un frame (`AHEAD_MAX`);
+- `native_vsync` tratta un frame arrivato prima del suo vblank PSP come puntuale;
+- `native_vsync_early` lo fa aspettare quel vblank prima del present, così il suo swap non
+  sostituisce quello del frame precedente.
+
+Primo tentativo senza le ultime due: PPSSPP al 196%, 100 vblank PS1 al secondo. Ora PPSSPP intro
+100%, 13,8 fps, sleep tutto nell'attesa del vsync (535 ms), 0-2 frame in ritardo al secondo.
+Fixed check verde, 59,1 fps. Tetto atteso sulla PSP: 73% × 1000 / (1000 − 174) ≈ 88%.
+
 ## La premessa del GOAL non regge più
 
 GOAL.MD dice «S21: port dell'IDCT e della conversione colore su VFPU». **È già fatto (S15).** Il

@@ -102,3 +102,25 @@ S20 is closed for LEV01, LOADER and WHEEL; the intro FMV stays below S19 and goe
 
 Three 60 s benches (`psxrt.bench` holding `60` beside the EBOOT) on one build: the intro FMV from
 boot, WHEEL 3D, LEV01 from a snapshot of that same EBOOT.
+
+## S21 step 2 against S20d (`s21p2_vs_s20d.txt`, EBOOT 3f6b45d)
+
+Only the seconds in which the game draws (LEV01 has 47 s at 0 fps: pause or menu, and they
+lower its mean fps from 27.5 to 14.3):
+
+| scene | S20d | S21 step 2 | |
+|---|---|---|---|
+| intro FMV | 74% (worst 68%) | 73% (worst 67%) | io_timer 70→41, sleep 106→174 |
+| WHEEL | 72% | 84% | |
+| INTRO | 82% (worst 68%) | 81% (worst 73%) | |
+| LEV01 | 97% (worst 94%), 26.4 fps | 97% (worst 90%), 27.5 fps | |
+
+- **The timer jump gives nothing to the FMV.** What the poll no longer spends is slept.
+- **The sleep is not the vsync wait.** That is 0-2 waits a second, about 0 ms. The 130-190 ms/s
+  come from `sync_time` in native.c, which slept once PS1 time was 2 ms ahead inside a frame:
+  during the stream wait, the jump takes PS1 time to the CD's next sector.
+- **Meanwhile the decode misses the vblank.** Each second has 43 PS1 vblanks and 16 PSP vblanks
+  skipped: 43 + 16 ≈ 59.9. Every PS1 frame takes at least one PSP frame, a late one two.
+- **Fix:** the lead allowed inside a frame is one frame (`AHEAD_MAX`). `native_vsync` already
+  paces every vblank, so the sleep moves there and the frame's later work starts at once. Upper
+  bound for the FMV: 73% × 1000 / (1000 − 174) ≈ 88%.
