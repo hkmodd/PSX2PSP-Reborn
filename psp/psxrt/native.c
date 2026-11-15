@@ -23,7 +23,8 @@
  * which adds what was spent to the count, so a counted wait loop lasts as long as on the PS1.
  * PS1 time runs at one PS1 frame per PSP display frame (59.94 Hz), and each PS1 vblank waits for
  * the PSP's (native_vsync), so that every game frame is shown once: PS1 time is the PSP's,
- * scaled by the frame lengths (+0.2% for NTSC, +0.9% for PAL60).
+ * scaled by the frame lengths (+0.2% for NTSC, +0.9% for PAL60). A PAL frame (314 lines) gets
+ * 6 PSP frames in 5, one of them shown twice: PS1 time runs at its own 50 Hz (+0.4%), not 120%.
  * When the count runs more than a frame ahead of that clock (checked at every host call and every
  * 256 interpreted instructions) the runtime sleeps; when it falls behind by more than BEHIND_MAX,
  * the clock is moved back instead: PS1 time slows down with the host, it never jumps, or devices
@@ -141,8 +142,23 @@ static u64 t_base, c_base;
 static u64 t_lock;     /* when the PSP vblank v_lock started, on native_vsync's grid */
 static u32 v_lock, vc; /* vc: the PSP vblank count at the last PS1 vblank */
 
-/* PS1 cycles in `us` of host time: a PS1 frame per PSP frame, 1001/60 ms */
-static u64 us_cycles(u64 us) { return us * P->frame_cycles * 6u / 100100u; }
+/* A PAL frame (314 lines, 50 Hz) is paced to 6/5 of a PSP frame; NTSC and PAL60 to one. */
+static int pal_pace(void) { return P->frame_cycles > PSX_CLOCK / 55; }
+/* Three PS1 frames in host us: 3 * 1001/60 ms, or 6/5 of that for PAL */
+static u32 frame_us3(void) { return pal_pace() ? 60060u : 50050u; }
+/* PS1 cycles in `us` of host time */
+static u64 us_cycles(u64 us) { return us * P->frame_cycles * 3u / frame_us3(); }
+/* PSP vblanks the PS1 frame just presented stays: 1, or 1 1 1 1 2 for PAL */
+static u32 vs_step(void)
+{
+    static u32 phase;
+    if (!pal_pace())
+        return phase = 0, 1;
+    phase += 6;
+    u32 s = phase / 5;
+    phase %= 5;
+    return s;
+}
 
 #define GRET_DEPTH 64
 static u32 gret[GRET_DEPTH];
@@ -551,7 +567,7 @@ static void sync_time(void)
         c_base = P->cycles + BEHIND_MAX, t_base = now;
     else if (P->cycles > clock + AHEAD_MAX) {
         u32 t = sceKernelGetSystemTimeLow();
-        sceKernelDelayThread((SceUInt)((P->cycles - clock) * 100100u / (6u * P->frame_cycles)));
+        sceKernelDelayThread((SceUInt)((P->cycles - clock) * frame_us3() / (3u * P->frame_cycles)));
         native_stats.us_sleep += sceKernelGetSystemTimeLow() - t;
     }
 }
@@ -581,10 +597,11 @@ void native_vsync(void)
         t_lock -= t_v - now, t_v = now;
     else if (now - t_v > VS_US(1))
         t_lock += now - t_v - VS_US(1), t_v = now - VS_US(1);
+    u32 s = vs_step();
     if ((s32)(vc - v) > 0) /* early (no sleep inside a frame): made vblank vc, still to come */
         t_v += VS_US(vc - v), v = vc;
     if (v == vc) {
-        t_base = t_v + VS_US(1) - VS_MARGIN, vc = v + 1;
+        t_base = t_v + VS_US(s) - VS_MARGIN, vc = v + s;
         if (t_base > now) {
             u32 dt = (u32)(t_base - now);
             sceKernelDelayThread(dt);
@@ -597,7 +614,7 @@ void native_vsync(void)
             native_stats.us_late_max = late;
         if (v - vc > OWE_MAX) /* forgiven: PS1 time slows down */
             native_stats.vs_adv += v - vc - OWE_MAX, vc = v - OWE_MAX;
-        vc++;
+        vc += s;
         t_base = t_lock + VS_US(vc - v_lock) - VS_MARGIN;
     }
     c_base = P->cycles;

@@ -823,9 +823,13 @@ static void frame(int show)
                     n += snprintf(line + n, sizeof line - (size_t)n, " %s %u", upd_names[k], ms_of(psx.us_upd[k] - upd0[k])),
                         upd0[k] = psx.us_upd[k];
                 static DiscStats d0;
-                n += snprintf(line + n, sizeof line - (size_t)n, "\n-- disc blocks: inline %u ahead %u (waited %u)\n",
+                n += snprintf(line + n, sizeof line - (size_t)n, "\n-- disc blocks: inline %u ahead %u (waited %u); ms read %u+%u inflate %u+%u\n",
                               (unsigned)(disc_stats.loads - d0.loads), (unsigned)(disc_stats.prefetched - d0.prefetched),
-                              (unsigned)(disc_stats.waited - d0.waited));
+                              (unsigned)(disc_stats.waited - d0.waited),
+                              (unsigned)((disc_stats.us_read[0] - d0.us_read[0]) / 1000),
+                              (unsigned)((disc_stats.us_read[1] - d0.us_read[1]) / 1000),
+                              (unsigned)((disc_stats.us_inflate[0] - d0.us_inflate[0]) / 1000),
+                              (unsigned)((disc_stats.us_inflate[1] - d0.us_inflate[1]) / 1000));
                 d0 = disc_stats;
                 native_stats.us_late_max = 0;
                 us_pwait = us_pdraw = us_ptext = 0;

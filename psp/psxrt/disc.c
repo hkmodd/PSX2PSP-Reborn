@@ -4,9 +4,11 @@
  * (README.md, "DATA.PSAR"). Three inflated blocks are kept: a CD reads sequentially, and a seek
  * back to the block before (file headers, XA interleave) does not inflate again. After a block
  * is served, a worker thread reads and inflates the next one into the third slot, with its own
- * file and zlib stream. Its priority is below the CPU thread's, so it runs while that one sleeps
- * (vsync waits, GE syncs): the inflate leaves the frame. If the CPU thread needs the block in
- * flight it waits for it. After the blocks come the translated executables (native.c), read with
+ * file and zlib stream. Its priority is above the CPU thread's: a game that streams while the CPU
+ * thread never sleeps (a level loading as it plays) would otherwise wait for every block, read and
+ * inflate both. Above it, the worker's file read overlaps the frame (the thread blocks in the
+ * driver) and only the inflate takes the CPU. If the CPU thread needs the block in flight it waits
+ * for it. After the blocks come the translated executables (native.c), read with
  * disc_blob().
  */
 #include "disc.h"
@@ -26,8 +28,8 @@
 #define BLOCK_LEN (BLOCK_SECTORS * RAW)
 #define PREGAP 150
 #define SLOTS 3
-/* below the CPU thread (0x20): the worker takes the time that one sleeps */
-#define PREFETCH_PRIORITY 0x30
+/* above the CPU thread (0x20), below audio (0x12) and callbacks (0x11) */
+#define PREFETCH_PRIORITY 0x1F
 
 typedef struct {
     char magic[8];
@@ -53,10 +55,11 @@ typedef struct {
     u8 *zbuf;
     z_stream zs;
     int quiet; /* the worker does not log: a block it fails is loaded again, and reported, inline */
+    int who;   /* its DiscStats index: 0 CPU thread, 1 worker */
 } Reader;
 
 DiscStats disc_stats;
-static Reader rd = {.fd = -1}, pf_rd = {.fd = -1, .quiet = 1};
+static Reader rd = {.fd = -1}, pf_rd = {.fd = -1, .quiet = 1, .who = 1};
 static u32 psar; /* file offset of DATA.PSAR */
 static u32 sectors, blocks;
 static u32 *offsets; /* blocks + 1 offsets */
@@ -194,6 +197,7 @@ static int load(Reader *r, Cached *c, u32 b)
     u32 off = offsets[b], len = offsets[b + 1] - offsets[b];
     u32 n = sectors - b * BLOCK_SECTORS;
     u32 raw_len = (n < BLOCK_SECTORS ? n : BLOCK_SECTORS) * RAW;
+    u32 t0 = sceKernelGetSystemTimeLow(), t1;
     c->block = -1;
     if (offsets[b + 1] < off || len > raw_len) {
         fail(r, b, "bad index", 0);
@@ -202,9 +206,11 @@ static int load(Reader *r, Cached *c, u32 b)
     if (len == raw_len) {
         if (!read_at(r, off, c->data, len))
             goto io;
+        t1 = sceKernelGetSystemTimeLow();
     } else {
         if (!read_at(r, off, r->zbuf, len))
             goto io;
+        t1 = sceKernelGetSystemTimeLow();
         inflateReset(&r->zs);
         r->zs.next_in = r->zbuf, r->zs.avail_in = len;
         r->zs.next_out = c->data, r->zs.avail_out = raw_len;
@@ -215,6 +221,8 @@ static int load(Reader *r, Cached *c, u32 b)
         }
     }
     c->block = (int)b;
+    disc_stats.us_read[r->who] += t1 - t0;
+    disc_stats.us_inflate[r->who] += sceKernelGetSystemTimeLow() - t1;
     return 0;
 io:
     fail(r, b, "read error", 0);

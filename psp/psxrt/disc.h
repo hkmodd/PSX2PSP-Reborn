@@ -33,9 +33,11 @@ typedef struct DiscInfo {
 #define DISC_PAL60 1u
 
 /* Disc blocks since boot: inflated by the CPU thread, inflated ahead by the worker (and how many
- * of those the CPU thread had to wait for). */
+ * of those the CPU thread had to wait for); microseconds reading the file and inflating, by the
+ * CPU thread [0] and the worker [1]. */
 typedef struct DiscStats {
     u32 loads, prefetched, waited;
+    u32 us_read[2], us_inflate[2];
 } DiscStats;
 extern DiscStats disc_stats;
 
