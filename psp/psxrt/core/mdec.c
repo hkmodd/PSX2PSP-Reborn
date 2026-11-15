@@ -239,7 +239,8 @@ INLINE void yuv(Mdec *m, const s16 *cr, const s16 *cb, const s16 *y, int xx, int
  * The colour step works on the hardware's integers held in floats: IDCT results rounded and
  * clamped to a signed byte, chroma terms k/256 exact, + 128 for an unsigned byte. vf2iz by 2^23
  * truncates and saturates at 2^31-1, and vi2uc takes bits 30-23 with negatives at 0, which clamps
- * the sum to 0-255 for free. vi2uc on a matrix row packs one pixel's R, G, B (and a zero byte).
+ * the sum to 0-255 for free. vi2uc on a matrix row packs one pixel's R, G, B (and a zero byte),
+ * into a column that holds four pixels in order: two sv.q a row.
  *
  * Within +-1 of the exact integer passes. A result past +-256, which the hardware wraps to 9 bits,
  * saturates here; no real stream reaches it. The first colour macroblock checks the path against
@@ -335,10 +336,10 @@ static void vf_colour(void)
                              "vadd.q C400, C010, C100\n vadd.q C410, C010, C110\n vadd.q C420, C010, C120\n"
                              "vf2iz.q C200, C200, 23\n vf2iz.q C210, C210, 23\n vf2iz.q C220, C220, 23\n"
                              "vf2iz.q C400, C400, 23\n vf2iz.q C410, C410, 23\n vf2iz.q C420, C420, 23\n"
-                             "vi2uc.q S300, R200\n vi2uc.q S310, R201\n vi2uc.q S320, R202\n vi2uc.q S330, R203\n"
-                             "vi2uc.q S301, R400\n vi2uc.q S311, R401\n vi2uc.q S321, R402\n vi2uc.q S331, R403\n"
-                             "sv.s S300, 0(%4)\n sv.s S301, 4(%4)\n sv.s S310, 8(%4)\n sv.s S311, 12(%4)\n"
-                             "sv.s S320, 16(%4)\n sv.s S321, 20(%4)\n sv.s S330, 24(%4)\n sv.s S331, 28(%4)\n"
+                             /* pixels x = 0-3 in C300, 4-7 in C310: even x from M2, odd from M4 */
+                             "vi2uc.q S300, R200\n vi2uc.q S302, R201\n vi2uc.q S310, R202\n vi2uc.q S312, R203\n"
+                             "vi2uc.q S301, R400\n vi2uc.q S303, R401\n vi2uc.q S311, R402\n vi2uc.q S313, R403\n"
+                             "sv.q C300, 0(%4)\n sv.q C310, 16(%4)\n"
                              :
                              : "r"(vf_pix[2 + i] + y * 8), "r"(vf_term[0] + c), "r"(vf_term[1] + c), "r"(vf_term[2] + c),
                                "r"(vf_rgba + oy * 16 + (i & 1) * 8)
@@ -683,6 +684,19 @@ u32 mdec_dma_block(Psx *psx, u32 *dst, u32 n)
         k = n;
     memcpy(dst, &m->out[m->rout], k * 4);
     m->rout += (int)k;
+    return k;
+}
+
+u32 mdec_dma_in(Psx *psx, const u32 *src, u32 n)
+{
+    Mdec *m = &psx->mdec;
+    if (m->state != 1 || m->words_left <= 0)
+        return 0;
+    u32 k = (u32)m->words_left < n ? (u32)m->words_left : n, fit = (u32)(m->in_cap - m->nin);
+    if (fit > k)
+        fit = k;
+    memcpy(m->in + m->nin, src, fit * 4); /* past the buffer the words are dropped, as in param() */
+    m->nin += (int)fit, m->words_left -= (int)k;
     return k;
 }
 

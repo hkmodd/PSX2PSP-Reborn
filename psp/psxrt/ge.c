@@ -46,7 +46,7 @@ typedef struct {
 
 typedef struct {
     u32 tris, ttris, rects, trects, fills, lines, line_runs, sw_tex15, sw_texwin, sw_copy, pages, cluts, clut_tmp;
-    u32 readbacks, read_tiles, read_us, uploads, upload_px, flushes;
+    u32 readbacks, read_tiles, read_us, uploads, upload_px, upload_us, flushes;
     u32 ge_copy, null_copy, copy_px, copy_from_ge; /* copies: on the GE, onto themselves, pixels, read from the GE */
     u32 bind_tex, bind_clut, kicks, rd_checks;     /* textures and CLUTs sent, stall moves, readback checks */
     u32 fast, fast_setups, fast_hits;              /* polygons through the fast lane; its state changes, found cached */
@@ -521,9 +521,11 @@ static void rd_wrote(void *self, s32 x, s32 y, s32 w, s32 h)
     (void)self;
     if (w <= 0 || h <= 0)
         return;
+    u32 t0 = sceKernelGetSystemTimeLow();
     begin();
     pieces(x, y, w, h, upload);
     bump(x, y, w, h);
+    ge.s.upload_us += sceKernelGetSystemTimeLow() - t0;
 }
 
 /* The CPU is about to read a rectangle of RAM's copy: when the GE drew any of its tiles, all of
@@ -1624,14 +1626,14 @@ int ge_log(char *buf, int cap)
     int n = clampn(snprintf(buf, (size_t)cap,
                             "-- ge: tri %u+%u tex, rect %u+%u tex, fill %u, line %u (%u runs); sw tex15 %u texwin %u "
                             "copy %u+%u sw+%u null (%u kpx, %u from ge); pages %u cluts %u+%u in list, readback %u (%u tiles, %u ms), upload %u "
-                            "(%u kpx), flush %u; bind %u tex %u clut, kick %u (%u ms), rd check %u; fast %u (%u setups %u ms, %u cached), slow tex %u big %u, flat %u, clipped %u; ring %s (wb %u ms), step %u\n",
+                            "(%u kpx, %u ms), flush %u; bind %u tex %u clut, kick %u (%u ms), rd check %u; fast %u (%u setups %u ms, %u cached), slow tex %u big %u, flat %u, clipped %u; ring %s (wb %u ms), step %u\n",
                             (unsigned)s->tris, (unsigned)s->ttris, (unsigned)s->rects, (unsigned)s->trects,
                             (unsigned)s->fills, (unsigned)s->lines, (unsigned)s->line_runs, (unsigned)s->sw_tex15,
                             (unsigned)s->sw_texwin,
                             (unsigned)s->ge_copy, (unsigned)s->sw_copy, (unsigned)s->null_copy, (unsigned)(s->copy_px / 1000), (unsigned)s->copy_from_ge,
                             (unsigned)s->pages, (unsigned)s->cluts, (unsigned)s->clut_tmp, (unsigned)s->readbacks, (unsigned)s->read_tiles,
                             (unsigned)(s->read_us / 1000), (unsigned)s->uploads, (unsigned)(s->upload_px / 1000),
-                            (unsigned)s->flushes, (unsigned)s->bind_tex, (unsigned)s->bind_clut, (unsigned)s->kicks, (unsigned)(kick_us / 1000),
+                            (unsigned)(s->upload_us / 1000), (unsigned)s->flushes, (unsigned)s->bind_tex, (unsigned)s->bind_clut, (unsigned)s->kicks, (unsigned)(kick_us / 1000),
                             (unsigned)s->rd_checks, (unsigned)s->fast, (unsigned)s->fast_setups, (unsigned)((s32)s->setup_us < 0 ? 0 : s->setup_us / 1000), (unsigned)s->fast_hits, (unsigned)s->slow_tex, (unsigned)s->slow_big, (unsigned)s->flat, (unsigned)s->clipped,
                             fl.cached ? "cached" : "uncached", (unsigned)(s->ring_wb_us / 1000), (unsigned)stall_step),
                    cap);

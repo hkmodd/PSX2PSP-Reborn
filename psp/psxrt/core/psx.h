@@ -568,6 +568,9 @@ u32 mdec_dma_out(Psx *psx);
 /* up to n output words into dst, at most one macroblock's worth: the words written (a 0 when
  * nothing is left, as mdec_dma_out) */
 u32 mdec_dma_block(Psx *psx, u32 *dst, u32 n);
+/* up to n parameter words of a decode command from src (DMA ch0): the words taken, 0 when the
+ * next word is not one (a command, a table), which goes through mdec_write */
+u32 mdec_dma_in(Psx *psx, const u32 *src, u32 n);
 int mdec_out_ready(Psx *psx);
 
 #endif

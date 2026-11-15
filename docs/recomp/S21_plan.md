@@ -50,6 +50,33 @@ Primo tentativo senza le ultime due: PPSSPP al 196%, 100 vblank PS1 al secondo. 
 100%, 13,8 fps, sleep tutto nell'attesa del vsync (535 ms), 0-2 frame in ritardo al secondo.
 Fixed check verde, 59,1 fps. Tetto atteso sulla PSP: 73% × 1000 / (1000 − 174) ≈ 88%.
 
+**Passo 3, il kernel VFPU: i tre sospetti cadono leggendo il codice.**
+- La conversione s32 → float è già nella VFPU (`vi2f.q`).
+- L'azzeramento di `vf_coef` è di 96 `sv.q` a macroblocco, ~1% del suo costo.
+- I buffer (`vf_*`, `Mdec.out`, `mdec_in` da `palloc`) sono tutti in memoria con cache.
+
+Anche un quarto sospetto cade: il writeback della cache da ~480 KB a ogni upload video.
+`sceKernelDcacheWritebackRange` (uOFW, `sysmem/start.S`) sopra i 64 KB scorre i tag della cache
+(128 set), non le righe del range: ~3000 cicli.
+
+Il log PSP di step 2 divide però l'FMV per canale DMA (ms al secondo per kparole):
+- ch0 (input MDEC) 25 ms per 80 kparole, ~100 cicli a parola: passava parola per parola da
+  `mdec_write`;
+- ch1 204 (decodifica 176, copia 28);
+- ch2 (upload in VRAM) 75 ms;
+- ch3 35.
+
+Correzioni con guadagno certo:
+- `mdec_dma_in` copia a blocchi i dati di un comando di decodifica (PPSSPP: ch0 1 ms per 156
+  kparole);
+- il colore scrive 2 `sv.q` per riga al posto di 8 `sv.s`;
+- la riga `ge` del log dà ora il tempo degli upload (`upload N (kpx, ms)`). Così il prossimo log
+  PSP divide i 75 ms del ch2 fra copia in VRAM e invio al GE.
+
+Il resto di un macroblocco sulla PSP (log di step 2: IDCT 13,3 µs, colore 14,5, packing 5,7, RLE ~16) è
+lavoro di istruzioni, senza uno spreco provato. Il prossimo intervento si sceglie con le parti di
+`update` del log 2b.
+
 ## La premessa del GOAL non regge più
 
 GOAL.MD dice «S21: port dell'IDCT e della conversione colore su VFPU». **È già fatto (S15).** Il

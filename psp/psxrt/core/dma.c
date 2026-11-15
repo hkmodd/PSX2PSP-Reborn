@@ -110,6 +110,13 @@ static void transfer(Psx *psx, int ch)
                     i += n, addr = (addr + 4 * n) & 0x1FFFFC;
                     continue;
                 }
+                if (ch == 0 && step == 4) { /* a decode command's data: a block copy */
+                    u32 n = words - i, room = (RAM_SIZE - addr) / 4;
+                    if ((n = mdec_dma_in(psx, (const u32 *)(psx->ram + addr), n < room ? n : room))) {
+                        i += n, addr = (addr + 4 * n) & 0x1FFFFC;
+                        continue;
+                    }
+                }
                 dev_write(psx, ch, rd(psx, addr));
                 i++, addr = (addr + step) & 0x1FFFFC;
             }
