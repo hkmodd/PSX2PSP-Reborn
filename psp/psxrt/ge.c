@@ -52,6 +52,7 @@ typedef struct {
     u32 fast, fast_setups, fast_hits;              /* polygons through the fast lane; its state changes, found cached */
     u32 slow_tex, slow_big, flat, clipped;        /* fast lane: turned away for texture or size; no area; cut at the origin */
     u32 ring_wb_us;                               /* writing the cached ring back */
+    u32 kick_us, setup_us;                        /* stall moves, all timed; fl_setup, 1 in 16 timed */
 } GeStats;
 
 /* A 4/8-bit texture page as a 256x256 T4/T8 texture. */
@@ -178,15 +179,23 @@ static void ring_flush(void)
     }
 }
 
+/* Moves the stall address, timed: on the device the system call's cost is not known. */
+static void stall_to(u32 n)
+{
+    u32 t = sceKernelGetSystemTimeLow();
+    list_stall = n;
+    sceGeListUpdateStallAddr(list_id, LIST_UNCACHED + n);
+    ge.s.kick_us += sceKernelGetSystemTimeLow() - t;
+    ge.s.kicks++;
+}
+
 /* Lets the GE run what is written so far, once STALL_STEP more bytes are there. */
 static void ge_kick(void)
 {
     u32 n = (u32)((u8 *)gu_list->current - (u8 *)gu_list->start); /* sceGuCheckList, inline */
     if (n - list_stall >= STALL_STEP) {
         ring_flush();
-        list_stall = n;
-        sceGeListUpdateStallAddr(list_id, LIST_UNCACHED + n);
-        ge.s.kicks++;
+        stall_to(n);
     }
 }
 
@@ -197,9 +206,7 @@ void ge_run(void)
     u32 n = (u32)((u8 *)gu_list->current - (u8 *)gu_list->start);
     if (n != list_stall) {
         ring_flush();
-        list_stall = n;
-        sceGeListUpdateStallAddr(list_id, LIST_UNCACHED + n);
-        ge.s.kicks++;
+        stall_to(n);
     }
 }
 
@@ -1182,6 +1189,19 @@ static void fl_setup(u32 cmd, u32 clut)
     ge.s.fast_setups++;
 }
 
+/* fl_setup, one call in 16 timed for the log. */
+static void fl_setup_timed(u32 cmd, u32 clut)
+{
+    static u32 n;
+    if (n++ % 16) {
+        fl_setup(cmd, clut);
+        return;
+    }
+    u32 t = sceKernelGetSystemTimeLow();
+    fl_setup(cmd, clut);
+    ge.s.setup_us += (sceKernelGetSystemTimeLow() - t) * 16 - prof_bias;
+}
+
 /* A draw of n ring vertices at vp in the lane's state: BASE when it moves, VADDR and PRIM, per
  * pass. Returns the list's next word. */
 static unsigned int *fl_draw(unsigned int *l, const u8 *vp, int prim, int n)
@@ -1254,11 +1274,11 @@ static int rd_poly(void *self, const u32 *c)
     u32 a0 = (u32)g->clip_x1 | (u32)g->clip_y1 << 16, a1 = (u32)g->clip_x2 | (u32)g->clip_y2 << 16;
     if (!fl.valid || k0 != fl.k0 || k1 != fl.k1 || a0 != fl.a0 || a1 != fl.a1 || ge.epoch != fl.epoch) {
         fl.k0 = k0, fl.k1 = k1, fl.a0 = a0, fl.a1 = a1;
-        fl_setup(cmd, k1);
+        fl_setup_timed(cmd, k1);
     } else if (tex && ge.nver != fl.nver) {
         /* tiles turned newer: only those under the page or the CLUT need the readback */
         if (fl_newer(g->texpage, k1))
-            fl_setup(cmd, k1);
+            fl_setup_timed(cmd, k1);
         else
             fl.nver = ge.nver;
     }
@@ -1374,6 +1394,62 @@ static void ring_bench(Psx *psx)
             (unsigned)(sum & 1));
 }
 
+/* At boot: the costs rd_poly pays while the GE draws, which ring_bench measures with the GE idle.
+ * The GE draws 32 full-screen sprites textured from a page slot in RAM, as the game's polygons
+ * are; meanwhile the CPU misses the cache on PS1 RAM and writes 64 KB of vertices uncached. Then
+ * the stall move, a system call made every 1 KB of list, on its own. */
+static void busy_bench(Psx *psx)
+{
+    typedef struct {
+        u16 u, v;
+        s16 x, y, z;
+    } SprVtx;
+    if (!ge.npages)
+        return;
+    ge_open();
+    sceGuDrawBufferList(GU_PSM_5650, (void *)GE_DISP_B, 512);
+    sceGuScissor(0, 0, 480, 272);
+    sceGuDisable(GU_DEPTH_TEST), sceGuDisable(GU_STENCIL_TEST), sceGuDisable(GU_BLEND), sceGuDisable(GU_ALPHA_TEST);
+    sceGuTexMode(GU_PSM_5650, 0, 0, 0);
+    sceGuTexImage(0, 128, 256, 128, ge.pages[0].data);
+    sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGB);
+    sceGuTexFilter(GU_NEAREST, GU_NEAREST);
+    sceGuTexFlush();
+    sceGuEnable(GU_TEXTURE_2D);
+    SprVtx *v = (SprVtx *)sceGuGetMemory(64 * sizeof(SprVtx));
+    for (int i = 0; i < 32; i++)
+        v[2 * i] = (SprVtx){0, 0, 0, 0, 0}, v[2 * i + 1] = (SprVtx){128, 256, 480, 272, 0};
+    sceGuDrawArray(GU_SPRITES, GU_TEXTURE_16BIT | GU_VERTEX_16BIT | GU_TRANSFORM_2D, 64, 0, v);
+    sceGuDisable(GU_TEXTURE_2D);
+    sceKernelDcacheWritebackInvalidateRange(psx->ram, 2 * 1024 * 1024);
+    volatile const u32 *ram = (const u32 *)psx->ram;
+    u32 sum = 0, t0 = sceKernelGetSystemTimeLow();
+    ge_run();
+    u32 t1 = sceKernelGetSystemTimeLow();
+    for (u32 i = 0; i < 512; i++)
+        sum += ram[i * 1024 + (i & 15) * 4];
+    u32 t2 = sceKernelGetSystemTimeLow(), n = 64 * 1024 / sizeof(TexVtx);
+    TexVtx *o = (TexVtx *)fl.ring_u;
+    for (u32 i = 0; i < n; i++) {
+        o[i].u = (float)(i & 0xFF) + 0.5f, o[i].v = (float)(i >> 8 & 0xFF) + 0.5f;
+        o[i].c = 0xFF000000u | i;
+        o[i].x = (float)(i & 511) + 0.5f, o[i].y = (float)(i >> 9) + 0.5f, o[i].z = 0;
+    }
+    u32 t3 = sceKernelGetSystemTimeLow();
+    ge_sync();
+    u32 t4 = sceKernelGetSystemTimeLow();
+    ge_open();
+    u32 t5 = sceKernelGetSystemTimeLow();
+    for (int i = 0; i < 256; i++)
+        sceGeListUpdateStallAddr(list_id, LIST_UNCACHED + list_stall);
+    u32 t6 = sceKernelGetSystemTimeLow();
+    ge_sync();
+    psx_log(psx, "ge busy %u us (from RAM): cache miss %u ns, 64 KB of vertices uncached %u us%s; stall move %u ns (%u)",
+            (unsigned)(t4 - t0), (unsigned)((t2 - t1) * 1000 / 512), (unsigned)(t3 - t2),
+            t4 - t3 < 20 ? " (the GE finished first)" : "", (unsigned)((t6 - t5) * 1000 / 256),
+            (unsigned)(sum & 1));
+}
+
 void ge_init(Psx *psx, int compare)
 {
     ge.psx = psx;
@@ -1401,7 +1477,7 @@ void ge_init(Psx *psx, int compare)
         fl.ring_c = r, fl.ring_u = fl.ring = (u8 *)((u32)r | 0x40000000u), fl.ring_bytes = b;
     }
     if (fl.ring)
-        ring_bench(psx);
+        ring_bench(psx), busy_bench(psx);
     for (int i = 0; i < 1 << FL_BITS; i++)
         fl_cache[i].k0 = ~0u; /* no key */
     sceKernelDcacheWritebackInvalidateRange(fl_arena, sizeof fl_arena); /* written uncached from now on */
@@ -1466,18 +1542,19 @@ static int compare(char *buf, int cap)
 int ge_log(char *buf, int cap)
 {
     const GeStats *s = &ge.s;
+    u32 kb = s->kicks * prof_bias / 16, kick_us = s->kick_us > kb ? s->kick_us - kb : 0; /* less one clock read each */
     int n = clampn(snprintf(buf, (size_t)cap,
                             "-- ge: tri %u+%u tex, rect %u+%u tex, fill %u, line %u (%u runs); sw tex15 %u texwin %u "
                             "copy %u+%u sw+%u null (%u kpx, %u from ge); pages %u cluts %u, readback %u (%u tiles, %u ms), upload %u "
-                            "(%u kpx), flush %u; bind %u tex %u clut, kick %u, rd check %u; fast %u (%u setups, %u cached), slow tex %u big %u, flat %u, clipped %u; ring %s (wb %u ms)\n",
+                            "(%u kpx), flush %u; bind %u tex %u clut, kick %u (%u ms), rd check %u; fast %u (%u setups %u ms, %u cached), slow tex %u big %u, flat %u, clipped %u; ring %s (wb %u ms)\n",
                             (unsigned)s->tris, (unsigned)s->ttris, (unsigned)s->rects, (unsigned)s->trects,
                             (unsigned)s->fills, (unsigned)s->lines, (unsigned)s->line_runs, (unsigned)s->sw_tex15,
                             (unsigned)s->sw_texwin,
                             (unsigned)s->ge_copy, (unsigned)s->sw_copy, (unsigned)s->null_copy, (unsigned)(s->copy_px / 1000), (unsigned)s->copy_from_ge,
                             (unsigned)s->pages, (unsigned)s->cluts, (unsigned)s->readbacks, (unsigned)s->read_tiles,
                             (unsigned)(s->read_us / 1000), (unsigned)s->uploads, (unsigned)(s->upload_px / 1000),
-                            (unsigned)s->flushes, (unsigned)s->bind_tex, (unsigned)s->bind_clut, (unsigned)s->kicks,
-                            (unsigned)s->rd_checks, (unsigned)s->fast, (unsigned)s->fast_setups, (unsigned)s->fast_hits, (unsigned)s->slow_tex, (unsigned)s->slow_big, (unsigned)s->flat, (unsigned)s->clipped,
+                            (unsigned)s->flushes, (unsigned)s->bind_tex, (unsigned)s->bind_clut, (unsigned)s->kicks, (unsigned)(kick_us / 1000),
+                            (unsigned)s->rd_checks, (unsigned)s->fast, (unsigned)s->fast_setups, (unsigned)((s32)s->setup_us < 0 ? 0 : s->setup_us / 1000), (unsigned)s->fast_hits, (unsigned)s->slow_tex, (unsigned)s->slow_big, (unsigned)s->flat, (unsigned)s->clipped,
                             fl.cached ? "cached" : "uncached", (unsigned)(s->ring_wb_us / 1000)),
                    cap);
     memset(&ge.s, 0, sizeof ge.s);
