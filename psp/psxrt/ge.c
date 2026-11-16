@@ -21,6 +21,7 @@
 #include <string.h>
 
 #include "ge.h"
+#include "gel.h"
 
 #define LIST_BYTES (512 * 1024)
 #define LIST_SLACK (32 * 1024) /* room a primitive, a readback or the host may need */
@@ -185,7 +186,7 @@ static int ring_ab = 1;
 
 /* The PS1 dither matrix, row = y & 3, column = x & 3; the GE adds it to 8-bit colours before
  * they are cut to 5 bits, as the PS1 does. */
-static const ScePspIMatrix4 ps1_dither = {{-4, 0, -3, 1}, {2, -2, 3, -1}, {-3, 1, -4, 0}, {3, -1, 2, -2}};
+static const int ps1_dither[16] = {-4, 0, -3, 1, 2, -2, 3, -1, -3, 1, -4, 0, 3, -1, 2, -2};
 
 #define DONE (ge.compare ? GPU_BOTH : GPU_DRAWN)
 
@@ -223,6 +224,12 @@ typedef struct {
     int parent_context;
 } GuListHead;
 extern GuListHead *gu_list;
+/* gel.h writes pspgu's list, and keeps the scissor where pspgu keeps it for the GU_SEND context
+ * (GuContext: 92 bytes, scissor_enable at 12): main.c's present calls pspgu into this same list,
+ * and sceGuEnable(GU_SCISSOR_TEST) sends the last scissor either side set. */
+extern char gu_contexts[];
+#define GL ((GelList *)gu_list)
+#define GSC ((GelScissor *)(gu_contexts + GU_SEND * 92 + 12))
 
 /* Before the GE may run more of the list: the vertices written through the cache go to RAM. */
 static void ring_flush(void)
@@ -289,24 +296,24 @@ void ge_sync(void)
 /* The state every renderer list starts from; the rest is sent as primitives need it. */
 static void base_state(void)
 {
-    sceGuDrawBufferList(GU_PSM_5551, (void *)GE_PS1_VRAM, VRAM_W);
-    sceGuSendCommandi(0x15, 0); /* REGION1/REGION2: the whole 1024x512, so the oracle sizes it so */
-    sceGuSendCommandi(0x16, (VRAM_H - 1) << 10 | (VRAM_W - 1));
-    sceGuOffset(2048 - VRAM_W / 2, 2048 - VRAM_H / 2);
-    sceGuViewport(2048, 2048, VRAM_W, VRAM_H);
-    sceGuDisable(GU_TEXTURE_2D);
-    sceGuDisable(GU_DEPTH_TEST);
-    sceGuDepthMask(GU_TRUE);
-    sceGuDisable(GU_ALPHA_TEST);
-    sceGuDisable(GU_CULL_FACE);
-    sceGuDisable(GU_CLIP_PLANES);
-    sceGuEnable(GU_SCISSOR_TEST);
-    sceGuEnable(GU_STENCIL_TEST); /* bit 15 = stencil: the mask bit is written and tested by it */
-    sceGuPixelMask(0);
-    sceGuShadeModel(GU_SMOOTH);
-    sceGuSetDither(&ps1_dither);
-    sceGuTexWrap(GU_REPEAT, GU_REPEAT);
-    sceGuTexFilter(GU_NEAREST, GU_NEAREST);
+    gel_draw_buffer_list(GL, GU_PSM_5551, (void *)GE_PS1_VRAM, VRAM_W);
+    gel_cmd(GL, 0x15, 0); /* REGION1/REGION2: the whole 1024x512, so the oracle sizes it so */
+    gel_cmd(GL, 0x16, (VRAM_H - 1) << 10 | (VRAM_W - 1));
+    gel_offset(GL, 2048 - VRAM_W / 2, 2048 - VRAM_H / 2);
+    gel_viewport(GL, 2048, 2048, VRAM_W, VRAM_H);
+    gel_disable(GL, GU_TEXTURE_2D);
+    gel_disable(GL, GU_DEPTH_TEST);
+    gel_depth_mask(GL, GU_TRUE);
+    gel_disable(GL, GU_ALPHA_TEST);
+    gel_disable(GL, GU_CULL_FACE);
+    gel_disable(GL, GU_CLIP_PLANES);
+    gel_scissor_on(GL, GSC);
+    gel_enable(GL, GU_STENCIL_TEST); /* bit 15 = stencil: the mask bit is written and tested by it */
+    gel_pixel_mask(GL, 0);
+    gel_shade_model(GL, GU_SMOOTH);
+    gel_set_dither(GL, ps1_dither);
+    gel_tex_wrap(GL, GU_REPEAT, GU_REPEAT);
+    gel_tex_filter(GL, GU_NEAREST, GU_NEAREST);
     ge.sc_x1 = -1;
     ge.st_check = ge.st_set = ge.blend = ge.dither = -2;
     ge.tex_sent = ge.clut_sent = NULL;
@@ -348,7 +355,7 @@ static void scissor(s32 x1, s32 y1, s32 x2, s32 y2)
     if (x1 == ge.sc_x1 && y1 == ge.sc_y1 && x2 == ge.sc_x2 && y2 == ge.sc_y2)
         return;
     ge.sc_x1 = x1, ge.sc_y1 = y1, ge.sc_x2 = x2, ge.sc_y2 = y2;
-    sceGuScissor(x1, y1, x2 - x1 + 1, y2 - y1 + 1);
+    gel_scissor(GL, GSC, x1, y1, x2 - x1 + 1, y2 - y1 + 1);
 }
 
 /* check: draw only where bit 15 is 0 (stencil != 0xFF); set: the written bit 15. */
@@ -356,11 +363,11 @@ static void stencil(int check, int set)
 {
     if (check != ge.st_check) {
         ge.st_check = check;
-        sceGuStencilFunc(check ? GU_NOTEQUAL : GU_ALWAYS, 0xFF, 0xFF);
+        gel_stencil_func(GL, check ? GU_NOTEQUAL : GU_ALWAYS, 0xFF, 0xFF);
     }
     if (set != ge.st_set) {
         ge.st_set = set;
-        sceGuStencilOp(GU_KEEP, GU_KEEP, set ? GU_REPLACE : GU_ZERO);
+        gel_stencil_op(GL, GU_KEEP, GU_KEEP, set ? GU_REPLACE : GU_ZERO);
     }
 }
 
@@ -373,11 +380,11 @@ static void blend(int mode)
     if (mode == ge.blend)
         return;
     if (mode < 0)
-        sceGuDisable(GU_BLEND);
+        gel_disable(GL, GU_BLEND);
     else {
         if (ge.blend < 0)
-            sceGuEnable(GU_BLEND);
-        sceGuBlendFunc(op[mode], GU_FIX, GU_FIX, src[mode], dst[mode]);
+            gel_enable(GL, GU_BLEND);
+        gel_blend_func(GL, op[mode], GU_FIX, GU_FIX, src[mode], dst[mode]);
     }
     ge.blend = mode;
 }
@@ -388,11 +395,11 @@ static void tex_mode(int on)
         return;
     ge.tex_on = on;
     if (on) {
-        sceGuEnable(GU_TEXTURE_2D);
-        sceGuEnable(GU_ALPHA_TEST);
+        gel_enable(GL, GU_TEXTURE_2D);
+        gel_enable(GL, GU_ALPHA_TEST);
     } else {
-        sceGuDisable(GU_ALPHA_TEST);
-        sceGuDisable(GU_TEXTURE_2D);
+        gel_disable(GL, GU_ALPHA_TEST);
+        gel_disable(GL, GU_TEXTURE_2D);
     }
 }
 
@@ -401,7 +408,7 @@ static void alpha(int func, int ref)
     if (func == ge.a_func && ref == ge.a_ref)
         return;
     ge.a_func = func, ge.a_ref = ref;
-    sceGuAlphaFunc(func, ref, 0xFF);
+    gel_alpha_func(GL, func, ref, 0xFF);
 }
 
 static void dither(int on)
@@ -410,9 +417,9 @@ static void dither(int on)
         return;
     ge.dither = on;
     if (on)
-        sceGuEnable(GU_DITHER);
+        gel_enable(GL, GU_DITHER);
     else
-        sceGuDisable(GU_DITHER);
+        gel_disable(GL, GU_DITHER);
 }
 
 /* ---- tiles ---- */
@@ -507,25 +514,25 @@ static void blit_part(u16 *src, s32 sx, s32 sy, s32 dx, s32 dy, s32 w, s32 h, in
 {
     s32 x8 = sx & ~7, u0 = sx - x8;
     u16 *tex = src + sy * VRAM_W + x8;
-    sceGuTexMode(GU_PSM_5551, 0, 0, 0);
+    gel_tex_mode(GL, GU_PSM_5551, 0, 0, 0);
     /* The oracle checks a texture in RAM for changes only when its address register changes, so
      * a second upload from the same place would draw the first one's pixels; a different address
      * first makes it look. */
-    sceGuTexImage(0, 1, 1, 8, tex + 8);
-    sceGuTexImage(0, 1 << pow2_log(u0 + w), 1 << pow2_log(h), VRAM_W, tex);
-    sceGuTexFlush();
-    UpVtx *v = (UpVtx *)sceGuGetMemory(2 * sizeof(UpVtx));
+    gel_tex_image(GL, 0, 1, 1, 8, tex + 8);
+    gel_tex_image(GL, 0, 1 << pow2_log(u0 + w), 1 << pow2_log(h), VRAM_W, tex);
+    gel_tex_flush(GL);
+    UpVtx *v = (UpVtx *)gel_get_memory(GL, 2 * sizeof(UpVtx));
     v[0] = (UpVtx){(u16)u0, 0, (s16)dx, (s16)dy, 0};
     v[1] = (UpVtx){(u16)(u0 + w), (u16)h, (s16)(dx + w), (s16)(dy + h), 0};
     scissor(dx, dy, dx + w - 1, dy + h - 1);
     stencil(check, set);
-    sceGuDrawArray(GU_SPRITES, GU_TEXTURE_16BIT | GU_VERTEX_16BIT | GU_TRANSFORM_2D, 2, 0, v);
+    gel_draw_array(GL, GU_SPRITES, GU_TEXTURE_16BIT | GU_VERTEX_16BIT | GU_TRANSFORM_2D, 2, 0, v);
     if (set)
         return;
     stencil(check, 1);
-    sceGuEnable(GU_ALPHA_TEST);
-    sceGuDrawArray(GU_SPRITES, GU_TEXTURE_16BIT | GU_VERTEX_16BIT | GU_TRANSFORM_2D, 2, 0, v);
-    sceGuDisable(GU_ALPHA_TEST);
+    gel_enable(GL, GU_ALPHA_TEST);
+    gel_draw_array(GL, GU_SPRITES, GU_TEXTURE_16BIT | GU_VERTEX_16BIT | GU_TRANSFORM_2D, 2, 0, v);
+    gel_disable(GL, GU_ALPHA_TEST);
 }
 
 /* A rectangle of `src` (RAM's copy, or the GE's own) drawn exactly at dx,dy as 5551 sprites. A
@@ -537,17 +544,17 @@ static void blit(u16 *src, s32 sx, s32 sy, s32 dx, s32 dy, s32 w, s32 h, int che
     tex_mode(0);
     blend(-1);
     dither(0);
-    sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGBA);
-    sceGuTexFilter(GU_NEAREST, GU_NEAREST);
-    sceGuAlphaFunc(GU_GREATER, 0, 0xFF);
-    sceGuEnable(GU_TEXTURE_2D);
+    gel_tex_func(GL, GU_TFX_REPLACE, GU_TCC_RGBA);
+    gel_tex_filter(GL, GU_NEAREST, GU_NEAREST);
+    gel_alpha_func(GL, GU_GREATER, 0, 0xFF);
+    gel_enable(GL, GU_TEXTURE_2D);
     for (s32 cx = 0; cx < w;) {
         s32 cw = w - cx, room = 512 - ((sx + cx) & 7);
         cw = cw > room ? room : cw;
         blit_part(src, sx + cx, sy, dx + cx, dy, cw, h, check, set);
         cx += cw;
     }
-    sceGuDisable(GU_TEXTURE_2D);
+    gel_disable(GL, GU_TEXTURE_2D);
     ge.tex_sent = NULL, ge.texfn = -1, ge.a_func = -1;
 }
 
@@ -591,7 +598,7 @@ static void rd_read(void *self, s32 x, s32 y, s32 w, s32 h)
     u32 t0 = sceKernelGetSystemTimeLow();
     begin();
     sceKernelDcacheWritebackInvalidateRange(ram, VRAM_W * VRAM_H * 2);
-    sceGuCopyImage(GU_PSM_5551, 0, 0, VRAM_W, VRAM_H, VRAM_W, VRAM_PTR, 0, 0, VRAM_W, ram);
+    gel_copy_image(GL, GU_PSM_5551, 0, 0, VRAM_W, VRAM_H, VRAM_W, VRAM_PTR, 0, 0, VRAM_W, ram);
     ge_sync();
     ge.s.read_us += sceKernelGetSystemTimeLow() - t0;
     for (int ty = 0; ty < TILES_Y; ty++) {
@@ -613,7 +620,7 @@ const unsigned short *ge_compare_vram(void)
         return NULL;
     begin();
     sceKernelDcacheWritebackInvalidateRange(ge.cmp, VRAM_W * VRAM_H * 2);
-    sceGuCopyImage(GU_PSM_5551, 0, 0, VRAM_W, VRAM_H, VRAM_W, VRAM_PTR, 0, 0, VRAM_W, ge.cmp);
+    gel_copy_image(GL, GU_PSM_5551, 0, 0, VRAM_W, VRAM_H, VRAM_W, VRAM_PTR, 0, 0, VRAM_W, ge.cmp);
     ge_sync();
     return ge.cmp;
 }
@@ -644,10 +651,10 @@ static void prim_state(const GpuPrim *p, s32 x1, s32 y1, s32 x2, s32 y2)
 static void sprite(s32 x1, s32 y1, s32 x2, s32 y2, u32 c)
 {
     tex_mode(0);
-    GeVtx *o = sceGuGetMemory(2 * sizeof(GeVtx));
+    GeVtx *o = gel_get_memory(GL, 2 * sizeof(GeVtx));
     o[0] = (GeVtx){c, (float)x1, (float)y1, 0};
     o[1] = (GeVtx){c, (float)x2, (float)y2, 0};
-    sceGuDrawArray(GU_SPRITES, GE_VTX, 2, NULL, o);
+    gel_draw_array(GL, GU_SPRITES, GE_VTX, 2, NULL, o);
 }
 
 /* Once per frame, a draw into PS1 VRAM that changes nothing: the oracle drops a framebuffer it has
@@ -656,10 +663,10 @@ static void sprite(s32 x1, s32 y1, s32 x2, s32 y2, u32 c)
 void ge_touch(void)
 {
     begin();
-    sceGuPixelMask(0xFFFFFFFF);
+    gel_pixel_mask(GL, 0xFFFFFFFF);
     scissor(0, 0, VRAM_W - 1, VRAM_H - 1);
     sprite(0, 0, 1, 1, 0xFF000000u);
-    sceGuPixelMask(0);
+    gel_pixel_mask(GL, 0);
 }
 
 /* ---- textures ---- */
@@ -817,7 +824,7 @@ static const u32 *clut(const GpuPrim *p, int *flags)
     u32 st = e->key == key && e->epoch == ge.epoch ? e->stamp : stamp((s32)p->clut_x, (s32)p->clut_y, n, 1);
     if (e->key != key || e->stamp != st) {
         int tmp = e->used == ge.syncs;
-        u32 *c = tmp ? (u32 *)(((u32)sceGuGetMemory(n * 4 + 16) + 15) & ~15u) : clut_pool[e - ge.cluts];
+        u32 *c = tmp ? (u32 *)(((u32)gel_get_memory(GL, n * 4 + 16) + 15) & ~15u) : clut_pool[e - ge.cluts];
         const u16 *row = ge.psx->gpu.vram + p->clut_y * VRAM_W;
         int f = 0;
         for (int i = 0; i < n; i++) {
@@ -872,10 +879,10 @@ static void tex_image(const GpuPrim *p, const u8 *t, int w, int h, int tbw, int 
 {
     u32 wh = (u32)w | (u32)h << 16;
     if (t != ge.tex_sent || wh != ge.tex_wh) {
-        sceGuTexMode(p->depth >= 2 ? GU_PSM_8888 : p->depth ? GU_PSM_T8 : GU_PSM_T4, 0, 0, 0);
-        sceGuTexImage(0, 1, 1, 64, t + 16); /* another address first: see upload_part */
-        sceGuTexImage(0, w, h, tbw, t);
-        sceGuTexFlush();
+        gel_tex_mode(GL, p->depth >= 2 ? GU_PSM_8888 : p->depth ? GU_PSM_T8 : GU_PSM_T4, 0, 0, 0);
+        gel_tex_image(GL, 0, 1, 1, 64, t + 16); /* another address first: see upload_part */
+        gel_tex_image(GL, 0, w, h, tbw, t);
+        gel_tex_flush(GL);
         ge.tex_sent = tmp ? NULL : t, ge.tex_wh = wh; /* list memory is not reused as it stands */
         ge.s.bind_tex++;
     }
@@ -921,7 +928,7 @@ static void tw_bind(const GpuPrim *p, int n, TexVtx *v)
         ge.s.tw_rep++;
     }
     if ((u32)t & 15) {
-        u8 *c = (u8 *)(((u32)sceGuGetMemory(16 * (u32)size[1] + 16) + 15) & ~15u);
+        u8 *c = (u8 *)(((u32)gel_get_memory(GL, 16 * (u32)size[1] + 16) + 15) & ~15u);
         for (int y = 0; y < size[1]; y++)
             memcpy(c + 16 * y, t + row * (u32)y, (size_t)size[0] * bits / 8);
         t = c, tbw = (int)(128 / bits), tmp = 1;
@@ -935,8 +942,8 @@ static void tw_bind(const GpuPrim *p, int n, TexVtx *v)
 static void bind(const GpuPrim *p, const u8 *pg, const u32 *cl)
 {
     if (cl && cl != ge.clut_sent) {
-        sceGuClutMode(GU_PSM_8888, 0, 0xFF, 0);
-        sceGuClutLoad(p->depth ? 32 : 2, cl); /* blocks of 8 entries */
+        gel_clut_mode(GL, GU_PSM_8888, 0, 0xFF, 0);
+        gel_clut_load(GL, p->depth ? 32 : 2, cl); /* blocks of 8 entries */
         ge.clut_sent = cl;
         ge.s.bind_clut++;
     }
@@ -948,7 +955,7 @@ static void bind(const GpuPrim *p, const u8 *pg, const u32 *cl)
     if (fn != ge.texfn) {
         ge.texfn = fn;
         /* TEX_FUNC: modulate with colour doubling, so 0x80 is 1.0 as on the PS1; or replace */
-        sceGuSendCommandi(0xC9, fn ? GU_TCC_RGBA << 8 | GU_TFX_REPLACE : 1 << 16 | GU_TCC_RGBA << 8 | GU_TFX_MODULATE);
+        gel_cmd(GL, 0xC9, fn ? GU_TCC_RGBA << 8 | GU_TFX_REPLACE : 1 << 16 | GU_TCC_RGBA << 8 | GU_TFX_MODULATE);
     }
 }
 
@@ -996,7 +1003,7 @@ static void tex_pass(const GpuPrim *p, int func, int ref, int mode, int set, int
     alpha(func, ref);
     blend(mode);
     stencil(p->mask_check, set);
-    sceGuDrawArray(prim, TEX_VTX, n, NULL, v);
+    gel_draw_array(GL, prim, TEX_VTX, n, NULL, v);
 }
 
 /* Texels without STP are opaque and written with the mask setting; texels with STP are blended
@@ -1095,13 +1102,13 @@ static int polygon(const GpuPrim *p, const GpuVtx *const *v, int n)
     if (minx >= 0 && miny >= 0) {
         if (!p->textured) {
             tex_mode(0);
-            GeVtx *o = sceGuGetMemory((u32)n * sizeof(GeVtx));
+            GeVtx *o = gel_get_memory(GL, (u32)n * sizeof(GeVtx));
             for (int i = 0; i < n; i++)
                 o[i] = (GeVtx){abgr(v[i]->r, v[i]->g, v[i]->b), (float)v[i]->x + 0.5f, (float)v[i]->y + 0.5f, 0};
-            sceGuDrawArray(prim, GE_VTX, n, NULL, o);
+            gel_draw_array(GL, prim, GE_VTX, n, NULL, o);
             return DONE;
         }
-        TexVtx *o = sceGuGetMemory((u32)n * sizeof(TexVtx));
+        TexVtx *o = gel_get_memory(GL, (u32)n * sizeof(TexVtx));
         for (int i = 0; i < n; i++)
             o[i] = (TexVtx){(float)v[i]->u + 0.5f, (float)v[i]->v + 0.5f, abgr(v[i]->r, v[i]->g, v[i]->b), (float)v[i]->x + 0.5f,
                             (float)v[i]->y + 0.5f, 0};
@@ -1121,13 +1128,13 @@ static int polygon(const GpuPrim *p, const GpuVtx *const *v, int n)
         return DONE;
     if (!p->textured) {
         tex_mode(0);
-        GeVtx *o = sceGuGetMemory((u32)n * sizeof(GeVtx));
+        GeVtx *o = gel_get_memory(GL, (u32)n * sizeof(GeVtx));
         for (int i = 0; i < n; i++)
             o[i] = (GeVtx){abgr(col8(in[i].r), col8(in[i].g), col8(in[i].b)), in[i].x + 0.5f, in[i].y + 0.5f, 0};
-        sceGuDrawArray(GU_TRIANGLE_FAN, GE_VTX, n, NULL, o);
+        gel_draw_array(GL, GU_TRIANGLE_FAN, GE_VTX, n, NULL, o);
         return DONE;
     }
-    TexVtx *o = sceGuGetMemory((u32)n * sizeof(TexVtx));
+    TexVtx *o = gel_get_memory(GL, (u32)n * sizeof(TexVtx));
     for (int i = 0; i < n; i++)
         o[i] = (TexVtx){in[i].u + 0.5f, in[i].v + 0.5f, abgr(col8(in[i].r), col8(in[i].g), col8(in[i].b)), in[i].x + 0.5f, in[i].y + 0.5f, 0};
     tex_draw(p, flags, GU_TRIANGLE_FAN, n, o);
@@ -1181,7 +1188,7 @@ static int rd_rect(void *self, const GpuPrim *p, s32 x, s32 y, s32 w, s32 h, con
     float u0 = (float)(flip_x ? ((c->u - dx) & 255) + 1 + 1024 : (c->u + dx) & 255);
     float v0 = (float)(flip_y ? ((c->v - dy) & 255) + 1 + 1024 : (c->v + dy) & 255);
     float u1 = flip_x ? u0 - (float)sw : u0 + (float)sw, v1 = flip_y ? v0 - (float)sh : v0 + (float)sh;
-    TexVtx *o = sceGuGetMemory(2 * sizeof(TexVtx));
+    TexVtx *o = gel_get_memory(GL, 2 * sizeof(TexVtx));
     o[0] = (TexVtx){u0, v0, col, (float)bx1, (float)by1, 0};
     o[1] = (TexVtx){u1, v1, col, (float)(bx2 + 1), (float)(by2 + 1), 0};
     tex_draw(p, flags, GU_SPRITES, 2, o);
@@ -1227,12 +1234,12 @@ static int rd_line(void *self, const GpuPrim *p, const GpuVtx *a, const GpuVtx *
     prim_state(p, x1, y1, x2, y2);
     mark(bx1, by1, bx2, by2);
     tex_mode(0);
-    GeVtx *o = sceGuGetMemory((u32)nr * 2 * sizeof(GeVtx));
+    GeVtx *o = gel_get_memory(GL, (u32)nr * 2 * sizeof(GeVtx));
     for (int i = 0; i < nr; i++) {
         o[2 * i] = (GeVtx){run[i].c, (float)run[i].x0, (float)run[i].y0, 0};
         o[2 * i + 1] = (GeVtx){run[i].c, (float)(run[i].x1 + 1), (float)(run[i].y1 + 1), 0};
     }
-    sceGuDrawArray(GU_SPRITES, GE_VTX, 2 * nr, NULL, o);
+    gel_draw_array(GL, GU_SPRITES, GE_VTX, 2 * nr, NULL, o);
     ge.s.lines++, ge.s.line_runs += (u32)nr;
     return DONE;
 }
@@ -1429,9 +1436,9 @@ static void fl_miss(FlEntry *e, u32 cmd, u32 clut, s32 x1, s32 y1, s32 x2, s32 y
                 e->two = 1;
             }
         }
-        sceGuSendCommandi(0x12, p.textured ? TEX_VTX : GE_VTX); /* VTYPE */
+        gel_cmd(GL, 0x12, p.textured ? TEX_VTX : GE_VTX); /* VTYPE */
         if (arena) {
-            sceGuSendCommandi(0x0B, 0); /* RET */
+            gel_cmd(GL, 0x0B, 0); /* RET */
             e->call[0] = 0x10000000u | ((u32)s >> 8 & 0xF0000);
             e->call[1] = 0x0A000000u | ((u32)s & 0xFFFFFF);
             l[0] = e->call[0], l[1] = e->call[1];
@@ -1805,20 +1812,20 @@ static void busy_bench(Psx *psx)
     if (!ge.npages)
         return;
     ge_open();
-    sceGuDrawBufferList(GU_PSM_5650, (void *)GE_DISP_B, 512);
-    sceGuScissor(0, 0, 480, 272);
-    sceGuDisable(GU_DEPTH_TEST), sceGuDisable(GU_STENCIL_TEST), sceGuDisable(GU_BLEND), sceGuDisable(GU_ALPHA_TEST);
-    sceGuTexMode(GU_PSM_5650, 0, 0, 0);
-    sceGuTexImage(0, 128, 256, 128, ge.pages[0].data);
-    sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGB);
-    sceGuTexFilter(GU_NEAREST, GU_NEAREST);
-    sceGuTexFlush();
-    sceGuEnable(GU_TEXTURE_2D);
-    SprVtx *v = (SprVtx *)sceGuGetMemory(64 * sizeof(SprVtx));
+    gel_draw_buffer_list(GL, GU_PSM_5650, (void *)GE_DISP_B, 512);
+    gel_scissor(GL, GSC, 0, 0, 480, 272);
+    gel_disable(GL, GU_DEPTH_TEST), gel_disable(GL, GU_STENCIL_TEST), gel_disable(GL, GU_BLEND), gel_disable(GL, GU_ALPHA_TEST);
+    gel_tex_mode(GL, GU_PSM_5650, 0, 0, 0);
+    gel_tex_image(GL, 0, 128, 256, 128, ge.pages[0].data);
+    gel_tex_func(GL, GU_TFX_REPLACE, GU_TCC_RGB);
+    gel_tex_filter(GL, GU_NEAREST, GU_NEAREST);
+    gel_tex_flush(GL);
+    gel_enable(GL, GU_TEXTURE_2D);
+    SprVtx *v = (SprVtx *)gel_get_memory(GL, 64 * sizeof(SprVtx));
     for (int i = 0; i < 32; i++)
         v[2 * i] = (SprVtx){0, 0, 0, 0, 0}, v[2 * i + 1] = (SprVtx){128, 256, 480, 272, 0};
-    sceGuDrawArray(GU_SPRITES, GU_TEXTURE_16BIT | GU_VERTEX_16BIT | GU_TRANSFORM_2D, 64, 0, v);
-    sceGuDisable(GU_TEXTURE_2D);
+    gel_draw_array(GL, GU_SPRITES, GU_TEXTURE_16BIT | GU_VERTEX_16BIT | GU_TRANSFORM_2D, 64, 0, v);
+    gel_disable(GL, GU_TEXTURE_2D);
     sceKernelDcacheWritebackInvalidateRange(psx->ram, 2 * 1024 * 1024);
     volatile const u32 *ram = (const u32 *)psx->ram;
     u32 sum = 0, t0 = sceKernelGetSystemTimeLow();
@@ -1859,10 +1866,17 @@ static void busy_bench(Psx *psx)
             t4 - t3c < 20 ? " (the GE finished first)" : "", (unsigned)((t6 - t5) * 1000 / 256), (unsigned)(sum & 1));
 }
 
+int gel_check(unsigned int *buf, unsigned int words, char *out, int cap);
+
 void ge_init(Psx *psx, int compare)
 {
     ge.psx = psx;
     ge.compare = compare;
+    if (!list_open) { /* the list is idle: gel.h against pspgu in it */
+        char m[160];
+        gel_check(list, LIST_BYTES / 4, m, sizeof m);
+        psx_log(psx, "%s", m);
+    }
     if (compare) {
         SceUID uid = sceKernelAllocPartitionMemory(2, "psxrt ge compare", PSP_SMEM_Low, VRAM_W * VRAM_H * 2, NULL);
         ge.cmp = uid < 0 ? NULL : sceKernelGetBlockHeadAddr(uid);
@@ -1921,7 +1935,7 @@ static int compare(char *buf, int cap)
                       cap);
     begin();
     sceKernelDcacheWritebackInvalidateRange(ge.cmp, VRAM_W * VRAM_H * 2);
-    sceGuCopyImage(GU_PSM_5551, 0, 0, VRAM_W, VRAM_H, VRAM_W, VRAM_PTR, 0, 0, VRAM_W, ge.cmp);
+    gel_copy_image(GL, GU_PSM_5551, 0, 0, VRAM_W, VRAM_H, VRAM_W, VRAM_PTR, 0, 0, VRAM_W, ge.cmp);
     ge_sync();
     const u16 *ram = ge.psx->gpu.vram;
     /* The oracle does not dither, so differences of one step per channel are expected there; the
