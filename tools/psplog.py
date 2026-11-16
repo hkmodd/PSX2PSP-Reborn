@@ -9,6 +9,12 @@ frame, is counted once). Logs older than update's parts count that frame twice, 
 is low. The end says how the run stopped: a bench line, a halt, or nothing (switched off or
 crashed), with the last event logged before it.
 
+Logs with the profiler (psxrt.prof) add, per scene, the CPU counters a second (M cycles, k misses;
+"gpu dma" is the share of the PS1 display lists walked into GE commands), the runtime's sampled
+brackets ("rt": host calls, updates and the empty bracket that calibrates them), the native
+line's calls (lean ones and timer/IRQ/pad host calls, where logged) and the top host call sites.
+Seconds whose GE ring was cached are a scene of their own ("<scene>/ring-cached").
+
     python -I tools/psplog.py LOG              table by scene
     python -I tools/psplog.py LOG --csv OUT    also every second as CSV
     python -I tools/psplog.py BASE LOG         LOG against BASE, scene by scene
@@ -30,6 +36,15 @@ MS_KEYS = ("interp", "io", "draw", "mdec", "spu", "update", "present", "sleep")
 # code: the rest of the second, not in any measured part: translated code, mostly
 COLS = (*MS_KEYS, "code")
 UPD_KEYS = tuple("upd_" + k for k in ("vbl", "spu", "host", "timers", "dma", "cd", "sio"))
+CPU_LINE = re.compile(
+    r"^-- cpu \(k\): on \d+ ck (\d+) stall \d+ memory (\d+) .*?uncached (\d+)/(\d+) .*?i_miss (\d+)"
+    r" d_miss (\d+) wb \d+; gpu dma ck (\d+) memory (\d+) i_miss (\d+) d_miss (\d+)")
+CPU_KEYS = ("ck", "memory", "unc_r", "unc_w", "i_miss", "d_miss", "gd_ck", "gd_memory", "gd_i_miss",
+            "gd_d_miss")
+RT_PART = re.compile(r"(\w+) ck (\d+) memory (\d+) i_miss (\d+) d_miss (\d+) \(w (\d+) kept (\d+)")
+RING = re.compile(r"; ring (\w+) ")
+NATIVE = re.compile(r"^-- native: (\d+) calls(?: \((\d+) lean(?:, (\d+) timer/irq/pad host)?)?")
+SITE = re.compile(r" ([0-9A-F]{8})/(\d+)")
 
 
 def read(path):
@@ -56,6 +71,27 @@ def read(path):
                 for part, ms in UPD_PAIR.findall(line[15:]):
                     cur["upd_" + part] = int(ms)
                 continue
+            if cur is not None and line.startswith("-- "):
+                m = CPU_LINE.match(line)
+                if m:
+                    cur.update(("cpu_" + k, int(v)) for k, v in zip(CPU_KEYS, m.groups()))
+                    continue
+                if line.startswith("-- rt "):
+                    for part, *v in RT_PART.findall(line):
+                        cur.update(("rt_%s_%s" % (part, k), int(x)) for k, x in zip(
+                            ("ck", "memory", "i_miss", "d_miss", "w", "kept"), v))
+                    continue
+                if line.startswith("-- sites "):
+                    cur["sites"] = {pc: int(n) for pc, n in SITE.findall(line)}
+                    continue
+                m = NATIVE.match(line)
+                if m:
+                    cur.update(("nat_" + k, int(v)) for k, v in zip(("calls", "lean", "host"), m.groups())
+                               if v is not None)
+                    continue
+                m = RING.search(line)
+                if m and line.startswith("-- ge:"):
+                    cur["ring"] = m[1]
             m = EXE.match(line)
             if m:
                 exe = m[1]
@@ -70,7 +106,8 @@ def read(path):
             elif line:
                 last_event = line
     for s in secs:
-        s["scene"] = s["exe"] + ("/fmv" if s.get("mdec", 0) > 0 else "")
+        s["scene"] = s["exe"] + ("/fmv" if s.get("mdec", 0) > 0 else "") + (
+            "/ring-cached" if s.get("ring") == "cached" else "")
         if "interp" in s:  # update holds the frontend's frame (upd_host: present, vsync wait)
             parts = ("interp", "io", "update", "present", "sleep")
             s["code"] = max(0, 1000 - sum(s[k] for k in parts) + s.get("upd_host", 0))
@@ -96,6 +133,16 @@ def summary(secs):
             r[k] = sum(v) / len(v) if v else 0
         for k in {k for s in ss for k in s if k.startswith(("io_", "upd_"))}:  # not listed: 0 ms
             r[k] = sum(s.get(k, 0) for s in ss) / len(ss)
+        for k in {k for s in ss for k in s if k.startswith(("cpu_", "rt_", "nat_"))}:  # where logged
+            v = [s[k] for s in ss if k in s]
+            r[k] = sum(v) / len(v)
+        sites = {}
+        for s in ss:
+            for pc, n in s.get("sites", {}).items():
+                sites[pc] = sites.get(pc, 0) + n
+        if sites:
+            r["sites"] = sorted(sites.items(), key=lambda p: -p[1])[:12]
+            r["sites_secs"] = sum(1 for s in ss if "sites" in s)
         rows[scene] = r
     return rows
 
@@ -112,6 +159,27 @@ def fmt(scene, r):
     if upd:  # update's parts; host is the frontend's frame (present, sleep) run inside it
         row += "\n%-14s update: %s (sum %.0f)" % ("", ", ".join("%s %.0f" % p for p in upd),
                                                    sum(v for _, v in upd))
+    if "cpu_ck" in r:  # M cycles and k misses a second
+        g = lambda k: r.get("cpu_" + k, 0)
+        row += ("\n%-14s cpu: ck %.0fM memory %.0fM i_miss %.0fk d_miss %.0fk uncached %.0fk/%.0fk;"
+                " gpu dma ck %.0fM memory %.0fM i_miss %.0fk d_miss %.0fk; rest ck %.0fM i_miss %.0fk"
+                " d_miss %.0fk") % (
+            "", g("ck") / 1e3, g("memory") / 1e3, g("i_miss"), g("d_miss"), g("unc_r"), g("unc_w"),
+            g("gd_ck") / 1e3, g("gd_memory") / 1e3, g("gd_i_miss"), g("gd_d_miss"),
+            (g("ck") - g("gd_ck")) / 1e3, g("i_miss") - g("gd_i_miss"), g("d_miss") - g("gd_d_miss"))
+    rt = [p for p in ("calls", "update", "empty") if "rt_%s_ck" % p in r]
+    if rt:  # sums already weighted to the second; empty: the brackets' own cost
+        row += "\n%-14s rt: %s" % ("", "; ".join(
+            "%s ck %.1fM memory %.1fM i_miss %.0fk d_miss %.0fk (kept %.0f)" % (
+                p, r["rt_%s_ck" % p] / 1e3, r["rt_%s_memory" % p] / 1e3, r["rt_%s_i_miss" % p],
+                r["rt_%s_d_miss" % p], r["rt_%s_kept" % p]) for p in rt))
+    if "nat_calls" in r:
+        row += "\n%-14s native: %.0f calls" % ("", r["nat_calls"]) + (
+            ", %.0f lean" % r["nat_lean"] if "nat_lean" in r else "") + (
+            ", %.0f timer/irq/pad host" % r["nat_host"] if "nat_host" in r else "")
+    if "sites" in r:
+        row += "\n%-14s sites (n/s, %d s): %s" % ("", r["sites_secs"], " ".join(
+            "%s/%.0f" % (pc, n / r["sites_secs"]) for pc, n in r["sites"]))
     return row
 
 
@@ -150,6 +218,10 @@ def main(argv):
             moved = ["%s %.0f->%.0f" % m for m in moved if abs(m[2] - m[1]) >= 10]
             if moved:
                 print("%-14s ms/s: %s" % ("", ", ".join(moved)))
+            cpu = [(k[4:], x[k], y[k]) for k in ("cpu_" + c for c in CPU_KEYS) if k in x and k in y]
+            cpu = ["%s %.0f->%.0f" % c for c in cpu if abs(c[2] - c[1]) >= 0.03 * max(c[1], 1)]
+            if cpu:  # k cycles or k misses a second, moves of 3% or more
+                print("%-14s cpu (k): %s" % ("", ", ".join(cpu)))
         print("base end:", be)
         print("log end: ", le)
         return 0
