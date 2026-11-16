@@ -25,6 +25,9 @@ void ge_sync(void);
 void ge_run(void);
 /* Brings the GE's pixels of a PS1 VRAM rectangle into RAM. */
 void ge_read(int x, int y, int w, int h);
+/* Compare mode: the GE's copy of PS1 VRAM, read back now (RAM's holds the software rasterizer's);
+ * NULL otherwise. */
+const unsigned short *ge_compare_vram(void);
 /* A draw into PS1 VRAM that changes nothing, once per frame (ge.c says why). */
 void ge_touch(void);
 /* Appends the per-second "-- ge:" lines (counters, and the comparison in compare mode). */

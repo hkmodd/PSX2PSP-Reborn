@@ -659,6 +659,8 @@ static int draw_ps1(Psx *psx)
     return 1;
 }
 
+static void shot_write(const u16 *vram, int x0, int y0, int w, int h, int deep, u32 frame_no, const char *sfx);
+
 /* Debugging: the PS1 display area as a 24-bit BMP, shotNNNNN.bmp beside the EBOOT. */
 static void shot(Psx *psx, u32 frame_no)
 {
@@ -670,8 +672,20 @@ static void shot(Psx *psx, u32 frame_no)
         ge_read(g->disp_x, g->disp_y, deep ? (w * 3 + 1) / 2 + 1 : w, h);
     if (deep)
         convert24(g, w, h);
+    /* in GE compare mode all of VRAM, RAM's copy (the software rasterizer's) and the GE's in
+     * shotNNNNNg.bmp */
+    const u16 *vram = g->vram, *gv = deep || !g->renderer ? NULL : ge_compare_vram();
+    int x0 = g->disp_x, y0 = g->disp_y;
+    if (gv)
+        x0 = y0 = 0, w = VRAM_W, h = VRAM_H;
+    for (int pass = 0; pass < (gv ? 2 : 1); pass++, vram = gv)
+        shot_write(vram, x0, y0, w, h, deep, frame_no, pass ? "g" : "");
+}
+
+static void shot_write(const u16 *vram, int x0, int y0, int w, int h, int deep, u32 frame_no, const char *sfx)
+{
     char path[300];
-    snprintf(path, sizeof path, "%sshot%05u.bmp", base_dir, (unsigned)frame_no);
+    snprintf(path, sizeof path, "%sshot%05u%s.bmp", base_dir, (unsigned)frame_no, sfx);
     SceUID fd = sceIoOpen(path, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
     if (fd < 0)
         return;
@@ -682,7 +696,7 @@ static void shot(Psx *psx, u32 frame_no)
         memcpy(hdr + fields[i], &fields[i + 1], 4);
     hdr[26] = 1; /* planes */
     sceIoWrite(fd, hdr, sizeof hdr);
-    static u8 row[512 * 3 + 4];
+    static u8 row[VRAM_W * 3 + 4];
     for (int y = h - 1; y >= 0; y--) {
         memset(row, 0, stride);
         for (int x = 0; x < w; x++) {
@@ -691,7 +705,7 @@ static void shot(Psx *psx, u32 frame_no)
                 u32 c = rgb24_tex[y * 512 + x];
                 o[0] = (u8)(c >> 16), o[1] = (u8)(c >> 8), o[2] = (u8)c;
             } else {
-                u16 c = g->vram[((g->disp_y + y) & (VRAM_H - 1)) * VRAM_W + ((g->disp_x + x) & (VRAM_W - 1))];
+                u16 c = vram[((y0 + y) & (VRAM_H - 1)) * VRAM_W + ((x0 + x) & (VRAM_W - 1))];
                 o[0] = (u8)((c >> 10 & 31) << 3), o[1] = (u8)((c >> 5 & 31) << 3), o[2] = (u8)((c & 31) << 3);
             }
         }

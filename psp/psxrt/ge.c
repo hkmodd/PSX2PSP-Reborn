@@ -56,6 +56,7 @@ typedef struct {
     u32 ring_wb_us;                               /* writing the cached ring back */
     u32 kick_us, setup_us;                        /* stall moves, all timed; fl_setup, 1 in 16 timed */
     u32 rb_why[3], rb_last;                       /* readbacks for the rest, a page, a CLUT; the last one's x | y << 10 | w << 20 */
+    u32 tw_ge, tw_rep, tw_copy; /* texture windows drawn on the GE; axes repeated; copied into the list */
 } GeStats;
 static int rb_why; /* what the next rd_read is for: 0 the rest, 1 a texture page, 2 a CLUT */
 
@@ -110,6 +111,7 @@ static struct {
     int sc_x1, sc_y1, sc_x2, sc_y2;
     int st_check, st_set, blend, dither; /* -2: unknown */
     const void *tex_sent, *clut_sent;    /* NULL: unknown */
+    u32 tex_wh;                          /* the size sent with tex_sent: width | height << 16 */
     int texfn;                           /* 0 modulate, 1 replace, -1 unknown */
     int tex_on;                          /* texturing and the alpha test enabled */
     int a_func, a_ref;                   /* alpha test; a_func -1: unknown */
@@ -605,6 +607,17 @@ static void rd_read(void *self, s32 x, s32 y, s32 w, s32 h)
 
 void ge_read(int x, int y, int w, int h) { rd_read(&ge, x, y, w, h); }
 
+const unsigned short *ge_compare_vram(void)
+{
+    if (!ge.compare)
+        return NULL;
+    begin();
+    sceKernelDcacheWritebackInvalidateRange(ge.cmp, VRAM_W * VRAM_H * 2);
+    sceGuCopyImage(GU_PSM_5551, 0, 0, VRAM_W, VRAM_H, VRAM_W, VRAM_PTR, 0, 0, VRAM_W, ge.cmp);
+    ge_sync();
+    return ge.cmp;
+}
+
 /* ---- primitives ---- */
 
 static u32 abgr(s32 r, s32 g, s32 b) { return 0xFF000000u | (u32)b << 16 | (u32)g << 8 | (u32)r; }
@@ -665,14 +678,23 @@ static u32 stamp(s32 x, s32 y, s32 w, s32 h)
     return s;
 }
 
-/* What the GE can sample: pages without a texture window. */
+/* A texture window's side along one axis: S when (u & and) | or is or + u mod S, S a power of two
+ * from 8 (256: no window), which the GE's GU_REPEAT does over a texture S texels wide that starts
+ * at texel or (bind); 0 when the window is not such (a mask with a gap). */
+static int tw_side(u32 and_, u32 or_)
+{
+    u32 s = and_ + 1;
+    return s >= 8 && !(s & and_) && !(or_ & and_) ? (int)s : 0;
+}
+
+/* What the GE can sample: pages, and texture windows that repeat as the GE does. */
 static int tex_ok(const GpuPrim *p)
 {
     if (p->depth >= 2 ? !ge.mir : !ge.npages) {
         ge.s.sw_tex15++;
         return 0;
     }
-    if (p->tw_and_u != 0xFF || p->tw_and_v != 0xFF || p->tw_or_u || p->tw_or_v) {
+    if (!tw_side(p->tw_and_u, p->tw_or_u) || !tw_side(p->tw_and_v, p->tw_or_v)) {
         ge.s.sw_texwin++;
         return 0;
     }
@@ -719,7 +741,7 @@ static const u8 *page(const GpuPrim *p)
         }
         sceKernelDcacheWritebackRange(s->data, (u32)(256 * hw * 2));
         s->key = key, s->stamp = st, s->ver++;
-        if (ge.tex_sent == s->data)
+        if ((u32)((const u8 *)ge.tex_sent - s->data) < PAGE_BYTES) /* the page, or a window in it */
             ge.tex_sent = NULL;
         ge.s.pages++;
     }
@@ -845,6 +867,71 @@ static int clut_current(ClutSlot *c)
     return 1;
 }
 
+/* The texture at t, w x h texels, rows tbw texels apart; tmp: in list memory. */
+static void tex_image(const GpuPrim *p, const u8 *t, int w, int h, int tbw, int tmp)
+{
+    u32 wh = (u32)w | (u32)h << 16;
+    if (t != ge.tex_sent || wh != ge.tex_wh) {
+        sceGuTexMode(p->depth >= 2 ? GU_PSM_8888 : p->depth ? GU_PSM_T8 : GU_PSM_T4, 0, 0, 0);
+        sceGuTexImage(0, 1, 1, 64, t + 16); /* another address first: see upload_part */
+        sceGuTexImage(0, w, h, tbw, t);
+        sceGuTexFlush();
+        ge.tex_sent = tmp ? NULL : t, ge.tex_wh = wh; /* list memory is not reused as it stands */
+        ge.s.bind_tex++;
+    }
+}
+
+/* The page of a primitive with a texture window, which tex_draw binds (tw_bind); NULL without. */
+static const u8 *tw_page;
+
+/* A texture window (tw_side) on the GE, for the texels the vertices sample: from floor of the
+ * lowest coordinate to ceil of the highest less one (polygons carry texel + 0.5, sprites the
+ * texel edges). Along an axis where those stay in one period of the window, the page as without
+ * a window and the coordinates moved into the window's texels; along one where they run into the
+ * next period, GU_REPEAT over a texture of the window's side that starts at its first texel. The
+ * GE takes a texture at a 16-byte boundary: a T4/T8 window off one (a side of 8 or 16) has its
+ * rows copied into the list, 16 bytes apart. */
+static void tw_bind(const GpuPrim *p, int n, TexVtx *v)
+{
+    u32 bits = p->depth >= 2 ? 32 : p->depth ? 8 : 4, row = p->depth >= 2 ? MIR_W * 4 : 32 * bits;
+    int tbw = p->depth >= 2 ? MIR_W : 256, tmp = 0, size[2] = {256, 256};
+    const u8 *t = tw_page;
+    float lo[2] = {v[0].u, v[0].v}, hi[2] = {v[0].u, v[0].v}, d[2] = {0, 0};
+    for (int i = 1; i < n; i++) {
+        lo[0] = v[i].u < lo[0] ? v[i].u : lo[0], hi[0] = v[i].u > hi[0] ? v[i].u : hi[0];
+        lo[1] = v[i].v < lo[1] ? v[i].v : lo[1], hi[1] = v[i].v > hi[1] ? v[i].v : hi[1];
+    }
+    u32 and_[2] = {p->tw_and_u, p->tw_and_v}, or_[2] = {p->tw_or_u, p->tw_or_v};
+    ge.s.tw_ge++;
+    for (int a = 0; a < 2; a++) {
+        int s = (int)and_[a] + 1;
+        if (s == 256)
+            continue;
+        int t0 = (int)lo[a], t1 = (int)hi[a];
+        if ((float)t1 == hi[a])
+            t1--;
+        int k = t0 / s;
+        if (lo[a] >= 0 && t1 / s == k) {
+            d[a] = (float)((int)or_[a] - k * s);
+            continue;
+        }
+        d[a] = lo[a] >= 0 ? (float)(-k * s) : 0;
+        t += a ? or_[a] * row : or_[a] * bits / 8;
+        size[a] = s;
+        ge.s.tw_rep++;
+    }
+    if ((u32)t & 15) {
+        u8 *c = (u8 *)(((u32)sceGuGetMemory(16 * (u32)size[1] + 16) + 15) & ~15u);
+        for (int y = 0; y < size[1]; y++)
+            memcpy(c + 16 * y, t + row * (u32)y, (size_t)size[0] * bits / 8);
+        t = c, tbw = (int)(128 / bits), tmp = 1;
+        ge.s.tw_copy++;
+    }
+    tex_image(p, t, size[0], size[1], tbw, tmp);
+    for (int i = 0; i < n; i++)
+        v[i].u += d[0], v[i].v += d[1];
+}
+
 static void bind(const GpuPrim *p, const u8 *pg, const u32 *cl)
 {
     if (cl && cl != ge.clut_sent) {
@@ -853,14 +940,10 @@ static void bind(const GpuPrim *p, const u8 *pg, const u32 *cl)
         ge.clut_sent = cl;
         ge.s.bind_clut++;
     }
-    if (pg != ge.tex_sent) {
-        sceGuTexMode(p->depth >= 2 ? GU_PSM_8888 : p->depth ? GU_PSM_T8 : GU_PSM_T4, 0, 0, 0);
-        sceGuTexImage(0, 1, 1, 64, pg + 16); /* another address first: see upload_part */
-        sceGuTexImage(0, 256, 256, p->depth >= 2 ? MIR_W : 256, pg);
-        sceGuTexFlush();
-        ge.tex_sent = pg;
-        ge.s.bind_tex++;
-    }
+    /* a texture window's texture depends on the texels its vertices sample: tw_bind */
+    tw_page = p->tw_and_u != 0xFF || p->tw_and_v != 0xFF ? pg : NULL;
+    if (!tw_page)
+        tex_image(p, pg, 256, 256, p->depth >= 2 ? MIR_W : 256, 0);
     int fn = p->raw;
     if (fn != ge.texfn) {
         ge.texfn = fn;
@@ -918,8 +1001,10 @@ static void tex_pass(const GpuPrim *p, int func, int ref, int mode, int set, int
 
 /* Texels without STP are opaque and written with the mask setting; texels with STP are blended
  * when the primitive is semi-transparent and set bit 15. A CLUT with both takes two passes. */
-static void tex_draw(const GpuPrim *p, int flags, int prim, int n, const TexVtx *v)
+static void tex_draw(const GpuPrim *p, int flags, int prim, int n, TexVtx *v)
 {
+    if (tw_page)
+        tw_bind(p, n, v);
     int semi = p->semi ? (int)p->abr : -1, set = p->mask_set != 0;
     tex_mode(1);
     if (flags == 1)
@@ -1877,12 +1962,12 @@ int ge_log(char *buf, int cap)
     const GeStats *s = &ge.s;
     u32 kb = s->kicks * prof_bias / 16, kick_us = s->kick_us > kb ? s->kick_us - kb : 0; /* less one clock read each */
     int n = clampn(snprintf(buf, (size_t)cap,
-                            "-- ge: tri %u+%u tex, rect %u+%u tex, fill %u, line %u (%u runs); sw tex15 %u texwin %u "
+                            "-- ge: tri %u+%u tex, rect %u+%u tex, fill %u, line %u (%u runs); sw tex15 %u texwin %u (ge %u, %u axes repeated, %u copied) "
                             "copy %u+%u sw+%u null (%u kpx, %u from ge); pages %u, 15-bit tiles %u, cluts %u+%u in list, readback %u (%u tiles, %u ms), upload %u "
                             "(%u kpx, %u ms), flush %u; bind %u tex %u clut, kick %u (%u ms), rd check %u; fast %u (%u setups %u ms, %u cached, mru %u), slow tex %u big %u, flat %u, clipped %u; ring %s (wb %u ms), step %u; readback page/clut/other %u/%u/%u, last at %u,%u w %u\n",
                             (unsigned)s->tris, (unsigned)s->ttris, (unsigned)s->rects, (unsigned)s->trects,
                             (unsigned)s->fills, (unsigned)s->lines, (unsigned)s->line_runs, (unsigned)s->sw_tex15,
-                            (unsigned)s->sw_texwin,
+                            (unsigned)s->sw_texwin, (unsigned)s->tw_ge, (unsigned)s->tw_rep, (unsigned)s->tw_copy,
                             (unsigned)s->ge_copy, (unsigned)s->sw_copy, (unsigned)s->null_copy, (unsigned)(s->copy_px / 1000), (unsigned)s->copy_from_ge,
                             (unsigned)s->pages, (unsigned)s->pages15, (unsigned)s->cluts, (unsigned)s->clut_tmp, (unsigned)s->readbacks, (unsigned)s->read_tiles,
                             (unsigned)(s->read_us / 1000), (unsigned)s->uploads, (unsigned)(s->upload_px / 1000),
