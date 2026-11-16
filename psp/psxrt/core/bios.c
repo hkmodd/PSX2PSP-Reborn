@@ -742,6 +742,38 @@ static int call_a(Psx *psx, u32 fn)
 {
     u32 a0 = G[R_A0], a1 = G[R_A1], a2 = G[R_A2];
     switch (fn) {
+    case 0x10: case 0x11: { /* atoi / atol: strtol(src, NULL, 10) (psx-spx): blanks 09-0D and 20
+                             * skipped, '-' negates, prefixes 0x, 0b and o set the base; atol also
+                             * takes a leading 0 as octal */
+        u32 p = a0, base = 10, v = 0;
+        u8 c;
+        if (!p) {
+            G[R_V0] = 0;
+            return 1;
+        }
+        while ((c = r8(psx, p)) == ' ' || (c >= 9 && c <= 13))
+            p++;
+        int neg = c == '-';
+        p += (u32)neg;
+        c = r8(psx, p);
+        u8 n = r8(psx, p + 1) | 0x20;
+        if (c == '0' && (n == 'x' || n == 'b')) {
+            base = n == 'x' ? 16 : 2;
+            p += 2;
+        } else if (c == 'o' || (fn == 0x11 && c == '0')) {
+            base = 8;
+            p++;
+        }
+        for (;; p++) {
+            u8 ch = r8(psx, p), l = ch | 0x20;
+            u32 d = ch >= '0' && ch <= '9' ? (u32)(ch - '0') : l >= 'a' && l <= 'z' ? (u32)(l - 'a' + 10) : 99;
+            if (d >= base)
+                break;
+            v = v * base + d;
+        }
+        G[R_V0] = neg ? 0u - v : v;
+        return 1;
+    }
     case 0x13: /* setjmp */
         w32(psx, a0, G[R_RA]);
         w32(psx, a0 + 4, G[R_SP]);
@@ -888,6 +920,11 @@ static int call_a(Psx *psx, u32 fn)
     case 0x71: /* _96_init */
         return 1;
     case 0x70: /* _bu_init */
+        return 1;
+    case 0x9F: /* SetMem(megabytes): the size goes to RAM at 00000060 (psx-spx); the BIOS also sets
+                * DRAM_CTRL bits 8-10, which change nothing here (the RAM is 2 MB) */
+        if (a0 == 2 || a0 == 8)
+            w32(psx, 0x60, a0);
         return 1;
     }
     if (fn <= 0x07)
