@@ -43,8 +43,10 @@ static void sw_read_texture(Psx *psx, const Prim *p)
 /* The per-pixel path is inlined into the loops that walk the pixels. */
 #ifdef _MSC_VER
 #define PIXEL static __forceinline
+#define NOINLINE __declspec(noinline)
 #else
 #define PIXEL static inline __attribute__((always_inline))
+#define NOINLINE __attribute__((noinline))
 #endif
 
 static const s8 dither[4][4] = {{-4, 0, -3, 1}, {2, -2, 3, -1}, {-3, 1, -4, 0}, {3, -1, 2, -2}};
@@ -76,12 +78,7 @@ static int cmd_words(u32 c, int *poly_line)
     return 1;
 }
 
-static void set_texpage(Psx *psx, u32 tp)
-{
-    Gpu *g = &psx->gpu;
-    g->texpage = tp & 0x9FF;
-    g->stat = (g->stat & ~0x87FFu) | (tp & 0x7FF) | ((tp & 0x800) << 4);
-}
+static void set_texpage(Psx *psx, u32 tp) { gpu_set_texpage(&psx->gpu, tp); }
 
 void gpu_prim_from(Psx *psx, GpuPrim *p, u32 cmd, u32 clut, u32 tp)
 {
@@ -348,14 +345,22 @@ static int poly_slow;
 static void draw_polygon(Psx *psx, const u32 *c)
 {
     u32 cmd = c[0] >> 24;
-    int quad = (cmd >> 3) & 1, tex = (cmd >> 2) & 1, gour = (cmd >> 4) & 1, n = quad ? 4 : 3;
+    int tex = (cmd >> 2) & 1, gour = (cmd >> 4) & 1;
     const GpuRenderer *rd = psx->gpu.renderer;
-    if (tex) /* the second vertex's texpage, as the loop below sets it */
+    if (tex) /* the second vertex's texpage, as gpu_poly_soft sets it */
         set_texpage(psx, (psx->gpu.texpage & ~0x1FFu) | (c[gour ? 5 : 4] >> 16 & 0x1FF));
     int fast = rd && rd->poly ? rd->poly(rd->self, c) : -1;
     poly_slow = fast != GPU_DRAWN;
-    if (fast == GPU_DRAWN)
-        return;
+    if (fast != GPU_DRAWN)
+        gpu_poly_soft(psx, c, fast);
+}
+
+/* Out of line: the renderer's fast lane takes nearly all polygons. */
+NOINLINE void gpu_poly_soft(Psx *psx, const u32 *c, int fast)
+{
+    u32 cmd = c[0] >> 24;
+    int quad = (cmd >> 3) & 1, tex = (cmd >> 2) & 1, gour = (cmd >> 4) & 1, n = quad ? 4 : 3;
+    const GpuRenderer *rd = psx->gpu.renderer;
     Vtx v[4];
     u32 clut = 0, tp = psx->gpu.texpage;
     int k = 0;

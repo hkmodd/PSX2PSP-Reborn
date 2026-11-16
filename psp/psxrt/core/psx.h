@@ -199,6 +199,11 @@ typedef struct GpuRenderer {
      * it, with the texpage of a textured one already set. -1: not handled (the core goes on as
      * without it); GPU_DRAWN; GPU_BOTH: drawn, and the core draws its triangles as well. */
     int (*poly)(void *self, const u32 *c);
+    /* Optional: n words of a DMA packet in PS1 RAM, offered before the core reads them. It runs
+     * the whole polygon commands at their front as the core would (counts, texpage, drawing, and
+     * gpu_poly_soft for what it does not draw) and returns how many words it took; the core runs
+     * the rest. Offered only with no command half way and no image transfer under way. */
+    u32 (*packet)(void *self, const u32 *w, u32 n);
 } GpuRenderer;
 
 typedef struct Gpu {
@@ -412,6 +417,13 @@ void psx_video_mode(Psx *psx); /* after a GPUSTAT video mode change: the frame l
 /* mem.c */
 u32 psx_read(Psx *psx, u32 addr, int size);
 void psx_write(Psx *psx, u32 addr, u32 v, int size);
+/* GP0 E1 (and a textured polygon's texpage word): the texpage and the GPUSTAT bits it sets. */
+static inline void gpu_set_texpage(Gpu *g, u32 tp)
+{
+    g->texpage = tp & 0x9FF;
+    g->stat = (g->stat & ~0x87FFu) | (tp & 0x7FF) | ((tp & 0x800) << 4);
+}
+
 static inline u8 *psx_ram_ptr(Psx *psx, u32 addr) { return psx->ram + (addr & (RAM_SIZE - 1)); }
 static inline u32 ram_r32(Psx *psx, u32 addr)
 {
@@ -514,6 +526,9 @@ u32 gpu_read(Psx *psx, int reg);
 void gpu_gp0(Psx *psx, u32 v);
 /* GP0 words of a DMA packet, in PS1 RAM (word aligned) */
 void gpu_gp0_packet(Psx *psx, const u32 *w, u32 n);
+/* A polygon command the renderer's poly() returned `fast` for (-1 or GPU_BOTH), drawn by the core
+ * as draw_polygon does; its texpage is already set. */
+void gpu_poly_soft(Psx *psx, const u32 *c, int fast);
 /* A primitive's fields from its command byte, CLUT and texpage, and the GPU's state */
 void gpu_prim_from(Psx *psx, GpuPrim *p, u32 cmd, u32 clut, u32 tp);
 /* GP0 words while a CPU->VRAM transfer is in progress, a row at a time: the words used (it

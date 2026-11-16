@@ -50,6 +50,7 @@ typedef struct {
     u32 ge_copy, null_copy, copy_px, copy_from_ge; /* copies: on the GE, onto themselves, pixels, read from the GE */
     u32 bind_tex, bind_clut, kicks, rd_checks;     /* textures and CLUTs sent, stall moves, readback checks */
     u32 fast, fast_setups, fast_hits;              /* polygons through the fast lane; its state changes, found cached */
+    u32 mru_hits;                                  /* state changes back to a key the open list already called (fl_mru) */
     u32 slow_tex, slow_big, flat, clipped;        /* fast lane: turned away for texture or size; no area; cut at the origin */
     u32 ring_wb_us;                               /* writing the cached ring back */
     u32 kick_us, setup_us;                        /* stall moves, all timed; fl_setup, 1 in 16 timed */
@@ -136,8 +137,9 @@ static struct {
     int cached, want;   /* the ring is written through the cache; the mode after the next sync */
 } fl;
 /* 1: the mode changes every second, and the "-- ge:" line says which ran. The PSP wrote 64 KB of
- * vertices in 326 us uncached, 700 us cached and written back (S16b): the ring stays uncached. */
-static int ring_ab = 0;
+ * vertices in 326 us uncached, 700 us cached and written back with the GE idle (S16b), but 1139 us
+ * uncached and 739 us cached under the GE's load (7587df1): the wheel runs both, a second each. */
+static int ring_ab = 1;
 
 /* The PS1 dither matrix, row = y & 3, column = x & 3; the GE adds it to 8-bit colours before
  * they are cut to 5 bits, as the PS1 does. */
@@ -1121,6 +1123,20 @@ typedef struct {
 } FlEntry;
 static FlEntry fl_cache[1 << FL_BITS];
 static u32 fl_uses;
+/* The keys fl_setup last found or built with a block the open list calls: games alternate a few
+ * keys (the language wheel set one up for 41% of its polygons, ~4.7 us each through the cache
+ * above). A key that comes back in the same list, with no tile changed (epoch) or, for a textured
+ * one, newly drawn (nver), is its CALL again: the entry still holds it while it has the key and
+ * the list called its block (blk), and neither its page nor its CLUT slot is rewritten while the
+ * list that uses them is open. */
+#define FL_MRU 4
+static struct {
+    u32 k0, k1, a0, a1;
+    FlEntry *e;
+    u32 syncs, epoch, nver;
+    s32 x1, y1, x2, y2;
+} fl_mru[FL_MRU];
+static u32 fl_mru_next;
 static u32 __attribute__((aligned(64))) fl_arena[FL_ARENA / 4];
 #define FL_ARENA_UNCACHED ((unsigned int *)((u32)fl_arena | 0x40000000u))
 
@@ -1223,7 +1239,7 @@ static void fl_miss(FlEntry *e, u32 cmd, u32 clut, s32 x1, s32 y1, s32 x2, s32 y
 }
 
 /* The key in fl.k0-a1 changed: the GE gets its state, from the cache when it holds. */
-static void fl_setup(u32 cmd, u32 clut)
+static __attribute__((noinline)) void fl_setup(u32 cmd, u32 clut)
 {
     s32 x1, y1, x2, y2;
     int flags = 0;
@@ -1267,6 +1283,44 @@ static void fl_setup(u32 cmd, u32 clut)
     fl.epoch = ge.epoch, fl.nver = ge.nver;
     fl.valid = 1;
     ge.s.fast_setups++;
+    if (flags && e->call[0] && e->k0 == fl.k0 && e->blk == ge.syncs) {
+        u32 i = 0;
+        while (i < FL_MRU && (fl_mru[i].k0 != fl.k0 || fl_mru[i].k1 != fl.k1 || fl_mru[i].a0 != fl.a0 || fl_mru[i].a1 != fl.a1))
+            i++;
+        if (i == FL_MRU)
+            i = fl_mru_next++ % FL_MRU;
+        fl_mru[i].k0 = fl.k0, fl_mru[i].k1 = fl.k1, fl_mru[i].a0 = fl.a0, fl_mru[i].a1 = fl.a1, fl_mru[i].e = e;
+        fl_mru[i].syncs = ge.syncs, fl_mru[i].epoch = ge.epoch, fl_mru[i].nver = ge.nver;
+        fl_mru[i].x1 = x1, fl_mru[i].y1 = y1, fl_mru[i].x2 = x2, fl_mru[i].y2 = y2;
+    }
+}
+
+/* fl_setup's work for a key in fl_mru: its CALL. 0: not there, or no longer current. */
+static int fl_mru_hit(void)
+{
+    if (!list_open || !state_valid || (u32)((u8 *)gu_list->current - (u8 *)gu_list->start) > LIST_BYTES - LIST_SLACK)
+        return 0;
+    for (int i = 0; i < FL_MRU; i++) {
+        if (fl_mru[i].k0 != fl.k0 || fl_mru[i].k1 != fl.k1 || fl_mru[i].a0 != fl.a0 || fl_mru[i].a1 != fl.a1)
+            continue;
+        FlEntry *e = fl_mru[i].e;
+        if (fl_mru[i].syncs != ge.syncs || fl_mru[i].epoch != ge.epoch || ((fl.k0 & 1) && fl_mru[i].nver != ge.nver) ||
+            e->k0 != fl.k0 || e->k1 != fl.k1 || e->a0 != fl.a0 || e->a1 != fl.a1 || e->blk != ge.syncs)
+            return 0;
+        unsigned int *l = gu_list->current;
+        l[0] = e->call[0], l[1] = e->call[1];
+        gu_list->current = l + 2;
+        fl.dirty = 1;
+        fl.flags = e->flags;
+        fl.two = e->two, fl.n1 = e->n1, fl.n2 = e->n2, fl.pass1 = e->pass1, fl.pass2 = e->pass2;
+        fl.x1 = fl_mru[i].x1, fl.y1 = fl_mru[i].y1, fl.x2 = fl_mru[i].x2, fl.y2 = fl_mru[i].y2;
+        fl.base = e->call[0] & 0xF0000;
+        fl.epoch = ge.epoch, fl.nver = ge.nver;
+        fl.valid = 1;
+        ge.s.mru_hits++;
+        return 1;
+    }
+    return 0;
 }
 
 /* fl_setup, one call in 16 timed for the log. */
@@ -1301,6 +1355,9 @@ static unsigned int *fl_draw(unsigned int *l, const u8 *vp, int prim, int n)
     }
     return l;
 }
+
+static unsigned int *poly_cut(unsigned int *l, u8 *vp, const s32 *x, const s32 *y, const u32 *col, const u32 *uv,
+                              int n, int tex, s32 minx, s32 miny, u32 vsz);
 
 /* A polygon command (GP0 20-3F) straight from its words, when the GE can sample its texture and
  * it is within the core's size limits; -1 otherwise. Each vertex is written once into the ring.
@@ -1354,7 +1411,8 @@ static int rd_poly(void *self, const u32 *c)
     u32 a0 = (u32)g->clip_x1 | (u32)g->clip_y1 << 16, a1 = (u32)g->clip_x2 | (u32)g->clip_y2 << 16;
     if (!fl.valid || k0 != fl.k0 || k1 != fl.k1 || a0 != fl.a0 || a1 != fl.a1 || ge.epoch != fl.epoch) {
         fl.k0 = k0, fl.k1 = k1, fl.a0 = a0, fl.a1 = a1;
-        fl_setup_timed(cmd, k1);
+        if (!fl_mru_hit())
+            fl_setup_timed(cmd, k1);
     } else if (tex && ge.nver != fl.nver) {
         /* tiles turned newer: only those under the page or the CLUT need the readback */
         if (fl_newer(g->texpage, k1))
@@ -1397,43 +1455,89 @@ static int rd_poly(void *self, const u32 *c)
         }
         l = fl_draw(l, vp, quad ? GU_TRIANGLE_STRIP : GU_TRIANGLE_FAN, n);
         fl.ring_off += (u32)n * vsz;
-    } else {
-        /* the core's triangles (a quad's are 0,1,2 and 1,2,3), each cut to a fan */
-        ge.s.clipped++;
-        for (int t = 0; t + 2 < n; t++) {
-            int i0 = t, i1 = t + 1, i2 = t + 2;
-            if ((x[i1] - x[i0]) * (y[i2] - y[i0]) == (x[i2] - x[i0]) * (y[i1] - y[i0]))
-                continue;
-            ClipVtx a[8], b[8], *in = a, *out = b, *s;
-            for (int j = 0; j < 3; j++) {
-                int i = t + j;
-                a[j] = (ClipVtx){(float)x[i], (float)y[i], (float)(col[i] & 0xFF), (float)(col[i] >> 8 & 0xFF),
-                                 (float)(col[i] >> 16 & 0xFF), (float)(uv[i] & 0xFF), (float)(uv[i] >> 8 & 0xFF)};
-            }
-            int m = 3;
-            if (minx < 0)
-                m = clip_axis(in, m, out, 0), s = in, in = out, out = s;
-            if (miny < 0 && m >= 3)
-                m = clip_axis(in, m, out, 1), s = in, in = out, out = s;
-            if (m < 3)
-                continue;
-            if (tex) {
-                TexVtx *o = (TexVtx *)vp;
-                for (int i = 0; i < m; i++)
-                    o[i] = (TexVtx){in[i].u + 0.5f, in[i].v + 0.5f, abgr(col8(in[i].r), col8(in[i].g), col8(in[i].b)),
-                                    in[i].x + 0.5f, in[i].y + 0.5f, 0};
-            } else {
-                GeVtx *o = (GeVtx *)vp;
-                for (int i = 0; i < m; i++)
-                    o[i] = (GeVtx){abgr(col8(in[i].r), col8(in[i].g), col8(in[i].b)), in[i].x + 0.5f, in[i].y + 0.5f, 0};
-            }
-            l = fl_draw(l, vp, GU_TRIANGLE_FAN, m);
-            vp += (u32)m * vsz, fl.ring_off += (u32)m * vsz;
-        }
-    }
+    } else
+        l = poly_cut(l, vp, x, y, col, uv, n, tex, minx, miny, vsz);
     gu_list->current = l;
     ge_kick();
     return DONE;
+}
+
+/* GpuRenderer.packet: the polygon commands at the front of a DMA packet, each as the core's
+ * execute() and draw_polygon() run it (counts, texpage), through rd_poly or, when it turns one
+ * away, gpu_poly_soft. One in 64 is timed for the core's profile. */
+static u32 rd_packet(void *self, const u32 *w, u32 n)
+{
+    (void)self;
+    static u32 t64;
+    Psx *psx = ge.psx;
+    Gpu *g = &psx->gpu;
+    u32 k = 0;
+    while (k < n) {
+        const u32 *c = w + k;
+        u32 cmd = c[0] >> 24;
+        if ((cmd & 0xE0) != 0x20)
+            break;
+        u32 quad = cmd >> 3 & 1, tex = cmd >> 2 & 1, gour = cmd >> 4 & 1, nv = quad ? 4 : 3;
+        u32 need = 1 + nv * (1 + tex) + (gour ? nv - 1 : 0);
+        if (need > n - k)
+            break;
+        g->n_kind[0]++;
+        gpu_writes++;
+        u32 t = t64++ % 64 ? 0 : sceKernelGetSystemTimeLow();
+        if (tex)
+            gpu_set_texpage(g, (g->texpage & ~0x1FFu) | (c[gour ? 5 : 4] >> 16 & 0x1FF));
+        int r = rd_poly(NULL, c);
+        if (r != GPU_DRAWN)
+            gpu_poly_soft(psx, c, r);
+        if (t) {
+            t = (sceKernelGetSystemTimeLow() - t) * 64 - prof_bias * 4;
+            g->us_draw += t, g->us_kind[0] += t;
+            if (r != GPU_DRAWN)
+                gpu_slow_us += t;
+        }
+        k += need;
+    }
+    return k;
+}
+
+/* rd_poly's polygon left of or above the VRAM origin: the core's triangles (a quad's are 0,1,2 and
+ * 1,2,3), each cut to a fan. Out of line, away from the lane's own code. Returns the list's next word. */
+static __attribute__((noinline, cold)) unsigned int *poly_cut(unsigned int *l, u8 *vp, const s32 *x, const s32 *y,
+                                                             const u32 *col, const u32 *uv, int n, int tex, s32 minx,
+                                                             s32 miny, u32 vsz)
+{
+    ge.s.clipped++;
+    for (int t = 0; t + 2 < n; t++) {
+        int i0 = t, i1 = t + 1, i2 = t + 2;
+        if ((x[i1] - x[i0]) * (y[i2] - y[i0]) == (x[i2] - x[i0]) * (y[i1] - y[i0]))
+            continue;
+        ClipVtx a[8], b[8], *in = a, *out = b, *s;
+        for (int j = 0; j < 3; j++) {
+            int i = t + j;
+            a[j] = (ClipVtx){(float)x[i], (float)y[i], (float)(col[i] & 0xFF), (float)(col[i] >> 8 & 0xFF),
+                             (float)(col[i] >> 16 & 0xFF), (float)(uv[i] & 0xFF), (float)(uv[i] >> 8 & 0xFF)};
+        }
+        int m = 3;
+        if (minx < 0)
+            m = clip_axis(in, m, out, 0), s = in, in = out, out = s;
+        if (miny < 0 && m >= 3)
+            m = clip_axis(in, m, out, 1), s = in, in = out, out = s;
+        if (m < 3)
+            continue;
+        if (tex) {
+            TexVtx *o = (TexVtx *)vp;
+            for (int i = 0; i < m; i++)
+                o[i] = (TexVtx){in[i].u + 0.5f, in[i].v + 0.5f, abgr(col8(in[i].r), col8(in[i].g), col8(in[i].b)),
+                                in[i].x + 0.5f, in[i].y + 0.5f, 0};
+        } else {
+            GeVtx *o = (GeVtx *)vp;
+            for (int i = 0; i < m; i++)
+                o[i] = (GeVtx){abgr(col8(in[i].r), col8(in[i].g), col8(in[i].b)), in[i].x + 0.5f, in[i].y + 0.5f, 0};
+        }
+        l = fl_draw(l, vp, GU_TRIANGLE_FAN, m);
+        vp += (u32)m * vsz, fl.ring_off += (u32)m * vsz;
+    }
+    return l;
 }
 
 /* ---- setup and log ---- */
@@ -1572,7 +1676,8 @@ void ge_init(Psx *psx, int compare)
     for (int i = 0; i < 1 << FL_BITS; i++)
         fl_cache[i].k0 = ~0u; /* no key */
     sceKernelDcacheWritebackInvalidateRange(fl_arena, sizeof fl_arena); /* written uncached from now on */
-    ge.r = (GpuRenderer){&ge, rd_triangle, rd_quad, rd_rect, rd_line, rd_fill, rd_copy, rd_read, rd_wrote, fl.ring ? rd_poly : NULL};
+    ge.r = (GpuRenderer){&ge, rd_triangle, rd_quad, rd_rect, rd_line, rd_fill, rd_copy, rd_read, rd_wrote, fl.ring ? rd_poly : NULL,
+                         fl.ring ? rd_packet : NULL};
     ge.syncs = 1; /* no slot (used 0) is in the list */
     psx_log(psx, "ge: %d texture page slots, %u KB vertex ring", ge.npages, (unsigned)(fl.ring_bytes / 1024));
     rd_fill(&ge, 0, 0, VRAM_W, VRAM_H, 0); /* also makes the oracle create the framebuffer */
@@ -1637,7 +1742,7 @@ int ge_log(char *buf, int cap)
     int n = clampn(snprintf(buf, (size_t)cap,
                             "-- ge: tri %u+%u tex, rect %u+%u tex, fill %u, line %u (%u runs); sw tex15 %u texwin %u "
                             "copy %u+%u sw+%u null (%u kpx, %u from ge); pages %u cluts %u+%u in list, readback %u (%u tiles, %u ms), upload %u "
-                            "(%u kpx, %u ms), flush %u; bind %u tex %u clut, kick %u (%u ms), rd check %u; fast %u (%u setups %u ms, %u cached), slow tex %u big %u, flat %u, clipped %u; ring %s (wb %u ms), step %u\n",
+                            "(%u kpx, %u ms), flush %u; bind %u tex %u clut, kick %u (%u ms), rd check %u; fast %u (%u setups %u ms, %u cached, mru %u), slow tex %u big %u, flat %u, clipped %u; ring %s (wb %u ms), step %u\n",
                             (unsigned)s->tris, (unsigned)s->ttris, (unsigned)s->rects, (unsigned)s->trects,
                             (unsigned)s->fills, (unsigned)s->lines, (unsigned)s->line_runs, (unsigned)s->sw_tex15,
                             (unsigned)s->sw_texwin,
@@ -1645,7 +1750,7 @@ int ge_log(char *buf, int cap)
                             (unsigned)s->pages, (unsigned)s->cluts, (unsigned)s->clut_tmp, (unsigned)s->readbacks, (unsigned)s->read_tiles,
                             (unsigned)(s->read_us / 1000), (unsigned)s->uploads, (unsigned)(s->upload_px / 1000),
                             (unsigned)(s->upload_us / 1000), (unsigned)s->flushes, (unsigned)s->bind_tex, (unsigned)s->bind_clut, (unsigned)s->kicks, (unsigned)(kick_us / 1000),
-                            (unsigned)s->rd_checks, (unsigned)s->fast, (unsigned)s->fast_setups, (unsigned)((s32)s->setup_us < 0 ? 0 : s->setup_us / 1000), (unsigned)s->fast_hits, (unsigned)s->slow_tex, (unsigned)s->slow_big, (unsigned)s->flat, (unsigned)s->clipped,
+                            (unsigned)s->rd_checks, (unsigned)s->fast, (unsigned)s->fast_setups, (unsigned)((s32)s->setup_us < 0 ? 0 : s->setup_us / 1000), (unsigned)s->fast_hits, (unsigned)s->mru_hits, (unsigned)s->slow_tex, (unsigned)s->slow_big, (unsigned)s->flat, (unsigned)s->clipped,
                             fl.cached ? "cached" : "uncached", (unsigned)(s->ring_wb_us / 1000), (unsigned)stall_step),
                    cap);
     memset(&ge.s, 0, sizeof ge.s);

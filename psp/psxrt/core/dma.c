@@ -85,11 +85,17 @@ static void transfer(Psx *psx, int ch)
     int from_ram = c->chcr & 1;
     u32 step = (c->chcr & 2) ? (u32)-4 : 4u;
     if (sync == 2) { /* linked list (GPU) */
+        const GpuRenderer *r = psx->gpu.renderer;
+        u32 (*packet)(void *, const u32 *, u32) = r ? r->packet : NULL;
         for (int guard = 0; guard < 0x40000; guard++) {
             u32 h = rd(psx, addr), n = h >> 24;
-            if (addr + 4 * (n + 1) <= RAM_SIZE)
-                gpu_gp0_packet(psx, (const u32 *)(psx->ram + addr + 4), n);
-            else
+            if (!n) { /* an empty ordering table entry */
+            } else if (addr + 4 * (n + 1) <= RAM_SIZE) {
+                const u32 *w = (const u32 *)(psx->ram + addr + 4);
+                u32 k = packet && !psx->gpu.ncmd && psx->gpu.xfer != 1 ? packet(r->self, w, n) : 0;
+                if (k < n)
+                    gpu_gp0_packet(psx, w + k, n - k);
+            } else
                 for (u32 i = 1; i <= n; i++)
                     gpu_gp0(psx, rd(psx, addr + 4 * i));
             words += n + 1;
