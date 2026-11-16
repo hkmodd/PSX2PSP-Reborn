@@ -22,6 +22,7 @@ typedef struct Sim {
     u8 spu_ram[512 * 1024];
     u32 mdec_in[MDEC_CAP];
     u32 frames;
+    u8 card[CARD_SIZE];
 } Sim;
 
 static void log_line(void *user, const char *line)
@@ -74,6 +75,18 @@ Sim *sim_new(void *user, ReadFn rd, u32 disc_end, TextFn tty, TextFn log)
     const char *audio_path = getenv("PSX2PSP_SIM_AUDIO");
     if (audio_path && !audio_file && (audio_file = fopen(audio_path, "wb")) != NULL)
         s->host.audio = audio;
+    /* PSX2PSP_SIM_CARD=<file>: a card in slot 1, read from the file (formatted when it is not a
+     * 128 KB image); the simulator never writes it back. */
+    const char *card_path = getenv("PSX2PSP_SIM_CARD");
+    if (card_path) {
+        FILE *cf = fopen(card_path, "rb");
+        size_t n = cf ? fread(s->card, 1, CARD_SIZE, cf) : 0;
+        if (cf)
+            fclose(cf);
+        if (n != CARD_SIZE)
+            card_format(s->card);
+        s->host.card[0] = s->card;
+    }
     psx_init(&s->psx, &s->host, s->ram, s->scratch, s->vram, s->spu_ram, s->mdec_in, MDEC_CAP);
     return s;
 }

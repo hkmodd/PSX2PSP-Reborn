@@ -298,6 +298,10 @@ int card_call(Psx *psx, u32 vector, u32 fn)
         memcpy(psx->bios.dirent_pattern, name, len < max ? len : max);
         psx->bios.dirent_pattern[len < max ? len : max] = 0;
         G[R_V0] = slot < 0 ? 0 : next_match(psx, a1);
+        /* the BIOS reads the directory from the card here: games that get 0 wait for this event
+         * to tell "no file" (IOE) from no card (TIMEOUT) */
+        if (slot >= 0)
+            bios_event(psx, HW_CARD, image(psx, (u32)slot) ? SP_IOE : SP_TIMEOUT);
         psx_log(psx, "card firstfile %s: %s", path, G[R_V0] ? "found" : "none");
         return 1;
     }
