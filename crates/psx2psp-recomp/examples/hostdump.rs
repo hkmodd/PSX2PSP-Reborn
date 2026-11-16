@@ -11,7 +11,8 @@ fn main() {
     let exe = PsxExe::parse(&std::fs::read(&a[1]).expect("read EXE")).expect("PS-X EXE");
     let (start, end) = (hex(&a[2]), hex(&a[3]));
     let d = Discovery::run(&exe);
-    let base = 0x0900_0000;
+    // BASE=<hex>: the host address the image has in the EBOOT (the runtime log's "code at").
+    let base = std::env::var("BASE").map_or(0x0900_0000, |b| hex(&b));
     let t = translate(&exe, &d, &Hazards::check(&exe, &d), base).expect("translate");
     let word = |h: u32| t.words[((h - base) / 4) as usize];
     let guest = |pc: u32| {
@@ -25,7 +26,7 @@ fn main() {
         let next = pcs.get(i + 1).map(|p| t.map[p]).unwrap_or(h + 4);
         let n = if next > h { (next - h) / 4 } else { 1 };
         let ws: Vec<String> = (0..n.min(24)).map(|k| format!("{:08X}", word(h + 4 * k))).collect();
-        println!("{pc:08X} {:08X} -> {:2} {}", guest(pc), n, ws.join(" "));
+        println!("{pc:08X} {:08X} -> {h:08X} {:2} {}", guest(pc), n, ws.join(" "));
         gn += 1;
         hn += n;
     }

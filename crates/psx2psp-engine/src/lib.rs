@@ -897,18 +897,40 @@ pub fn disc_executables(img: &DiscImage, patches: &[&dyn ImagePatch]) -> Vec<(St
 }
 
 /// The files of the disc that could be overlays (S24): not a PS-X EXE, and from 0x800 to
-/// [`native_code::OVERLAY_MAX`] bytes. Which of them are code, and where, is
+/// [`native_code::OVERLAY_MAX`] bytes; and the entries of that size of an archive of any size
+/// ([`overlay::archive_entries`]), named `FILE+offset`. Which of them are code, and where, is
 /// [`native_code::build`]'s to find.
 pub fn disc_overlay_files(img: &DiscImage, patches: &[&dyn ImagePatch]) -> Vec<(String, Vec<u8>)> {
+    use psx2psp_recomp::overlay;
+    const HEAD: u32 = 0x1_0000;
     let Ok(files) = img.iso_files() else { return Vec::new() };
+    let fits = |n: u32| (0x800..=native_code::OVERLAY_MAX).contains(&n);
     let mut rd = img.reader();
     let mut out = Vec::new();
-    for f in files.iter().filter(|f| (0x800..=native_code::OVERLAY_MAX).contains(&f.size)) {
+    for f in files.iter().filter(|f| f.size >= 0x800) {
         if img.read_file(&mut rd, f, 8).is_ok_and(|h| h == b"PS-X EXE") {
             continue;
         }
-        if let Ok(bytes) = read_patched_file(img, &mut rd, f, patches) {
-            out.push((f.path.rsplit('/').next().unwrap_or(&f.path).to_string(), bytes));
+        let name = f.path.rsplit('/').next().unwrap_or(&f.path).to_string();
+        let whole = if fits(f.size) { read_patched_range(img, &mut rd, f, 0, f.size, patches).ok() } else { None };
+        let head = match &whole {
+            Some(b) => b[..b.len().min(HEAD as usize)].to_vec(),
+            None => read_patched_range(img, &mut rd, f, 0, f.size.min(HEAD), patches).unwrap_or_default(),
+        };
+        for (o, s) in overlay::archive_entries(&head, u64::from(f.size)) {
+            if !fits(s) {
+                continue;
+            }
+            let bytes = match &whole {
+                Some(b) => Ok(b[o as usize..(o + s) as usize].to_vec()),
+                None => read_patched_range(img, &mut rd, f, o, s, patches),
+            };
+            if let Ok(bytes) = bytes {
+                out.push((format!("{name}+{o:X}"), bytes));
+            }
+        }
+        if let Some(bytes) = whole {
+            out.push((name, bytes));
         }
     }
     out
@@ -916,17 +938,24 @@ pub fn disc_overlay_files(img: &DiscImage, patches: &[&dyn ImagePatch]) -> Vec<(
 
 /// An ISO9660 file of Mode 1 or Mode 2 Form 1 sectors, with `patches` applied to each sector.
 fn read_patched_file(img: &DiscImage, rd: &mut psx2psp_core::disc::DiscReader, f: &psx2psp_core::IsoFile, patches: &[&dyn ImagePatch]) -> psx2psp_core::Result<Vec<u8>> {
-    let len = f.size as usize;
-    let mut out = Vec::with_capacity(len.next_multiple_of(2048));
+    read_patched_range(img, rd, f, 0, f.size, patches)
+}
+
+/// `len` bytes from `at` of an ISO9660 file of Mode 1 or Mode 2 Form 1 sectors, with `patches`
+/// applied to each sector.
+fn read_patched_range(img: &DiscImage, rd: &mut psx2psp_core::disc::DiscReader, f: &psx2psp_core::IsoFile, at: u32, len: u32, patches: &[&dyn ImagePatch]) -> psx2psp_core::Result<Vec<u8>> {
+    let (first, skip) = (at / 2048, (at % 2048) as usize);
+    let mut out = Vec::with_capacity((skip + len as usize).next_multiple_of(2048));
     let mut s = [0u8; SECTOR];
-    for i in 0..len.div_ceil(2048) as u32 {
+    for i in first..(at + len).div_ceil(2048) {
         let lba = f.lba.saturating_add(i);
         img.read_sector(rd, lba, &mut s)?;
         patches.iter().for_each(|p| p.apply(u64::from(lba) * SECTOR as u64, &mut s));
-        let at = if s[15] == 1 { 16 } else { 24 };
-        out.extend_from_slice(&s[at..at + 2048]);
+        let d = if s[15] == 1 { 16 } else { 24 };
+        out.extend_from_slice(&s[d..d + 2048]);
     }
-    out.truncate(len);
+    out.drain(..skip);
+    out.truncate(len as usize);
     Ok(out)
 }
 

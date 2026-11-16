@@ -107,6 +107,33 @@ pub fn locate_all(files: &[&[u8]]) -> Vec<Option<(u32, u32)>> {
         .collect()
 }
 
+/// The entries (offset, size) of an archive of `len` bytes whose `head` is a table of contents:
+/// little-endian (offset, size) pairs up to the first offset, each entry starting where the one
+/// before ends or at the next 2 KB sector. Games pack their level overlays so (Spyro 2's WAD.WAD:
+/// 196 entries, the level code among them), and an overlay is then an entry, not a file. Empty
+/// unless the table holds at least two entries; it ends at the first pair that breaks the rule.
+pub fn archive_entries(head: &[u8], len: u64) -> Vec<(u32, u32)> {
+    let pair = |i: usize| head.get(i..i + 8).map(|p| (u32::from_le_bytes(p[..4].try_into().unwrap()), u32::from_le_bytes(p[4..].try_into().unwrap())));
+    let Some((first, _)) = pair(0) else { return Vec::new() };
+    if first < 16 || first & 3 != 0 {
+        return Vec::new();
+    }
+    let mut out: Vec<(u32, u32)> = Vec::new();
+    let mut i = 0;
+    while let Some((o, s)) = pair(i).filter(|_| i < first as usize) {
+        let after = out.last().map_or(first as u64, |&(po, ps)| po as u64 + ps as u64);
+        if s == 0 || (o as u64) < after || o as u64 - after >= 0x800 || o as u64 + s as u64 > len {
+            break;
+        }
+        out.push((o, s));
+        i += 8;
+    }
+    if out.len() < 2 {
+        out.clear();
+    }
+    out
+}
+
 /// The overlay `bytes` as an executable at `base` for discovery and translation: its entry is
 /// its first prologue (discovery also starts from every other prologue and every pointer to its
 /// text, so the choice only names one function).
@@ -144,5 +171,21 @@ mod tests {
         assert_eq!(at[1], Some((B, 2)));
         // Without a slot fixed by another file the small one stays unplaced.
         assert_eq!(locate_all(&[&small]), vec![None]);
+    }
+
+    #[test]
+    fn an_archive_table_of_contents_lists_its_entries() {
+        let toc = |pairs: &[(u32, u32)]| -> Vec<u8> { pairs.iter().flat_map(|&(o, s)| [o.to_le_bytes(), s.to_le_bytes()].concat()).collect() };
+        // Spyro 2's WAD.WAD head: entries back to back from the end of a 2 KB table.
+        let wad = [(0x800, 0x20000), (0x20800, 0x13000), (0x33800, 0x6E800)];
+        assert_eq!(archive_entries(&toc(&wad), 0xA2000), wad.to_vec());
+        // Sector padding between entries is allowed; the table stops at the first odd pair.
+        let padded = [(0x18, 0x100), (0x800, 0x10), (0x1000, 4), (0, 0), (0x1000, 4)];
+        assert_eq!(archive_entries(&toc(&padded), 0x2000), padded[..3].to_vec());
+        // An entry past the end of the file, a single entry, or a head that is not a table.
+        assert!(archive_entries(&toc(&wad), 0xA1FFF).len() == 2);
+        assert!(archive_entries(&toc(&wad[..1]), 0xA2000).is_empty());
+        assert!(archive_entries(b"PS-X EXE\0\0\0\0\0\0\0\0", 0x10000).is_empty());
+        assert!(archive_entries(&toc(&[(0x800, 0x100), (0x2000, 0x100)]), 0x10000).is_empty());
     }
 }
