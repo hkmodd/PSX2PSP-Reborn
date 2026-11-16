@@ -5,9 +5,10 @@
  * gp, ra and HI/LO. For that to hold nothing here calls other code, nor anything that becomes
  * a library call (no 64-bit division).
  *
- * Served: aligned reads of I_STAT, I_MASK and the root counters' count, mode and target, for a
- * counter on the system clock, timer 2's eighth of it or timer 1's hblanks and not stopped, when
- * no device event is due, no interrupt is pending and the read raises none. What they return and
+ * Served: aligned reads of the pad port (SIO0, core/sio.c), I_STAT, I_MASK and the root
+ * counters' count, mode and target, for a counter on the system clock, timer 2's eighth of it or
+ * timer 1's hblanks and not stopped, when no device event is due, no interrupt is pending and the
+ * read raises none. What they return and
  * leave behind is what psx_read's would (native_init checks it on random counters, both video
  * modes). Anything else, and a counter read at which native.c poll_skip lets PS1 time pass (a
  * polling loop), goes on as a host call.
@@ -59,11 +60,29 @@ static int tmr_sync(Psx *psx, int i)
     return 0;
 }
 
-/* The word psx_read gives for the device register at physical `p` (word aligned) and what the
+/* The word psx_read gives for the device register at physical `p` (word aligned, halfword on
+ * the pad port) and what the
  * read leaves behind, before the size's mask; nonzero (tmr_sync's codes), with nothing changed,
  * if not served. */
 int io_fast_dev(Psx *psx, u32 p, u32 *v)
 {
+    u32 s = p - 0x1F801040;
+    if (s < 0x20) { /* core/sio.c sio_read */
+        Sio *o = &psx->sio;
+        switch (s) {
+        case 0x00:
+            *v = o->rx_full ? o->rx : 0xFFu;
+            o->rx_full = 0;
+            break;
+        case 0x04: *v = 0x5u | (u32)o->rx_full << 1 | (o->stat & 0x200u); break;
+        case 0x08: *v = o->mode; break;
+        case 0x0A: *v = o->ctrl; break;
+        case 0x0E: *v = o->baud; break;
+        case 0x14: *v = 0x5; break;
+        default: *v = 0;
+        }
+        return 0;
+    }
     if (p == 0x1F801070 || p == 0x1F801074) {
         *v = p == 0x1F801070 ? psx->i_stat : psx->i_mask;
         return 0;
@@ -102,7 +121,10 @@ u32 native_io_read(u32 a)
     volatile u32 *ctx = CTX;
     const u32 *site = (const u32 *)ctx[C_SITE];
     u32 insn = site[1], op = insn >> 26, p = a & 0x1FFFFFFFu, b = ctx[C_BUDGET];
-    if ((p & 3) || (p - 0x1F801070 >= 8 && p - 0x1F801100 >= 0x30) || (s32)b < -(s32)(NATIVE_FORCED / 2))
+    u32 size = op == 0x23 ? 4 : (op & 1) ? 2 : 1;
+    int sio = p - 0x1F801040 < 0x20;
+    if ((p & (size - 1)) || (!sio && ((p & 3) || (p - 0x1F801070 >= 8 && p - 0x1F801100 >= 0x30))) ||
+        (s32)b < -(s32)(NATIVE_FORCED / 2))
         return 1;
     psx->cycles += (u32)((s32)NATIVE_BUDGET - (s32)b) >> io_fast_shift;
     ctx[C_BUDGET] = NATIVE_BUDGET;
@@ -134,7 +156,7 @@ u32 native_io_read(u32 a)
     ctx[(insn >> 16) & 31] = v;
     psx->cycles += 2;
     native_stats.calls++;
-    native_stats.n_io[timer ? IO_TIMER : IO_IRQ]++;
+    native_stats.n_io[timer ? IO_TIMER : sio ? IO_PAD : IO_IRQ]++;
     native_stats.io_lean++;
     return 0;
 }

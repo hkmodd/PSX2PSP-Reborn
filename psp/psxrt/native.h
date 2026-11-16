@@ -30,8 +30,9 @@ typedef struct NativeStats {
      * (the next one comes early); waited us */
     u32 vs_wait, vs_late, vs_adv, vs_short, us_vs_wait, us_late, us_late_max;
     u32 updates; /* device updates (psx_update, the stall's included) */
-    u32 io_lean; /* of the host calls, device reads served by io_fast.c (IO_READ) */
-    u32 io_fall[6]; /* timer/IRQ reads io_fast.c left to the host call: event due, IRQ pending, poll, then tmr_sync 1-3 */
+    u32 io_lean; /* of the host calls, device reads served by io_fast.c (IO_READ) and pad/IRQ writes by native_io_write (IO_WRITE) */
+    u32 io_fall[6]; /* timer/IRQ/pad accesses those left to the host call: event due, IRQ pending (or unmasked by the write), poll, then tmr_sync 1-3 */
+    u32 io_host; /* timer/IRQ/pad instructions run as host calls (recipes' own reads not counted) */
 } NativeStats;
 
 extern NativeStats native_stats;

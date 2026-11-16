@@ -453,15 +453,25 @@ fn run_psp(
             h.jump(ret);
             continue;
         }
-        // IO_READ is a host call that leaves every guest register in CTX for the site's reload.
+        // IO_READ is a host call that leaves every guest register in CTX for the site's reload;
+        // IO_WRITE one that finds the stored register in CTX.
         let io = h.pc == layout::IO_READ;
-        if h.pc == RT_CALL || io {
+        let io_w = h.pc == layout::IO_WRITE;
+        if h.pc == RT_CALL || io || io_w {
             let ra = h.gpr[RA as usize];
             let word_at = |a: u32| code.get(((a - CODE) / 4) as usize).copied().unwrap();
             let (pc, word) = (word_at(ra), word_at(ra + 4));
             if io {
                 let a = h.gpr[(word >> 21 & 31) as usize].wrapping_add(word as i16 as u32);
                 assert_eq!(h.gpr[K1G as usize], a, "IO_READ address at {pc:08x}");
+            }
+            if io_w {
+                let a = h.gpr[(word >> 21 & 31) as usize].wrapping_add(word as i16 as u32);
+                assert_eq!(h.gpr[K1G as usize], a, "IO_WRITE address at {pc:08x}");
+                let rt = word >> 16 & 31;
+                if rt != 0 && rt != RA {
+                    assert_eq!(m.ctx(ctx::GPR + 4 * rt), h.gpr[rt as usize], "IO_WRITE value at {pc:08x}");
+                }
             }
             h.gpr[RA as usize] = m.ctx(ctx::GPR + 4 * RA);
             to_guest(&h, m, &mut g);

@@ -9,6 +9,7 @@
 //! | [`GTE`] | 0x100 | GTE registers: 32 data words, then 32 control words ([`gte`]) |
 //! | [`RT_CALL`] | | Runtime entry for host calls (written by the runtime) |
 //! | [`IO_READ`] | | Runtime entry for a device read (written by the runtime) |
+//! | [`IO_WRITE`] | | Runtime entry for a device write (written by the runtime) |
 //! | [`MISS`] | | Runtime entry for a dispatch-table miss (written by the runtime) |
 //! | [`GTE_CMD`] | | Runtime entry for a GTE command (written by the runtime) |
 //! | [`GTE_NCLIP`] .. [`GTE_RTPT`] | | Runtime entries for the commands of [`GTE_OWN`] |
@@ -37,6 +38,13 @@ pub const RT_CALL: u32 = 0x09A0_0F00;
 /// taken first comes back to the first word); either way the loaded value is in [`ctx::GPR`]
 /// and every other guest register as it was when it returns past the two words.
 pub const IO_READ: u32 = 0x09A0_0F08;
+/// Device-write entry, for a plain store (`sb`/`sh`/`sw`; `rs` not `ra`) whose address is neither
+/// RAM nor the scratchpad: `sw rt,GPR(rt)(k0)` (unless `rt` is 0 or `ra`); `sw ra,GPR31(k0); jal
+/// IO_WRITE; addiu k1,rs,off; .word pc; .word insn; j back; nop`. The runtime serves the write
+/// with the guest address in `k1` and the value in [`ctx::GPR`], or runs it as a host call (an
+/// interrupt taken first comes back to the `sw ra`); either way every guest register is as it
+/// was when it returns past the two words.
+pub const IO_WRITE: u32 = 0x09A0_0F10;
 /// Dispatch-miss entry: the guest target is in [`ctx::TARGET`].
 pub const MISS: u32 = 0x09A0_0F40;
 /// GTE command entry: `sw ra,GPR31(k0); lui k1,hi; jal GTE_CMD; ori k1,k1,lo` with the

@@ -156,6 +156,44 @@ psxrt_io_read:
     move $ra, $k1
     .end psxrt_io_read
 
+/* IO_WRITE: `sw rt,GPR(rt)(k0); sw ra,GPR31(k0); jal IO_WRITE; addiu k1,rs,off; .word pc; .word
+ * insn; j back; nop`, the guest address in k1. native_io_write(k1) is ordinary C (native.c), so
+ * every caller-saved register is saved; the stored value is in CTX either way. It returns 0 when
+ * the write is done: on past the two words. Otherwise the site goes on as a host call. */
+    .globl psxrt_io_write
+    .ent psxrt_io_write
+psxrt_io_write:
+    sw $ra, GTE_RET($k0)
+    .irp r,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,24,25,28,29
+    sw $\r, G(\r)($k0)
+    .endr
+    mfhi $at
+    sw $at, HI($k0)
+    mflo $at
+    sw $at, LO($k0)
+    move $a0, $k1
+    TO_HOST
+    jal native_io_write
+    nop
+    lui $k0, %hi(K0_VALUE)
+    ori $k0, $k0, %lo(K0_VALUE)
+    lw $at, HI($k0)
+    mthi $at
+    lw $at, LO($k0)
+    mtlo $at
+    .irp r,1,3,4,5,6,7,8,9,10,11,12,13,14,15,24,25,28,29
+    lw $\r, G(\r)($k0)
+    .endr
+    lw $k1, GTE_RET($k0)
+    bnez $v0, 1f
+    lw $v0, G(2)($k0)
+    addiu $k1, $k1, 8
+    jr $k1
+    lw $ra, G(31)($k0)
+1:  b psxrt_rt_call
+    move $ra, $k1
+    .end psxrt_io_write
+
 /* GTE_CMD when psxrt.trace bit 7 asks for the GTE's time: native_gte_prof is ordinary C, so
  * every caller-saved register is saved. */
     .globl psxrt_gte_prof

@@ -62,6 +62,7 @@
 #define GTE_ADDR 0x09A00500u /* psx->gte: translated code moves to and from it directly */
 #define STUB_RT_CALL 0x09A00F00u
 #define STUB_IO_READ 0x09A00F08u
+#define STUB_IO_WRITE 0x09A00F10u
 #define STUB_MISS 0x09A00F40u
 #define STUB_DIRTY 0x09A00F60u
 #define STUB_CALL_RET 0x09A00F80u
@@ -81,6 +82,7 @@
 #define C_LO (0x84 / 4)
 #define C_TARGET (0x88 / 4)
 #define C_BUDGET (0x90 / 4)
+#define C_SITE (0x94 / 4) /* CTX.GTE_RET: IO_WRITE parks its site there */
 #define BUDGET NATIVE_BUDGET
 #define FORCED NATIVE_FORCED
 #define RESUME 1u
@@ -119,6 +121,7 @@ void native_enter(u32 host_pc);
 void native_gte_fast(u32 cmd);
 /* io_fast.c */
 void psxrt_io_read(void);
+void psxrt_io_write(void);
 extern Psx *io_fast_psx;
 extern u32 io_fast_shift;
 int io_fast_dev(Psx *psx, u32 p, u32 *v);
@@ -1045,6 +1048,7 @@ static int io_fast(u32 pc, u32 insn, u32 back, u32 *next)
     }
     native_stats.calls++;
     native_stats.n_io[kind]++;
+    native_stats.io_host += kind == IO_TIMER || kind == IO_IRQ || kind == IO_PAD;
     *next = back;
     if (psx_irq_pending(P)) {
         Cpu *c = &P->cpu;
@@ -1054,6 +1058,38 @@ static int io_fast(u32 pc, u32 insn, u32 back, u32 *next)
         *next = to_ctx(c, run_guest(0));
     }
     return 1;
+}
+
+/* IO_WRITE (psxrt_io_write) with the guest address `a`: an aligned store to the pad port, I_STAT
+ * or I_MASK runs here as io_fast() runs it, the value from CTX, without the host-call path (no
+ * CPU state copy, no clock read). None of these raises an interrupt but an I_MASK write that
+ * unmasks a pending one: that write is undone and, like any write when a device event is due or
+ * an interrupt pending, goes on as a host call (nonzero). */
+u32 native_io_write(u32 a)
+{
+    const u32 *site = (const u32 *)ctx[C_SITE];
+    u32 insn = site[1], op = insn >> 26, rt = (insn >> 16) & 31, p = a & 0x1FFFFFFFu;
+    u32 size = op == 0x2B ? 4 : op == 0x29 ? 2 : 1;
+    int sio = p - 0x1F801040 < 0x20;
+    if ((a & (size - 1)) || (!sio && p - 0x1F801070 >= 8) || (s32)ctx[C_BUDGET] < -(s32)(FORCED / 2))
+        return 1;
+    charge();
+    if (P->cycles >= P->next_event || psx_irq_pending(P)) {
+        native_stats.io_fall[P->cycles >= P->next_event ? 0 : 1]++;
+        return 1;
+    }
+    u32 mask = P->i_mask;
+    psx_write(P, a, rt ? ctx[rt] : 0, (int)size);
+    if (psx_irq_pending(P)) {
+        P->i_mask = mask;
+        native_stats.io_fall[1]++;
+        return 1;
+    }
+    P->cycles += 2;
+    native_stats.calls++;
+    native_stats.n_io[sio ? IO_PAD : IO_IRQ]++;
+    native_stats.io_lean++;
+    return 0;
 }
 
 /* ---- entries from trampolines.S ---- */
@@ -1410,6 +1446,7 @@ static u32 rt_call(const u32 *site)
         native_stats.us_io_kind[kind] += t;
     }
     native_stats.n_io[kind]++;
+    native_stats.io_host += kind == IO_TIMER || kind == IO_IRQ || kind == IO_PAD;
     finish_load(c);
     if (c->pc == pc + 4 && !c->in_delay)
         jump(c, back);
@@ -1571,8 +1608,10 @@ static void gte_stubs(int asm_ok)
 static int io_fast_check(Psx *psx, int n, int *served)
 {
     static const u32 regs[] = {0x1F801070, 0x1F801074, 0x1F801100, 0x1F801104, 0x1F801108, 0x1F80110C,
-                               0x1F801110, 0x1F801114, 0x1F801118, 0x1F801120, 0x1F801124, 0x1F801128};
+                               0x1F801110, 0x1F801114, 0x1F801118, 0x1F801120, 0x1F801124, 0x1F801128,
+                               0x1F801040, 0x1F801044, 0x1F801048, 0x1F80104A, 0x1F80104E, 0x1F801054, 0x1F801042};
     Timers keep = psx->tmr;
+    Sio sio = psx->sio;
     u64 cycles = psx->cycles;
     u32 stat = psx->i_stat, mask = psx->i_mask, gpustat = psx->gpu.stat;
     int bad = 0;
@@ -1594,14 +1633,18 @@ static int io_fast_check(Psx *psx, int n, int *served)
         u32 is = rnd() & 0x7FF, im = rnd() & 0x7FF, a = regs[rnd() % (sizeof regs / 4)], v, want;
         psx->tmr = in, psx->cycles = now, psx->i_stat = is, psx->i_mask = im;
         psx->gpu.stat = (gpustat & ~(1u << 20)) | (rnd() & 1) << 20; /* PAL or NTSC hblanks */
+        Sio *o = &psx->sio;
+        o->rx = (u8)rnd(), o->rx_full = (int)(rnd() & 1), o->stat = (u16)rnd16(), o->mode = (u16)rnd16(), o->ctrl = (u16)rnd16(), o->baud = (u16)rnd16();
+        Sio sin = *o;
         if (io_fast_dev(psx, a, &v))
             continue;
         ++*served;
         Timers got = psx->tmr;
         u32 got_stat = psx->i_stat;
-        psx->tmr = in, psx->i_stat = is;
+        int got_full = o->rx_full;
+        psx->tmr = in, psx->i_stat = is, *o = sin;
         want = psx_read(psx, a, 4);
-        int differ = v != want || got_stat != psx->i_stat;
+        int differ = v != want || got_stat != psx->i_stat || got_full != o->rx_full;
         for (int i = 0; i < 3; i++) {
             const Timer *x = &got.t[i], *y = &psx->tmr.t[i];
             differ |= x->count != y->count || x->mode != y->mode || x->target != y->target || x->base != y->base;
@@ -1610,6 +1653,7 @@ static int io_fast_check(Psx *psx, int n, int *served)
             say("native: device read %08X in io_fast: %08X, want %08X", (unsigned)a, (unsigned)v, (unsigned)want);
     }
     psx->tmr = keep, psx->cycles = cycles, psx->i_stat = stat, psx->i_mask = mask, psx->gpu.stat = gpustat;
+    psx->sio = sio;
     return bad;
 }
 
@@ -1661,7 +1705,8 @@ const char *native_init(Psx *psx, const DiscInfo *info)
     int served;
     bad = io_fast_check(psx, 65536, &served);
     stub(STUB_IO_READ, bad ? psxrt_rt_call : psxrt_io_read);
-    say("native: timer/IRQ reads in io_fast, %d of %d served checks differ%s", bad, served, bad ? ": through the runtime" : "");
+    stub(STUB_IO_WRITE, psxrt_io_write);
+    say("native: timer/IRQ/pad reads in io_fast, %d of %d served checks differ%s", bad, served, bad ? ": through the runtime" : "");
     flush_code();
     __asm__ volatile("move %0, $gp" : "=r"(native_host_gp));
     psx->call = native_call;

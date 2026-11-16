@@ -890,7 +890,8 @@ impl Em<'_> {
 
     /// `op` (base `k1`, offset 0) on the host address of the guest address of the load or store
     /// `i`, then `then`. RAM and the scratchpad are reached directly; anything else runs `i` in
-    /// the runtime after `undo` (a plain load through [`layout::IO_READ`]).
+    /// the runtime after `undo` (a plain load through [`layout::IO_READ`], a plain store through
+    /// [`layout::IO_WRITE`]).
     fn access(&mut self, pc: u32, i: Insn, op: u32, then: &[u32], undo: &[u32]) -> Code {
         let (rs, off) = (i.rs() as u32, i.imm() as u16);
         let (slow, io, back) = (self.label(), self.label(), self.label());
@@ -930,6 +931,23 @@ impl Em<'_> {
             s.push(i.0);
             s.jump(2, To::Label(back), pc);
             s.push(lw(rt, k0_off(layout::CTX + ctx::GPR + 4 * rt), K0R));
+            self.stub(s);
+            return c;
+        }
+        // A plain store goes to IO_WRITE with its value in CTX (the runtime keeps only the
+        // caller-saved registers there); the site's sw ra is where an interrupt comes back to.
+        let store = matches!(i.0 >> 26, 0x28 | 0x29 | 0x2B);
+        if store && then.is_empty() && undo.is_empty() && rs != RA {
+            if rt != 0 && rt != RA {
+                s.push(sw(rt, k0_off(layout::CTX + ctx::GPR + 4 * rt), K0R));
+            }
+            s.push(sw(RA, k0_off(layout::CTX + ctx::GPR + 4 * RA), K0R));
+            s.push(jal(layout::IO_WRITE));
+            s.push(addiu(K1R, rs, off));
+            s.push(pc);
+            s.push(i.0);
+            s.jump(2, To::Label(back), pc);
+            s.push(NOP);
             self.stub(s);
             return c;
         }
