@@ -33,6 +33,7 @@ typedef struct NativeStats {
     u32 io_lean; /* of the host calls, device reads served by io_fast.c (IO_READ) and pad/IRQ writes by native_io_write (IO_WRITE) */
     u32 io_fall[6]; /* timer/IRQ/pad accesses those left to the host call: event due, IRQ pending (or unmasked by the write), poll, then tmr_sync 1-3 */
     u32 io_host; /* timer/IRQ/pad instructions run as host calls (recipes' own reads not counted) */
+    u32 vsync_passes; /* v_wait passes counted down at once by hook_vsync_wait (not run as guest code) */
 } NativeStats;
 
 extern NativeStats native_stats;

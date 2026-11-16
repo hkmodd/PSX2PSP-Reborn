@@ -1112,7 +1112,7 @@ static u32 leave(Cpu *c, u32 host)
 /* ---- recipes (crates/psx2psp-recomp/src/hooks.rs) ---- */
 
 #define HOOK 2u
-enum { HOOK_PAD_CHK_RC2_WAIT = 1, HOOK_PAD_SIO_ACK_WAIT = 2, HOOK_DEC_DCT_VLC = 3 };
+enum { HOOK_PAD_CHK_RC2_WAIT = 1, HOOK_PAD_SIO_ACK_WAIT = 2, HOOK_DEC_DCT_VLC = 3, HOOK_VSYNC_WAIT = 4 };
 #define T2_COUNT 0x1F801120u
 #define T2_MODE 0x1F801124u
 #define T2_TARGET 0x1F801128u
@@ -1256,6 +1256,41 @@ static u32 hook_dct_vlc(Cpu *c, const u32 *arg, u32 pc)
     return next;
 }
 
+/* The loop of libetc's `v_wait(count, timeout)` (hooks.rs VSYNC_WAIT), from its head `pc`: a pass
+ * counts the timeout down at 16(sp) and stops on -1 (v1) or when Vcount (arg 0) reaches a0, the
+ * PS1 cycles of the translated pass (arg 1) charged. Vcount moves only in the vblank interrupt, so
+ * between device events the passes that fit are counted down at once, never the one that times
+ * out: the same writes, v0 and PS1 time as the loop's, without the host spinning through them.
+ * Returns the exit (head + 0x60), the timeout path (head + 0x20), or `pc` to take an interrupt. */
+static u32 hook_vsync_wait(Cpu *c, const u32 *arg, u32 pc)
+{
+    u32 *g = c->gpr, at = g[29] + 16, pass = arg[1];
+    for (;;) {
+        u32 n = psx_read(P, at, 4) - 1;
+        psx_write(P, at, n, 4);
+        g[2] = n;
+        if (n == g[3])
+            return pc + 0x20;
+        g[2] = (s32)psx_read(P, arg[0], 4) < (s32)g[4];
+        P->cycles += pass;
+        if (!g[2])
+            return pc + 0x60;
+        u64 room = P->next_event > P->cycles ? (P->next_event - P->cycles) / pass : 0;
+        u32 left = n - g[3] - 1; /* passes on before the one that times out */
+        if (room > left)
+            room = left;
+        if (room) {
+            psx_write(P, at, n - (u32)room, 4);
+            P->cycles += room * pass;
+            native_stats.vsync_passes += (u32)room;
+        }
+        if (P->cycles >= P->next_event)
+            update();
+        if (psx_irq_pending(P))
+            return pc;
+    }
+}
+
 /* A hook's host call: the recipe runs, then the guest goes on where it says (a guest address or a
  * host one), through the table. An unknown id runs the guest code instead. */
 static u32 hook(const u32 *site, u32 pc)
@@ -1276,6 +1311,7 @@ static u32 hook(const u32 *site, u32 pc)
         switch (site[1]) {
         case HOOK_PAD_CHK_RC2_WAIT: next = hook_pad_chk(c, site + 2); break;
         case HOOK_PAD_SIO_ACK_WAIT: next = hook_pad_ack(c, site + 2, pc); break;
+        case HOOK_VSYNC_WAIT: next = hook_vsync_wait(c, site + 2, pc); break;
         case HOOK_DEC_DCT_VLC:
             if (IN_RAM(c->gpr[5]) && (!c->gpr[4] || IN_RAM(c->gpr[4]))) {
                 next = hook_dct_vlc(c, site + 2, pc);
@@ -1286,8 +1322,9 @@ static u32 hook(const u32 *site, u32 pc)
             jump(c, pc);
             return leave(c, run_guest(2));
         }
-        if (timed && site[1] != HOOK_DEC_DCT_VLC) { /* the libpad recipes wait on the timer: their
-                                                      * time is the timer's (the VLC times itself) */
+        if (timed && site[1] <= HOOK_PAD_SIO_ACK_WAIT) { /* the libpad recipes wait on the timer:
+                                                           * their time is the timer's (the VLC times
+                                                           * itself, v_wait's is update's) */
             t = (sceKernelGetSystemTimeLow() - t) * PROF_EVERY - prof_bias;
             native_stats.us_io += t;
             native_stats.us_io_kind[IO_TIMER] += t;

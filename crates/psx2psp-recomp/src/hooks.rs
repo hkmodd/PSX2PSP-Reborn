@@ -27,6 +27,12 @@ pub const PAD_SIO_ACK_WAIT: u32 = 2;
 /// the runtime's C (`psp/psxrt/vlc.c`). Arguments: the address of its `size` global (its saved
 /// registers 4 bytes on, the output's end 0x28 on), and of its first table (the second 64 KB on).
 pub const DEC_DCT_VLC: u32 = 3;
+/// The loop of libetc's `v_wait(count, timeout)`, under `VSync(n)`, hooked at its head: passes
+/// that count the timeout down at 16(sp) and read `Vcount`, which only the vblank interrupt moves.
+/// Arguments: the address of `Vcount`, and the loop's back-edge (the translation sends the PS1
+/// cycles of one pass there instead, [`crate::emit`]'s `loop_cost`, so the runtime charges each
+/// pass what the translated loop would).
+pub const VSYNC_WAIT: u32 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Hook {
@@ -127,6 +133,22 @@ const DCT_VLC: [(u32, u32); 212] = [
     (0xAD18_001C, F), (0xAD19_0020, F), (0x03E0_0008, F), (0x2002_0001, F),
 ];
 
+/// `v_wait`, PsyQ libetc (Sheep Dog 'n' Wolf: 0x80092078, MediEvil: 0x800A3F90), the whole
+/// routine: `Vcount` read at 3, 4 and 28, 29; the loop's head at 10, its timeout path at 18 (a
+/// message and two calls, then `j` to the exit at 34), its back-edge at 32.
+const V_WAIT: [(u32, u32); 38] = [
+    (0x27BD_FFE0, F), (0x0005_2BC0, F), (0xAFA5_0010, F), (0x3C02_0000, I),
+    (0x8C42_0000, I), (0x0000_0000, F), (0x0044_102A, F), (0x1040_001A, F),
+    (0xAFBF_0018, F), (0x2403_FFFF, F), (0x8FA2_0010, F), (0x0000_0000, F),
+    (0x2442_FFFF, F), (0xAFA2_0010, F), (0x8FA2_0010, F), (0x0000_0000, F),
+    (0x1443_000B, F), (0x0000_0000, F), (0x3C04_0000, I), (0x0C00_0000, J),
+    (0x2484_0000, I), (0x0C00_0000, J), (0x0000_2021, F), (0x2404_0003, F),
+    (0x0C00_0000, J), (0x0000_2821, F), (0x0800_0000, J), (0x0000_0000, F),
+    (0x3C02_0000, I), (0x8C42_0000, I), (0x0000_0000, F), (0x0044_102A, F),
+    (0x1440_FFE9, F), (0x0000_0000, F), (0x8FBF_0018, F), (0x27BD_0020, F),
+    (0x03E0_0008, F), (0x0000_0000, F),
+];
+
 fn matches(text: &[u32], at: usize, pat: &[(u32, u32)]) -> bool {
     text.get(at..at + pat.len())
         .is_some_and(|w| w.iter().zip(pat).all(|(&w, &(v, m))| w & m == v))
@@ -184,6 +206,14 @@ pub fn find(exe: &PsxExe, d: &Discovery) -> BTreeMap<u32, Hook> {
                 && [46, 187].iter().all(|&h| g(h) == size.wrapping_add(0x28));
             if laid_out {
                 hooks.insert(pc, Hook { id: DEC_DCT_VLC, args: [size, tab1] });
+            }
+        } else if matches(&text, i, &V_WAIT) {
+            let w = &text[i..i + V_WAIT.len()];
+            let vcount = global(w[3] & 0xFFFF, w[4] & 0xFFFF);
+            let (head, timeout, exit) = (pc + 0x28, pc + 0x48, pc + 0x88);
+            let reached = [head, timeout, exit].iter().all(|a| d.code.contains(a));
+            if global(w[28] & 0xFFFF, w[29] & 0xFFFF) == vcount && j_target(pc_of(i + 26), w[26]) == exit && reached {
+                hooks.insert(head, Hook { id: VSYNC_WAIT, args: [vcount, pc + 0x80] });
             }
         }
     }
@@ -265,6 +295,24 @@ mod tests {
         assert_eq!(h.len(), 1);
         // The saved registers somewhere else in one place: not the layout the runtime knows.
         w[200] = 0x2508_ACF4;
+        let (x, d) = exe(at, &w);
+        assert!(find(&x, &d).is_empty());
+    }
+
+    #[test]
+    fn finds_v_wait_at_its_loop_head() {
+        let at = 0x800A_3F90; // MediEvil's words
+        let mut w = real(
+            &V_WAIT,
+            &[(3, 0x3C02_800F), (4, 0x8C42_CB98), (18, 0x3C04_800C), (19, 0x0C02_E6E8), (20, 0x2484_6E60),
+              (21, 0x0C02_A497), (24, 0x0C02_E700), (26, 0x0802_9006), (28, 0x3C02_800F), (29, 0x8C42_CB98)],
+        );
+        let (x, d) = exe(at, &w);
+        let h = find(&x, &d);
+        assert_eq!(h.get(&0x800A_3FB8), Some(&Hook { id: VSYNC_WAIT, args: [0x800E_CB98, 0x800A_4010] }));
+        assert_eq!(h.len(), 1);
+        // The loop reading another global than the first test: not the recipe.
+        w[29] = 0x8C42_CB9C;
         let (x, d) = exe(at, &w);
         assert!(find(&x, &d).is_empty());
     }

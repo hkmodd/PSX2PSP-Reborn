@@ -602,9 +602,11 @@ impl Em<'_> {
         if let Some(&h) = self.hooks.get(&a) {
             // The runtime continues where the recipe's code would, through the dispatch table.
             self.runtime.insert(a, Reason::Hook);
+            // v_wait's pass costs the runtime what the translated loop's pass would.
+            let arg1 = if h.id == hooks::VSYNC_WAIT { u32::from(self.loop_cost(a, h.args[1])) } else { h.args[1] };
             self.out.host_call(a | HOOK, h.id);
             self.out.push(h.args[0]);
-            self.out.push(h.args[1]);
+            self.out.push(arg1);
             return None;
         }
         let Some((i, k)) = self.at(a) else {

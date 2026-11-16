@@ -895,11 +895,11 @@ static void frame(void)
             }
             if (native) {
                 const NativeStats *s = &native_stats;
-                n += snprintf(line + n, sizeof line - (size_t)n, "-- native: %u calls (%u lean, %u timer/irq/pad host; not: event %u irq %u poll %u source %u hit %u once %u), %u misses, %u steps, %u bios, %u hashes, %u loads, %u poll skips (%u far, %u ra scans), %u hooks, %u updates\n",(unsigned)(s->calls - n0.calls), (unsigned)(s->io_lean - n0.io_lean), (unsigned)(s->io_host - n0.io_host),
+                n += snprintf(line + n, sizeof line - (size_t)n, "-- native: %u calls (%u lean, %u timer/irq/pad host; not: event %u irq %u poll %u source %u hit %u once %u), %u misses, %u steps, %u bios, %u hashes, %u loads, %u poll skips (%u far, %u ra scans), %u hooks (%u v_wait passes), %u updates\n",(unsigned)(s->calls - n0.calls), (unsigned)(s->io_lean - n0.io_lean), (unsigned)(s->io_host - n0.io_host),
                               (unsigned)(s->io_fall[0] - n0.io_fall[0]), (unsigned)(s->io_fall[1] - n0.io_fall[1]), (unsigned)(s->io_fall[2] - n0.io_fall[2]), (unsigned)(s->io_fall[3] - n0.io_fall[3]), (unsigned)(s->io_fall[4] - n0.io_fall[4]), (unsigned)(s->io_fall[5] - n0.io_fall[5]),
                               (unsigned)(s->misses - n0.misses), (unsigned)(s->steps - n0.steps), (unsigned)(s->bios - n0.bios), (unsigned)(s->hashes - n0.hashes),
                               (unsigned)s->loads, (unsigned)(s->poll_skips - n0.poll_skips), (unsigned)(s->poll_far - n0.poll_far),
-                              (unsigned)(s->ra_scans - n0.ra_scans), (unsigned)(s->hooks - n0.hooks), (unsigned)(s->updates - n0.updates));
+                              (unsigned)(s->ra_scans - n0.ra_scans), (unsigned)(s->hooks - n0.hooks), (unsigned)(s->vsync_passes - n0.vsync_passes), (unsigned)(s->updates - n0.updates));
                 n += snprintf(line + n, sizeof line - (size_t)n,
                               "-- ms: interp %u io %u (draw %u mdec %u spu %u) update %u present %u (wait %u draw %u text %u rgb24 %u) sleep %u;"
                               " audio drops %u gaps %u trims %u peak %u/%u; vsync wait %u (%u ms) late %u (avg %u max %u us) skipped %u short %u\n",
