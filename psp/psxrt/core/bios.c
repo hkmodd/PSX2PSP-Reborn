@@ -940,6 +940,7 @@ static int call_b(Psx *psx, u32 fn)
         G[R_V0] = 2;
         return 1;
     case 0x13: /* StartPAD */
+    case 0x4B: /* StartCARD: the same PadCard handler, which reads the pads InitPAD set up */
         if (!psx->bios.pad_started) {
             w32(psx, K_ENTRIES + 4 * 16 + 4, M_PAD_H);
             w32(psx, K_ENTRIES + 4 * 16 + 8, M_PAD_V);
@@ -951,10 +952,12 @@ static int call_b(Psx *psx, u32 fn)
         G[R_V0] = 1;
         return 1;
     case 0x14: /* StopPAD */
+    case 0x4C: /* StopCARD: stops the pads too */
         if (psx->bios.pad_started) {
             deq_int(psx, 2, K_ENTRIES + 4 * 16);
             psx->bios.pad_started = 0;
         }
+        G[R_V0] = 1;
         return 1;
     case 0x15: /* OutdatedPadInitAndStart(type, dst, ...) */
         psx_log(psx, "OutdatedPadInitAndStart(%X, %08X)", a0, a1);
@@ -967,10 +970,8 @@ static int call_b(Psx *psx, u32 fn)
     case 0x5B: /* ChangeClearPad */
         psx->bios.pad_clear = (int)a0;
         return 1;
-    /* InitCard, StartCard, StopCard: the cards are images at the BIOS level (card.c) */
+    /* InitCard: the cards are images at the BIOS level (card.c) */
     case 0x4A:
-    case 0x4B:
-    case 0x4C:
         G[R_V0] = 1;
         return 1;
     /* Function tables where the real BIOS keeps them. Code that patches the BIOS exception
