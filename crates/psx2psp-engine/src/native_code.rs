@@ -152,9 +152,13 @@ pub struct Captured {
     /// the code is taken with them whether it has a prologue or not, and they are entries of
     /// every image holding these bytes there.
     pub entries: Vec<u32>,
+    /// Only the entries count: the words that ran are as taken, others (variables) changed.
+    pub seeds_only: bool,
 }
 
-/// Smallest piece of captured code translated: one block of the runtime's code checks.
+/// Smallest piece of code found by its shape translated: one block of the runtime's code checks.
+/// Code taken where it ran has no false finds: a piece of it is translated at any size if it
+/// holds an entry (Crash 2 runs 0x130 bytes of GOOL native code alone at 8016F4B4).
 const MIN_CAPTURED: u32 = 0x400;
 /// Largest disc file looked at as an overlay: the PS1 RAM above the kernel area.
 pub const OVERLAY_MAX: u32 = 0x1F_0000;
@@ -210,7 +214,7 @@ pub fn build(exes: Vec<(String, Vec<u8>)>, overlays: Vec<(String, Vec<u8>)>, cap
         .iter()
         .flat_map(|c| c.entries.iter().filter_map(|&e| e.checked_sub(c.at).map(|o| (e, c.bytes[o as usize..(o as usize + 16).min(c.bytes.len())].to_vec()))))
         .collect();
-    let captured = captured.into_iter().flat_map(|Captured { at, bytes, ram, entries, .. }| {
+    let captured = captured.into_iter().filter(|c| !c.seeds_only).flat_map(|Captured { at, bytes, ram, entries, .. }| {
         let mut pieces = vec![(at & 0x1FFF_FFFF, (at & 0x1FFF_FFFF) + bytes.len() as u32)];
         for &(s, e) in &disc {
             pieces = pieces.into_iter().flat_map(|(a, b)| [(a, b.min(s)), (a.max(e), b)]).filter(|(a, b)| b > a).collect();
@@ -219,7 +223,7 @@ pub fn build(exes: Vec<(String, Vec<u8>)>, overlays: Vec<(String, Vec<u8>)>, cap
         let base = at & 0x1FFF_FFFF;
         pieces
             .into_iter()
-            .filter(|(a, b)| b - a >= MIN_CAPTURED)
+            .filter(|(a, b)| b - a >= MIN_CAPTURED || !entries.is_empty())
             .map(|(a, b)| (seg | a, bytes[(a - base) as usize..(b - base) as usize].to_vec(), (seg, ram.clone()), !entries.is_empty()))
             .collect::<Vec<_>>()
     });
@@ -239,7 +243,8 @@ pub fn build(exes: Vec<(String, Vec<u8>)>, overlays: Vec<(String, Vec<u8>)>, cap
                 .filter(|(a, b)| b > a)
                 .collect();
         }
-        for (a, b) in pieces.into_iter().filter(|(a, b)| b - a >= MIN_CAPTURED) {
+        let entry_in = |a: u32, b: u32| ran.iter().any(|(e, _)| (a..b).contains(e));
+        for (a, b) in pieces.into_iter().filter(|&(a, b)| b - a >= MIN_CAPTURED || (ran_code && entry_in(a, b))) {
             let (name, bytes) = (format!("RAM {a:08X}"), &bytes[(a - at) as usize..(b - at) as usize]);
             let held = |x: &PsxExe| a.checked_sub(x.text_addr).is_some_and(|o| x.text.get(o as usize..o as usize + bytes.len()) == Some(bytes));
             if parsed.iter().any(|(_, x, ..)| held(x)) {
@@ -545,7 +550,7 @@ mod tests {
         let mut ram = vec![0u8; 0x20_0000];
         let o = (at & 0x1F_FFFF) as usize;
         ram[o..o + bytes.len()].copy_from_slice(&bytes);
-        Captured { name: format!("RAM {at:08X}"), at, bytes, ram: Arc::new(ram), entries: Vec::new() }
+        Captured { name: format!("RAM {at:08X}"), at, bytes, ram: Arc::new(ram), entries: Vec::new(), seeds_only: false }
     }
 
     #[test]
@@ -599,6 +604,10 @@ mod tests {
         let slot = |i: usize| u32::from_le_bytes(im[0].table[4 * i..4 * i + 4].try_into().unwrap());
         assert_eq!((im.len(), im[0].text_addr), (1, at));
         assert!(slot(0) != layout::MISS && slot(4) != layout::MISS);
+        // A piece under MIN_CAPTURED is taken when it ran (Crash 2's 8016F4B4, 0x130 bytes).
+        let small = |entries: Vec<u32>| build(vec![], vec![], vec![Captured { entries, ..cap(at, body[..0x40].to_vec()) }]).unwrap().images;
+        assert!(small(vec![]).is_empty());
+        assert_eq!(small(vec![at + 0x10]).len(), 1);
         // The code an image already holds is left to it, its entries seeding it.
         let main = [JR_RA, 0, 0, 0, ADDIU_V0_1, JR_RA, 0];
         let words: Vec<u8> = main.iter().flat_map(|w| w.to_le_bytes()).collect();

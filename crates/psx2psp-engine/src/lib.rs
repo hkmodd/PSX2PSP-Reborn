@@ -991,20 +991,29 @@ pub fn captured_code(img: &DiscImage, patches: &[&dyn ImagePatch], kuseg: bool) 
                     continue;
                 }
                 let at = seg | s;
-                out.push(native_code::Captured { name: format!("RAM {at:08X}"), at, bytes: bytes.to_vec(), ram: before.clone(), entries: Vec::new() });
+                out.push(native_code::Captured { name: format!("RAM {at:08X}"), at, bytes: bytes.to_vec(), ram: before.clone(), entries: Vec::new(), seeds_only: false });
             }
             // The code that ran since the last look and stayed as it was: one capture per piece
             // of code, joined with the captures of the same bytes at earlier looks.
+            let word = |m: &[u8], i: usize| m[4 * i..4 * i + 4].to_vec();
             for (s, e, entries) in overlay::ran_runs(before, &ran_now).into_iter().filter(|&(s, ..)| s >= 0x1_0000) {
                 let (mut s, mut e) = (s as usize, e as usize);
                 if before[s..e] != ram[s..e] {
+                    // A variable among code that stayed (Crash 2's counter at 8003C13C, in its
+                    // executable's text): the entries seed the images holding the code; no image
+                    // is made of these bytes, whose hash RAM would seldom match.
+                    if (s / 4..e / 4).all(|i| ran_now[i] == 0 || word(before, i) == word(ram, i)) {
+                        let at = seg | s as u32;
+                        let entries = entries.into_iter().map(|o| seg | o).collect();
+                        ran.push(native_code::Captured { name: format!("RAM {at:08X}"), at, bytes: before[s..e].to_vec(), ram: before.clone(), entries, seeds_only: true });
+                    }
                     continue;
                 }
                 let mut entries: std::collections::BTreeSet<u32> = entries.into_iter().map(|o| seg | o).collect();
                 loop {
                     let joined = ran.iter().position(|c: &native_code::Captured| {
                         let (cs, ce) = ((c.at & 0x1FFF_FFFF) as usize, (c.at & 0x1FFF_FFFF) as usize + c.bytes.len());
-                        cs <= e && s <= ce && before[cs..ce] == c.bytes[..]
+                        !c.seeds_only && cs <= e && s <= ce && before[cs..ce] == c.bytes[..]
                     });
                     let Some(i) = joined else { break };
                     let c = ran.swap_remove(i);
@@ -1013,7 +1022,7 @@ pub fn captured_code(img: &DiscImage, patches: &[&dyn ImagePatch], kuseg: bool) 
                     entries.extend(c.entries);
                 }
                 let at = seg | s as u32;
-                ran.push(native_code::Captured { name: format!("RAM {at:08X}"), at, bytes: before[s..e].to_vec(), ram: before.clone(), entries: entries.into_iter().collect() });
+                ran.push(native_code::Captured { name: format!("RAM {at:08X}"), at, bytes: before[s..e].to_vec(), ram: before.clone(), entries: entries.into_iter().collect(), seeds_only: false });
             }
         }
         last = Some(std::sync::Arc::new(ram.to_vec()));
