@@ -1177,18 +1177,30 @@ impl Em<'_> {
                 None
             }
             Jr | Jalr => {
-                let fin = if k == Jr { jr(K1R) } else { jalr(i.rd() as u32, K1R) };
+                // Only `ra` takes a host link (a translated `jr ra` returns natively). Another
+                // link register is data to the guest: Crash 2's GOOL code ends its native pieces
+                // with `jalr s5,ra`, and s5, the bytecode pointer, must be 8 past the guest jalr.
+                let rd = if k == Jalr { i.rd() as u32 } else { ZR };
+                let fin = if rd == RA { jalr(RA, K1R) } else { jr(K1R) };
+                let link = |o: &mut Code| {
+                    if rd != ZR && rd != RA {
+                        o.push(lui(rd, ((a + 8) >> 16) as u16));
+                        o.push(ori(rd, rd, (a + 8) as u16));
+                    }
+                };
                 let rs = i.rs() as u32;
                 // A switch table holds guest addresses only.
                 let host = !matches!(self.d.jumps.get(&a), Some(JumpReg::Table { .. }));
                 if let Some(w) = simple_slot {
                     self.dispatch(rs, host, a);
+                    link(&mut self.out);
                     self.out.push(fin);
                     self.out.simple(w, s);
                 } else if !clobbers {
                     let c = slot(self);
                     self.out.append(c);
                     self.dispatch(rs, host, a);
+                    link(&mut self.out);
                     self.out.push(fin);
                     self.out.push(NOP);
                 } else {
@@ -1197,6 +1209,7 @@ impl Em<'_> {
                     let c = slot(self);
                     self.out.append(c);
                     self.out.push(lw(K1R, k0_off(layout::CTX + ctx::JUMP), K0R));
+                    link(&mut self.out);
                     self.out.push(fin);
                     self.out.push(NOP);
                 }

@@ -1069,6 +1069,29 @@ fn a_guest_return_address_loaded_into_ra_goes_through_the_table() {
     assert!(run.t.runtime.is_empty(), "{:?}", run.t.runtime);
 }
 
+/// A `jalr` linking another register than `ra` writes the guest address 8 past it: Crash 2's
+/// GOOL code ends its native pieces with `jalr s5,ra`, and s5 is the bytecode pointer.
+#[test]
+fn jalr_links_a_guest_address_into_a_register_other_than_ra() {
+    let w = [
+        lui(T0, 0x8001),          // 0
+        addiu(T0, T0, 0x20),      // 1  t0 = word 8
+        r(9, T0, 0, S5, 0),       // 2  jalr s5,t0
+        NOP,                      // 3
+        addiu(T2, T2, 1),         // 4  the return point
+        j(2, 12),                 // 5  j end
+        NOP,                      // 6
+        NOP,                      // 7
+        addiu(T1, T1, 1),         // 8  the callee
+        r(8, S5, 0, 0, 0),        // 9  jr s5
+        NOP,                      // 10
+        NOP,                      // 11
+        j(2, 12),                 // 12 end
+        NOP,                      // 13
+    ];
+    check(&w, 12, |_| {}, false);
+}
+
 /// Branches whose host distance exceeds 16 bits, forward and backward, go through a `j`.
 #[test]
 fn far_branches_are_relaxed() {
