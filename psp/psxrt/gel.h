@@ -14,6 +14,54 @@
 
 #include <stdint.h>
 
+/* The pspgu names ge.c uses, defined as pspgu.h defines them, character for character: a file
+ * that includes both (gel_check.c) has the compiler check each one is the same. */
+#define GU_TRUE			(1)
+#define GU_TRIANGLE_STRIP	(4)
+#define GU_TRIANGLE_FAN		(5)
+#define GU_SPRITES		(6)
+#define GU_ALPHA_TEST		(0)
+#define GU_DEPTH_TEST		(1)
+#define GU_SCISSOR_TEST		(2)
+#define GU_STENCIL_TEST		(3)
+#define GU_BLEND		(4)
+#define GU_CULL_FACE		(5)
+#define GU_DITHER		(6)
+#define GU_CLIP_PLANES		(8)
+#define GU_TEXTURE_2D		(9)
+#define GU_TEXTURE_SHIFT(n)	((n)<<0)
+#define GU_TEXTURE_16BIT	GU_TEXTURE_SHIFT(2)
+#define GU_TEXTURE_32BITF	GU_TEXTURE_SHIFT(3)
+#define GU_COLOR_SHIFT(n)	((n)<<2)
+#define GU_COLOR_8888		GU_COLOR_SHIFT(7)
+#define GU_VERTEX_SHIFT(n)	((n)<<7)
+#define GU_VERTEX_16BIT		GU_VERTEX_SHIFT(2)
+#define GU_VERTEX_32BITF	GU_VERTEX_SHIFT(3)
+#define GU_TRANSFORM_SHIFT(n)	((n)<<23)
+#define GU_TRANSFORM_2D		GU_TRANSFORM_SHIFT(1)
+#define GU_PSM_5650		(0) /* Display, Texture, Palette */
+#define GU_PSM_5551		(1) /* Display, Texture, Palette */
+#define GU_PSM_8888		(3) /* Display, Texture, Palette */
+#define GU_PSM_T4		(4) /* Texture */
+#define GU_PSM_T8		(5) /* Texture */
+#define GU_SMOOTH		(1)
+#define GU_NEAREST		(0)
+#define GU_REPEAT		(0)
+#define GU_ALWAYS		(1)
+#define GU_EQUAL		(2)
+#define GU_NOTEQUAL		(3)
+#define GU_GREATER		(6)
+#define GU_TFX_MODULATE		(0)
+#define GU_TFX_REPLACE		(3)
+#define GU_TCC_RGB		(0)
+#define GU_TCC_RGBA		(1)
+#define GU_ADD			(0)
+#define GU_REVERSE_SUBTRACT	(2)
+#define GU_FIX                        (10) /* Note: behavior of 11-15 blend factors is identical to GU_FIX */
+#define GU_KEEP			(0)
+#define GU_ZERO			(1)
+#define GU_REPLACE		(2)
+
 /* pspgu's GuListHead begins so: the words go at current. unsigned int, as pspgu's (psp-gcc's uint32_t is a long). */
 typedef struct {
     unsigned int *start, *current;

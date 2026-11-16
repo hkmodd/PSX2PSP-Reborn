@@ -12,15 +12,11 @@
  * The list is built in a GU_SEND context and enqueued when it opens; the GE runs behind it up to
  * a stall address moved every STALL_STEP bytes, not after every draw as GU_DIRECT would.
  */
-#include <pspge.h>
-#include <pspgu.h>
-#include <pspkernel.h>
-#include <pspsysmem.h>
-#include <psputils.h>
 #include <stdio.h>
 #include <string.h>
 
 #include "ge.h"
+#include "ge_host.h"
 #include "gel.h"
 
 #define LIST_BYTES (512 * 1024)
@@ -29,7 +25,7 @@
 #define TILE_H 32
 #define TILES_X (VRAM_W / TILE_W)
 #define TILES_Y (VRAM_H / TILE_H)
-#define VRAM_PTR ((void *)(0x04000000u + GE_PS1_VRAM))
+#define VRAM_PTR ((void *)((u8 *)GEH_VRAM + GE_PS1_VRAM))
 
 /* through mode: colour, then position (pixel corners: PS1 coordinates + 0.5) */
 typedef struct {
@@ -202,15 +198,13 @@ static const int ps1_dither[16] = {-4, 0, -3, 1, 2, -2, 3, -1, -3, 1, -4, 0, 3, 
  * 62% from 65%. Back to 1 KB. */
 #define STALL_STEP (1 * 1024)
 static u32 stall_step = STALL_STEP;
-#define LIST_UNCACHED ((u8 *)((u32)list | 0x40000000u))
 static int list_id;
 static u32 list_stall; /* bytes the GE may run */
 
 void ge_open(void)
 {
     if (!list_open) {
-        sceGuStart(GU_SEND, list);
-        list_id = sceGeListEnQueue(LIST_UNCACHED, LIST_UNCACHED, -1, NULL);
+        list_id = geh_list_start(list);
         list_stall = 0;
         list_open = 1;
     }
@@ -218,26 +212,17 @@ void ge_open(void)
     fl.valid = 0;
 }
 
-/* pspgu's display list (guInternal.h): both pointers through the uncached mirror. */
-typedef struct {
-    unsigned int *start, *current;
-    int parent_context;
-} GuListHead;
-extern GuListHead *gu_list;
-/* gel.h writes pspgu's list, and keeps the scissor where pspgu keeps it for the GU_SEND context
- * (GuContext: 92 bytes, scissor_enable at 12): main.c's present calls pspgu into this same list,
- * and sceGuEnable(GU_SCISSOR_TEST) sends the last scissor either side set. */
-extern char gu_contexts[];
-#define GL ((GelList *)gu_list)
-#define GSC ((GelScissor *)(gu_contexts + GU_SEND * 92 + 12))
+/* The host's list (both pointers through the uncached mirror) and the scissor kept with it. */
+#define GL GEH_LIST
+#define GSC GEH_SCISSOR
 
 /* Before the GE may run more of the list: the vertices written through the cache go to RAM. */
 static void ring_flush(void)
 {
     if (fl.cached && fl.ring_off > fl.ring_wb) {
-        u32 a = fl.ring_wb & ~63u, t = sceKernelGetSystemTimeLow();
-        sceKernelDcacheWritebackRange(fl.ring_c + a, fl.ring_off - a);
-        ge.s.ring_wb_us += sceKernelGetSystemTimeLow() - t;
+        u32 a = fl.ring_wb & ~63u, t = geh_us();
+        geh_wb(fl.ring_c + a, fl.ring_off - a);
+        ge.s.ring_wb_us += geh_us() - t;
         fl.ring_wb = fl.ring_off;
     }
 }
@@ -245,17 +230,17 @@ static void ring_flush(void)
 /* Moves the stall address, timed: on the device the system call's cost is not known. */
 static void stall_to(u32 n)
 {
-    u32 t = sceKernelGetSystemTimeLow();
+    u32 t = geh_us();
     list_stall = n;
-    sceGeListUpdateStallAddr(list_id, LIST_UNCACHED + n);
-    ge.s.kick_us += sceKernelGetSystemTimeLow() - t;
+    geh_list_stall(list_id, list, n);
+    ge.s.kick_us += geh_us() - t;
     ge.s.kicks++;
 }
 
 /* Lets the GE run what is written so far, once STALL_STEP more bytes are there. */
 static void ge_kick(void)
 {
-    u32 n = (u32)((u8 *)gu_list->current - (u8 *)gu_list->start); /* sceGuCheckList, inline */
+    u32 n = (u32)((u8 *)GL->current - (u8 *)GL->start); /* sceGuCheckList, inline */
     if (n - list_stall >= stall_step) {
         ring_flush();
         stall_to(n);
@@ -266,7 +251,7 @@ void ge_run(void)
 {
     if (!list_open)
         return;
-    u32 n = (u32)((u8 *)gu_list->current - (u8 *)gu_list->start);
+    u32 n = (u32)((u8 *)GL->current - (u8 *)GL->start);
     if (n != list_stall) {
         ring_flush();
         stall_to(n);
@@ -276,10 +261,10 @@ void ge_run(void)
 void ge_sync(void)
 {
     if (list_open) {
-        u32 n = (u32)sceGuFinish();
+        u32 n = geh_list_finish();
         ring_flush();
-        sceGeListUpdateStallAddr(list_id, LIST_UNCACHED + n);
-        sceGuSync(0, 0);
+        geh_list_stall(list_id, list, n);
+        geh_list_wait();
         list_open = 0;
         ge.syncs++;
     }
@@ -288,7 +273,7 @@ void ge_sync(void)
     if (fl.want != fl.cached && fl.ring_c) {
         /* no line of the ring stays in the cache: one dirty from the cached mode would be written
          * back over uncached writes, one clean but stale would be written back with them */
-        sceKernelDcacheWritebackInvalidateRange(fl.ring_c, fl.ring_bytes);
+        geh_wbinv(fl.ring_c, fl.ring_bytes);
         fl.cached = fl.want, fl.ring = fl.cached ? fl.ring_c : fl.ring_u;
     }
 }
@@ -338,7 +323,7 @@ static void begin(void)
     if (fl.dirty)
         fl_forget(), fl.dirty = 0;
     if (list_open) {
-        if (sceGuCheckList() > LIST_BYTES - LIST_SLACK) {
+        if ((u32)((u8 *)GL->current - (u8 *)GL->start) > LIST_BYTES - LIST_SLACK) {
             ge_sync();
             ge.s.flushes++;
         } else
@@ -561,7 +546,7 @@ static void blit(u16 *src, s32 sx, s32 sy, s32 dx, s32 dy, s32 w, s32 h, int che
 static void upload(s32 x, s32 y, s32 w, s32 h)
 {
     u16 *ram = ge.psx->gpu.vram;
-    sceKernelDcacheWritebackRange(ram + y * VRAM_W + x, (u32)((h - 1) * VRAM_W + w) * 2);
+    geh_wb(ram + y * VRAM_W + x, (u32)((h - 1) * VRAM_W + w) * 2);
     blit(ram, x, y, x, y, w, h, 0, 0);
     ge.s.uploads++, ge.s.upload_px += (u32)(w * h);
 }
@@ -572,11 +557,11 @@ static void rd_wrote(void *self, s32 x, s32 y, s32 w, s32 h)
     (void)self;
     if (w <= 0 || h <= 0)
         return;
-    u32 t0 = sceKernelGetSystemTimeLow();
+    u32 t0 = geh_us();
     begin();
     pieces(x, y, w, h, upload);
     bump(x, y, w, h);
-    ge.s.upload_us += sceKernelGetSystemTimeLow() - t0;
+    ge.s.upload_us += geh_us() - t0;
 }
 
 /* The CPU is about to read a rectangle of RAM's copy: when the GE drew any of its tiles, all of
@@ -595,12 +580,12 @@ static void rd_read(void *self, s32 x, s32 y, s32 w, s32 h)
     if (!any)
         return;
     u16 *ram = ge.psx->gpu.vram;
-    u32 t0 = sceKernelGetSystemTimeLow();
+    u32 t0 = geh_us();
     begin();
-    sceKernelDcacheWritebackInvalidateRange(ram, VRAM_W * VRAM_H * 2);
+    geh_wbinv(ram, VRAM_W * VRAM_H * 2);
     gel_copy_image(GL, GU_PSM_5551, 0, 0, VRAM_W, VRAM_H, VRAM_W, VRAM_PTR, 0, 0, VRAM_W, ram);
     ge_sync();
-    ge.s.read_us += sceKernelGetSystemTimeLow() - t0;
+    ge.s.read_us += geh_us() - t0;
     for (int ty = 0; ty < TILES_Y; ty++) {
         for (int tx = 0; tx < TILES_X; tx++)
             if (ge.newer[ty] >> tx & 1)
@@ -619,7 +604,7 @@ const unsigned short *ge_compare_vram(void)
     if (!ge.compare)
         return NULL;
     begin();
-    sceKernelDcacheWritebackInvalidateRange(ge.cmp, VRAM_W * VRAM_H * 2);
+    geh_wbinv(ge.cmp, VRAM_W * VRAM_H * 2);
     gel_copy_image(GL, GU_PSM_5551, 0, 0, VRAM_W, VRAM_H, VRAM_W, VRAM_PTR, 0, 0, VRAM_W, ge.cmp);
     ge_sync();
     return ge.cmp;
@@ -746,7 +731,7 @@ static const u8 *page(const GpuPrim *p)
             if (a < hw)
                 memcpy(o + a, row, (size_t)(hw - a) * 2);
         }
-        sceKernelDcacheWritebackRange(s->data, (u32)(256 * hw * 2));
+        geh_wb(s->data, (u32)(256 * hw * 2));
         s->key = key, s->stamp = st, s->ver++;
         if ((u32)((const u8 *)ge.tex_sent - s->data) < PAGE_BYTES) /* the page, or a window in it */
             ge.tex_sent = NULL;
@@ -839,7 +824,7 @@ static const u32 *clut(const GpuPrim *p, int *flags)
             *flags = f;
             return c;
         }
-        sceKernelDcacheWritebackRange(c, (u32)n * 4);
+        geh_wb(c, (u32)n * 4);
         if (ge.clut_sent == c)
             ge.clut_sent = NULL;
         e->key = key, e->stamp = st, e->flags = f, e->ver++;
@@ -1345,7 +1330,7 @@ static struct {
 } fl_mru[FL_MRU];
 static u32 fl_mru_next;
 static u32 __attribute__((aligned(64))) fl_arena[FL_ARENA / 4];
-#define FL_ARENA_UNCACHED ((unsigned int *)((u32)fl_arena | 0x40000000u))
+#define FL_ARENA_UNCACHED ((unsigned int *)GEH_UNCACHED(fl_arena))
 
 /* A tile under the texels (tu_lo-tu_hi) of a texpage's page or under a CLUT is newer on the GE
  * (prim_begin would read back). When not, tu_part tells whether the rest of the page is. */
@@ -1378,12 +1363,12 @@ static int fl_current(FlEntry *e)
 /* A pass's state, sent from unknown so that its words alone set it, and kept. */
 static void fl_capture(u32 *dst, int *n, int func, int ref, int mode, int check, int set)
 {
-    unsigned int *s = gu_list->current;
+    unsigned int *s = GL->current;
     ge.a_func = -1, ge.blend = -2, ge.st_check = ge.st_set = -2;
     alpha(func, ref);
     blend(mode);
     stencil(check, set);
-    *n = (int)(gu_list->current - s);
+    *n = (int)(GL->current - s);
     for (int i = 0; i < *n; i++)
         dst[i] = s[i];
 }
@@ -1409,11 +1394,11 @@ static void fl_miss(FlEntry *e, u32 cmd, u32 clut, s32 x1, s32 y1, s32 x2, s32 y
     if (flags) {
         const u8 *pg = ge.tex_sent;
         const u32 *cl = ge.clut_sent;
-        unsigned int *l = gu_list->current;
+        unsigned int *l = GL->current;
         int arena = e->blk != ge.syncs; /* prim_begin may have run the list */
         if (arena)
-            gu_list->current = FL_ARENA_UNCACHED + (e - fl_cache) * FL_SLOT;
-        unsigned int *s = gu_list->current;
+            GL->current = FL_ARENA_UNCACHED + (e - fl_cache) * FL_SLOT;
+        unsigned int *s = GL->current;
         fl_forget();
         if (p.textured)
             bind(&p, pg, cl);
@@ -1428,10 +1413,10 @@ static void fl_miss(FlEntry *e, u32 cmd, u32 clut, s32 x1, s32 y1, s32 x2, s32 y
                 blend(flags == 2 ? semi : -1);
                 stencil(p.mask_check, flags == 1 ? set : 1);
             } else {
-                unsigned int *m = gu_list->current; /* the lane sends these before each pass */
+                unsigned int *m = GL->current; /* the lane sends these before each pass */
                 fl_capture(e->pass1, &e->n1, GU_EQUAL, 0xFF, -1, p.mask_check, set);
                 fl_capture(e->pass2, &e->n2, GU_EQUAL, 0x80, semi, p.mask_check, 1);
-                gu_list->current = m;
+                GL->current = m;
                 ge.a_func = -1, ge.blend = -2, ge.st_check = ge.st_set = -2;
                 e->two = 1;
             }
@@ -1442,7 +1427,7 @@ static void fl_miss(FlEntry *e, u32 cmd, u32 clut, s32 x1, s32 y1, s32 x2, s32 y
             e->call[0] = 0x10000000u | ((u32)s >> 8 & 0xF0000);
             e->call[1] = 0x0A000000u | ((u32)s & 0xFFFFFF);
             l[0] = e->call[0], l[1] = e->call[1];
-            gu_list->current = l + 2;
+            GL->current = l + 2;
             e->blk = ge.syncs;
         } else
             e->k0 = ~0u, e->call[0] = 0; /* used this once, never found */
@@ -1478,9 +1463,9 @@ static __attribute__((noinline)) void fl_setup(u32 cmd, u32 clut)
                     ge.cluts[e->cslot].used = ge.syncs;
             }
             if (e->flags) {
-                unsigned int *l = gu_list->current;
+                unsigned int *l = GL->current;
                 l[0] = e->call[0], l[1] = e->call[1];
-                gu_list->current = l + 2;
+                GL->current = l + 2;
                 fl.dirty = 1;
                 e->blk = ge.syncs;
             }
@@ -1511,7 +1496,7 @@ static __attribute__((noinline)) void fl_setup(u32 cmd, u32 clut)
 /* fl_setup's work for a key in fl_mru: its CALL. 0: not there, or no longer current. */
 static int fl_mru_hit(void)
 {
-    if (!list_open || !state_valid || (u32)((u8 *)gu_list->current - (u8 *)gu_list->start) > LIST_BYTES - LIST_SLACK)
+    if (!list_open || !state_valid || (u32)((u8 *)GL->current - (u8 *)GL->start) > LIST_BYTES - LIST_SLACK)
         return 0;
     for (int i = 0; i < FL_MRU; i++) {
         if (fl_mru[i].k0 != fl.k0 || fl_mru[i].k1 != fl.k1 || fl_mru[i].a0 != fl.a0 || fl_mru[i].a1 != fl.a1)
@@ -1520,9 +1505,9 @@ static int fl_mru_hit(void)
         if (fl_mru[i].syncs != ge.syncs || fl_mru[i].epoch != ge.epoch || ((fl.k0 & 1) && fl_mru[i].nver != ge.nver) ||
             e->k0 != fl.k0 || e->k1 != fl.k1 || e->a0 != fl.a0 || e->a1 != fl.a1 || e->blk != ge.syncs)
             return 0;
-        unsigned int *l = gu_list->current;
+        unsigned int *l = GL->current;
         l[0] = e->call[0], l[1] = e->call[1];
-        gu_list->current = l + 2;
+        GL->current = l + 2;
         fl.dirty = 1;
         fl.flags = e->flags;
         fl.two = e->two, fl.n1 = e->n1, fl.n2 = e->n2, fl.pass1 = e->pass1, fl.pass2 = e->pass2;
@@ -1544,9 +1529,9 @@ static void fl_setup_timed(u32 cmd, u32 clut)
         fl_setup(cmd, clut);
         return;
     }
-    u32 t = sceKernelGetSystemTimeLow();
+    u32 t = geh_us();
     fl_setup(cmd, clut);
-    ge.s.setup_us += (sceKernelGetSystemTimeLow() - t) * 16 - prof_bias;
+    ge.s.setup_us += (geh_us() - t) * 16 - prof_bias;
 }
 
 /* A draw of n ring vertices at vp in the lane's state: BASE when it moves, VADDR and PRIM, per
@@ -1619,7 +1604,7 @@ static int rd_poly(void *self, const u32 *c)
     if (fl.ring_off + (u32)(cut ? 10 : n) * vsz > fl.ring_bytes) {
         ge_sync();
         ge.s.flushes++;
-    } else if (fl.valid && (u32)((u8 *)gu_list->current - (u8 *)gu_list->start) > LIST_BYTES - LIST_SLACK)
+    } else if (fl.valid && (u32)((u8 *)GL->current - (u8 *)GL->start) > LIST_BYTES - LIST_SLACK)
         fl.valid = 0; /* fl_setup's begin() runs the list */
     /* only what changes the GE state: flat and Gouraud polygons, triangles and quads share it,
      * and the dither bit counts only where fl_setup's prim_state would dither */
@@ -1656,7 +1641,7 @@ static int rd_poly(void *self, const u32 *c)
     if (raw)
         for (int i = 0; i < n; i++)
             col[i] = 0x808080;
-    unsigned int *l = gu_list->current;
+    unsigned int *l = GL->current;
     u8 *vp = fl.ring + fl.ring_off;
     if (!cut) {
         /* +0.5 as in polygon() */
@@ -1678,7 +1663,7 @@ static int rd_poly(void *self, const u32 *c)
         fl.ring_off += (u32)n * vsz;
     } else
         l = poly_cut(l, vp, x, y, col, uv, n, tex, minx, miny, vsz);
-    gu_list->current = l;
+    GL->current = l;
     ge_kick();
     return DONE;
 }
@@ -1704,14 +1689,14 @@ static u32 rd_packet(void *self, const u32 *w, u32 n)
             break;
         g->n_kind[0]++;
         gpu_writes++;
-        u32 t = t64++ % 64 ? 0 : sceKernelGetSystemTimeLow();
+        u32 t = t64++ % 64 ? 0 : geh_us();
         if (tex)
             gpu_set_texpage(g, (g->texpage & ~0x1FFu) | (c[gour ? 5 : 4] >> 16 & 0x1FF));
         int r = rd_poly(NULL, c);
         if (r != GPU_DRAWN)
             gpu_poly_soft(psx, c, r);
         if (t) {
-            t = (sceKernelGetSystemTimeLow() - t) * 64 - prof_bias * 4;
+            t = (geh_us() - t) * 64 - prof_bias * 4;
             g->us_draw += t, g->us_kind[0] += t;
             if (r != GPU_DRAWN)
                 gpu_slow_us += t;
@@ -1771,30 +1756,30 @@ static void ring_bench(Psx *psx)
     u32 t[2], n = 64 * 1024 / sizeof(TexVtx);
     for (int m = 0; m < 2; m++) {
         TexVtx *o = (TexVtx *)(m ? fl.ring_c : fl.ring_u);
-        u32 t0 = sceKernelGetSystemTimeLow();
+        u32 t0 = geh_us();
         for (u32 i = 0; i < n; i++) {
             o[i].u = (float)(i & 0xFF) + 0.5f, o[i].v = (float)(i >> 8 & 0xFF) + 0.5f;
             o[i].c = 0xFF000000u | i;
             o[i].x = (float)(i & 511) + 0.5f, o[i].y = (float)(i >> 9) + 0.5f, o[i].z = 0;
         }
         if (m)
-            sceKernelDcacheWritebackRange(o, n * sizeof(TexVtx));
-        t[m] = sceKernelGetSystemTimeLow() - t0;
+            geh_wb(o, n * sizeof(TexVtx));
+        t[m] = geh_us() - t0;
     }
-    sceKernelDcacheWritebackInvalidateRange(fl.ring_c, fl.ring_bytes);
+    geh_wbinv(fl.ring_c, fl.ring_bytes);
     psx_log(psx, "ge: 64 KB of vertices in %u us uncached, %u us cached and written back", (unsigned)t[0], (unsigned)t[1]);
     /* the profile's own cost (each timed call adds one clock read) and a data cache miss: 512
      * reads of PS1 RAM 4 KB apart, after the cache was emptied of it */
-    u32 t0 = sceKernelGetSystemTimeLow();
+    u32 t0 = geh_us();
     for (int i = 0; i < 256; i++)
-        sceKernelGetSystemTimeLow();
-    u32 clk = sceKernelGetSystemTimeLow() - t0, sum = 0;
-    sceKernelDcacheWritebackInvalidateRange(psx->ram, 2 * 1024 * 1024);
+        geh_us();
+    u32 clk = geh_us() - t0, sum = 0;
+    geh_wbinv(psx->ram, 2 * 1024 * 1024);
     volatile const u32 *ram = (const u32 *)psx->ram;
-    t0 = sceKernelGetSystemTimeLow();
+    t0 = geh_us();
     for (u32 i = 0; i < 512; i++)
         sum += ram[i * 1024 + (i & 15) * 4];
-    u32 miss = sceKernelGetSystemTimeLow() - t0;
+    u32 miss = geh_us() - t0;
     psx_log(psx, "cpu: clock read %u ns, cache miss %u ns (%u)", (unsigned)(clk * 1000 / 256), (unsigned)(miss * 1000 / 512),
             (unsigned)(sum & 1));
 }
@@ -1826,21 +1811,21 @@ static void busy_bench(Psx *psx)
         v[2 * i] = (SprVtx){0, 0, 0, 0, 0}, v[2 * i + 1] = (SprVtx){128, 256, 480, 272, 0};
     gel_draw_array(GL, GU_SPRITES, GU_TEXTURE_16BIT | GU_VERTEX_16BIT | GU_TRANSFORM_2D, 64, 0, v);
     gel_disable(GL, GU_TEXTURE_2D);
-    sceKernelDcacheWritebackInvalidateRange(psx->ram, 2 * 1024 * 1024);
+    geh_wbinv(psx->ram, 2 * 1024 * 1024);
     volatile const u32 *ram = (const u32 *)psx->ram;
-    u32 sum = 0, t0 = sceKernelGetSystemTimeLow();
+    u32 sum = 0, t0 = geh_us();
     ge_run();
-    u32 t1 = sceKernelGetSystemTimeLow();
+    u32 t1 = geh_us();
     for (u32 i = 0; i < 512; i++)
         sum += ram[i * 1024 + (i & 15) * 4];
-    u32 t2 = sceKernelGetSystemTimeLow(), n = 64 * 1024 / sizeof(TexVtx);
+    u32 t2 = geh_us(), n = 64 * 1024 / sizeof(TexVtx);
     TexVtx *o = (TexVtx *)fl.ring_u;
     for (u32 i = 0; i < n; i++) {
         o[i].u = (float)(i & 0xFF) + 0.5f, o[i].v = (float)(i >> 8 & 0xFF) + 0.5f;
         o[i].c = 0xFF000000u | i;
         o[i].x = (float)(i & 511) + 0.5f, o[i].y = (float)(i >> 9) + 0.5f, o[i].z = 0;
     }
-    u32 t3 = sceKernelGetSystemTimeLow();
+    u32 t3 = geh_us();
     /* the same through the cache and written back in lines: under the GE's load, single uncached
      * stores may cost more than line fills and bursts (with the GE idle they cost half) */
     o = (TexVtx *)fl.ring_c;
@@ -1849,16 +1834,16 @@ static void busy_bench(Psx *psx)
         o[i].c = 0xFF000000u | i;
         o[i].x = (float)(i & 511) + 0.5f, o[i].y = (float)(i >> 9) + 0.5f, o[i].z = 0;
     }
-    sceKernelDcacheWritebackRange(o, n * sizeof(TexVtx));
-    u32 t3c = sceKernelGetSystemTimeLow();
+    geh_wb(o, n * sizeof(TexVtx));
+    u32 t3c = geh_us();
     ge_sync();
-    u32 t4 = sceKernelGetSystemTimeLow();
-    sceKernelDcacheWritebackInvalidateRange(fl.ring_c, n * sizeof(TexVtx)); /* uncached from here on */
+    u32 t4 = geh_us();
+    geh_wbinv(fl.ring_c, n * sizeof(TexVtx)); /* uncached from here on */
     ge_open();
-    u32 t5 = sceKernelGetSystemTimeLow();
+    u32 t5 = geh_us();
     for (int i = 0; i < 256; i++)
-        sceGeListUpdateStallAddr(list_id, LIST_UNCACHED + list_stall);
-    u32 t6 = sceKernelGetSystemTimeLow();
+        geh_list_stall(list_id, list, list_stall);
+    u32 t6 = geh_us();
     ge_sync();
     psx_log(psx, "ge busy %u us (from RAM): cache miss %u ns, 64 KB of vertices uncached %u us, cached and written back %u us%s;"
             " stall move %u ns (%u)",
@@ -1874,48 +1859,44 @@ void ge_init(Psx *psx, int compare)
     ge.compare = compare;
     if (!list_open) { /* the list is idle: gel.h against pspgu in it */
         char m[160];
-        gel_check(list, LIST_BYTES / 4, m, sizeof m);
-        psx_log(psx, "%s", m);
+        if (geh_check(list, LIST_BYTES / 4, m, sizeof m))
+            psx_log(psx, "%s", m);
     }
     if (compare) {
-        SceUID uid = sceKernelAllocPartitionMemory(2, "psxrt ge compare", PSP_SMEM_Low, VRAM_W * VRAM_H * 2, NULL);
-        ge.cmp = uid < 0 ? NULL : sceKernelGetBlockHeadAddr(uid);
+        ge.cmp = geh_alloc("psxrt ge compare", VRAM_W * VRAM_H * 2);
         ge.compare = ge.cmp != NULL;
     }
     for (int n = PAGE_SLOTS; n >= 4 && !ge.npages; n /= 2) {
-        SceUID uid = sceKernelAllocPartitionMemory(2, "psxrt ge pages", PSP_SMEM_Low, (SceSize)(n * PAGE_BYTES + 64), NULL);
-        if (uid < 0)
+        u8 *b = geh_alloc("psxrt ge pages", (u32)(n * PAGE_BYTES));
+        if (!b)
             continue;
-        u8 *b = (u8 *)(((u32)sceKernelGetBlockHeadAddr(uid) + 63) & ~63u);
         for (int i = 0; i < n; i++)
             ge.pages[i].data = b + i * PAGE_BYTES;
         ge.npages = n;
     }
     for (u32 b = RING_MAX; b >= 64 * 1024 && !fl.ring; b /= 2) {
-        SceUID uid = sceKernelAllocPartitionMemory(2, "psxrt ge ring", PSP_SMEM_Low, b + 64, NULL);
-        if (uid < 0)
+        u8 *r = geh_alloc("psxrt ge ring", b);
+        if (!r)
             continue;
-        u8 *r = (u8 *)(((u32)sceKernelGetBlockHeadAddr(uid) + 63) & ~63u);
-        sceKernelDcacheWritebackInvalidateRange(r, b); /* first written through the uncached mirror */
-        fl.ring_c = r, fl.ring_u = fl.ring = (u8 *)((u32)r | 0x40000000u), fl.ring_bytes = b;
+        geh_wbinv(r, b); /* first written through the uncached mirror */
+        fl.ring_c = r, fl.ring_u = fl.ring = GEH_UNCACHED(r), fl.ring_bytes = b;
     }
-    SceUID mu = sceKernelAllocPartitionMemory(2, "psxrt ge 15-bit", PSP_SMEM_Low, MIR_BYTES + 64, NULL);
-    if (mu >= 0) {
-        ge.mir = (u32 *)(((u32)sceKernelGetBlockHeadAddr(mu) + 63) & ~63u);
-        sceKernelDcacheWritebackInvalidateRange(ge.mir, MIR_BYTES); /* written uncached from now on */
-        ge.mir_u = (u32 *)((u32)ge.mir | 0x40000000u);
+    ge.mir = geh_alloc("psxrt ge 15-bit", MIR_BYTES);
+    if (ge.mir) {
+        geh_wbinv(ge.mir, MIR_BYTES); /* written uncached from now on */
+        ge.mir_u = GEH_UNCACHED(ge.mir);
     }
     memset(ge.mir_gen, 0xFF, sizeof ge.mir_gen);
     if (fl.ring)
         ring_bench(psx), busy_bench(psx);
     for (int i = 0; i < 1 << FL_BITS; i++)
         fl_cache[i].k0 = ~0u; /* no key */
-    sceKernelDcacheWritebackInvalidateRange(fl_arena, sizeof fl_arena); /* written uncached from now on */
+    geh_wbinv(fl_arena, sizeof fl_arena); /* written uncached from now on */
     ge.r = (GpuRenderer){&ge, rd_triangle, rd_quad, rd_rect, rd_line, rd_fill, rd_copy, rd_read, rd_wrote, fl.ring ? rd_poly : NULL,
                          fl.ring ? rd_packet : NULL};
     ge.syncs = 1; /* no slot (used 0) is in the list */
     psx_log(psx, "ge: %d texture page slots, 15-bit copy %s, %u KB vertex ring; %u KB free", ge.npages, ge.mir ? "on" : "OFF (software)",
-            (unsigned)(fl.ring_bytes / 1024), (unsigned)(sceKernelMaxFreeMemSize() / 1024));
+            (unsigned)(fl.ring_bytes / 1024), (unsigned)(geh_free() / 1024));
     rd_fill(&ge, 0, 0, VRAM_W, VRAM_H, 0); /* also makes the oracle create the framebuffer */
     ge_sync();
     newer_clear(); /* both copies are zero */
@@ -1934,7 +1915,7 @@ static int compare(char *buf, int cap)
                                (int)g->xx, (int)g->xy, (int)g->xw, (int)g->xh, (int)g->xr),
                       cap);
     begin();
-    sceKernelDcacheWritebackInvalidateRange(ge.cmp, VRAM_W * VRAM_H * 2);
+    geh_wbinv(ge.cmp, VRAM_W * VRAM_H * 2);
     gel_copy_image(GL, GU_PSM_5551, 0, 0, VRAM_W, VRAM_H, VRAM_W, VRAM_PTR, 0, 0, VRAM_W, ge.cmp);
     ge_sync();
     const u16 *ram = ge.psx->gpu.vram;
