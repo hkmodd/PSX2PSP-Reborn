@@ -13,8 +13,9 @@
 //!   lowest and highest address are checked once (RAM, one 2 MB mirror) and each access is then
 //!   one host word; a failed check runs an out-of-line copy of the group, access by access.
 //!   Accesses are 70% of the main-pass code, which the I-cache refills (LEV01: -14% of it).
-//! * Calls are host calls (`jal` writes a host `ra`, `jr ra` returns natively). A `jal` outside
-//!   the image, `jr` and `jalr` go through the dispatch table.
+//! * Calls are host calls (`jal` writes a host `ra`, a leaf's `jr ra` returns natively). A `jal`
+//!   outside the image, `jr` and `jalr`, and the `jr ra` of a function that writes `ra`, go
+//!   through the dispatch table ([`leaf_returns`]).
 //! * GTE moves, `lwc2` and `swc2` work directly on the GTE registers at [`layout::GTE`] (but
 //!   for the few registers with unusual rules); GTE commands enter [`layout::GTE_CMD`], or the
 //!   entry of their own [`layout::GTE_OWN`] or [`layout::GTE_WORD`] gives them.
@@ -370,6 +371,8 @@ struct Em<'a> {
     /// Conditional branches whose guest target is beyond 16 bits in host code.
     long: &'a BTreeSet<u32>,
     hooks: &'a BTreeMap<u32, Hook>,
+    /// [`leaf_returns`].
+    leaf: &'a BTreeSet<u32>,
 }
 
 enum Fail {
@@ -405,8 +408,9 @@ pub fn translate_with(
         return Err(EmitError::Base(base));
     }
     let mut long = BTreeSet::new();
+    let leaf = leaf_returns(exe, d);
     loop {
-        match emit(exe, d, hz, base, &long, hooks) {
+        match emit(exe, d, hz, base, &long, hooks, &leaf) {
             Ok(t) => return Ok(t),
             Err(Fail::Error(e)) => return Err(e),
             Err(Fail::Far(far)) => {
@@ -421,6 +425,32 @@ pub fn translate_with(
     }
 }
 
+/// The `jr ra` sites that may return natively: every function body they end writes no `ra`, so
+/// `ra` is the caller's, which a translated call or the runtime's hand-over (`fix_ra`) made host
+/// code. Any other `jr ra` may read an `ra` from memory that an interpreted prologue saved as a
+/// guest address: Silent Hill's switch case at 80071C08 (a table outside the image, so its
+/// bodies are interpreted) calls 80073E3C with the guest ra 80071C10, and a translated
+/// `lw ra; jr ra` jumped to PSP 0x80071C10 at f1808. Those go through [`Em::dispatch`]: host
+/// code as it is, a guest address through the table.
+fn leaf_returns(exe: &PsxExe, d: &Discovery) -> BTreeSet<u32> {
+    use Kind::*;
+    let img = Image(exe);
+    let writes_ra = |a: u32| {
+        img.at(a).is_some_and(|(i, k)| {
+            Uses::of(i, k).write & (1 << RA) != 0
+                || matches!(k, Jal | Bltzal | Bgezal)
+                || (k == Jalr && i.rd() == RA as usize)
+        })
+    };
+    let (mut leaf, mut not) = (BTreeSet::new(), BTreeSet::new());
+    for &e in d.entries.keys() {
+        let b = d.body(exe, e);
+        let into = if b.insns.iter().any(|&a| writes_ra(a)) { &mut not } else { &mut leaf };
+        into.extend(b.returns);
+    }
+    &leaf - &not
+}
+
 fn emit(
     exe: &PsxExe,
     d: &Discovery,
@@ -428,6 +458,7 @@ fn emit(
     base: u32,
     long: &BTreeSet<u32>,
     hooks: &BTreeMap<u32, Hook>,
+    leaf: &BTreeSet<u32>,
 ) -> Result<Translation, Fail> {
     let mut em = Em {
         exe,
@@ -435,6 +466,7 @@ fn emit(
         hz,
         long,
         hooks,
+        leaf,
         out: Code::default(),
         stubs: Vec::new(),
         stub_words: 0,
@@ -1125,7 +1157,7 @@ impl Em<'_> {
         let uncond = matches!(k, J) || (k == Beq && i.rs() == i.rt()) || (k == Bgez && i.rs() == 0);
         let bal = k == Bgezal && i.rs() == 0;
         match k {
-            Jr if i.rs() == RA as usize => {
+            Jr if i.rs() == RA as usize && self.leaf.contains(&a) => {
                 if let Some(w) = simple_slot {
                     self.out.push(jr(RA));
                     self.out.simple(w, s);

@@ -1042,6 +1042,33 @@ fn a_host_return_address_through_another_register_goes_as_it_is() {
     assert!(run.log.missed.is_empty(), "{:x?}", run.log.missed);
 }
 
+/// A guest return address an interpreted prologue saved (Silent Hill's 80073E3C, called from a
+/// switch case with ra 80071C10) and a translated `lw ra; jr ra` takes back goes through the
+/// dispatch table: a native `jr ra` jumped to PSP 0x80071C10. A leaf's `jr ra` stays native.
+#[test]
+fn a_guest_return_address_loaded_into_ra_goes_through_the_table() {
+    let w = [
+        lui(A0, 0x8002),          // 0
+        lui(T0, 0x8001),          // 1
+        addiu(T0, T0, 0x2C),      // 2  t0 = word 11
+        mem(SW, T0, 0, A0),       // 3  the saved guest ra
+        b(5, ZERO, ZERO, 4, 11),  // 4  bne zero,zero,11 (never taken: 11 is code)
+        NOP,                      // 5
+        mem(LW, RA, 0, A0),       // 6
+        NOP,                      // 7
+        r(8, RA, 0, 0, 0),        // 8  jr ra
+        addiu(T1, T1, 1),         // 9  slot
+        NOP,                      // 10
+        addiu(T2, T2, 1),         // 11 the return point
+        j(2, 14),                 // 12 j end
+        NOP,                      // 13
+        j(2, 14),                 // 14 end
+        NOP,                      // 15
+    ];
+    let run = check(&w, 14, |_| {}, false);
+    assert!(run.t.runtime.is_empty(), "{:?}", run.t.runtime);
+}
+
 /// Branches whose host distance exceeds 16 bits, forward and backward, go through a `j`.
 #[test]
 fn far_branches_are_relaxed() {
