@@ -253,8 +253,13 @@ static void apply(const Cmd *k)
         st.errors++, last_err = r, last_op = k->op;
 }
 
+/* The audio thread, the one sas_mix runs on: sas_log reads its run time from the kernel. */
+static SceUID audio_tid;
+
 u32 sas_mix(s16 *ring, u32 size, u32 wr)
 {
+    if (!audio_tid)
+        audio_tid = sceKernelGetThreadId();
     while (wr - pos >= GRAIN) {
         u32 r = cmd_rd, w = cmd_wr;
         __asm__ volatile("" ::: "memory"); /* the index before the commands it publishes */
@@ -318,6 +323,17 @@ int sas_log(char *line, int cap, u32 *us)
     if (mode == 2 && len < cap)
         len += snprintf(line + len, (size_t)(cap - len), "; rms spu %u/%u sas %u/%u", (unsigned)rms(e[0], n), (unsigned)rms(e[1], n),
                         (unsigned)rms(d.e[0] - st0.e[0], d.n - st0.n), (unsigned)rms(d.e[1] - st0.e[1], d.n - st0.n));
+    /* the whole audio thread's CPU time (SAS grains, commands, ring writes, its own waits excluded),
+     * from the kernel's per-thread run clock, in us */
+    static u64 run0;
+    SceKernelThreadRunStatus rs;
+    rs.size = sizeof rs;
+    if (audio_tid > 0 && sceKernelReferThreadRunStatus(audio_tid, &rs) >= 0) {
+        u64 run = (u64)rs.runClocks.hi << 32 | rs.runClocks.low;
+        if (len < cap)
+            len += snprintf(line + len, (size_t)(cap - len), "; thread %u ms", (unsigned)((run - run0) / 1000));
+        run0 = run;
+    }
     if (len < cap)
         len += snprintf(line + len, (size_t)(cap - len), "\n");
 #undef D
