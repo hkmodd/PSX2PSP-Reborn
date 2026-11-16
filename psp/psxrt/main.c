@@ -483,15 +483,14 @@ static u32 us_rgb24; /* time spent converting, for the log */
  * list (the PS1 picture to the screen), then the text */
 static u32 us_pwait, us_pdraw, us_ptext;
 
-static const void *convert24(const Gpu *g, int w, int h)
+static void convert24_to(const Gpu *g, int w, int h, u32 *dst)
 {
-    u32 t = sceKernelGetSystemTimeLow();
     const u32 wrap = VRAM_W * 2 - 1, b0 = (u32)g->disp_x * 2;
     /* whole words when the line starts on one and does not wrap: 4 pixels in 3 words */
     u32 fast = (b0 & 3) == 0 && b0 + 3u * (u32)w <= VRAM_W * 2 ? (u32)w & ~3u : 0;
     for (int y = 0; y < h; y++) {
         const u8 *row = (const u8 *)g->vram + (u32)((g->disp_y + y) & (VRAM_H - 1)) * VRAM_W * 2;
-        u32 *o = rgb24_tex + y * 512;
+        u32 *o = dst + y * 512;
         const u32 *s = (const u32 *)(row + b0);
         for (u32 x = 0; x < fast; x += 4, s += 3) {
             u32 a = s[0], b = s[1], c = s[2];
@@ -503,6 +502,31 @@ static const void *convert24(const Gpu *g, int w, int h)
         for (u32 x = fast, b = b0 + 3 * fast; x < (u32)w; x++, b += 3)
             o[x] = 0xFF000000u | (u32)row[(b + 2) & wrap] << 16 | (u32)row[(b + 1) & wrap] << 8 | row[b & wrap];
     }
+}
+
+static const void *convert24(const Gpu *g, int w, int h)
+{
+    /* Once, where the conversion's time goes: the stores into cached lines (each missing line read
+     * from RAM first), the writeback, or the reads; the same stores uncached for comparison */
+    static int measured;
+    if (!measured) {
+        u32 t0 = sceKernelGetSystemTimeLow();
+        convert24_to(g, w, h, rgb24_tex);
+        u32 t1 = sceKernelGetSystemTimeLow();
+        sceKernelDcacheWritebackRange(rgb24_tex, (u32)h * 512 * 4);
+        u32 t2 = sceKernelGetSystemTimeLow();
+        sceKernelDcacheWritebackInvalidateRange(rgb24_tex, (u32)h * 512 * 4);
+        u32 t3 = sceKernelGetSystemTimeLow();
+        convert24_to(g, w, h, (u32 *)((u32)rgb24_tex | 0x40000000u));
+        u32 t4 = sceKernelGetSystemTimeLow();
+        convert24_to(g, w, h, rgb24_tex); /* again, the source now cached */
+        u32 t5 = sceKernelGetSystemTimeLow();
+        say("rgb24 %dx%d on the CPU: cached %u us + writeback %u us; uncached %u us; cached again %u us", w, h,
+            (unsigned)(t1 - t0), (unsigned)(t2 - t1), (unsigned)(t4 - t3), (unsigned)(t5 - t4));
+        measured = 1;
+    }
+    u32 t = sceKernelGetSystemTimeLow();
+    convert24_to(g, w, h, rgb24_tex);
     sceKernelDcacheWritebackRange(rgb24_tex, (u32)h * 512 * 4);
     us_rgb24 += sceKernelGetSystemTimeLow() - t;
     return rgb24_tex;

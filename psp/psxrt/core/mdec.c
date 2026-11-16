@@ -308,38 +308,93 @@ static void vf_idct(const s32 *coef, const float *L, float *out)
         : "memory");
 }
 
-/* Rounds and clamps C000 and C010 to signed bytes; C700 holds 127s, C710 -128s. */
-#define VROUND2 "vf2in.q C000, C000, 0\n vf2in.q C010, C010, 0\n vi2f.q C000, C000, 0\n vi2f.q C010, C010, 0\n" \
-    "vmin.q C000, C000, C700\n vmin.q C010, C010, C700\n vmax.q C000, C000, C710\n vmax.q C010, C010, C710\n"
+/* vf_idct for a block whose coefficients all sit in the top-left quadrant (rows and columns 0-3),
+ * 72% of the blocks in a video: X10 = X01 = X11 = 0, so P00 = L00 X00, P10 = L10 X00, P01 = P11 = 0,
+ * and Q takes four products: six vmmul instead of sixteen, P kept in registers. The terms left out
+ * are exact zeros, so the results are vf_idct's bit for bit. */
+static void vf_idct_tl(const s32 *coef, const float *L, float *out)
+{
+    __asm__ volatile(
+        VL4("0", "0", "1") VL4("2", "128", "1") VLR("4", "0", "0") VI2F("4")
+        "vmmul.q M600, M000, M400\n vmmul.q M700, M200, M400\n"
+        VL4("0", "0", "2") VL4("1", "64", "2")
+        "vmmul.q M200, M600, M000\n vmmul.q M300, M600, M100\n" VSR("2", "0", "3") VSR("3", "128", "3")
+        "vmmul.q M200, M700, M000\n vmmul.q M300, M700, M100\n" VSR("2", "16", "3") VSR("3", "144", "3")
+        :
+        : "r"(coef), "r"(L), "r"(vf_right), "r"(out)
+        : "memory");
+}
 
-/* The six blocks in vf_coef (Cr, Cb, Y0-Y3) to vf_rgba. */
+/* Quadrants a raster position belongs to, as mask bits: 1 top-left, 2 top-right, 4 bottom-left,
+ * 8 bottom-right. vf_mask[b] holds the quadrants block b's coefficients were written to. */
+#define VF_QB_TOP 1, 1, 1, 1, 2, 2, 2, 2
+#define VF_QB_BOT 4, 4, 4, 4, 8, 8, 8, 8
+static const u8 vf_qbit[64] = {VF_QB_TOP, VF_QB_TOP, VF_QB_TOP, VF_QB_TOP, VF_QB_BOT, VF_QB_BOT, VF_QB_BOT, VF_QB_BOT};
+static u8 vf_mask[6] = {15, 15, 15, 15, 15, 15};
+
+static void vf_idct_any(int b)
+{
+    if (vf_mask[b] == 1)
+        vf_idct_tl(vf_coef[b], vf_left[b >= 2], vf_pix[b]);
+    else
+        vf_idct(vf_coef[b], vf_left[b >= 2], vf_pix[b]);
+}
+
+/* Zeroes what block b's mask says was written: the top-left quadrant alone or the whole block. */
+static void vf_zero(int b)
+{
+    if (vf_mask[b] == 1)
+        __asm__ volatile("vzero.q C000\n sv.q C000, 0(%0)\n sv.q C000, 32(%0)\n sv.q C000, 64(%0)\n sv.q C000, 96(%0)\n"
+                         : : "r"(vf_coef[b]) : "memory");
+    else if (vf_mask[b])
+        __asm__ volatile("vzero.q C000\n" VZ8("0", "0") VZ8("0", "128") : : "r"(vf_coef[b]) : "memory");
+    vf_mask[b] = 0;
+}
+
+/* Rounds and clamps C000-C030 to signed bytes (C700 holds 127s, C710 -128s), each step on the four
+ * columns before the next: four chains in flight. */
+#define VROUND4 "vf2in.q C000, C000, 0\n vf2in.q C010, C010, 0\n vf2in.q C020, C020, 0\n vf2in.q C030, C030, 0\n" \
+    "vi2f.q C000, C000, 0\n vi2f.q C010, C010, 0\n vi2f.q C020, C020, 0\n vi2f.q C030, C030, 0\n" \
+    "vmin.q C000, C000, C700\n vmin.q C010, C010, C700\n vmin.q C020, C020, C700\n vmin.q C030, C030, C700\n" \
+    "vmax.q C000, C000, C710\n vmax.q C010, C010, C710\n vmax.q C020, C020, C710\n vmax.q C030, C030, C710\n"
+
+/* The six blocks in vf_coef (Cr, Cb, Y0-Y3) to vf_rgba. Two chroma quads and two luma rows a step:
+ * the rows of a pair are one chroma row (oy even), so its terms load once, and the two rows'
+ * operations interleave, each waiting out the other's latency. Each value takes the same
+ * operations as one row at a time. */
 static void vf_colour(void)
 {
     for (int b = 0; b < 6; b++)
-        vf_idct(vf_coef[b], vf_left[b >= 2], vf_pix[b]);
-    __asm__ volatile(VL4("7", "0", "0") "vzero.q C230\n vzero.q C430\n" : : "r"(vf_k) : "memory");
-    for (int q = 0; q < 64; q += 4) /* chroma terms: R 359r, G -88b -183r, B 454b, all / 256, + 128 */
-        __asm__ volatile("lv.q C000, 0(%0)\n lv.q C010, 0(%1)\n" VROUND2
-                         "vscl.q C100, C000, S720\n vscl.q C110, C010, S721\n vscl.q C120, C000, S722\n"
-                         "vadd.q C100, C100, C730\n vadd.q C110, C110, C120\n vscl.q C120, C010, S723\n"
-                         "vadd.q C110, C110, C730\n vadd.q C120, C120, C730\n"
-                         "sv.q C100, 0(%2)\n sv.q C110, 0(%3)\n sv.q C120, 0(%4)\n"
+        vf_idct_any(b);
+    __asm__ volatile(VL4("7", "0", "0") : : "r"(vf_k) : "memory");
+    for (int q = 0; q < 64; q += 8) /* chroma terms: R 359r, G -88b -183r, B 454b, all / 256, + 128 */
+        __asm__ volatile("lv.q C000, 0(%0)\n lv.q C010, 0(%1)\n lv.q C020, 16(%0)\n lv.q C030, 16(%1)\n" VROUND4
+                         "vscl.q C100, C000, S720\n vscl.q C200, C020, S720\n vscl.q C110, C010, S721\n vscl.q C210, C030, S721\n"
+                         "vscl.q C120, C000, S722\n vscl.q C220, C020, S722\n vadd.q C100, C100, C730\n vadd.q C200, C200, C730\n"
+                         "vadd.q C110, C110, C120\n vadd.q C210, C210, C220\n vscl.q C120, C010, S723\n vscl.q C220, C030, S723\n"
+                         "vadd.q C110, C110, C730\n vadd.q C210, C210, C730\n vadd.q C120, C120, C730\n vadd.q C220, C220, C730\n"
+                         "sv.q C100, 0(%2)\n sv.q C110, 0(%3)\n sv.q C120, 0(%4)\n sv.q C200, 16(%2)\n sv.q C210, 16(%3)\n sv.q C220, 16(%4)\n"
                          :
                          : "r"(vf_pix[0] + q), "r"(vf_pix[1] + q), "r"(vf_term[0] + q), "r"(vf_term[1] + q), "r"(vf_term[2] + q)
                          : "memory");
+    __asm__ volatile("vzero.q C230\n vzero.q C430\n vzero.q C530\n vzero.q C630\n");
     for (int i = 0; i < 4; i++)
-        for (int y = 0; y < 8; y++) {
+        for (int y = 0; y < 8; y += 2) {
             int oy = (i >> 1) * 8 + y, c = (oy >> 1) * 8 + (i & 1) * 4;
-            __asm__ volatile("lv.q C000, 0(%0)\n lv.q C010, 16(%0)\n" VROUND2
+            __asm__ volatile("lv.q C000, 0(%0)\n lv.q C010, 16(%0)\n lv.q C020, 32(%0)\n lv.q C030, 48(%0)\n" VROUND4
                              "lv.q C100, 0(%1)\n lv.q C110, 0(%2)\n lv.q C120, 0(%3)\n"
-                             "vadd.q C200, C000, C100\n vadd.q C210, C000, C110\n vadd.q C220, C000, C120\n"
-                             "vadd.q C400, C010, C100\n vadd.q C410, C010, C110\n vadd.q C420, C010, C120\n"
-                             "vf2iz.q C200, C200, 23\n vf2iz.q C210, C210, 23\n vf2iz.q C220, C220, 23\n"
-                             "vf2iz.q C400, C400, 23\n vf2iz.q C410, C410, 23\n vf2iz.q C420, C420, 23\n"
-                             /* pixels x = 0-3 in C300, 4-7 in C310: even x from M2, odd from M4 */
-                             "vi2uc.q S300, R200\n vi2uc.q S302, R201\n vi2uc.q S310, R202\n vi2uc.q S312, R203\n"
-                             "vi2uc.q S301, R400\n vi2uc.q S303, R401\n vi2uc.q S311, R402\n vi2uc.q S313, R403\n"
-                             "sv.q C300, 0(%4)\n sv.q C310, 16(%4)\n"
+                             /* row oy: even x in M2, odd in M4; row oy + 1: even in M5, odd in M6 */
+                             "vadd.q C200, C000, C100\n vadd.q C400, C010, C100\n vadd.q C500, C020, C100\n vadd.q C600, C030, C100\n"
+                             "vadd.q C210, C000, C110\n vadd.q C410, C010, C110\n vadd.q C510, C020, C110\n vadd.q C610, C030, C110\n"
+                             "vadd.q C220, C000, C120\n vadd.q C420, C010, C120\n vadd.q C520, C020, C120\n vadd.q C620, C030, C120\n"
+                             "vf2iz.q C200, C200, 23\n vf2iz.q C400, C400, 23\n vf2iz.q C500, C500, 23\n vf2iz.q C600, C600, 23\n"
+                             "vf2iz.q C210, C210, 23\n vf2iz.q C410, C410, 23\n vf2iz.q C510, C510, 23\n vf2iz.q C610, C610, 23\n"
+                             "vf2iz.q C220, C220, 23\n vf2iz.q C420, C420, 23\n vf2iz.q C520, C520, 23\n vf2iz.q C620, C620, 23\n"
+                             "vi2uc.q S300, R200\n vi2uc.q S301, R400\n vi2uc.q S320, R500\n vi2uc.q S321, R600\n"
+                             "vi2uc.q S302, R201\n vi2uc.q S303, R401\n vi2uc.q S322, R501\n vi2uc.q S323, R601\n"
+                             "vi2uc.q S310, R202\n vi2uc.q S311, R402\n vi2uc.q S330, R502\n vi2uc.q S331, R602\n"
+                             "vi2uc.q S312, R203\n vi2uc.q S313, R403\n vi2uc.q S332, R503\n vi2uc.q S333, R603\n"
+                             "sv.q C300, 0(%4)\n sv.q C310, 16(%4)\n sv.q C320, 64(%4)\n sv.q C330, 80(%4)\n"
                              :
                              : "r"(vf_pix[2 + i] + y * 8), "r"(vf_term[0] + c), "r"(vf_term[1] + c), "r"(vf_term[2] + c),
                                "r"(vf_rgba + oy * 16 + (i & 1) * 8)
@@ -382,23 +437,37 @@ static void vf_check(Psx *psx)
 {
     static Mdec t;
     static s16 blk[6][64];
-    u32 seed = 0x2545F491u, near = 0, far = 0, bytes = 0;
+    static float full[64] A64;
+    u32 seed = 0x2545F491u, near = 0, far = 0, bytes = 0, tl_diff = 0, tl_n = 0;
     Mdec *m = &psx->mdec;
     vf_build(m->scale);
     memcpy(t.scale, m->scale, sizeof t.scale);
     clamp_init();
     for (int it = 0; it < 64; it++) {
-        int depth = 2 + (it & 1), sign = it >> 1 & 1;
+        /* kind 0 and 3: coefficients anywhere; 1: top-left quadrant only; 2: DC only */
+        int depth = 2 + (it & 1), sign = it >> 1 & 1, kind = it >> 3 & 3;
         for (int b = 0; b < 6; b++) {
             memset(blk[b], 0, sizeof blk[b]);
             seed = seed * 1664525u + 1013904223u;
             blk[b][0] = (s16)((s32)(seed >> 16) % 1000 - 500);
-            for (int k = 0; k < 10; k++) {
+            for (int k = 0; k < 10 && kind != 2; k++) {
                 seed = seed * 1664525u + 1013904223u;
-                blk[b][1 + (seed >> 8) % 63] = (s16)((s32)(seed >> 20 & 127) - 64);
+                u32 p = 1 + (seed >> 8) % 63;
+                if (kind == 1)
+                    p = (p >> 2 & 3) * 8 + (p & 3);
+                blk[b][p] = (s16)((s32)(seed >> 20 & 127) - 64);
             }
-            for (int k = 0; k < 64; k++)
+            vf_mask[b] = 0;
+            for (int k = 0; k < 64; k++) {
                 vf_coef[b][k] = blk[b][k];
+                if (blk[b][k])
+                    vf_mask[b] |= vf_qbit[k];
+            }
+            if (vf_mask[b] == 1) { /* the top-left path against the full one, bit for bit */
+                vf_idct(vf_coef[b], vf_left[b >= 2], full);
+                vf_idct_tl(vf_coef[b], vf_left[b >= 2], vf_pix[b]);
+                tl_diff += memcmp(full, vf_pix[b], sizeof full) != 0, tl_n++;
+            }
             idct(&t, blk[b]);
         }
         t.depth = depth, t.sign = sign, t.bit15 = it >> 2 & 1;
@@ -427,9 +496,10 @@ static void vf_check(Psx *psx)
         }
     }
     u32 rle_bad = vf_check_rle(m);
-    vf_state = far || rle_bad ? -1 : 1;
-    psx_log(psx, "mdec: VFPU IDCT and colour %s, %u of %u channels differ by 1, %u by more; %u of 512 RLE blocks differ",
-            vf_state > 0 ? "in use" : "refused", near, bytes, far, rle_bad);
+    vf_state = far || rle_bad || tl_diff ? -1 : 1;
+    psx_log(psx, "mdec: VFPU IDCT and colour %s, %u of %u channels differ by 1, %u by more; %u of 512 RLE blocks differ; "
+            "%u of %u top-left blocks differ from the full IDCT",
+            vf_state > 0 ? "in use" : "refused", near, bytes, far, rle_bad, tl_diff, tl_n);
     /* What a macroblock costs, by part, on the last random blocks: the S19 device run spent
      * ~48 us a macroblock in the intro movie */
     const PsxHost *h = psx->host;
@@ -446,9 +516,14 @@ static void vf_check(Psx *psx)
         for (int i = 0; i < 64; i++)
             vf_pack(out, 2, 0, 0);
         u32 t3 = h->usec(h->user);
-        psx_log(psx, "mdec: a macroblock costs %u ns of IDCT, %u ns of IDCT and colour, %u ns of 24-bit packing",
-                (t1 - t0) * 1000 / 64, (t2 - t1) * 1000 / 64, (t3 - t2) * 1000 / 64);
+        for (int i = 0; i < 64; i++)
+            for (int b = 0; b < 6; b++)
+                vf_idct_tl(vf_coef[b], vf_left[b >= 2], vf_pix[b]);
+        u32 t4 = h->usec(h->user);
+        psx_log(psx, "mdec: a macroblock costs %u ns of IDCT (%u ns with top-left blocks), %u ns of IDCT and colour, %u ns of 24-bit packing",
+                (t1 - t0) * 1000 / 64, (t4 - t3) * 1000 / 64, (t2 - t1) * 1000 / 64, (t3 - t2) * 1000 / 64);
     }
+    memset(vf_mask, 15, sizeof vf_mask); /* the checks left coefficients everywhere */
 }
 
 #define VF_HALF(n) (n = in[hp >> 1] >> ((hp & 1) << 4) & 0xFFFF, hp++)
@@ -456,11 +531,11 @@ static void vf_check(Psx *psx)
 
 /* rle() for a zeroed block of ints, with the read position in a register and one multiply per
  * coefficient: the quant table times the block's scale is kept per scale, which a video seldom
- * changes. */
-static int vf_rle(Mdec *m, s32 *f, int t)
+ * changes. *mask gets the quadrants written to (vf_qbit). */
+static int vf_rle(Mdec *m, s32 *f, int t, u8 *mask)
 {
     const u32 *in = m->in;
-    u32 hp = (u32)m->hpos, end = (u32)m->nin * 2, n;
+    u32 hp = (u32)m->hpos, end = (u32)m->nin * 2, n, mk = 0;
     do {
         if (hp >= end) {
             m->hpos = (int)hp;
@@ -473,6 +548,7 @@ static int vf_rle(Mdec *m, s32 *f, int t)
         for (;;) { /* raster order, each value doubled */
             val = sext10(n) * 2;
             f[k] = VF_CLAMP(val);
+            mk |= vf_qbit[k];
             if (hp >= end)
                 break;
             VF_HALF(n);
@@ -489,7 +565,9 @@ static int vf_rle(Mdec *m, s32 *f, int t)
         }
         val = sext10(n) * qt[0];
         for (;;) {
-            f[zagzig[k]] = VF_CLAMP(val);
+            u32 p = zagzig[k];
+            f[p] = VF_CLAMP(val);
+            mk |= vf_qbit[p];
             if (hp >= end)
                 break;
             VF_HALF(n);
@@ -499,6 +577,7 @@ static int vf_rle(Mdec *m, s32 *f, int t)
         }
     }
     m->hpos = (int)hp;
+    *mask = (u8)mk;
     return 1;
 }
 
@@ -536,9 +615,10 @@ static u32 vf_check_rle(const Mdec *m)
         int ra = rle(&r, a, t ? r.iq_uv : r.iq_y), pa = r.hpos;
         memset(vf_coef[0], 0, sizeof vf_coef[0]);
         r.hpos = 0;
-        int rb = vf_rle(&r, vf_coef[0], t), diff = ra != rb || pa != r.hpos;
-        for (int k = 0; k < 64; k++)
-            diff |= a[k] != vf_coef[0][k];
+        u8 mk = 0;
+        int rb = vf_rle(&r, vf_coef[0], t, &mk), diff = ra != rb || pa != r.hpos;
+        for (int k = 0; k < 64; k++) /* the mask must hold every coefficient written */
+            diff |= a[k] != vf_coef[0][k] || (a[k] && !(mk & vf_qbit[k]));
         bad += (u32)diff;
     }
     vf_qtq_q[0] = vf_qtq_q[1] = -1;
@@ -548,12 +628,11 @@ static u32 vf_check_rle(const Mdec *m)
 /* A colour macroblock through the VFPU; 0 when the input ran out. */
 static int vf_decode(Mdec *m)
 {
-    __asm__ volatile("vzero.q C000\n");
-    for (int b = 0; b < 6; b += 2)
-        __asm__ volatile(VZ8("0", "0") VZ8("0", "128") VZ8("0", "256") VZ8("0", "384") : : "r"(vf_coef[b]) : "memory");
+    for (int b = 0; b < 6; b++)
+        vf_zero(b);
     for (int b = 0; b < 6; b++) {
         m->block = b < 2 ? 4 + b : b - 2;
-        if (!vf_rle(m, vf_coef[b], b < 2))
+        if (!vf_rle(m, vf_coef[b], b < 2, &vf_mask[b]))
             return 0;
     }
     if (vf_stale && memcmp(vf_from, m->scale, sizeof vf_from))
