@@ -14,9 +14,14 @@
 #define GE_DISP_B 0x144000u
 
 /* Installs the renderer as psx->gpu.renderer and clears the GE's copy of PS1 VRAM (RAM's copy is
- * all zero after psx_init). compare: the GE and the software rasterizer both draw everything and
- * the copies are compared once per second (psxrt.trace bit 3). */
-void ge_init(Psx *psx, int compare);
+ * all zero after psx_init). mode:
+ *   GE_NORMAL  the GE draws what it can, the software rasterizer the rest;
+ *   GE_COMPARE the GE and the software rasterizer both draw everything and the copies are
+ *              compared once per second (psxrt.trace bit 3);
+ *   GE_SHADOW  the GE works as in GE_NORMAL and the software rasterizer draws everything too, so
+ *              RAM's copy never needs the GE's pixels (the sim, which has no GE, checks lists so). */
+enum { GE_NORMAL, GE_COMPARE, GE_SHADOW };
+void ge_init(Psx *psx, int mode);
 /* Opens the display list for host commands; the renderer sets its state again afterwards. */
 void ge_open(void);
 /* Ends the display list and waits for the GE. */

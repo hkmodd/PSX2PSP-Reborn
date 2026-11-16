@@ -19,6 +19,17 @@
 #include "ge_host.h"
 #include "gel.h"
 
+#ifdef _MSC_VER /* the PC simulator's compiler */
+#pragma warning(disable : 4244) /* int into s16: rd_line's runs (a cast there costs the PSP's min/max) */
+#define A64 __declspec(align(64))
+#define NOINLINE __declspec(noinline)
+#define COLD NOINLINE
+#else
+#define A64 __attribute__((aligned(64)))
+#define NOINLINE __attribute__((noinline))
+#define COLD __attribute__((noinline, cold))
+#endif
+
 #define LIST_BYTES (512 * 1024)
 #define LIST_SLACK (32 * 1024) /* room a primitive, a readback or the host may need */
 #define TILE_W 64
@@ -89,15 +100,16 @@ typedef struct {
     u32 ver;        /* bumped whenever the slot is written */
     int flags;      /* clut()'s */
 } ClutSlot;
-static u32 __attribute__((aligned(64))) clut_pool[CLUT_SLOTS][256];
+static A64 u32 clut_pool[CLUT_SLOTS][256];
 
-static unsigned int __attribute__((aligned(64))) list[LIST_BYTES / 4];
+static A64 unsigned int list[LIST_BYTES / 4];
 static int list_open, state_valid;
 
 static struct {
     Psx *psx;
     GpuRenderer r;
     int compare;
+    int done;                  /* what a drawn primitive returns: GPU_BOTH when the core draws it too */
     u16 *cmp;                  /* compare mode: the GE's copy, read back */
     u16 newer[TILES_Y];        /* per tile row, a bit per tile column: the GE's copy is newer */
     u32 nver;                  /* bumped whenever `newer` gains a bit */
@@ -184,7 +196,7 @@ static int ring_ab = 1;
  * they are cut to 5 bits, as the PS1 does. */
 static const int ps1_dither[16] = {-4, 0, -3, 1, 2, -2, 3, -1, -3, 1, -4, 0, 3, -1, 2, -2};
 
-#define DONE (ge.compare ? GPU_BOTH : GPU_DRAWN)
+#define DONE (ge.done)
 
 /* The list runs while it is written, but its stall address moves every STALL_STEP bytes and at
  * the end, not after every draw as GU_DIRECT does (one system call per draw): a GU_SEND list,
@@ -809,7 +821,7 @@ static const u32 *clut(const GpuPrim *p, int *flags)
     u32 st = e->key == key && e->epoch == ge.epoch ? e->stamp : stamp((s32)p->clut_x, (s32)p->clut_y, n, 1);
     if (e->key != key || e->stamp != st) {
         int tmp = e->used == ge.syncs;
-        u32 *c = tmp ? (u32 *)(((u32)gel_get_memory(GL, n * 4 + 16) + 15) & ~15u) : clut_pool[e - ge.cluts];
+        u32 *c = tmp ? (u32 *)(((uintptr_t)gel_get_memory(GL, n * 4 + 16) + 15) & ~(uintptr_t)15) : clut_pool[e - ge.cluts];
         const u16 *row = ge.psx->gpu.vram + p->clut_y * VRAM_W;
         int f = 0;
         for (int i = 0; i < n; i++) {
@@ -912,8 +924,8 @@ static void tw_bind(const GpuPrim *p, int n, TexVtx *v)
         size[a] = s;
         ge.s.tw_rep++;
     }
-    if ((u32)t & 15) {
-        u8 *c = (u8 *)(((u32)gel_get_memory(GL, 16 * (u32)size[1] + 16) + 15) & ~15u);
+    if (gel_addr(t) & 15) {
+        u8 *c = (u8 *)(((uintptr_t)gel_get_memory(GL, 16 * (u32)size[1] + 16) + 15) & ~(uintptr_t)15);
         for (int y = 0; y < size[1]; y++)
             memcpy(c + 16 * y, t + row * (u32)y, (size_t)size[0] * bits / 8);
         t = c, tbw = (int)(128 / bits), tmp = 1;
@@ -1190,7 +1202,11 @@ static int rd_line(void *self, const GpuPrim *p, const GpuVtx *a, const GpuVtx *
         return DONE;
     s32 dx = b->x - a->x, dy = b->y - a->y, adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
     s32 n = adx > ady ? adx : ady;
-    static struct { s16 x0, y0, x1, y1; u32 c; } run[1025];
+    typedef struct {
+        s16 x0, y0, x1, y1;
+        u32 c;
+    } Run;
+    static Run run[1025];
     int nr = 0;
     s32 bx1 = VRAM_W, by1 = VRAM_H, bx2 = -1, by2 = -1;
     for (s32 i = 0; i <= n; i++) {
@@ -1202,7 +1218,7 @@ static int rd_line(void *self, const GpuPrim *p, const GpuVtx *a, const GpuVtx *
                      a->b + (n ? (b->b - a->b) * i / n : 0));
         bx1 = x < bx1 ? x : bx1, by1 = y < by1 ? y : by1, bx2 = x > bx2 ? x : bx2, by2 = y > by2 ? y : by2;
         if (nr) {
-            typeof(run[0]) *r = &run[nr - 1];
+            Run *r = &run[nr - 1];
             int row = r->y0 == y && r->y1 == y && (x == r->x1 + 1 || x == r->x0 - 1);
             int col = r->x0 == x && r->x1 == x && (y == r->y1 + 1 || y == r->y0 - 1);
             if (r->c == c && (row || col)) {
@@ -1211,7 +1227,7 @@ static int rd_line(void *self, const GpuPrim *p, const GpuVtx *a, const GpuVtx *
                 continue;
             }
         }
-        run[nr++] = (typeof(run[0])){(s16)x, (s16)y, (s16)x, (s16)y, c};
+        run[nr++] = (Run){(s16)x, (s16)y, (s16)x, (s16)y, c};
     }
     if (!nr)
         return DONE;
@@ -1329,7 +1345,7 @@ static struct {
     s32 x1, y1, x2, y2;
 } fl_mru[FL_MRU];
 static u32 fl_mru_next;
-static u32 __attribute__((aligned(64))) fl_arena[FL_ARENA / 4];
+static A64 u32 fl_arena[FL_ARENA / 4];
 #define FL_ARENA_UNCACHED ((unsigned int *)GEH_UNCACHED(fl_arena))
 
 /* A tile under the texels (tu_lo-tu_hi) of a texpage's page or under a CLUT is newer on the GE
@@ -1424,8 +1440,8 @@ static void fl_miss(FlEntry *e, u32 cmd, u32 clut, s32 x1, s32 y1, s32 x2, s32 y
         gel_cmd(GL, 0x12, p.textured ? TEX_VTX : GE_VTX); /* VTYPE */
         if (arena) {
             gel_cmd(GL, 0x0B, 0); /* RET */
-            e->call[0] = 0x10000000u | ((u32)s >> 8 & 0xF0000);
-            e->call[1] = 0x0A000000u | ((u32)s & 0xFFFFFF);
+            e->call[0] = 0x10000000u | (gel_addr(s) >> 8 & 0xF0000);
+            e->call[1] = 0x0A000000u | (gel_addr(s) & 0xFFFFFF);
             l[0] = e->call[0], l[1] = e->call[1];
             GL->current = l + 2;
             e->blk = ge.syncs;
@@ -1436,7 +1452,7 @@ static void fl_miss(FlEntry *e, u32 cmd, u32 clut, s32 x1, s32 y1, s32 x2, s32 y
 }
 
 /* The key in fl.k0-a1 changed: the GE gets its state, from the cache when it holds. */
-static __attribute__((noinline)) void fl_setup(u32 cmd, u32 clut)
+static NOINLINE void fl_setup(u32 cmd, u32 clut)
 {
     s32 x1, y1, x2, y2;
     int flags = 0;
@@ -1538,7 +1554,7 @@ static void fl_setup_timed(u32 cmd, u32 clut)
  * pass. Returns the list's next word. */
 static unsigned int *fl_draw(unsigned int *l, const u8 *vp, int prim, int n)
 {
-    u32 base = (u32)vp >> 8 & 0xF0000, va = 0x01000000u | ((u32)vp & 0xFFFFFF);
+    u32 base = gel_addr(vp) >> 8 & 0xF0000, va = 0x01000000u | (gel_addr(vp) & 0xFFFFFF);
     u32 pr = 0x04000000u | (u32)prim << 16 | (u32)n;
     if (fl.two)
         for (int i = 0; i < fl.n1; i++)
@@ -1708,7 +1724,7 @@ static u32 rd_packet(void *self, const u32 *w, u32 n)
 
 /* rd_poly's polygon left of or above the VRAM origin: the core's triangles (a quad's are 0,1,2 and
  * 1,2,3), each cut to a fan. Out of line, away from the lane's own code. Returns the list's next word. */
-static __attribute__((noinline, cold)) unsigned int *poly_cut(unsigned int *l, u8 *vp, const s32 *x, const s32 *y,
+static COLD unsigned int *poly_cut(unsigned int *l, u8 *vp, const s32 *x, const s32 *y,
                                                              const u32 *col, const u32 *uv, int n, int tex, s32 minx,
                                                              s32 miny, u32 vsz)
 {
@@ -1851,21 +1867,22 @@ static void busy_bench(Psx *psx)
             t4 - t3c < 20 ? " (the GE finished first)" : "", (unsigned)((t6 - t5) * 1000 / 256), (unsigned)(sum & 1));
 }
 
-int gel_check(unsigned int *buf, unsigned int words, char *out, int cap);
-
-void ge_init(Psx *psx, int compare)
+void ge_init(Psx *psx, int mode)
 {
     ge.psx = psx;
-    ge.compare = compare;
+    ge.compare = mode == GE_COMPARE;
+    geh_region(list, sizeof list), geh_region(clut_pool, sizeof clut_pool), geh_region(fl_arena, sizeof fl_arena);
+    geh_region(psx->gpu.vram, VRAM_W * VRAM_H * 2);
     if (!list_open) { /* the list is idle: gel.h against pspgu in it */
         char m[160];
         if (geh_check(list, LIST_BYTES / 4, m, sizeof m))
             psx_log(psx, "%s", m);
     }
-    if (compare) {
+    if (ge.compare) {
         ge.cmp = geh_alloc("psxrt ge compare", VRAM_W * VRAM_H * 2);
         ge.compare = ge.cmp != NULL;
     }
+    ge.done = ge.compare || mode == GE_SHADOW ? GPU_BOTH : GPU_DRAWN;
     for (int n = PAGE_SLOTS; n >= 4 && !ge.npages; n /= 2) {
         u8 *b = geh_alloc("psxrt ge pages", (u32)(n * PAGE_BYTES));
         if (!b)

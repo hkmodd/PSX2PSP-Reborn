@@ -74,7 +74,14 @@ typedef struct {
     int32_t x1, y1, x2, y2;
 } GelScissor;
 
+/* A pointer as the GE addresses it. A host whose pointers are not the GE's (the sim's are 64-bit)
+ * names its own map as GEL_ADDR. */
+#ifdef GEL_ADDR
+uint32_t GEL_ADDR(const void *p);
+static inline uint32_t gel_addr(const void *p) { return GEL_ADDR(p); }
+#else
 static inline uint32_t gel_addr(const void *p) { return (uint32_t)(uintptr_t)p; }
+#endif
 
 static inline void gel_cmd(GelList *l, uint32_t cmd, uint32_t arg) { *l->current++ = cmd << 24 | (arg & 0xFFFFFF); }
 

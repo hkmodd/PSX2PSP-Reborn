@@ -37,6 +37,8 @@ static inline void *geh_alloc(const char *name, u32 bytes)
 }
 /* the largest block geh_alloc could still have */
 static inline u32 geh_free(void) { return (u32)sceKernelMaxFreeMemSize(); }
+/* memory of ge.c's own that its lists address (the GE reads the PSP's directly) */
+static inline void geh_region(const void *p, u32 bytes) { (void)p, (void)bytes; }
 
 /* The list: pspgu's GU_SEND context, which main.c's present writes too. Its head and the scissor
  * pspgu keeps for it (GuContext: 92 bytes, scissor_enable at 12), so that sceGuEnable
@@ -73,6 +75,7 @@ extern u16 *geh_vram;
 #define GEH_VRAM ((void *)geh_vram)
 void *geh_alloc(const char *name, u32 bytes);
 u32 geh_free(void);
+void geh_region(const void *p, u32 bytes);
 extern GelList *geh_list;
 extern GelScissor geh_scissor;
 #define GEH_LIST geh_list
