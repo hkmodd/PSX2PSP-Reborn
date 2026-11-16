@@ -30,9 +30,48 @@ typedef struct NativeStats {
      * (the next one comes early); waited us */
     u32 vs_wait, vs_late, vs_adv, vs_short, us_vs_wait, us_late, us_late_max;
     u32 updates; /* device updates (psx_update, the stall's included) */
+    u32 io_lean; /* of the host calls, device reads served by io_fast.c (IO_READ) */
+    u32 io_fall[6]; /* timer/IRQ reads io_fast.c left to the host call: event due, IRQ pending, poll, then tmr_sync 1-3 */
 } NativeStats;
 
 extern NativeStats native_stats;
+
+/* CTX.BUDGET is refilled to NATIVE_BUDGET at every runtime entry (1 ms of loops between them);
+ * the interrupt alarm subtracts NATIVE_FORCED to make the next back-edge enter. */
+#define NATIVE_BUDGET (PSX_CLOCK / 1000)
+#define NATIVE_FORCED 0x40000000u
+/* Timer reads of a polling loop (native.c poll_skip): a pair's second read comes within
+ * NATIVE_POLL_PAIR cycles of its first, a loop's next pass within NATIVE_POLL_GAP. */
+#define NATIVE_POLL_PAIR 16u
+#define NATIVE_POLL_GAP 2048u
+
+/* poll_skip's track of the counter reads, kept by io_fast.c's reads too: the loop's site, how
+ * many passes in a row, when it last passed and how long that pass took, when any counter was
+ * last read. */
+typedef struct { u32 hot, streak; u64 hot_at, period, last_at; } NativePoll;
+extern NativePoll native_poll;
+
+/* The track after a counter read at guest `pc` at `now`, `tick` cycles a count (0: not a running
+ * count register): nonzero when poll_skip moves the clock on at this read. */
+static inline int native_poll_note(NativePoll *q, u32 pc, u32 tick, u64 now, u64 next_event)
+{
+    u64 since = now - q->last_at;
+    q->last_at = now;
+    if (!tick)
+        return 0;
+    if (pc != q->hot) {
+        if (since >= NATIVE_POLL_PAIR)
+            q->hot = pc, q->hot_at = now, q->streak = 0;
+        return 0;
+    }
+    u64 period = q->period = now - q->hot_at;
+    q->hot_at = now;
+    if (period >= NATIVE_POLL_GAP) {
+        q->streak = 0;
+        return 0;
+    }
+    return ++q->streak >= 4 && tick > period && next_event > now;
+}
 
 /* main.c, with psxrt.prof: the profiler's counters around the runtime's own work, sampled, each
  * kept sample counted `weight` times. PB_CALL host calls of translated code, PB_UPDATE device

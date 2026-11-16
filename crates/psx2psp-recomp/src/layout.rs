@@ -8,6 +8,7 @@
 //! | [`CTX`] | 0x100 | Guest state the code does not keep in registers ([`ctx`]) |
 //! | [`GTE`] | 0x100 | GTE registers: 32 data words, then 32 control words ([`gte`]) |
 //! | [`RT_CALL`] | | Runtime entry for host calls (written by the runtime) |
+//! | [`IO_READ`] | | Runtime entry for a device read (written by the runtime) |
 //! | [`MISS`] | | Runtime entry for a dispatch-table miss (written by the runtime) |
 //! | [`GTE_CMD`] | | Runtime entry for a GTE command (written by the runtime) |
 //! | [`GTE_NCLIP`] .. [`GTE_RTPT`] | | Runtime entries for the commands of [`GTE_OWN`] |
@@ -29,6 +30,13 @@ pub const CTX: u32 = 0x09A0_0400;
 pub const GTE: u32 = 0x09A0_0500;
 /// Host-call entry.
 pub const RT_CALL: u32 = 0x09A0_0F00;
+/// Device-read entry, for a plain load (`lb`/`lbu`/`lh`/`lhu`/`lw`; `rt` not 0, neither `rt`
+/// nor `rs` `ra`) whose address is neither RAM nor the scratchpad: `sw ra,GPR31(k0); jal
+/// IO_READ; addiu k1,rs,off; .word pc; .word insn; j back; lw rt,GPR(rt)(k0)`. The runtime
+/// serves the read with the guest address in `k1`, or runs it as a host call (an interrupt
+/// taken first comes back to the first word); either way the loaded value is in [`ctx::GPR`]
+/// and every other guest register as it was when it returns past the two words.
+pub const IO_READ: u32 = 0x09A0_0F08;
 /// Dispatch-miss entry: the guest target is in [`ctx::TARGET`].
 pub const MISS: u32 = 0x09A0_0F40;
 /// GTE command entry: `sw ra,GPR31(k0); lui k1,hi; jal GTE_CMD; ori k1,k1,lo` with the

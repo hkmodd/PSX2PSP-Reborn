@@ -890,7 +890,7 @@ impl Em<'_> {
 
     /// `op` (base `k1`, offset 0) on the host address of the guest address of the load or store
     /// `i`, then `then`. RAM and the scratchpad are reached directly; anything else runs `i` in
-    /// the runtime after `undo`.
+    /// the runtime after `undo` (a plain load through [`layout::IO_READ`]).
     fn access(&mut self, pc: u32, i: Insn, op: u32, then: &[u32], undo: &[u32]) -> Code {
         let (rs, off) = (i.rs() as u32, i.imm() as u16);
         let (slow, io, back) = (self.label(), self.label(), self.label());
@@ -917,6 +917,22 @@ impl Em<'_> {
         s.jump(2, To::Label(back), pc);
         s.push(NOP);
         s.def(io);
+        // A plain load goes to IO_READ, which leaves the loaded value in CTX. Its guest address
+        // is in k1 from the jal's slot: an interrupt taken first runs the site again from its
+        // first word, as a host call's (the slot reads ra after the link, so not on ra).
+        let rt = i.rt() as u32;
+        let plain = matches!(i.0 >> 26, 0x20 | 0x21 | 0x23 | 0x24 | 0x25);
+        if plain && then.is_empty() && undo.is_empty() && rt != 0 && rt != RA && rs != RA {
+            s.push(sw(RA, k0_off(layout::CTX + ctx::GPR + 4 * RA), K0R));
+            s.push(jal(layout::IO_READ));
+            s.push(addiu(K1R, rs, off));
+            s.push(pc);
+            s.push(i.0);
+            s.jump(2, To::Label(back), pc);
+            s.push(lw(rt, k0_off(layout::CTX + ctx::GPR + 4 * rt), K0R));
+            self.stub(s);
+            return c;
+        }
         undo.iter().for_each(|&w| s.push(w));
         s.host_call(pc, i.0);
         s.jump(2, To::Label(back), pc);

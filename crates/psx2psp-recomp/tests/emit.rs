@@ -453,10 +453,16 @@ fn run_psp(
             h.jump(ret);
             continue;
         }
-        if h.pc == RT_CALL {
+        // IO_READ is a host call that leaves every guest register in CTX for the site's reload.
+        let io = h.pc == layout::IO_READ;
+        if h.pc == RT_CALL || io {
             let ra = h.gpr[RA as usize];
             let word_at = |a: u32| code.get(((a - CODE) / 4) as usize).copied().unwrap();
             let (pc, word) = (word_at(ra), word_at(ra + 4));
+            if io {
+                let a = h.gpr[(word >> 21 & 31) as usize].wrapping_add(word as i16 as u32);
+                assert_eq!(h.gpr[K1G as usize], a, "IO_READ address at {pc:08x}");
+            }
             h.gpr[RA as usize] = m.ctx(ctx::GPR + 4 * RA);
             to_guest(&h, m, &mut g);
             // A hook's recipe does what its code does, so the interpreter runs that code instead.
@@ -484,6 +490,9 @@ fn run_psp(
                 }
             }
             back(&g, &mut h, m);
+            if io {
+                (1..32).for_each(|r| m.set_ctx(ctx::GPR + 4 * r, g.gpr[r as usize]));
+            }
             h.jump(ra + 8);
             continue;
         }

@@ -61,6 +61,7 @@
 #define CTX_ADDR 0x09A00400u
 #define GTE_ADDR 0x09A00500u /* psx->gte: translated code moves to and from it directly */
 #define STUB_RT_CALL 0x09A00F00u
+#define STUB_IO_READ 0x09A00F08u
 #define STUB_MISS 0x09A00F40u
 #define STUB_DIRTY 0x09A00F60u
 #define STUB_CALL_RET 0x09A00F80u
@@ -80,8 +81,8 @@
 #define C_LO (0x84 / 4)
 #define C_TARGET (0x88 / 4)
 #define C_BUDGET (0x90 / 4)
-#define BUDGET (PSX_CLOCK / 1000) /* 1 ms of loops between runtime entries */
-#define FORCED 0x40000000u        /* the alarm subtracts this from the budget */
+#define BUDGET NATIVE_BUDGET
+#define FORCED NATIVE_FORCED
 #define RESUME 1u
 #define POLL 0u /* host-call word of an interrupt poll */
 #define ALARM_US 500
@@ -116,6 +117,11 @@ u32 psxrt_zero3[3]; /* MVMVA's translation when it has none */
 void native_enter(u32 host_pc);
 /* gte_fast.c */
 void native_gte_fast(u32 cmd);
+/* io_fast.c */
+void psxrt_io_read(void);
+extern Psx *io_fast_psx;
+extern u32 io_fast_shift;
+int io_fast_dev(Psx *psx, u32 p, u32 *v);
 u32 native_host_sp, native_host_gp;
 
 NativeStats native_stats;
@@ -923,8 +929,8 @@ static int gte_fast(u32 insn)
  * equality test still sees its value. When the code only compares the value's magnitude with a
  * limit (pollscan.c, the streamed-frame wait of S21), the clock moves on to where that comparison
  * flips, the counter's target or wrap, or the next device event, whichever comes first. */
-#define POLL_PAIR 16u
-#define POLL_GAP 2048u
+#define POLL_PAIR NATIVE_POLL_PAIR
+#define POLL_GAP NATIVE_POLL_GAP
 
 /* The guest return address that `ra` stands for. Translated calls write a host ra (the start of
  * the translation of the word after the call's delay slot), calls from the interpreter into
@@ -967,27 +973,14 @@ static u32 guest_ra(u32 ra)
     return seen_g[k];
 }
 
+NativePoll native_poll;
+
 static void poll_skip(u32 pc, u32 addr, const u32 *gpr)
 {
-    static u32 hot, streak;
-    static u64 hot_at, last_at;
+    NativePoll *q = &native_poll;
     u32 tick = timer_tick(P, addr);
-    u64 now = P->cycles, since = now - last_at;
-    last_at = now;
-    if (!tick)
-        return;
-    if (pc != hot) {
-        if (since >= POLL_PAIR)
-            hot = pc, hot_at = now, streak = 0;
-        return;
-    }
-    u64 period = now - hot_at;
-    hot_at = now;
-    if (period >= POLL_GAP) {
-        streak = 0;
-        return;
-    }
-    if (++streak >= 4 && tick > period && P->next_event > now) {
+    u64 now = P->cycles;
+    if (native_poll_note(q, pc, tick, now, P->next_event)) {
         u32 g[32], room, raw = timer_poll_count(P, addr, &room);
         for (int i = 0; i < 32; i++)
             g[i] = gpr[i];
@@ -996,14 +989,14 @@ static void poll_skip(u32 pc, u32 addr, const u32 *gpr)
         if (t) {
             u64 to = timer_tick_at(P, addr, t);
             P->cycles = to < P->next_event ? to : P->next_event;
-            hot_at = last_at = P->cycles;
+            q->hot_at = q->last_at = P->cycles;
             native_stats.poll_skips++;
             native_stats.poll_far++;
             return;
         }
-        u64 d = P->next_event - now, s = tick - period;
+        u64 d = P->next_event - now, s = tick - q->period;
         P->cycles += d < s ? d : s;
-        hot_at = last_at = P->cycles;
+        q->hot_at = q->last_at = P->cycles;
         native_stats.poll_skips++;
     }
 }
@@ -1572,6 +1565,54 @@ static void gte_stubs(int asm_ok)
         stub(gte_ops[i].at, asm_ok ? gte_ops[i].fn : gte_ops[i].door);
 }
 
+/* io_fast_dev against psx_read on random counters, clock and interrupt registers: the number of
+ * reads it serves (`*served`) with another value or leaving another state. The counters,
+ * GPUSTAT, the clock and I_STAT/I_MASK are kept. */
+static int io_fast_check(Psx *psx, int n, int *served)
+{
+    static const u32 regs[] = {0x1F801070, 0x1F801074, 0x1F801100, 0x1F801104, 0x1F801108, 0x1F80110C,
+                               0x1F801110, 0x1F801114, 0x1F801118, 0x1F801120, 0x1F801124, 0x1F801128};
+    Timers keep = psx->tmr;
+    u64 cycles = psx->cycles;
+    u32 stat = psx->i_stat, mask = psx->i_mask, gpustat = psx->gpu.stat;
+    int bad = 0;
+    *served = 0;
+    for (int k = 0; k < n; k++) {
+        Timers in;
+        u64 now = (u64)rnd() << 6 | (rnd() & 63);
+        for (int i = 0; i < 3; i++) {
+            Timer *t = &in.t[i];
+            static const u32 spans[4] = {0xFF, 0xFFFFF, 0x7FFFFFFF, 0xFFFFFFFF};
+            t->mode = rnd() & 0x1FFF;
+            if (rnd() & 1)
+                t->mode &= ~0x330u; /* system clock, no interrupt: the reads it serves */
+            u32 r = rnd() & 3;
+            t->target = r == 0 ? 0 : r == 1 ? rnd() & 0xFF : rnd16();
+            t->count = rnd() & 1 ? rnd() % (t->target + 1) : rnd16();
+            t->base = now - (rnd() & spans[rnd() & 3]);
+        }
+        u32 is = rnd() & 0x7FF, im = rnd() & 0x7FF, a = regs[rnd() % (sizeof regs / 4)], v, want;
+        psx->tmr = in, psx->cycles = now, psx->i_stat = is, psx->i_mask = im;
+        psx->gpu.stat = (gpustat & ~(1u << 20)) | (rnd() & 1) << 20; /* PAL or NTSC hblanks */
+        if (io_fast_dev(psx, a, &v))
+            continue;
+        ++*served;
+        Timers got = psx->tmr;
+        u32 got_stat = psx->i_stat;
+        psx->tmr = in, psx->i_stat = is;
+        want = psx_read(psx, a, 4);
+        int differ = v != want || got_stat != psx->i_stat;
+        for (int i = 0; i < 3; i++) {
+            const Timer *x = &got.t[i], *y = &psx->tmr.t[i];
+            differ |= x->count != y->count || x->mode != y->mode || x->target != y->target || x->base != y->base;
+        }
+        if (differ && !bad++)
+            say("native: device read %08X in io_fast: %08X, want %08X", (unsigned)a, (unsigned)v, (unsigned)want);
+    }
+    psx->tmr = keep, psx->cycles = cycles, psx->i_stat = stat, psx->i_mask = mask, psx->gpu.stat = gpustat;
+    return bad;
+}
+
 const char *native_init(Psx *psx, const DiscInfo *info)
 {
     if (info->images > MAX_IMAGES)
@@ -1616,6 +1657,11 @@ const char *native_init(Psx *psx, const DiscInfo *info)
     gte_stubs(!bad);
     say("native: GTE NCLIP/AVSZ/RTPS/RTPT/MVMVA/GPF in asm, %d of %d checks differ%s", bad, GTE_OPS * 4096,
         bad ? ": through the runtime" : "");
+    io_fast_psx = psx, io_fast_shift = cpu_shift;
+    int served;
+    bad = io_fast_check(psx, 65536, &served);
+    stub(STUB_IO_READ, bad ? psxrt_rt_call : psxrt_io_read);
+    say("native: timer/IRQ reads in io_fast, %d of %d served checks differ%s", bad, served, bad ? ": through the runtime" : "");
     flush_code();
     __asm__ volatile("move %0, $gp" : "=r"(native_host_gp));
     psx->call = native_call;
