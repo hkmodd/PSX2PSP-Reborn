@@ -21,7 +21,7 @@
 #include <zlib.h>
 
 #define MAGIC "PSXRTDAT"
-#define VERSION 4
+#define VERSION 5
 #define HEADER_LEN 0xD0
 #define BLOCK_SECTORS 16
 #define RAW 2352
@@ -40,7 +40,7 @@ typedef struct {
     u32 dir_offset, images, code_base, code_size;
     u32 flags;
     u32 cpu_shift;
-    u32 pad[2];
+    u32 disc_table, discs; /* 0, 0 for one disc; else discs entries of 0x20 B (ID, sectors, index offset, blocks, 0) */
 } Header;
 
 typedef struct {

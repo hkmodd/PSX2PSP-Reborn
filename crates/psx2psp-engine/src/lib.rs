@@ -815,17 +815,29 @@ pub const NATIVE_RUNTIME: &[u8] = include_bytes!("../../../resources/psxrt.prx")
 ///   slice, each deflated or stored the same way, its patch table ([`native_code::patch_groups`]:
 ///   one (offset from the table, stored length, raw length) triple per group, then the groups,
 ///   each deflated or stored), then a directory of
-///   [`NATIVE_CODE_ENTRY_LEN`]-byte entries ([`native_code_entry`]). None without code.
+///   [`NATIVE_CODE_ENTRY_LEN`]-byte entries ([`native_code_entry`]). None without code. One
+///   directory serves every disc of the set: a disc change keeps the code that runs;
+/// - with more than one disc, each further disc's index and blocks, laid out as the first's, then
+///   the disc table: [`NATIVE_DISC_ENTRY_LEN`] bytes per disc, the first included (disc ID 16,
+///   raw sectors 4, index offset 4, blocks 4, zero 4). The header's first-disc fields stay, so a
+///   one-disc set has no table.
 pub const NATIVE_PSAR_MAGIC: [u8; 8] = *b"PSXRTDAT";
-pub const NATIVE_PSAR_VERSION: u32 = 4;
+pub const NATIVE_PSAR_VERSION: u32 = 5;
 /// magic 8, version 4, header length 4, disc ID 16, title 128, disc sectors 4, sectors per block
 /// 4, index offset 4, block count 4, code directory offset 4, code images 4, host address of the
-/// code 4, code size 4 (these four written once the code is), flags 4 ([`NATIVE_FLAG_PAL60`]).
+/// code 4, code size 4 (these four written once the code is), flags 4 ([`NATIVE_FLAG_PAL60`]),
+/// CPU shift 4, disc table offset 4 and discs 4 (both 0 for one disc).
 pub const NATIVE_PSAR_HEADER_LEN: usize = 0xD0;
 /// Offset of the code fields in the header.
 const NATIVE_PSAR_CODE_FIELDS: u64 = 0xB0;
 /// Offset of the flags in the header.
 const NATIVE_PSAR_FLAGS: usize = 0xC0;
+/// Offset of the disc table fields (table offset, discs) in the header.
+const NATIVE_PSAR_DISC_FIELDS: u64 = 0xC8;
+/// Bytes per entry of the disc table.
+pub const NATIVE_DISC_ENTRY_LEN: usize = 0x20;
+/// Discs of a native set at most (as a PSTITLEIMG).
+pub const NATIVE_MAX_DISCS: usize = 5;
 /// Flag: a PAL picture runs at 60 vblanks a second (patch database `pal60`, "60 Hz" switch on).
 pub const NATIVE_FLAG_PAL60: u32 = 1;
 /// Bytes per entry of the code directory.
@@ -1057,41 +1069,89 @@ fn read_patched_range(img: &DiscImage, rd: &mut psx2psp_core::disc::DiscReader, 
     Ok(out)
 }
 
-/// Writes a native DATA.PSAR at `psar` (where `w` stands): header, index, the disc's blocks
-/// with `patches` applied and deflated at `level` in parallel, and the translated code.
-#[allow(clippy::too_many_arguments)]
-fn write_native_psar<W: Write + Seek>(
+/// One disc of a native set: its image, ID and the patches of POPS mode, in the same order (PPFs,
+/// PAL→NTSC, the title's code patches, the loader CRCs). They change the disc the runtime reads
+/// and the executables the translator sees, so the translations match the patched code in RAM.
+struct NativeDisc {
+    img: DiscImage,
+    disc_id: String,
+    ppf: Vec<PpfPatch>,
+    pal: Option<PatternPatch>,
+    fix: Vec<PatternPatch>,
+    crc: Option<SectorWrites>,
+}
+
+impl NativeDisc {
+    fn patches(&self) -> Vec<&dyn ImagePatch> {
+        self.ppf
+            .iter()
+            .map(|p| p as &dyn ImagePatch)
+            .chain(self.pal.iter().map(|p| p as &dyn ImagePatch))
+            .chain(self.fix.iter().map(|p| p as &dyn ImagePatch))
+            .chain(self.crc.iter().map(|p| p as &dyn ImagePatch))
+            .collect()
+    }
+}
+
+/// Opens disc `n` of a native set and works out its patches; `pal60` is the set's (its 60hz
+/// patches stay off).
+fn native_disc(req: &ConvertRequest, d: &DiscInput, n: usize, pal60: bool, monitor: &dyn Monitor) -> Result<NativeDisc> {
+    let img = DiscImage::open(&d.path)?;
+    let disc_id = match &d.disc_id {
+        Some(id) if !id.trim().is_empty() => normalise_id(id),
+        _ => img.probe().disc_id.ok_or_else(|| EngineError::Input(format!("disc {}: no SYSTEM.CNF game ID found — enter it manually", n + 1)))?,
+    };
+    monitor.log(&format!("Native: disc {} {} — ID {disc_id}", n + 1, d.path.display()));
+    let id = req.patches.pops_id(&disc_id);
+    let user_ppf = match &d.ppf {
+        Some(p) => {
+            let patch = load_ppf(&img, p, n)?;
+            monitor.log(&format!("Disc {}: {}", n + 1, patch.describe()));
+            Some(patch)
+        }
+        None => None,
+    };
+    let fixes_input = DiscInput { ntsc_60hz: d.ntsc_60hz && !pal60, ..d.clone() };
+    let TitleFixes { config, ppfs: mut ppf, patterns: fix } = title_fixes_for(&fixes_input, &req.patches, &img, user_ppf.as_ref(), &id, n, monitor)?;
+    if config.is_some() {
+        monitor.log("Native: the POPS config does not apply to the native runtime");
+    }
+    ppf.extend(user_ppf);
+    let base: Vec<&PpfPatch> = ppf.iter().collect();
+    let pal = if d.pal_ntsc { pal_ntsc_for(&img, &base, &id, n, monitor)? } else { None };
+    let crc = exe_crc_for(&img, &base, pal.iter().chain(&fix).collect(), n, monitor)?;
+    Ok(NativeDisc { img, disc_id, ppf, pal, fix, crc })
+}
+
+/// Writes a disc's block index (zeros, filled later) and blocks at the current position of `w`,
+/// with its patches applied and deflated at `level` in parallel: the index's offset from `psar`
+/// and its words. `done` and `total` are the raw bytes of the set for the progress.
+fn write_native_blocks<W: Write + Seek>(
     w: &mut W,
     psar: u64,
-    img: &DiscImage,
-    patches: &[&dyn ImagePatch],
-    disc_id: &str,
-    title: &str,
-    flags: u32,
+    disc: &NativeDisc,
     level: u8,
-    code: &native_code::CodePack,
+    stats: &mut PsarStats,
+    total: u64,
     monitor: &dyn Monitor,
-) -> psx2psp_core::Result<PsarStats> {
+) -> psx2psp_core::Result<(u64, Vec<u8>)> {
     use rayon::prelude::*;
     const BATCH: usize = 64;
     let block_len = NATIVE_BLOCK_SECTORS as usize * SECTOR;
-    let total = img.size_bytes();
-    let blocks = img.sectors().div_ceil(NATIVE_BLOCK_SECTORS) as usize;
-    let offset = |pos: u64| u32::try_from(pos).map_err(|_| psx2psp_core::Error::Unsupported("disc data exceeds 4 GiB".into()));
-
-    w.write_all(&native_psar_header(disc_id, title, img.sectors(), flags))?;
+    let size = disc.img.size_bytes();
+    let blocks = disc.img.sectors().div_ceil(NATIVE_BLOCK_SECTORS) as usize;
+    let patches = disc.patches();
     let index_at = w.stream_position()?;
     w.write_all(&vec![0u8; (blocks + 1) * 4])?;
     let mut pos = index_at + (blocks as u64 + 1) * 4 - psar;
     let mut index = Vec::with_capacity((blocks + 1) * 4);
-    let mut rd = img.reader();
+    let mut rd = disc.img.reader();
     let mut batch = vec![0u8; BATCH * block_len];
-    let mut stats = PsarStats::default();
     for first in (0..blocks).step_by(BATCH) {
         if monitor.cancelled() {
             return Err(psx2psp_core::Error::Cancelled);
         }
-        let len = (total - (first * block_len) as u64).min(batch.len() as u64) as usize;
+        let len = (size - (first * block_len) as u64).min(batch.len() as u64) as usize;
         let buf = &mut batch[..len];
         rd.read_exact(buf)?;
         let at = (first * block_len) as u64;
@@ -1104,7 +1164,7 @@ fn write_native_psar<W: Write + Seek>(
             })
             .collect();
         for data in &out {
-            index.extend_from_slice(&offset(pos)?.to_le_bytes());
+            index.extend_from_slice(&psar_offset(pos)?.to_le_bytes());
             w.write_all(data)?;
             pos += data.len() as u64;
         }
@@ -1112,7 +1172,33 @@ fn write_native_psar<W: Write + Seek>(
         stats.raw_bytes += len as u64;
         monitor.progress(stats.raw_bytes, total);
     }
-    index.extend_from_slice(&offset(pos)?.to_le_bytes());
+    index.extend_from_slice(&psar_offset(pos)?.to_le_bytes());
+    Ok((index_at - psar, index))
+}
+
+fn psar_offset(pos: u64) -> psx2psp_core::Result<u32> {
+    u32::try_from(pos).map_err(|_| psx2psp_core::Error::Unsupported("disc data exceeds 4 GiB".into()))
+}
+
+/// Writes a native DATA.PSAR at `psar` (where `w` stands): header, the first disc's index and
+/// blocks, the translated code, then the other discs' and the disc table.
+fn write_native_psar<W: Write + Seek>(
+    w: &mut W,
+    psar: u64,
+    discs: &[NativeDisc],
+    title: &str,
+    flags: u32,
+    level: u8,
+    code: &native_code::CodePack,
+    monitor: &dyn Monitor,
+) -> psx2psp_core::Result<PsarStats> {
+    use rayon::prelude::*;
+    let offset = psar_offset;
+    let total: u64 = discs.iter().map(|d| d.img.size_bytes()).sum();
+    let mut stats = PsarStats::default();
+    w.write_all(&native_psar_header(&discs[0].disc_id, title, discs[0].img.sectors(), flags))?;
+    let mut indexes = vec![write_native_blocks(w, psar, &discs[0], level, &mut stats, total, monitor)?];
+    let mut pos = w.stream_position()? - psar;
 
     if !code.images.is_empty() {
         let pack = |raw: &[u8]| {
@@ -1149,10 +1235,35 @@ fn write_native_psar<W: Write + Seek>(
         w.write_all(&fields.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
         w.seek(SeekFrom::Start(end))?;
     }
+    if discs.len() > 1 {
+        for d in &discs[1..] {
+            indexes.push(write_native_blocks(w, psar, d, level, &mut stats, total, monitor)?);
+        }
+        pos = w.stream_position()? - psar;
+        let mut table = Vec::with_capacity(discs.len() * NATIVE_DISC_ENTRY_LEN);
+        for (d, (at, _)) in discs.iter().zip(&indexes) {
+            let id = d.disc_id.as_bytes();
+            let n = id.len().min(15);
+            table.extend_from_slice(&id[..n]);
+            table.resize(table.len() + 16 - n, 0);
+            for v in [d.img.sectors(), offset(*at)?, d.img.sectors().div_ceil(NATIVE_BLOCK_SECTORS), 0] {
+                table.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        w.write_all(&table)?;
+        let fields = [offset(pos)?, discs.len() as u32];
+        pos += table.len() as u64;
+        let end = w.stream_position()?;
+        w.seek(SeekFrom::Start(psar + NATIVE_PSAR_DISC_FIELDS))?;
+        w.write_all(&fields.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+        w.seek(SeekFrom::Start(end))?;
+    }
     stats.stored_bytes = pos;
     let end = w.stream_position()?;
-    w.seek(SeekFrom::Start(index_at))?;
-    w.write_all(&index)?;
+    for (at, index) in &indexes {
+        w.seek(SeekFrom::Start(psar + at))?;
+        w.write_all(index)?;
+    }
     w.seek(SeekFrom::Start(end))?;
     Ok(stats)
 }
@@ -1174,62 +1285,64 @@ pub fn native_sfo(title: &str, disc_id: &str) -> Sfo {
 
 /// Output mode Native (recomp backend, `docs/recomp/PLAN.md`): an EBOOT that runs the native
 /// runtime instead of POPS. Same title, ID and artwork as [`convert`]; DATA.PSAR carries the
-/// whole disc for the runtime's CD ([`NATIVE_PSAR_MAGIC`]). One disc; patches, donor and boot
-/// picture do not apply.
+/// whole disc for the runtime's CD ([`NATIVE_PSAR_MAGIC`]). Up to [`NATIVE_MAX_DISCS`] discs, the
+/// runtime changing them on the player's word, with one translation of the code of them all;
+/// donor and boot picture do not apply.
 pub fn convert_native(req: &ConvertRequest, monitor: &dyn Monitor) -> Result<ConvertReport> {
     let t0 = Instant::now();
-    let [d] = req.discs.as_slice() else {
-        return Err(EngineError::Input(format!("native mode builds one disc, {} selected", req.discs.len())));
-    };
+    if req.discs.is_empty() || req.discs.len() > NATIVE_MAX_DISCS {
+        return Err(EngineError::Input(format!("native mode builds 1 to {NATIVE_MAX_DISCS} discs, {} selected", req.discs.len())));
+    }
     if req.title.trim().is_empty() {
         return Err(EngineError::Input("title is empty".into()));
     }
-    let img = DiscImage::open(&d.path)?;
-    let disc_id = match &d.disc_id {
-        Some(id) if !id.trim().is_empty() => normalise_id(id),
-        _ => img.probe().disc_id.ok_or_else(|| EngineError::Input("no SYSTEM.CNF game ID found — enter it manually".into()))?,
+    monitor.log(&format!("Native: {} disc(s), runtime psxrt {} B", req.discs.len(), NATIVE_RUNTIME.len()));
+    // A `pal60` game keeps its PAL picture: the runtime gives it 60 Hz in place of its 60hz
+    // patches. The first disc decides for the set.
+    let d0 = &req.discs[0];
+    let id0 = match &d0.disc_id {
+        Some(id) if !id.trim().is_empty() => Some(normalise_id(id)),
+        _ => DiscImage::open(&d0.path)?.probe().disc_id,
     };
-    monitor.log(&format!("Native: {} — ID {disc_id}, runtime psxrt {} B", d.path.display(), NATIVE_RUNTIME.len()));
-    // The disc patches of POPS mode, in the same order: PPFs, PAL→NTSC, the title's code
-    // patches, the loader CRCs. They change the disc the runtime reads and the executables the
-    // translator sees, so the translations match the patched code in RAM.
-    let id = req.patches.pops_id(&disc_id);
-    let user_ppf = match &d.ppf {
-        Some(p) => {
-            let patch = load_ppf(&img, p, 0)?;
-            monitor.log(&format!("Disc 1: {}", patch.describe()));
-            Some(patch)
-        }
-        None => None,
-    };
-    // A `pal60` game keeps its PAL picture: the runtime gives it 60 Hz in place of its 60hz patches.
-    let pal60 = d.ntsc_60hz && req.patches.pal60(&id);
-    let fixes_input = DiscInput { ntsc_60hz: d.ntsc_60hz && !pal60, ..d.clone() };
+    let pal60 = d0.ntsc_60hz && id0.is_some_and(|id| req.patches.pal60(&req.patches.pops_id(&id)));
     if pal60 {
-        monitor.log(&format!("Native: {id} runs its PAL picture at 60 Hz (PAL60), its 60hz patches stay off"));
+        monitor.log("Native: the PAL picture runs at 60 Hz (PAL60), the 60hz patches stay off");
     }
-    let TitleFixes { config, ppfs: mut ppf, patterns: fix } = title_fixes_for(&fixes_input, &req.patches, &img, user_ppf.as_ref(), &id, 0, monitor)?;
-    if config.is_some() {
-        monitor.log("Native: the POPS config does not apply to the native runtime");
+    let discs = req.discs.iter().enumerate().map(|(n, d)| native_disc(req, d, n, pal60, monitor)).collect::<Result<Vec<_>>>()?;
+    let disc_id = discs[0].disc_id.clone();
+
+    // The code of every disc, each piece once: a disc change keeps the translations that run.
+    let mut exes: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut overlays: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut captured: Vec<native_code::Captured> = Vec::new();
+    let mut found = 0;
+    for d in &discs {
+        let patches = d.patches();
+        let mine = disc_executables(&d.img, &patches);
+        found += mine.len();
+        for e in mine {
+            if !exes.iter().any(|x| x.1 == e.1) {
+                exes.push(e);
+            }
+        }
+        for o in disc_overlay_files(&d.img, &patches) {
+            if !overlays.iter().any(|x| x.1 == o.1) {
+                overlays.push(o);
+            }
+        }
     }
-    ppf.extend(user_ppf);
-    let base: Vec<&PpfPatch> = ppf.iter().collect();
-    let pal = if d.pal_ntsc { pal_ntsc_for(&img, &base, &id, 0, monitor)? } else { None };
-    let crc = exe_crc_for(&img, &base, pal.iter().chain(&fix).collect(), 0, monitor)?;
-    let patches: Vec<&dyn ImagePatch> = ppf
-        .iter()
-        .map(|p| p as &dyn ImagePatch)
-        .chain(pal.iter().map(|p| p as &dyn ImagePatch))
-        .chain(fix.iter().map(|p| p as &dyn ImagePatch))
-        .chain(crc.iter().map(|p| p as &dyn ImagePatch))
-        .collect();
-    let exes = disc_executables(&img, &patches);
-    let found = exes.len();
     let kuseg = exes.iter().any(|(_, b)| psx2psp_recomp::exe::PsxExe::parse(b).is_ok_and(|x| x.text_addr >> 29 == 0));
-    let started = Instant::now();
-    let captured = captured_code(&img, &patches, kuseg);
-    monitor.log(&format!("Native: {} code runs captured in {CAPTURE_FRAMES} frames ({:.1} s)", captured.len(), started.elapsed().as_secs_f64()));
-    let code = native_code::build(exes, disc_overlay_files(&img, &patches), captured).map_err(EngineError::Input)?;
+    for d in &discs {
+        let started = Instant::now();
+        let mine = captured_code(&d.img, &d.patches(), kuseg);
+        monitor.log(&format!("Native: disc {}: {} code runs captured in {CAPTURE_FRAMES} frames ({:.1} s)", d.disc_id, mine.len(), started.elapsed().as_secs_f64()));
+        for c in mine {
+            if !captured.iter().any(|x| x.at == c.at && x.seeds_only == c.seeds_only && x.bytes == c.bytes) {
+                captured.push(c);
+            }
+        }
+    }
+    let code = native_code::build(exes, overlays, captured).map_err(EngineError::Input)?;
     for (name, why) in &code.skipped {
         monitor.log(&format!("Native: {name} left to the interpreter: {why}"));
     }
@@ -1261,7 +1374,7 @@ pub fn convert_native(req: &ConvertRequest, monitor: &dyn Monitor) -> Result<Con
     let mut stats = PsarStats::default();
     write_pbp(&mut w, &sections, 0x10, |w, psar| {
         let flags = if pal60 { NATIVE_FLAG_PAL60 } else { 0 };
-        stats = write_native_psar(w, psar, &img, &patches, &disc_id, &req.title, flags, level, &code, monitor)?;
+        stats = write_native_psar(w, psar, &discs, &req.title, flags, level, &code, monitor)?;
         Ok(())
     })?;
     let file = w.into_inner().map_err(|e| EngineError::from(e.into_error()))?;
@@ -1269,7 +1382,7 @@ pub fn convert_native(req: &ConvertRequest, monitor: &dyn Monitor) -> Result<Con
     let file_size = file.metadata()?.len();
     drop(file);
     part.commit(&req.output)?;
-    let report = ConvertReport { output: req.output.clone(), disc_ids: vec![disc_id], stats, file_size, elapsed: t0.elapsed() };
+    let report = ConvertReport { output: req.output.clone(), disc_ids: discs.iter().map(|d| d.disc_id.clone()).collect(), stats, file_size, elapsed: t0.elapsed() };
     monitor.log(&format!("Done: {} ({} B, native)", report.output.display(), file_size));
     Ok(report)
 }
@@ -1791,13 +1904,14 @@ mod tests {
         assert_eq!(pbp.range(Section::DataPsar).start % 0x10, 0);
         let head = native_psar_header("SLES02895", "Sheep Dog 'n' Wolf", 40, 0);
         assert_eq!(psar[..NATIVE_PSAR_HEADER_LEN], head);
-        assert_eq!(psar[..16], *b"PSXRTDAT\x04\0\0\0\xD0\0\0\0");
+        assert_eq!(psar[..16], *b"PSXRTDAT\x05\0\0\0\xD0\0\0\0");
         assert_eq!(&psar[0x10..0x1A], b"SLES02895\0");
         assert_eq!(&psar[0x20..0x33], b"Sheep Dog 'n' Wolf\0");
         let word = |at: usize| u32::from_le_bytes(psar[at..at + 4].try_into().unwrap()) as usize;
         assert_eq!([word(0xA0), word(0xA4), word(0xA8), word(0xAC)], [40, 16, 0xD0, 3]);
         assert_eq!([word(0xB0), word(0xB4), word(0xB8), word(0xBC)], [0; 4], "no filesystem, no code");
         assert_eq!(word(0xC0), 0, "no flags");
+        assert_eq!([word(0xC8), word(0xCC)], [0, 0], "one disc, no disc table");
 
         // The index bounds every block; each one gives back its sectors, the noise stored as is.
         let index: Vec<usize> = (0..4).map(|i| word(0xD0 + 4 * i)).collect();
@@ -1828,8 +1942,39 @@ mod tests {
         };
         assert_eq!([flags(&pal60, true), flags(&pal60, false), flags(&PatchDb::default(), true)], [NATIVE_FLAG_PAL60, 0, 0]);
 
-        let two = ConvertRequest { discs: vec![req.discs[0].clone(), req.discs[0].clone()], ..req };
-        assert!(convert_native(&two, &()).is_err(), "one disc only");
+        // Two discs: the first as before, the second (20 sectors, its own ID) after it, and a table
+        // of both. Each disc's index gives back its own sectors.
+        let raw2: Vec<u8> = (0..20u32).flat_map(|lba| patching::sector::build_mode2_form1(lba, &[0xA0 | lba as u8; 2048])).collect();
+        std::fs::write(t.path().join("h.bin"), &raw2).unwrap();
+        let cue2 = touch(t.path(), "h.cue", "FILE \"h.bin\" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n");
+        let disc2 = DiscInput { path: cue2, disc_id: Some("SLES-12895".into()), ..Default::default() };
+        let two = ConvertRequest { discs: vec![req.discs[0].clone(), disc2], ..req.clone() };
+        let rep = convert_native(&two, &()).unwrap();
+        assert_eq!(rep.disc_ids, ["SLES02895", "SLES12895"]);
+        let psar = PbpFile::open(File::open(&output).unwrap()).unwrap().read(Section::DataPsar).unwrap();
+        let word = |at: usize| u32::from_le_bytes(psar[at..at + 4].try_into().unwrap()) as usize;
+        assert_eq!(psar[..NATIVE_PSAR_HEADER_LEN - 8], head[..NATIVE_PSAR_HEADER_LEN - 8], "the first disc's header as for one disc");
+        let (table, discs) = (word(0xC8), word(0xCC));
+        assert_eq!((discs, table + 2 * NATIVE_DISC_ENTRY_LEN), (2, psar.len()));
+        let back = |entry: usize| {
+            let e = table + entry * NATIVE_DISC_ENTRY_LEN;
+            let (sectors, index, blocks) = (word(e + 16), word(e + 20), word(e + 24));
+            assert_eq!((blocks, word(e + 28)), (sectors.div_ceil(16), 0));
+            let mut out = Vec::new();
+            for i in 0..blocks {
+                let (s, e) = (word(index + 4 * i), word(index + 4 * i + 4));
+                let len = (sectors - 16 * i).min(16) * SECTOR;
+                out.extend(if e - s == len { psar[s..e].to_vec() } else { miniz_oxide::inflate::decompress_to_vec(&psar[s..e]).unwrap() });
+            }
+            (psar[e..e + 16].to_vec(), out)
+        };
+        assert_eq!(word(table + 20), 0xD0, "entry 0 is the first disc");
+        assert_eq!(back(0), (b"SLES02895\0\0\0\0\0\0\0".to_vec(), raw.clone()));
+        assert_eq!(back(1), (b"SLES12895\0\0\0\0\0\0\0".to_vec(), raw2));
+        assert_eq!((rep.stats.blocks, rep.stats.raw_bytes), (5, (raw.len() + 20 * SECTOR) as u64));
+
+        let six = ConvertRequest { discs: vec![req.discs[0].clone(); NATIVE_MAX_DISCS + 1], ..req };
+        assert!(convert_native(&six, &()).is_err(), "at most NATIVE_MAX_DISCS");
     }
 
     #[test]

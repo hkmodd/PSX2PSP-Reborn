@@ -19,7 +19,11 @@
 #define G(r) (0x3B4 + 4 * (r)) /* CTX GPR r from k0 */
 #define HI 0x434
 #define LO 0x438
-#define GTE_RET 0x448 /* CTX.GTE_RET */
+/* CTX.GTE_RET: one slot for every lean entry (psxrt_gte_*, psxrt_io_read/write): each parks its
+ * return site here and the C behind it (C_SITE in io_fast.c, native.c) reads it once on entry.
+ * That holds only while no lean entry runs translated code (run_guest) before reading C_SITE: a
+ * nested entry would overwrite the outer one's return. */
+#define GTE_RET 0x448
 
 /* frame of native_enter: 16 bytes for the callee, s0-s7, fp, ra, gp, previous host sp */
 #define F_S0 16
