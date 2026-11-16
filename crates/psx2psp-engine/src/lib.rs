@@ -949,7 +949,7 @@ const CAPTURE_EVERY: u32 = 300;
 /// or in an archive of a format of its own: Silent Hill's body, decompressed from SILENT to
 /// 8002DD08-800A8974. (name, address, bytes), each once; KUSEG addresses when `kuseg` (a game
 /// that runs there, as Lilo & Stitch does).
-pub fn captured_code(img: &DiscImage, patches: &[&dyn ImagePatch], kuseg: bool) -> Vec<(String, u32, Vec<u8>)> {
+pub fn captured_code(img: &DiscImage, patches: &[&dyn ImagePatch], kuseg: bool) -> Vec<native_code::Captured> {
     use psx2psp_recomp::overlay;
     use psx2psp_sim::{CROSS, Machine, START};
     let mut rd = img.reader();
@@ -965,7 +965,7 @@ pub fn captured_code(img: &DiscImage, patches: &[&dyn ImagePatch], kuseg: bool) 
     let Some(mut m) = Machine::boot(img.sectors(), read) else { return Vec::new() };
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    let mut last: Option<Vec<u8>> = None;
+    let mut last: Option<std::sync::Arc<Vec<u8>>> = None;
     for f in 1..=CAPTURE_FRAMES {
         let press = f.checked_sub(600).filter(|k| k % 150 < 6).map(|k| k / 150);
         let alive = m.frame(match press {
@@ -984,10 +984,10 @@ pub fn captured_code(img: &DiscImage, patches: &[&dyn ImagePatch], kuseg: bool) 
                     continue;
                 }
                 let at = if kuseg { s } else { 0x8000_0000 | s };
-                out.push((format!("RAM {at:08X}"), at, bytes.to_vec()));
+                out.push(native_code::Captured { name: format!("RAM {at:08X}"), at, bytes: bytes.to_vec(), ram: before.clone() });
             }
         }
-        last = Some(ram.to_vec());
+        last = Some(std::sync::Arc::new(ram.to_vec()));
         if !alive {
             break;
         }

@@ -434,7 +434,7 @@ pub fn translate_with(
 /// code as it is, a guest address through the table.
 fn leaf_returns(exe: &PsxExe, d: &Discovery) -> BTreeSet<u32> {
     use Kind::*;
-    let img = Image(exe);
+    let img = Image(exe, &[]);
     let writes_ra = |a: u32| {
         img.at(a).is_some_and(|(i, k)| {
             Uses::of(i, k).write & (1 << RA) != 0
@@ -684,7 +684,7 @@ impl Em<'_> {
         if i.rt() != RA as usize {
             return None;
         }
-        let img = Image(self.exe);
+        let img = Image(self.exe, &[]);
         let v = match k {
             Kind::Addiu | Kind::Addi => img.const_of(i.rs(), pc)?.wrapping_add(i.simm()),
             Kind::Ori => img.const_of(i.rs(), pc)? | i.imm(),

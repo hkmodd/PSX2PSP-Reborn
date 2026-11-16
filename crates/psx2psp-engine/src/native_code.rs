@@ -8,7 +8,7 @@
 //! resident together. Nothing here knows a game: what is translated is what the disc holds.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use psx2psp_recomp::emit::patchable;
 use psx2psp_recomp::{Discovery, Hazards, Hit, PsxExe, Signatures, Translation, layout, overlay, translate};
@@ -140,6 +140,16 @@ struct Parsed {
 
 /// Most images the runtime takes (`psp/psxrt/native.c`, MAX_IMAGES).
 pub const MAX_IMAGES: usize = 256;
+/// Code taken from the guest's RAM ([`crate::captured_code`]).
+pub struct Captured {
+    pub name: String,
+    pub at: u32,
+    pub bytes: Vec<u8>,
+    /// The RAM it was taken from, at the address of its first byte (`at`'s segment): switch
+    /// tables outside the code are read there.
+    pub ram: Arc<Vec<u8>>,
+}
+
 /// Smallest piece of captured code translated: one block of the runtime's code checks.
 const MIN_CAPTURED: u32 = 0x400;
 /// Largest disc file looked at as an overlay: the PS1 RAM above the kernel area.
@@ -151,10 +161,10 @@ pub const OVERLAY_MAX: u32 = 0x1F_0000;
 /// files of `overlays` that are not code are ignored; duplicates (same address and text) are
 /// translated once. Overlays never make the build fail: past [`MAX_IMAGES`], or when the code
 /// would not fit, they are left to the interpreter (the largest group first). Fails only when
-/// the executables alone do not fit between [`CODE_FLOOR`] and the PS1 RAM. `captured` (name,
-/// address, bytes) is code taken from the guest's RAM ([`crate::captured_code`]), translated as
-/// overlays at its address unless an image already taken holds those bytes there.
-pub fn build(exes: Vec<(String, Vec<u8>)>, overlays: Vec<(String, Vec<u8>)>, captured: Vec<(String, u32, Vec<u8>)>) -> Result<CodePack, String> {
+/// the executables alone do not fit between [`CODE_FLOOR`] and the PS1 RAM. `captured` is code
+/// taken from the guest's RAM, translated as overlays at its address unless an image already
+/// taken holds those bytes there.
+pub fn build(exes: Vec<(String, Vec<u8>)>, overlays: Vec<(String, Vec<u8>)>, captured: Vec<Captured>) -> Result<CodePack, String> {
     let mut pack = CodePack::default();
     let mut seen = HashSet::new();
     let mut parsed = Vec::new();
@@ -172,7 +182,7 @@ pub fn build(exes: Vec<(String, Vec<u8>)>, overlays: Vec<(String, Vec<u8>)>, cap
         }
         let hash = fnv1a32(&exe.text);
         if seen.insert((exe.text_addr, exe.text.len(), hash)) {
-            parsed.push((name, exe, false));
+            parsed.push((name, exe, false, None));
         }
     }
     let at = overlay::locate_all(&overlays.iter().map(|(_, b)| b.as_slice()).collect::<Vec<_>>());
@@ -184,14 +194,14 @@ pub fn build(exes: Vec<(String, Vec<u8>)>, overlays: Vec<(String, Vec<u8>)>, cap
         }
         let hash = fnv1a32(&exe.text);
         if seen.insert((exe.text_addr, exe.text.len(), hash)) {
-            parsed.push((name, exe, true));
+            parsed.push((name, exe, true, None));
         }
     }
     // A captured run keeps only what lies outside the text of every disc image: one image across
     // an executable and the slot its overlays are loaded into would call the overlay resident at
     // capture directly, and run it after another overlay is loaded there.
-    let disc: Vec<(u32, u32)> = parsed.iter().map(|(_, x, _)| (x.text_addr & 0x1FFF_FFFF, (x.text_addr & 0x1FFF_FFFF) + x.text.len() as u32)).collect();
-    let captured = captured.into_iter().flat_map(|(_, at, bytes)| {
+    let disc: Vec<(u32, u32)> = parsed.iter().map(|(_, x, ..)| (x.text_addr & 0x1FFF_FFFF, (x.text_addr & 0x1FFF_FFFF) + x.text.len() as u32)).collect();
+    let captured = captured.into_iter().flat_map(|Captured { at, bytes, ram, .. }| {
         let mut pieces = vec![(at & 0x1FFF_FFFF, (at & 0x1FFF_FFFF) + bytes.len() as u32)];
         for &(s, e) in &disc {
             pieces = pieces.into_iter().flat_map(|(a, b)| [(a, b.min(s)), (a.max(e), b)]).filter(|(a, b)| b > a).collect();
@@ -201,12 +211,12 @@ pub fn build(exes: Vec<(String, Vec<u8>)>, overlays: Vec<(String, Vec<u8>)>, cap
         pieces
             .into_iter()
             .filter(|(a, b)| b - a >= MIN_CAPTURED)
-            .map(|(a, b)| (format!("RAM {:08X}", seg | a), seg | a, bytes[(a - base) as usize..(b - base) as usize].to_vec()))
+            .map(|(a, b)| (format!("RAM {:08X}", seg | a), seg | a, bytes[(a - base) as usize..(b - base) as usize].to_vec(), (seg, ram.clone())))
             .collect::<Vec<_>>()
     });
-    for (name, at, bytes) in captured {
+    for (name, at, bytes, far) in captured {
         let held = |x: &PsxExe| at.checked_sub(x.text_addr).is_some_and(|o| x.text.get(o as usize..o as usize + bytes.len()) == Some(&bytes[..]));
-        if parsed.iter().any(|(_, x, _)| held(x)) {
+        if parsed.iter().any(|(_, x, ..)| held(x)) {
             continue;
         }
         let Some(exe) = overlay::as_exe(&bytes, at) else { continue };
@@ -215,13 +225,16 @@ pub fn build(exes: Vec<(String, Vec<u8>)>, overlays: Vec<(String, Vec<u8>)>, cap
             continue;
         }
         if seen.insert((exe.text_addr, exe.text.len(), fnv1a32(&exe.text))) {
-            parsed.push((name, exe, true));
+            parsed.push((name, exe, true, Some(far)));
         }
     }
     let parsed: Vec<Parsed> = parsed
         .into_par_iter()
-        .map(|(name, exe, overlay)| {
-            let disc = Discovery::run(&exe);
+        .map(|(name, exe, overlay, far)| {
+            let disc = match &far {
+                Some((seg, ram)) => Discovery::run_far(&exe, &[(*seg, &ram[..])]),
+                None => Discovery::run(&exe),
+            };
             let hz = Hazards::check(&exe, &disc);
             Parsed { name, exe, overlay, disc, hz }
         })
@@ -460,6 +473,14 @@ mod tests {
         assert_ne!(word(36), layout::MISS, "each function is translated");
     }
 
+    /// Code captured at `at`, with a RAM of zeros around it.
+    fn cap(at: u32, bytes: Vec<u8>) -> Captured {
+        let mut ram = vec![0u8; 0x20_0000];
+        let o = (at & 0x1F_FFFF) as usize;
+        ram[o..o + bytes.len()].copy_from_slice(&bytes);
+        Captured { name: format!("RAM {at:08X}"), at, bytes, ram: Arc::new(ram) }
+    }
+
     #[test]
     fn captured_code_is_translated_where_no_image_holds_it() {
         let main = [ADDIU_V0_1, JR_RA, 0, 0x27BD_FFF8, JR_RA, 0x27BD_0008];
@@ -469,9 +490,9 @@ mod tests {
             vec![],
             vec![
                 // The executable's own functions, as RAM holds them: nothing new.
-                ("RAM 8001000C".into(), 0x8001_000C, main[3..].iter().flat_map(|w| w.to_le_bytes()).collect()),
+                cap(0x8001_000C, main[3..].iter().flat_map(|w| w.to_le_bytes()).collect()),
                 // Code no disc file holds as it is (a decompressed body): taken at its address.
-                ("RAM 80030000".into(), 0x8003_0000, body.clone()),
+                cap(0x8003_0000, body.clone()),
             ],
         )
         .unwrap();
@@ -490,7 +511,7 @@ mod tests {
         let mut ram: Vec<u8> = main.iter().flat_map(|w| w.to_le_bytes()).collect();
         ram[..4].copy_from_slice(&0x2402_0002u32.to_le_bytes());
         ram.extend(&body);
-        let pack = build(vec![("MAIN.EXE".into(), exe(0x8001_0000, &main))], vec![], vec![("RAM 80010000".into(), 0x8001_0000, ram)]).unwrap();
+        let pack = build(vec![("MAIN.EXE".into(), exe(0x8001_0000, &main))], vec![], vec![cap(0x8001_0000, ram)]).unwrap();
         let names: Vec<&str> = pack.images.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(names, ["MAIN.EXE", "RAM 80010018"]);
         assert_eq!(pack.images[1].hash, fnv1a32(&body[..4 * 139]));

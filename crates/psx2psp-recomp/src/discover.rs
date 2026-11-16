@@ -163,11 +163,27 @@ pub struct Body {
     pub returns: Vec<u32>,
 }
 
-/// Instruction access over the text.
+/// Data outside the text that switch tables may be read from: (address of the first byte, bytes).
+pub type Far<'a> = &'a [(u32, &'a [u8])];
+
+/// Instruction access over the text, and the far data switch tables are read from.
 #[derive(Clone, Copy)]
-pub(crate) struct Image<'a>(pub &'a PsxExe);
+pub(crate) struct Image<'a>(pub &'a PsxExe, pub Far<'a>);
 
 impl Image<'_> {
+    /// The data word at `a`: the text's, else the far data's.
+    fn data(self, a: u32) -> Option<u32> {
+        if a & 3 != 0 {
+            return None;
+        }
+        self.0.word(a).or_else(|| {
+            self.1.iter().find_map(|&(base, b)| {
+                let o = a.checked_sub(base)? as usize;
+                b.get(o..o + 4).map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+            })
+        })
+    }
+
     /// The instruction at `a`, if inside the text and canonical.
     pub(crate) fn at(self, a: u32) -> Option<(Insn, Kind)> {
         let i = Insn(self.0.word(a)?);
@@ -268,8 +284,8 @@ impl Image<'_> {
             return Err("addu operands are not table + index*4");
         };
         let table = base.wrapping_add(lw.simm());
-        if !self.0.contains(table) {
-            return Err("table outside the text");
+        if self.data(table).is_none() {
+            return Err("table outside the text and the far data");
         }
         let mut bound = None;
         let mut a = sll_at.wrapping_sub(4);
@@ -288,7 +304,7 @@ impl Image<'_> {
         match bound {
             Some(n) => {
                 for e in 0..n {
-                    match self.0.word(table.wrapping_add(4 * e)) {
+                    match self.data(table.wrapping_add(4 * e)) {
                         Some(t) => targets.push(t),
                         None => break,
                     }
@@ -296,7 +312,7 @@ impl Image<'_> {
             }
             None => {
                 for e in 0..512 {
-                    match self.0.word(table.wrapping_add(4 * e)) {
+                    match self.data(table.wrapping_add(4 * e)) {
                         Some(t) if self.at(t).is_some() => targets.push(t),
                         _ => break,
                     }
@@ -310,7 +326,14 @@ impl Image<'_> {
 impl Discovery {
     /// Discovers the code of `exe`.
     pub fn run(exe: &PsxExe) -> Self {
-        let img = Image(exe);
+        Self::run_far(exe, &[])
+    }
+
+    /// Discovers the code of `exe`, reading switch tables outside its text from `far` (the RAM
+    /// the code was captured from). A table only names the entries to translate: the jump goes
+    /// through the dispatch table, so a stale or wrong word costs code, never a wrong jump.
+    pub fn run_far(exe: &PsxExe, far: Far) -> Self {
+        let img = Image(exe, far);
         let mut d = Discovery::default();
         d.entries.insert(exe.pc0, Origin::Entry);
         d.explore(img, vec![exe.pc0]);
@@ -452,7 +475,7 @@ impl Discovery {
 
     /// The body of the function at `entry`.
     pub fn body(&self, exe: &PsxExe, entry: u32) -> Body {
-        let img = Image(exe);
+        let img = Image(exe, &[]);
         let other = |t: u32| t != entry && self.entries.contains_key(&t);
         let mut body = Body::default();
         let mut seen = HashSet::new();

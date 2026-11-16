@@ -104,6 +104,20 @@ fn discovery_finds_calls_switch_tables_and_prologues() {
     assert_eq!(d.body(&x, at(17)).returns, [at(17)]);
 }
 
+/// A switch table outside the text (in data the code was captured with) is read from the far
+/// data; without it the jump stays unresolved.
+#[test]
+fn switch_tables_outside_the_text_are_read_from_far_data() {
+    let mut x = program();
+    x.text[4 * 11..4 * 12].copy_from_slice(&i(0x23, T1, T0, 0x1000).to_le_bytes()); // lw t0,0x1000(t1)
+    let table = BASE + 0x1000;
+    assert!(matches!(Discovery::run(&x).jumps[&at(13)], JumpReg::Unresolved(_)));
+    let data: Vec<u8> = [at(19), at(21), 0x1234_5678].iter().flat_map(|w| w.to_le_bytes()).collect();
+    let d = Discovery::run_far(&x, &[(table, &data)]);
+    assert_eq!(d.jumps[&at(13)], JumpReg::Table { table, targets: vec![at(19), at(21)], bounded: true });
+    assert!(d.code.contains(&at(19)) && d.code.contains(&at(21)));
+}
+
 /// A handler that ends in a tail call, reached only through a pointer in data, is found; a
 /// pointer to a word that does not decode is not followed.
 #[test]
