@@ -140,6 +140,8 @@ struct Parsed {
 
 /// Most images the runtime takes (`psp/psxrt/native.c`, MAX_IMAGES).
 pub const MAX_IMAGES: usize = 256;
+/// Smallest piece of captured code translated: one block of the runtime's code checks.
+const MIN_CAPTURED: u32 = 0x400;
 /// Largest disc file looked at as an overlay: the PS1 RAM above the kernel area.
 pub const OVERLAY_MAX: u32 = 0x1F_0000;
 
@@ -185,6 +187,23 @@ pub fn build(exes: Vec<(String, Vec<u8>)>, overlays: Vec<(String, Vec<u8>)>, cap
             parsed.push((name, exe, true));
         }
     }
+    // A captured run keeps only what lies outside the text of every disc image: one image across
+    // an executable and the slot its overlays are loaded into would call the overlay resident at
+    // capture directly, and run it after another overlay is loaded there.
+    let disc: Vec<(u32, u32)> = parsed.iter().map(|(_, x, _)| (x.text_addr & 0x1FFF_FFFF, (x.text_addr & 0x1FFF_FFFF) + x.text.len() as u32)).collect();
+    let captured = captured.into_iter().flat_map(|(_, at, bytes)| {
+        let mut pieces = vec![(at & 0x1FFF_FFFF, (at & 0x1FFF_FFFF) + bytes.len() as u32)];
+        for &(s, e) in &disc {
+            pieces = pieces.into_iter().flat_map(|(a, b)| [(a, b.min(s)), (a.max(e), b)]).filter(|(a, b)| b > a).collect();
+        }
+        let seg = at & !0x1FFF_FFFF;
+        let base = at & 0x1FFF_FFFF;
+        pieces
+            .into_iter()
+            .filter(|(a, b)| b - a >= MIN_CAPTURED)
+            .map(|(a, b)| (format!("RAM {:08X}", seg | a), seg | a, bytes[(a - base) as usize..(b - base) as usize].to_vec()))
+            .collect::<Vec<_>>()
+    });
     for (name, at, bytes) in captured {
         let held = |x: &PsxExe| at.checked_sub(x.text_addr).is_some_and(|o| x.text.get(o as usize..o as usize + bytes.len()) == Some(&bytes[..]));
         if parsed.iter().any(|(_, x, _)| held(x)) {
@@ -460,5 +479,20 @@ mod tests {
         assert_eq!(names, ["MAIN.EXE", "RAM 80030000"]);
         let o = &pack.images[1];
         assert_eq!((o.overlay, o.text_addr, o.hash), (true, 0x8003_0000, fnv1a32(&body[..4 * 139])));
+    }
+
+    #[test]
+    fn captured_code_leaves_out_the_text_of_disc_images() {
+        // RAM as captured: the executable with a word rewritten, then a body past its text. One
+        // image across both would call into the executable's text directly.
+        let main = [ADDIU_V0_1, JR_RA, 0, 0x27BD_FFF8, JR_RA, 0x27BD_0008];
+        let body = overlay(0x8001_0018);
+        let mut ram: Vec<u8> = main.iter().flat_map(|w| w.to_le_bytes()).collect();
+        ram[..4].copy_from_slice(&0x2402_0002u32.to_le_bytes());
+        ram.extend(&body);
+        let pack = build(vec![("MAIN.EXE".into(), exe(0x8001_0000, &main))], vec![], vec![("RAM 80010000".into(), 0x8001_0000, ram)]).unwrap();
+        let names: Vec<&str> = pack.images.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, ["MAIN.EXE", "RAM 80010018"]);
+        assert_eq!(pack.images[1].hash, fnv1a32(&body[..4 * 139]));
     }
 }
