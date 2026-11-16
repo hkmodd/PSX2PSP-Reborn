@@ -210,6 +210,24 @@ fn a_failed_leaf_is_tried_again_as_a_built_pointer() {
     assert!(!d.code.contains(&at(5)));
     assert!(d.dead_ends.is_empty());
 }
+/// A pointer to code after a long run of zero words (Crash 2's rasterizer 800409F4, 203 zero
+/// words after a `b`) is a handler; the zeros are not code.
+#[test]
+fn a_pointer_after_a_long_zero_gap_is_a_handler() {
+    let mut w = vec![
+        r(8, RA, 0, 0, 0),   // 0 jr ra
+        NOP,                 // 1
+        j(2, 0),             // 2 j 0
+        NOP,                 // 3
+    ];
+    w.extend([0; 40]);
+    let h = w.len() as u32;
+    w.extend([i(9, ZERO, V0, 1), j(2, 0), NOP, at(h)]); // h: addiu v0,zero,1; j 0; pointer to h
+    let d = Discovery::run(&exe(&w));
+    assert_eq!(d.entries.get(&at(h)), Some(&Origin::Pointer));
+    assert!(!d.code.contains(&at(10)));
+}
+
 #[test]
 fn hazards_in_sequence_and_across_returns() {
     let x = program();

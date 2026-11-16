@@ -39,12 +39,13 @@ fn after_return(exe: &PsxExe, a: u32) -> bool {
 }
 
 /// `a` holds a non-zero word right after a transfer that does not fall through (`jr ra`, `j`,
-/// `b`, `jr`), its delay slot and up to 3 zero words.
+/// `b`, `jr`), its delay slot and any number of zero words (Crash 2's rasterizer 800409F4,
+/// reached through a table, follows 203 of them).
 fn after_end(img: Image, a: u32) -> bool {
     if img.0.word(a).is_none_or(|w| w == 0) {
         return false;
     }
-    for pad in 0..4u32 {
+    for pad in 0.. {
         let slot = a.wrapping_sub(4 * (pad + 1));
         if matches!(img.flow_at(slot.wrapping_sub(4)), Some(Flow::Return | Flow::Goto(_) | Flow::JumpReg)) {
             return true;
