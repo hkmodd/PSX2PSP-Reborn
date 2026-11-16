@@ -24,6 +24,10 @@
 #define K_STACK 0x8000DF00u   /* stack for chain functions */
 #define K_DCB 0x80007000u     /* device control blocks, 0x50 bytes each; names after them */
 #define DCB_SIZE 0x50u
+/* B0(5Bh) ChangeClearPad's "address": PsyQ libapi's _patch_pad takes the BIOS pad code from it,
+ * EnablePAD at +0x884 and DisablePAD at +0x894 (called through pointers), and zeroes 11 words at
+ * +0x594. Here both are returns and the zeroed words are free kernel RAM (0x7200-0x722B). */
+#define K_PADFN (0x80007200u - 0x594u)
 
 /* magic BIOS ROM addresses, see bios_rom_entry() */
 #define M_RCNT_V(n) (0xBFC0FF20u + (n) * 8)
@@ -1078,6 +1082,10 @@ void bios_init(Psx *psx)
     w32(psx, 0x800000B0u, 0x3C080000u);
     w32(psx, 0x800000C0u, 0x3C080000u);
     w32(psx, 0x80000674u + 6 * 4, 0x00000C80u); /* C0 table: exception handler entry */
+    w32(psx, 0x80000874u + 0x5B * 4, K_PADFN);  /* B0 table: ChangeClearPad, for _patch_pad */
+    g_memset(psx, K_PADFN + 0x594u, 0, 0x884u - 0x594u + 0x18u);
+    w32(psx, K_PADFN + 0x884u, 0x03E00008u); /* EnablePAD: jr ra */
+    w32(psx, K_PADFN + 0x894u, 0x03E00008u); /* DisablePAD: jr ra */
     /* root counter and vblank handlers, priority 1 */
     for (int n = 0; n < 4; n++) {
         u32 e = K_ENTRIES + 16 * (u32)n;
