@@ -17,6 +17,10 @@ const HIGH: u32 = 0x8020_0000;
 const STRONG: u32 = 8;
 /// Votes a file needs to take one of the load addresses the strong files of its disc fixed.
 const WEAK: u32 = 3;
+/// Votes a file needs to take a slot no address beats (only ties): a small overlay whose
+/// functions the executable reaches through its own tables, such as MediEvil's CR.BIN (2 votes
+/// at the slot its 25 sibling overlays fixed, 2 at unrelated addresses).
+const TIED: u32 = 2;
 
 fn is_prologue(w: u32) -> bool {
     matches!(w >> 16, 0x27BD | 0x23BD) && w & 0x8000 != 0
@@ -76,7 +80,8 @@ fn best(votes: &HashMap<u32, u32>, among: impl Fn(u32) -> bool) -> Option<((u32,
 /// A file fixes its address alone with [`STRONG`] votes and three times the runner-up's. The
 /// addresses so fixed are the disc's overlay slots; a file with fewer votes (a small overlay
 /// that only calls into the executable, say) takes the slot it gives most votes, with at least
-/// [`WEAK`] and more than any other address. A wrong slot costs nothing at run time: the runtime
+/// [`WEAK`] and more than any other address, or [`TIED`] with no address above and no other
+/// slot as high. A wrong slot costs nothing at run time: the runtime
 /// takes a translation only when the RAM there holds exactly the file.
 pub fn locate_all(files: &[&[u8]]) -> Vec<Option<(u32, u32)>> {
     let tallies: Vec<Option<HashMap<u32, u32>>> = files.iter().map(|f| tally(f)).collect();
@@ -94,9 +99,9 @@ pub fn locate_all(files: &[&[u8]]) -> Vec<Option<(u32, u32)>> {
         .map(|(t, s)| {
             s.or_else(|| {
                 let t = t.as_ref()?;
-                let ((b, v), _) = best(t, |b| slots.contains(&b))?;
+                let ((b, v), slot2) = best(t, |b| slots.contains(&b))?;
                 let other = best(t, |b| !slots.contains(&b)).map_or(0, |((_, v), _)| v);
-                (v >= WEAK && v > other).then_some((b, v))
+                (v >= WEAK && v > other || v >= TIED && v >= other && v > slot2).then_some((b, v))
             })
         })
         .collect()
@@ -109,4 +114,35 @@ pub fn as_exe(bytes: &[u8], base: u32) -> Option<PsxExe> {
     let text = bytes[..bytes.len() & !3].to_vec();
     let pc0 = text.chunks_exact(4).position(|c| is_prologue(u32::from_le_bytes(c.try_into().unwrap())))?;
     Some(PsxExe { pc0: base + 4 * pc0 as u32, gp0: 0, text_addr: base, text, bss: (0, 0), stack: (0, 0) })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PROLOGUE: u32 = 0x27BD_FFE0;
+    const B: u32 = 0x8001_0000;
+
+    /// 512 words: prologues at the word indices `pro`, then `targets` as data words from 400.
+    fn file(pro: &[usize], targets: &[u32]) -> Vec<u8> {
+        let mut w = vec![0u32; 512];
+        pro.iter().for_each(|&i| w[i] = PROLOGUE);
+        targets.iter().enumerate().for_each(|(k, &t)| w[400 + k] = t);
+        w.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn a_small_overlay_takes_a_fixed_slot_on_a_tie() {
+        // Strong: prologues at 2^k - 1 (distinct differences), each pointed at once: 9 votes at B.
+        let pro: Vec<usize> = (0..9).map(|k| (1 << k) - 1).collect();
+        let strong = file(&pro, &pro.iter().map(|&i| B + 4 * i as u32).collect::<Vec<_>>());
+        // Small: 2 votes at B (its functions at 10 and 50 pointed), 2 at X (X and X + 40).
+        let x = 0x8010_0000;
+        let small = file(&[0, 10, 50], &[B + 40, B + 200, x, x + 40]);
+        let at = locate_all(&[&strong, &small]);
+        assert_eq!(at[0], Some((B, 9)));
+        assert_eq!(at[1], Some((B, 2)));
+        // Without a slot fixed by another file the small one stays unplaced.
+        assert_eq!(locate_all(&[&small]), vec![None]);
+    }
 }

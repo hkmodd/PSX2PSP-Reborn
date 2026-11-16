@@ -28,8 +28,10 @@ pub struct CodeImage {
     /// File name on the disc, for the runtime's log.
     pub name: String,
     pub text_addr: u32,
+    /// Bytes of the text up to its last translated word and that word's delay slot (the data
+    /// after it is not checked).
     pub text_size: u32,
-    /// [`fnv1a32`] of the text as loaded: the runtime takes this translation only when the
+    /// [`fnv1a32`] of those bytes as loaded: the runtime takes this translation only when the
     /// guest RAM holds exactly that.
     pub hash: u32,
     /// [`fnv1a32`] of the first [`HEAD_LEN`] bytes of the text: the runtime's cheap check before
@@ -131,7 +133,6 @@ pub fn fnv1a32(bytes: &[u8]) -> u32 {
 struct Parsed {
     name: String,
     exe: PsxExe,
-    hash: u32,
     overlay: bool,
     disc: Discovery,
     hz: Hazards,
@@ -167,7 +168,7 @@ pub fn build(exes: Vec<(String, Vec<u8>)>, overlays: Vec<(String, Vec<u8>)>) -> 
         }
         let hash = fnv1a32(&exe.text);
         if seen.insert((exe.text_addr, exe.text.len(), hash)) {
-            parsed.push((name, exe, hash, false));
+            parsed.push((name, exe, false));
         }
     }
     let at = overlay::locate_all(&overlays.iter().map(|(_, b)| b.as_slice()).collect::<Vec<_>>());
@@ -179,15 +180,15 @@ pub fn build(exes: Vec<(String, Vec<u8>)>, overlays: Vec<(String, Vec<u8>)>) -> 
         }
         let hash = fnv1a32(&exe.text);
         if seen.insert((exe.text_addr, exe.text.len(), hash)) {
-            parsed.push((name, exe, hash, true));
+            parsed.push((name, exe, true));
         }
     }
     let parsed: Vec<Parsed> = parsed
         .into_par_iter()
-        .map(|(name, exe, hash, overlay)| {
+        .map(|(name, exe, overlay)| {
             let disc = Discovery::run(&exe);
             let hz = Hazards::check(&exe, &disc);
-            Parsed { name, exe, hash, overlay, disc, hz }
+            Parsed { name, exe, overlay, disc, hz }
         })
         .collect();
 
@@ -246,7 +247,13 @@ pub fn build(exes: Vec<(String, Vec<u8>)>, overlays: Vec<(String, Vec<u8>)>) -> 
             if t.words.len() as u32 * 4 != len {
                 return Err(format!("translation at {host_base:#010x} is {} words, {} at first", t.words.len(), len / 4));
             }
-            let text_size = p.exe.text.len() as u32;
+            // The text up to its last translated word and that word's delay slot: the data after
+            // it (an overlay's variables, which the game sets before it calls in) stays out of
+            // the hashes, or the runtime would never find the text it translated.
+            let len = p.exe.text.len() as u32;
+            let last = t.map.keys().map(|&g| g.wrapping_sub(p.exe.text_addr)).filter(|&o| o < len).max();
+            let text_size = last.map_or(len, |o| (o + 8).min(len));
+            let text = &p.exe.text[..text_size as usize];
             let mut table = vec![layout::MISS; text_size.div_ceil(4) as usize];
             for (&g, &h) in &t.map {
                 if let Some(slot) = g.checked_sub(p.exe.text_addr).and_then(|o| table.get_mut(o as usize / 4)) {
@@ -257,8 +264,8 @@ pub fn build(exes: Vec<(String, Vec<u8>)>, overlays: Vec<(String, Vec<u8>)>) -> 
                 name: p.name,
                 text_addr: p.exe.text_addr,
                 text_size,
-                hash: p.hash,
-                head_hash: fnv1a32(&p.exe.text[..p.exe.text.len().min(HEAD_LEN)]),
+                hash: fnv1a32(text),
+                head_hash: fnv1a32(&text[..text.len().min(HEAD_LEN)]),
                 host_base,
                 code: t.words.iter().flat_map(|w| w.to_le_bytes()).collect(),
                 table: table.iter().flat_map(|w| w.to_le_bytes()).collect(),
@@ -407,8 +414,10 @@ mod tests {
         assert!(pack.skipped.is_empty(), "{:?}", pack.skipped);
         let [m, o] = &pack.images[..] else { panic!("{:?}", pack.images.iter().map(|i| &i.name).collect::<Vec<_>>()) };
         assert_eq!((m.name.as_str(), m.overlay), ("MAIN.EXE", false));
-        assert_eq!((o.name.as_str(), o.overlay, o.text_addr, o.text_size), ("LEVEL.OVL", true, 0x800A_0000, 0x800));
-        assert_eq!(o.hash, fnv1a32(&overlay(0x800A_0000)));
+        // The text checked ends with the last function translated (words 136-138): the caller
+        // at 200 is reached by nothing, and the rest is data.
+        assert_eq!((o.name.as_str(), o.overlay, o.text_addr, o.text_size), ("LEVEL.OVL", true, 0x800A_0000, 4 * 139));
+        assert_eq!(o.hash, fnv1a32(&overlay(0x800A_0000)[..4 * 139]));
         assert!(o.host_base >= m.host_base + m.code.len() as u32, "disjoint regions");
         let word = |i: usize| u32::from_le_bytes(o.table[4 * i..4 * i + 4].try_into().unwrap());
         assert_ne!(word(36), layout::MISS, "each function is translated");
