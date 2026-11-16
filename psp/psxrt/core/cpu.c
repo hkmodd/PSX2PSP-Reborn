@@ -285,6 +285,9 @@ int cpu_step(Psx *psx)
         break;
     case 0x12: /* COP2 (GTE) */
         if (rs & 0x10) {
+#ifdef PSXRT_PC_TRACE
+            psxrt_io_trace(in & 0x3F, 3);
+#endif
             gte_command(psx, in & 0x1FFFFFF);
             psx->cycles += 8;
         } else

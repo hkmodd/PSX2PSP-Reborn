@@ -119,7 +119,9 @@ void psxrt_pc_trace(u32 pc)
 }
 
 /* The device accesses while a trace is written, by instruction, address and direction (2: a
- * psx_update, at pc 0), written beside the trace as FILE.io, most frequent first. */
+ * psx_update, at pc 0; 3: a GTE command, p = its number), written beside the trace as FILE.io,
+ * most frequent first. In the trace each is a marker pair (0xFFFFFFF0 | direction, p) after the
+ * run that made it, where the native runtime's code runs. */
 #define IO_SLOTS 8192
 static struct IoSlot { u32 pc, p, w, n; } io_slots[IO_SLOTS];
 
@@ -128,6 +130,13 @@ void psxrt_io_trace(u32 p, int write)
     if (!trace_file)
         return;
     u32 pc = write == 2 ? 0 : tr_last;
+    if (tr_first)
+        trace_put();
+    tr_first = tr_last = 0;
+    tr_prev[0] = tr_prev[1] = 0;
+    tr_buf[tr_n++] = 0xFFFFFFF0u | (u32)write, tr_buf[tr_n++] = p;
+    if (tr_n == 8192)
+        fwrite(tr_buf, 4, (size_t)tr_n, trace_file), tr_n = 0;
     for (u32 i = (pc * 2654435761u ^ p * 40503u ^ (u32)write) % IO_SLOTS, k = 0; k < IO_SLOTS; k++, i = (i + 1) % IO_SLOTS) {
         struct IoSlot *s = &io_slots[i];
         if (!s->n)
@@ -152,7 +161,7 @@ static void io_dump(const char *trace_path)
     FILE *f = fopen(path, "w");
     qsort(io_slots, IO_SLOTS, sizeof io_slots[0], io_cmp);
     for (int i = 0; f && i < IO_SLOTS && io_slots[i].n; i++)
-        fprintf(f, "%08X %08X %c %u\n", (unsigned)io_slots[i].pc, (unsigned)io_slots[i].p, "rwu"[io_slots[i].w],
+        fprintf(f, "%08X %08X %c %u\n", (unsigned)io_slots[i].pc, (unsigned)io_slots[i].p, "rwug"[io_slots[i].w],
                 (unsigned)io_slots[i].n);
     if (f)
         fclose(f);

@@ -453,7 +453,8 @@ void cpu_run_call(Psx *psx, u32 addr); /* psx->call for the interpreter */
 u32 cpu_run(Psx *psx, u64 until); /* runs until the cycle `until`, an exit or a fatal error */
 #ifdef PSXRT_PC_TRACE
 void psxrt_pc_trace(u32 pc); /* the simulator's: every instruction the interpreter is about to run */
-void psxrt_io_trace(u32 p, int write); /* the simulator's: every device access (physical address) */
+/* the simulator's: every device access (physical address; write 0/1), psx_update (2), GTE command (3, p = its number) */
+void psxrt_io_trace(u32 p, int write);
 #endif
 int cpu_cop0_read(Psx *psx, int r, u32 *v);
 void cpu_cop0_write(Psx *psx, int r, u32 v);
