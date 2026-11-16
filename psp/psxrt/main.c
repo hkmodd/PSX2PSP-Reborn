@@ -194,7 +194,7 @@ typedef struct {
 } Poke;
 static Poke pokes[POKE_MAX]; /* from psxrt.poke beside the EBOOT: RAM writes, like cheat codes */
 static int poke_n;
-static char log_buf[8192];
+static char log_buf[32768]; /* holds 10 quiet seconds of stats (~2.5 KB each) */
 static int log_len;
 /* psxrt.bench beside the EBOOT: seconds to measure (after BENCH_SKIP), then one summary line
  * and a stop */
@@ -217,14 +217,14 @@ static void log_flush(void)
 }
 
 /* The stick's directory gets the file's size only when it is closed: a game switched off or hung
- * would leave an empty log. Closed and reopened every second for the first 20, then every 5th, and
- * in any second that logged an event (a load, an Exec, a flush): a crash then loses at most the
- * second it happens in, not the 5 before it (the S20a device crash left no line after CD_init). */
+ * would leave an empty log. The log is written and the file closed and reopened every second for
+ * the first 20, in any second that logged an event (a load, an Exec, a flush) and every 10th: a
+ * crash then loses no event (the S20a device crash left no line after CD_init) and at most 10 s
+ * of stats. A write every second kept the stick's light on in a pause. */
 static int log_event;
 static void log_keep(void)
 {
-    static u32 n;
-    if (log_fd < 0 || (n++ >= 20 && n % 5 && !log_event))
+    if (log_fd < 0)
         return;
     log_event = 0;
     sceIoClose(log_fd);
@@ -1055,10 +1055,20 @@ static void frame(void)
                               (unsigned)(bench.fps * 10 / k % 10), (unsigned)(bench.interp / k), (unsigned)(bench.io / k), (unsigned)(bench.draw / k),
                               (unsigned)(bench.spu / k), (unsigned)(bench.timer / k), (unsigned)(bench.dma2 / k), (unsigned)(bench.update / k),
                               (unsigned)(bench.present / k), (unsigned)(bench.sleep / k), (unsigned)(bench.sas / k));
-            log_flush();
-            sceIoWrite(log_fd, line, n);
-            log_keep();
-            if (bench_secs && bench_n > BENCH_SKIP && k >= bench_secs) {
+            static u32 log_secs;
+            int done = bench_secs && bench_n > BENCH_SKIP && k >= bench_secs;
+            if (n > (int)sizeof line - 1)
+                n = (int)sizeof line - 1;
+            if (log_len + n > (int)sizeof log_buf)
+                log_flush();
+            memcpy(log_buf + log_len, line, (size_t)n);
+            log_len += n;
+            log_secs++;
+            if (log_event || log_secs <= 20 || log_secs % 10 == 0 || done) {
+                log_flush();
+                log_keep();
+            }
+            if (done) {
                 char hot[1024];
                 sceIoWrite(log_fd, hot, native_hot_log(hot, sizeof hot));
                 if (rec_buf)
@@ -1116,7 +1126,11 @@ static void host_audio(void *user, const s16 *samples, int frames)
 static int audio_thread(SceSize args, void *argp)
 {
     (void)args, (void)argp;
-    static s16 buf[AUDIO_BLOCK * 2] __attribute__((aligned(64)));
+    /* The channel reads a block from memory while it plays, after sceAudioOutputBlocking returned:
+     * one buffer rewritten at once reached the speaker in pieces, as the cache let lines go (a
+     * crackle the samples handed over never had). Three in turn: the one written has played. */
+    static s16 bufs[3][AUDIO_BLOCK * 2] __attribute__((aligned(64)));
+    u32 bi = 0;
     int ch = sceAudioChReserve(PSP_AUDIO_NEXT_CHANNEL, AUDIO_BLOCK, PSP_AUDIO_FORMAT_STEREO);
     if (ch < 0) {
         say("audio: no channel (%08X)", ch);
@@ -1128,6 +1142,8 @@ static int audio_thread(SceSize args, void *argp)
     s32 p1[2] = {0, 0}, p2[2] = {0, 0}; /* the last two samples out, per side */
     u32 taken = 0;                       /* when the channel last took a block */
     for (;;) {
+        s16 *buf = bufs[bi];
+        bi = bi == 2 ? 0 : bi + 1;
         u32 top = audio_wr; /* with sceSasCore playing voices: up to where it has mixed them in */
         if (sas_on) {
             u32 mixed = sas_mix(audio_ring, AUDIO_RING, top);
@@ -1175,7 +1191,7 @@ static int audio_thread(SceSize args, void *argp)
             rec_w += AUDIO_BLOCK;
         }
         audio_rd = rd;
-        sceKernelDcacheWritebackRange(buf, sizeof buf);
+        sceKernelDcacheWritebackRange(buf, sizeof bufs[0]);
         u32 now = sceKernelGetSystemTimeLow();
         if (taken && now - taken > AUDIO_BLOCK * 1000000u / 44100u) {
             audio_late++;
