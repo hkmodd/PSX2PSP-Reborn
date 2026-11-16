@@ -881,6 +881,7 @@ static u32 audio_peak_in, audio_peak_out; /* per second: the largest sample from
  * passes POP_D2 (a step no 44.1 kHz sound of this level makes: a click), the largest one */
 #define POP_D2 6000
 static u32 audio_late, audio_late_max, audio_pops, audio_d2_max;
+static u32 audio_step_lo = ~0u, audio_step_hi; /* per second: the resampler's slowest and fastest step (16.16) */
 
 static u32 watch_word(u32 a)
 {
@@ -937,7 +938,7 @@ static void frame(void)
                               (unsigned)(s->ra_scans - n0.ra_scans), (unsigned)(s->hooks - n0.hooks), (unsigned)(s->vsync_passes - n0.vsync_passes), (unsigned)(s->updates - n0.updates));
                 n += snprintf(line + n, sizeof line - (size_t)n,
                               "-- ms: interp %u io %u (draw %u mdec %u spu %u) update %u present %u (wait %u draw %u text %u rgb24 %u) sleep %u;"
-                              " audio drops %u gaps %u trims %u peak %u/%u late %u (max %u us) pops %u (max d2 %u); vsync wait %u (%u ms) late %u (avg %u max %u us) skipped %u short %u\n",
+                              " audio drops %u gaps %u trims %u peak %u/%u late %u (max %u us) pops %u (max d2 %u) step %u-%u; vsync wait %u (%u ms) late %u (avg %u max %u us) skipped %u short %u\n",
                               ms_of(s->us_interp - n0.us_interp), ms_of(s->us_io - n0.us_io),
                               ms_of(psx.gpu.us_draw - draw0), ms_of(psx.mdec.us_decode - mdec0),
                               ms_of(psx.spu.us_mix - spu0),
@@ -945,7 +946,9 @@ static void frame(void)
                               ms_of(us_pwait), ms_of(us_pdraw), ms_of(us_ptext),
                               ms_of(us_rgb24 - rgb0), ms_of(s->us_sleep - n0.us_sleep),
                               (unsigned)audio_drops, (unsigned)audio_gaps, (unsigned)audio_trims, (unsigned)audio_peak_in, (unsigned)audio_peak_out,
-                              (unsigned)audio_late, (unsigned)audio_late_max, (unsigned)audio_pops, (unsigned)audio_d2_max, (unsigned)(s->vs_wait - n0.vs_wait),
+                              (unsigned)audio_late, (unsigned)audio_late_max, (unsigned)audio_pops, (unsigned)audio_d2_max,
+                              (unsigned)(audio_step_lo == ~0u ? 0 : audio_step_lo * 1000ull >> 16), (unsigned)(audio_step_hi * 1000ull >> 16),
+                              (unsigned)(s->vs_wait - n0.vs_wait),
                               ms_of(s->us_vs_wait - n0.us_vs_wait), (unsigned)(s->vs_late - n0.vs_late),
                               (unsigned)((s->us_late - n0.us_late) / ((s->vs_late - n0.vs_late) | 1)), (unsigned)s->us_late_max,
                               (unsigned)(s->vs_adv - n0.vs_adv), (unsigned)(s->vs_short - n0.vs_short));
@@ -974,6 +977,7 @@ static void frame(void)
                 us_pwait = us_pdraw = us_ptext = 0;
                 audio_drops = audio_gaps = audio_trims = audio_peak_in = audio_peak_out = 0;
                 audio_late = audio_late_max = audio_pops = audio_d2_max = 0;
+                audio_step_lo = ~0u, audio_step_hi = 0;
                 static const char *const io_names[IO_KINDS] = IO_KIND_NAMES;
                 n += snprintf(line + n, sizeof line - (size_t)n, "-- io (n/ms):");
                 for (int k = 0; k < IO_KINDS; k++)
@@ -1092,12 +1096,13 @@ static u32 host_usec(void *user)
 
 /* ---- audio: the SPU's 44100 Hz stereo through a ring to a thread that feeds one hardware
  * channel. PS1 time follows the PSP display (native_vsync), so the SPU makes up to ~0.9% more
- * samples than the channel's 44100 Hz takes: the consumer resamples, its step following the
- * ring's smoothed fill (each sample above the target is 1/65536 faster), which settles where the
- * two rates meet. The ring absorbs the SPU's per-frame bursts; past ~190 ms of backlog the
- * consumer trims it, when it runs dry the channel gets silence. ---- */
+ * samples than the channel's 44100 Hz takes, and fewer when the PS1 runs below full speed: the
+ * consumer resamples, its step following the rate the ring fills at and its smoothed fill (each
+ * sample above the target is 1/65536 faster). The ring absorbs the SPU's per-frame bursts; past
+ * ~190 ms of backlog the consumer trims it, when it runs dry the sound fades to silence. ---- */
 #define AUDIO_RING 16384 /* stereo samples, a power of two */
 #define AUDIO_BLOCK 1024 /* samples per hardware output, a multiple of 64 */
+#define AUDIO_RAMP 256   /* samples to fade out when the ring runs dry and in when it is back */
 static s16 audio_ring[AUDIO_RING * 2] __attribute__((aligned(64))); /* sceSasCore mixes into its grains */
 static volatile u32 audio_rd, audio_wr;
 
@@ -1137,10 +1142,19 @@ static int audio_thread(SceSize args, void *argp)
         return 0;
     }
     const s32 target = 3 * AUDIO_BLOCK;
-    s32 avg = target; /* the fill, smoothed over ~16 blocks */
+    s32 avg = target; /* the fill, smoothed over ~32 blocks */
     u32 pos = 0;      /* 16.16: the fraction of a sample past rd */
     s32 p1[2] = {0, 0}, p2[2] = {0, 0}; /* the last two samples out, per side */
     u32 taken = 0;                       /* when the channel last took a block */
+    /* The SPU makes 44100 samples per PS1 second: below full speed it makes fewer per real second
+     * than the channel takes. The step follows that rate (what the ring got over the last 64
+     * blocks, 1.5 s: (top - then) / 65536 in 16.16 is top - then), smoothed over ~16 blocks, and
+     * the fill's distance from the target corrects what is left: the sound slows down with the
+     * picture instead of running dry. A model of SPU bursts of 735 samples (STATE.md): no gaps
+     * at 89% or 97% (22/s and 6/s before), pitch moving 1.5 cents faster than 1 Hz. */
+    u32 tops[64] = {0}, ti = 0, seen = 0;
+    s32 rate = 65536;
+    int dry = 0; /* the last block ran dry: the next one ramps in from silence */
     for (;;) {
         s16 *buf = bufs[bi];
         bi = bi == 2 ? 0 : bi + 1;
@@ -1150,12 +1164,22 @@ static int audio_thread(SceSize args, void *argp)
             if (sas_on == 1)
                 top = mixed;
         }
+        if (seen >= 64)
+            rate += ((s32)(top - tops[ti]) - rate) / 16;
+        else
+            seen++;
+        tops[ti] = top, ti = (ti + 1) & 63;
         u32 rd = audio_rd, fill = top - rd;
         if (fill > 8 * AUDIO_BLOCK) /* more than ~190 ms behind: catch up to ~70 ms */
             rd += fill - (u32)target, fill = (u32)target, avg = target, audio_trims++;
-        avg += ((s32)fill - avg) / 16;
+        avg += ((s32)fill - avg) / 32;
         s32 d = avg - target;
-        u32 step = 65536u + (u32)(d < -1311 ? -1311 : d > 1311 ? 1311 : d); /* within 2% */
+        s32 st = rate + (d < -2621 ? -2621 : d > 2621 ? 2621 : d); /* the fill corrects within 4% */
+        u32 step = (u32)(st < 49152 ? 49152 : st > 68157 ? 68157 : st); /* 0.75 to 1.04 */
+        if (step < audio_step_lo)
+            audio_step_lo = step;
+        if (step > audio_step_hi)
+            audio_step_hi = step;
         if (fill > ((pos + step * AUDIO_BLOCK) >> 16) + 1) {
             for (u32 i = 0; i < AUDIO_BLOCK; i++, pos += step) {
                 u32 a = ((rd + (pos >> 16)) & (AUDIO_RING - 1)) * 2, b = (a + 2) & (AUDIO_RING * 2 - 1);
@@ -1164,14 +1188,22 @@ static int audio_thread(SceSize args, void *argp)
                 buf[2 * i + 1] = (s16)(audio_ring[a + 1] + ((audio_ring[b + 1] - audio_ring[a + 1]) * f >> 15));
             }
             rd += pos >> 16, pos &= 0xFFFF;
-        } else { /* ran dry: what there is, then silence */
+            if (dry) /* back from silence: no step up to where the sound is */
+                for (u32 i = 0; i < AUDIO_RAMP; i++)
+                    buf[2 * i] = (s16)(buf[2 * i] * (s32)i / AUDIO_RAMP),
+                    buf[2 * i + 1] = (s16)(buf[2 * i + 1] * (s32)i / AUDIO_RAMP);
+            dry = 0;
+        } else { /* ran dry: what there is, then down to silence, no step */
             u32 n = fill < AUDIO_BLOCK ? fill : AUDIO_BLOCK;
             for (u32 i = 0; i < n; i++, rd++) {
                 u32 at = (rd & (AUDIO_RING - 1)) * 2;
                 buf[2 * i] = audio_ring[at], buf[2 * i + 1] = audio_ring[at + 1];
             }
-            memset(buf + 2 * n, 0, (AUDIO_BLOCK - n) * 4);
+            s32 l = n ? buf[2 * n - 2] : p1[0], r = n ? buf[2 * n - 1] : p1[1];
+            for (u32 i = n, k = AUDIO_RAMP; i < AUDIO_BLOCK; i++, k -= k > 0)
+                buf[2 * i] = (s16)(l * (s32)k / AUDIO_RAMP), buf[2 * i + 1] = (s16)(r * (s32)k / AUDIO_RAMP);
             audio_gaps += n > 0;
+            dry = 1;
             pos = 0;
         }
         for (u32 i = 0; i < AUDIO_BLOCK * 2; i++) {
