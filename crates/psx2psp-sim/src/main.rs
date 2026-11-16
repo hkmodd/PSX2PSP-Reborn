@@ -3,10 +3,12 @@
 //!
 //! ```text
 //! psx2psp-sim <disc.cue|disc.bin> [--frames N] [--every N] [--out DIR] [--press FRAME:BUTTON,...]
-//!             [--poke FRAME:ADDR:HEX,...] [--dump FRAME,...]
+//!             [--poke FRAME:ADDR:HEX,...] [--dump FRAME,...] [--pad FILE] [--trace FROM:TO:FILE]
 //! ```
 //! Buttons: select start up right down left l2 r2 l1 r1 triangle circle cross square; each press
-//! holds for 6 frames. A poke writes the bytes `HEX` at the RAM address `ADDR` (hex) before that
+//! holds for 6 frames. `--pad` reads a runtime `psxrt.pad` script. `--trace` writes the
+//! straight-line runs the guest executes in frames FROM..=TO (the I-cache model's input,
+//! `psx2psp-recomp --example icache`). A poke writes the bytes `HEX` at the RAM address `ADDR` (hex) before that
 //! frame runs, like a cheat code; a dump writes the 2 MB of RAM as `ramNNNNN.bin` after it.
 
 use std::ffi::{c_char, c_int, c_void};
@@ -34,6 +36,7 @@ unsafe extern "C" {
     fn sim_display(s: *const Sim, out: *mut c_int);
     fn sim_status(s: *const Sim, out: *mut u32);
     fn sim_trace(s: *mut Sim, flags: c_int);
+    fn sim_trace_to(path: *const c_char, out: *mut u64) -> c_int;
     #[cfg(test)]
     fn sim_poll_bound(s: *mut Sim, pc: u32, gpr: *const u32, raw: u32, room: u32) -> u32;
 }
@@ -97,7 +100,10 @@ struct Args {
     frames: u32,
     every: u32,
     out: PathBuf,
-    presses: Vec<(u32, u16)>,
+    /// Frame, frames held, PS1 buttons.
+    presses: Vec<(u32, u32, u16)>,
+    /// First frame, last frame, file.
+    trace: Option<(u32, u32, PathBuf)>,
     pokes: Vec<(u32, u32, Vec<u8>)>,
     dumps: Vec<u32>,
 }
@@ -126,6 +132,7 @@ fn args() -> Result<Args, String> {
         every: 60,
         out: PathBuf::from("D:/Temp/PSX2PSP-Reborn/sim"),
         presses: Vec::new(),
+        trace: None,
         pokes: Vec::new(),
         dumps: Vec::new(),
     };
@@ -139,8 +146,31 @@ fn args() -> Result<Args, String> {
                 for p in it.next().ok_or("--press needs FRAME:BUTTON,...")?.split(',') {
                     let (f, b) = p.split_once(':').ok_or(format!("bad press {p}"))?;
                     let f = f.parse::<u32>().map_err(|_| format!("bad frame in {p}"))?;
-                    a.presses.push((f, button(b).ok_or(format!("unknown button {b}"))?));
+                    a.presses.push((f, 6, button(b).ok_or(format!("unknown button {b}"))?));
                 }
+            }
+            "--pad" => {
+                // psxrt.pad: "frame buttons(hex, PSP bits) frames" triples; L+R+START (the
+                // runtime's snapshot request) is left out.
+                let path = it.next().ok_or("--pad needs a file")?;
+                let text = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
+                let v: Vec<&str> = text.split_whitespace().collect();
+                for t in v.chunks_exact(3) {
+                    let bad = || format!("bad press {} {} {} in {path}", t[0], t[1], t[2]);
+                    let f = t[0].parse::<u32>().map_err(|_| bad())?;
+                    let b = u32::from_str_radix(t[1], 16).map_err(|_| bad())?;
+                    let n = t[2].parse::<u32>().map_err(|_| bad())?;
+                    if b & 0x308 != 0x308 {
+                        a.presses.push((f, n, ((b & 0xF0F9) | ((b >> 8) & 3) << 10) as u16));
+                    }
+                }
+            }
+            "--trace" => {
+                let s = it.next().ok_or("--trace needs FROM:TO:FILE")?;
+                let mut p = s.splitn(3, ':');
+                let (f, t, file) = (p.next(), p.next(), p.next());
+                let n = |v: Option<&str>| v.and_then(|x| x.parse::<u32>().ok()).ok_or(format!("bad trace {s}"));
+                a.trace = Some((n(f)?, n(t)?, PathBuf::from(file.ok_or(format!("bad trace {s}"))?)));
             }
             "--poke" => {
                 for p in it.next().ok_or("--poke needs FRAME:ADDR:HEX,...")?.split(',') {
@@ -251,9 +281,21 @@ fn main() -> ExitCode {
                     eprintln!("{}: {e}", path.display());
                 }
             }
-            for &(f, b) in &a.presses {
+            for &(f, n, b) in &a.presses {
                 if f == frame {
-                    held.push((frame + 6, b));
+                    held.push((frame + n, b));
+                }
+            }
+            if let Some((from, to, file)) = &a.trace {
+                let mut st = [0u64; 2];
+                if frame == *from {
+                    let c = std::ffi::CString::new(file.to_string_lossy().as_bytes()).unwrap_or_default();
+                    if sim_trace_to(c.as_ptr(), st.as_mut_ptr()) != 0 {
+                        eprintln!("{}: cannot write the trace", file.display());
+                    }
+                } else if frame == to + 1 {
+                    sim_trace_to(std::ptr::null(), st.as_mut_ptr());
+                    println!("[sim] trace frames {from}..={to}: {} instructions, {} runs written to {}", st[0], st[1], file.display());
                 }
             }
             held.retain(|&(until, _)| frame < until);

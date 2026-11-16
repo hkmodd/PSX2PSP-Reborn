@@ -381,6 +381,9 @@ static int run_until(Psx *psx, u32 stop_pc, u64 until)
             return 0;
         if (psx->cycles >= psx->next_event)
             psx_update(psx);
+#ifdef PSXRT_PC_TRACE
+        psxrt_pc_trace(c->pc);
+#endif
         if (cpu_step(psx) < 0) {
             psx->exiting = 2;
             return -1;

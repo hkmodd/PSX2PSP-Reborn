@@ -80,6 +80,114 @@ Sim *sim_new(void *user, ReadFn rd, u32 disc_end, TextFn tty, TextFn log)
 
 void sim_free(Sim *s) { free(s); }
 
+/* --trace: the straight-line runs the interpreter executes, as (first pc, last pc) pairs of u32;
+ * a run equal to the one before it is not written again (a loop of one run stays in the I-cache
+ * after its first pass), but its instructions count. */
+static FILE *trace_file;
+static u32 tr_first, tr_last, tr_prev[2], tr_buf[8192];
+static int tr_n;
+static unsigned long long tr_insns, tr_runs;
+
+static void trace_put(void)
+{
+    tr_insns += (tr_last - tr_first) / 4 + 1;
+    if (tr_first == tr_prev[0] && tr_last == tr_prev[1])
+        return;
+    tr_prev[0] = tr_first, tr_prev[1] = tr_last, tr_runs++;
+    tr_buf[tr_n++] = tr_first, tr_buf[tr_n++] = tr_last;
+    if (tr_n == 8192)
+        fwrite(tr_buf, 4, (size_t)tr_n, trace_file), tr_n = 0;
+}
+
+/* Instructions run at each RAM word while a trace is written, written beside it as FILE.cnt (2 MB
+ * of RAM as 512k little-endian u32). */
+static u32 pc_count[RAM_SIZE / 4];
+
+void psxrt_pc_trace(u32 pc)
+{
+    if (!trace_file)
+        return;
+    if ((pc & 0x1FFFFFFFu) < RAM_SIZE)
+        pc_count[(pc & (RAM_SIZE - 1)) >> 2]++;
+    if (pc == tr_last + 4 && tr_first) {
+        tr_last = pc;
+        return;
+    }
+    if (tr_first)
+        trace_put();
+    tr_first = tr_last = pc;
+}
+
+/* The device accesses while a trace is written, by instruction, address and direction (2: a
+ * psx_update, at pc 0), written beside the trace as FILE.io, most frequent first. */
+#define IO_SLOTS 8192
+static struct IoSlot { u32 pc, p, w, n; } io_slots[IO_SLOTS];
+
+void psxrt_io_trace(u32 p, int write)
+{
+    if (!trace_file)
+        return;
+    u32 pc = write == 2 ? 0 : tr_last;
+    for (u32 i = (pc * 2654435761u ^ p * 40503u ^ (u32)write) % IO_SLOTS, k = 0; k < IO_SLOTS; k++, i = (i + 1) % IO_SLOTS) {
+        struct IoSlot *s = &io_slots[i];
+        if (!s->n)
+            s->pc = pc, s->p = p, s->w = (u32)write;
+        if (s->pc == pc && s->p == p && s->w == (u32)write) {
+            s->n++;
+            return;
+        }
+    }
+}
+
+static int io_cmp(const void *a, const void *b)
+{
+    u32 x = ((const struct IoSlot *)a)->n, y = ((const struct IoSlot *)b)->n;
+    return x < y ? 1 : x > y ? -1 : 0;
+}
+
+static void io_dump(const char *trace_path)
+{
+    char path[1024];
+    snprintf(path, sizeof path, "%s.io", trace_path);
+    FILE *f = fopen(path, "w");
+    qsort(io_slots, IO_SLOTS, sizeof io_slots[0], io_cmp);
+    for (int i = 0; f && i < IO_SLOTS && io_slots[i].n; i++)
+        fprintf(f, "%08X %08X %c %u\n", (unsigned)io_slots[i].pc, (unsigned)io_slots[i].p, "rwu"[io_slots[i].w],
+                (unsigned)io_slots[i].n);
+    if (f)
+        fclose(f);
+    memset(io_slots, 0, sizeof io_slots);
+    snprintf(path, sizeof path, "%s.cnt", trace_path);
+    if ((f = fopen(path, "wb")) != NULL) {
+        fwrite(pc_count, 4, RAM_SIZE / 4, f);
+        fclose(f);
+    }
+    memset(pc_count, 0, sizeof pc_count);
+}
+
+static char trace_path[1024];
+
+/* Starts writing the trace to `path`, or ends it (NULL): returns the instructions and the runs
+ * written so far. */
+int sim_trace_to(const char *path, unsigned long long *out)
+{
+    if (trace_file) {
+        if (tr_first)
+            trace_put();
+        fwrite(tr_buf, 4, (size_t)tr_n, trace_file);
+        fclose(trace_file);
+        trace_file = NULL;
+        io_dump(trace_path);
+    }
+    if (path)
+        snprintf(trace_path, sizeof trace_path, "%s", path);
+    out[0] = tr_insns, out[1] = tr_runs;
+    tr_n = 0, tr_first = tr_last = tr_prev[0] = tr_prev[1] = 0, tr_insns = tr_runs = 0;
+    if (path && !(trace_file = fopen(path, "wb")))
+        return -1;
+    return 0;
+}
+
 int sim_boot(Sim *s) { return psx_boot(&s->psx); }
 
 /* Runs until the next vblank has been handled; returns the exit state (0 running). */

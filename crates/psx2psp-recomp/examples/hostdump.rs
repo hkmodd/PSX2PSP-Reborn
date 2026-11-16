@@ -1,6 +1,7 @@
 //! `cargo run --release -p psx2psp-recomp --example hostdump -- EXE START END`: the host words the
 //! translator writes for each guest instruction of START..END (hex), main pass only, and the
-//! totals of the executable: how much host code a guest word costs.
+//! totals of the executable: how much host code a guest word costs. `KINDS=1`: the range's
+//! main-pass words by guest instruction kind, the 20 largest.
 
 use psx2psp_recomp::{Discovery, Hazards, PsxExe, translate};
 
@@ -29,6 +30,22 @@ fn main() {
         hn += n;
     }
     println!("range: {gn} guest words, {hn} host words ({:.2} per guest word)", hn as f64 / gn.max(1) as f64);
+    // KINDS=1: main-pass words by guest instruction kind over the range (Translation::spans; a
+    // group's span is its first word's, out-of-line code is not counted).
+    if std::env::var("KINDS").is_ok() {
+        let mut by: std::collections::BTreeMap<String, (u32, u32)> = Default::default();
+        for &(pc, s, e) in t.spans.iter().filter(|s| (start..end).contains(&s.0)) {
+            let kind = format!("{:?}", psx2psp_recomp::decode(psx2psp_recomp::Insn(guest(pc)), psx2psp_recomp::Isa::R3000A));
+            let k = by.entry(kind).or_default();
+            k.0 += 1;
+            k.1 += (e - s) / 4;
+        }
+        let mut v: Vec<_> = by.into_iter().collect();
+        v.sort_by_key(|(_, (_, w))| std::cmp::Reverse(*w));
+        for (k, (n, w)) in v.iter().take(20) {
+            println!("{k:8} {n:7} guest {w:8} host ({:.2} each)", *w as f64 / *n as f64);
+        }
+    }
     println!(
         "exe: {} guest words discovered, {} host words ({:.2} each), cold {} words in {} blocks",
         d.code.len(),

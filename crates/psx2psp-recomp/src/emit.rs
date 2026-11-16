@@ -117,6 +117,10 @@ pub struct Translation {
     /// Words of out-of-line code (slow paths, interrupt checks, host calls, long jumps), and the
     /// number of blocks they are written in between the main-pass code.
     pub cold: (usize, usize),
+    /// Main-pass code in guest order: guest pc, host start, host end of the code a straight-line
+    /// run through it executes (a group's span covers its guest words; out-of-line code is not in
+    /// it). The I-cache model's map (`examples/icache.rs`).
+    pub spans: Vec<(u32, u32, u32)>,
 }
 
 /// The host word for `guest` written where the simple instruction translated to `host` was, if
@@ -353,6 +357,8 @@ struct Em<'a> {
     runtime: BTreeMap<u32, Reason>,
     /// Out-of-line words written so far, and in how many blocks.
     cold: (usize, usize),
+    /// [`Translation::spans`] as word indices.
+    spans: Vec<(u32, usize, usize)>,
     /// Conditional branches whose guest target is beyond 16 bits in host code.
     long: &'a BTreeSet<u32>,
     hooks: &'a BTreeMap<u32, Hook>,
@@ -432,6 +438,7 @@ fn emit(
         skip_to: 0,
         runtime: BTreeMap::new(),
         cold: (0, 0),
+        spans: Vec::new(),
     };
     em.targets = em.targets();
     let targets = em.targets.clone();
@@ -440,15 +447,16 @@ fn emit(
             continue;
         }
         em.far_flush();
-        em.map.insert(a, em.out.w.len());
-        match em.insn(a) {
-            Some(n) if em.first(n) => {}
-            Some(n) => {
-                let c = em.resume(n, Reason::Unreached);
-                em.out.append(c);
-                em.run_end();
-            }
-            None => em.run_end(),
+        let start = em.out.w.len();
+        em.map.insert(a, start);
+        let next = em.insn(a);
+        if let Some(n) = next.filter(|&n| !em.first(n)) {
+            let c = em.resume(n, Reason::Unreached);
+            em.out.append(c);
+        }
+        em.spans.push((a, start, em.out.w.len()));
+        if !next.is_some_and(|n| em.first(n)) {
+            em.run_end();
         }
     }
     // Delay slots that are also jumped to get a copy of their own.
@@ -795,14 +803,15 @@ impl Em<'_> {
         let ok = |p: u32| self.first(p) && !self.hz.sites.contains_key(&p) && !self.hooks.contains_key(&p);
         let (i, k) = self.at(a)?;
         let u = Uses::of(i, k);
-        if !mem(k) || !ok(a) || (u.read | u.write) & GUEST_K != 0 {
+        let base = i.rs();
+        // An access that writes its own base is a group of one.
+        if !mem(k) || !ok(a) || (u.read | u.write) & GUEST_K != 0 || u.write & (1 << base) != 0 {
             return None;
         }
-        let base = i.rs();
         let (mut lo, mut hi) = (i.simm() as i32, i.simm() as i32);
         let (mut pcs, mut last) = (vec![a], 0);
         let mut p = a;
-        while u.write & (1 << base) == 0 {
+        loop {
             p += 4;
             if !ok(p) || self.targets.contains(&p) {
                 break;
@@ -1137,7 +1146,7 @@ impl Em<'_> {
     }
 
     fn finish(self, base: u32) -> Result<Translation, Fail> {
-        let Em { out, mut map, map_at, runtime, labels, cold, .. } = self;
+        let Em { out, mut map, map_at, runtime, labels, cold, spans, .. } = self;
         let Code { mut w, fix, defs, pat } = out;
         let mut at = vec![usize::MAX; labels];
         for (l, i) in defs {
@@ -1182,6 +1191,7 @@ impl Em<'_> {
             runtime,
             patch,
             cold,
+            spans: spans.into_iter().map(|(g, s, e)| (g, host(s), host(e))).collect(),
         })
     }
 }

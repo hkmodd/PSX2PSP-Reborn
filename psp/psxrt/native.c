@@ -653,7 +653,21 @@ static void update_once(void);
 /* psx_update, then the stall native_vsync asked for: the guest runs no code while the devices
  * go through their events in order up to stall_to (one jump made the CD lose interrupts: the
  * boot hung in CD_init). */
+static void update_stall(void);
+/* Brackets one non-vblank update in PB_EVERY (a vblank's presents and sleeps: other threads run
+ * inside it, on the same counters). */
 static void update(void)
+{
+    static u32 k;
+    u32 calls = native_stats.calls;
+    int b = P->cycles < P->next_vblank && !(k++ % PB_EVERY) && prof_begin(PB_UPDATE, PB_EVERY);
+    native_stats.updates++;
+    update_stall();
+    if (b)
+        prof_end(PB_UPDATE, native_stats.calls != calls);
+}
+
+static void update_stall(void)
 {
     update_once();
     if (stall_to > P->cycles) /* native_vsync's c_base is after the stall, as for a frame on time */
@@ -1325,8 +1339,27 @@ int native_hot_log(char *buf, int len)
     return n < len ? n + snprintf(buf + n, (size_t)(len - n), "\n") : len;
 }
 
-/* Host call at `site` (the address of its .word pc, .word insn): returns where to go on. */
+static u32 rt_call(const u32 *site);
+
+/* Host call at `site` (the address of its .word pc, .word insn): returns where to go on. One in
+ * PB_EVERY is bracketed (dropped when it ran an update or translated code), and one in PB_EVERY,
+ * halfway between, brackets nothing before it runs. */
 u32 native_rt_call(const u32 *site)
+{
+    static u32 k;
+    u32 s = k++ % PB_EVERY;
+    prof_site(site[0]);
+    if (s == PB_EVERY / 2 && prof_begin(PB_EMPTY, PB_EVERY))
+        prof_end(PB_EMPTY, 0);
+    if (s || !prof_begin(PB_CALL, PB_EVERY))
+        return rt_call(site);
+    u32 calls = native_stats.calls, updates = native_stats.updates;
+    u32 next = rt_call(site);
+    prof_end(PB_CALL, native_stats.calls - calls > 1 || native_stats.updates != updates);
+    return next;
+}
+
+static u32 rt_call(const u32 *site)
 {
     Cpu *c = &P->cpu;
     u32 pc = site[0], insn = site[1], back = (u32)site + 8;

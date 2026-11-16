@@ -114,6 +114,9 @@ u32 psx_read(Psx *psx, u32 addr, int size)
         const u8 *m = psx->scratch + (p & 0x3FF);
         return size == 1 ? m[0] : size == 2 ? (u32)(m[0] | m[1] << 8) : m[0] | m[1] << 8 | m[2] << 16 | (u32)m[3] << 24;
     }
+#ifdef PSXRT_PC_TRACE
+    psxrt_io_trace(p, 0);
+#endif
     u32 v = io_read(psx, p, size);
     return size == 1 ? v & 0xFF : size == 2 ? v & 0xFFFF : v;
 }
@@ -141,5 +144,8 @@ void psx_write(Psx *psx, u32 addr, u32 v, int size)
             m[2] = (u8)(v >> 16), m[3] = (u8)(v >> 24);
         return;
     }
+#ifdef PSXRT_PC_TRACE
+    psxrt_io_trace(p, 1);
+#endif
     io_write(psx, p, v, size);
 }

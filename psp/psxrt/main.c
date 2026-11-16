@@ -82,7 +82,7 @@ static void prof_clear(void)
 /* The counters' share of the GPU DMAs (the PS1 display lists walked into GE commands): cpu ck,
  * memory stall, i_miss, d_miss. A DMA runs on the CPU thread, never across the log's clear. */
 static const u8 gd_reg[4] = {2, 4, 13, 14};
-static u32 gd_at[4], gd_sum[4];
+static u32 gd_at[4], gd_sum[4], gd_runs;
 static void host_gpu_dma(void *user, int end)
 {
     (void)user;
@@ -95,6 +95,73 @@ static void host_gpu_dma(void *user, int end)
         else
             gd_at[k] = r;
     }
+    gd_runs += end;
+}
+
+/* The same counters around the runtime's own work (native.h): sums of the kept samples times
+ * their weight, the weights' sum, the samples kept and dropped. A sample across the log's clear
+ * (the counters went back) is dropped too. */
+static u32 pb_at[4], pb_w, pb_gd, pb_sum[PB_PARTS][4], pb_wsum[PB_PARTS], pb_kept[PB_PARTS], pb_drop[PB_PARTS];
+static int pb_open = -1;
+
+int prof_begin(int part, u32 weight)
+{
+    if (!prof_on || pb_open >= 0)
+        return 0;
+    pb_open = part, pb_w = weight, pb_gd = gd_runs;
+    for (int k = 0; k < 4; k++)
+        pb_at[k] = kuKernelPeekw(PROF_REG(gd_reg[k]));
+    return 1;
+}
+
+void prof_end(int part, int drop)
+{
+    u32 r[4];
+    for (int k = 0; k < 4; k++)
+        r[k] = kuKernelPeekw(PROF_REG(gd_reg[k]));
+    pb_open = -1;
+    if (drop || pb_gd != gd_runs || r[0] < pb_at[0]) {
+        pb_drop[part]++;
+        return;
+    }
+    pb_kept[part]++, pb_wsum[part] += pb_w;
+    for (int k = 0; k < 4; k++)
+        pb_sum[part][k] += (r[k] - pb_at[k]) * pb_w;
+}
+
+/* Host calls by site (guest pc and flag bits), the most frequent logged each second. */
+#define SITES 512
+static struct { u32 pc, n; } sites[SITES];
+static u32 sites_lost;
+
+void prof_site(u32 pc)
+{
+    if (!prof_on)
+        return;
+    for (u32 i = pc * 2654435761u >> 23, k = 0; k < 8; k++, i = (i + 1) % SITES)
+        if (!sites[i].n || sites[i].pc == pc) {
+            sites[i].pc = pc, sites[i].n++;
+            return;
+        }
+    sites_lost++;
+}
+
+static int sites_log(char *buf, int len)
+{
+    int n = snprintf(buf, (size_t)len, "-- sites (pc/n, %u lost):", (unsigned)sites_lost);
+    for (int top = 0; top < 24 && n < len - 24; top++) {
+        int best = -1;
+        for (int i = 0; i < SITES; i++)
+            if (sites[i].n && (best < 0 || sites[i].n > sites[best].n))
+                best = i;
+        if (best < 0)
+            break;
+        n += snprintf(buf + n, (size_t)(len - n), " %08X/%u", (unsigned)sites[best].pc, (unsigned)sites[best].n);
+        sites[best].n = 0;
+    }
+    memset(sites, 0, sizeof sites);
+    sites_lost = 0;
+    return n < len ? n + snprintf(buf + n, (size_t)(len - n), "\n") : len;
 }
 /* psxrt.spu beside the EBOOT: "cpu" (0) the SPU mixes every voice; "both" (2) sceSasCore plays
  * its voices beside the SPU, for the level comparison; otherwise (1) sceSasCore plays them */
@@ -815,7 +882,7 @@ static void frame(void)
         snprintf(status, sizeof status, "f %u pc %08X %u%% %u vbl %u fps", (unsigned)frames, (unsigned)psx.cpu.pc, (unsigned)speed,
                  (unsigned)fps, (unsigned)game_fps);
         if (log_fd >= 0) { /* the speed goes to the file only: the screen has its status line */
-            char line[3072]; /* a busy second writes ~1.8 KB */
+            char line[4096]; /* a busy second writes ~2.2 KB */
             int n = snprintf(line, sizeof line, "-- %s\n", status);
             if (watch_n) {
                 n += snprintf(line + n, sizeof line - (size_t)n, "-- watch (last/flip sum):");
@@ -828,10 +895,10 @@ static void frame(void)
             }
             if (native) {
                 const NativeStats *s = &native_stats;
-                n += snprintf(line + n, sizeof line - (size_t)n, "-- native: %u calls, %u misses, %u steps, %u bios, %u hashes, %u loads, %u poll skips (%u far, %u ra scans), %u hooks\n",(unsigned)(s->calls - n0.calls),
+                n += snprintf(line + n, sizeof line - (size_t)n, "-- native: %u calls, %u misses, %u steps, %u bios, %u hashes, %u loads, %u poll skips (%u far, %u ra scans), %u hooks, %u updates\n",(unsigned)(s->calls - n0.calls),
                               (unsigned)(s->misses - n0.misses), (unsigned)(s->steps - n0.steps), (unsigned)(s->bios - n0.bios), (unsigned)(s->hashes - n0.hashes),
                               (unsigned)s->loads, (unsigned)(s->poll_skips - n0.poll_skips), (unsigned)(s->poll_far - n0.poll_far),
-                              (unsigned)(s->ra_scans - n0.ra_scans), (unsigned)(s->hooks - n0.hooks));
+                              (unsigned)(s->ra_scans - n0.ra_scans), (unsigned)(s->hooks - n0.hooks), (unsigned)(s->updates - n0.updates));
                 n += snprintf(line + n, sizeof line - (size_t)n,
                               "-- ms: interp %u io %u (draw %u mdec %u spu %u) update %u present %u (wait %u draw %u text %u rgb24 %u) sleep %u;"
                               " audio drops %u gaps %u trims %u peak %u/%u; vsync wait %u (%u ms) late %u (avg %u max %u us) skipped %u short %u\n",
@@ -929,6 +996,16 @@ static void frame(void)
                               (unsigned)(r[13] / 1000), (unsigned)(r[14] / 1000), (unsigned)(r[15] / 1000), (unsigned)(gd_sum[0] / 1000),
                               (unsigned)(gd_sum[1] / 1000), (unsigned)(gd_sum[2] / 1000), (unsigned)(gd_sum[3] / 1000));
                 memset(gd_sum, 0, sizeof gd_sum);
+                static const char *const pb_names[PB_PARTS] = {"calls", "update", "empty"};
+                n += snprintf(line + n, sizeof line - (size_t)n, "-- rt (k, sampled 1/%u):", (unsigned)PB_EVERY);
+                for (int p = 0; p < PB_PARTS; p++)
+                    n += snprintf(line + n, sizeof line - (size_t)n, " %s ck %u memory %u i_miss %u d_miss %u (w %u kept %u dropped %u)%s",
+                                  pb_names[p], (unsigned)(pb_sum[p][0] / 1000), (unsigned)(pb_sum[p][1] / 1000),
+                                  (unsigned)(pb_sum[p][2] / 1000), (unsigned)(pb_sum[p][3] / 1000), (unsigned)pb_wsum[p],
+                                  (unsigned)pb_kept[p], (unsigned)pb_drop[p], p + 1 < PB_PARTS ? ";" : "\n");
+                memset(pb_sum, 0, sizeof pb_sum), memset(pb_wsum, 0, sizeof pb_wsum);
+                memset(pb_kept, 0, sizeof pb_kept), memset(pb_drop, 0, sizeof pb_drop);
+                n += sites_log(line + n, (int)sizeof line - n);
             }
             n += ge_log(line + n, (int)sizeof line - n);
             u32 k = bench_n - BENCH_SKIP;

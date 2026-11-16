@@ -147,6 +147,9 @@ void psx_update(Psx *psx)
 {
     int prof = psx->prof_scale != 0;
     u32 t = prof ? (psx->prof_reads++, psx->host->usec(psx->host->user)) : 0;
+#ifdef PSXRT_PC_TRACE
+    psxrt_io_trace(0, 2);
+#endif
 #define MARK(k) if (prof) t = upd_mark(psx, k, t)
     if (psx->cycles >= psx->next_vblank) {
         psx->next_vblank += psx->frame_cycles;

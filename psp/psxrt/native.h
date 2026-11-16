@@ -29,9 +29,21 @@ typedef struct NativeStats {
     /* PS1 vblanks that waited for the PSP's, came after it, forgiven (PS1 time slowed), owed
      * (the next one comes early); waited us */
     u32 vs_wait, vs_late, vs_adv, vs_short, us_vs_wait, us_late, us_late_max;
+    u32 updates; /* device updates (psx_update, the stall's included) */
 } NativeStats;
 
 extern NativeStats native_stats;
+
+/* main.c, with psxrt.prof: the profiler's counters around the runtime's own work, sampled, each
+ * kept sample counted `weight` times. PB_CALL host calls of translated code, PB_UPDATE device
+ * updates, PB_EMPTY a bracket around nothing taken like PB_CALL's (what the counter reads add to
+ * each sample). prof_begin returns 0 when not sampling; `drop`: other bracketed work ran inside. */
+enum { PB_CALL, PB_UPDATE, PB_EMPTY, PB_PARTS };
+#define PB_EVERY 64u
+int prof_begin(int part, u32 weight);
+void prof_end(int part, int drop);
+/* main.c, with psxrt.prof: a host call at guest `pc` (its flag bits kept), counted for the log */
+void prof_site(u32 pc);
 
 /* Takes over `psx` (after psx_init, before psx_boot): guest calls, RAM-load tracking, the
  * dispatch table, the stubs and the interrupt alarm. The code region must be reserved. NULL,

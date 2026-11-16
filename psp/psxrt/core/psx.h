@@ -451,6 +451,10 @@ void cpu_exception(Psx *psx, u32 code, u32 pc, int in_delay);
 int cpu_step(Psx *psx); /* one instruction; 0 ok, -1 fatal */
 void cpu_run_call(Psx *psx, u32 addr); /* psx->call for the interpreter */
 u32 cpu_run(Psx *psx, u64 until); /* runs until the cycle `until`, an exit or a fatal error */
+#ifdef PSXRT_PC_TRACE
+void psxrt_pc_trace(u32 pc); /* the simulator's: every instruction the interpreter is about to run */
+void psxrt_io_trace(u32 p, int write); /* the simulator's: every device access (physical address) */
+#endif
 int cpu_cop0_read(Psx *psx, int r, u32 *v);
 void cpu_cop0_write(Psx *psx, int r, u32 v);
 void cpu_rfe(Psx *psx);
