@@ -732,14 +732,16 @@ static SceUInt alarm(void *common)
 /* ---- the interpreter, between translations ---- */
 
 /* A guest `ra` the translated code may return to: its translation, or GRET. Only a return site, a
- * KSEG0/KSEG1 word after a jal/jalr/bltzal/bgezal and its delay slot, or a BIOS address:
- * hand-written code keeps data in ra (Crash 2's rasterizer at 8003C360, `move ra,v1` with a jump
- * offset in the top byte, 0x08..0xC8, read by `srl at,ra,24`), and GRET there sent 8003C448's
- * `jr at` to 8003C459. */
+ * KUSEG/KSEG0/KSEG1 word after a jal/jalr/bltzal/bgezal and its delay slot, or a KSEG0/KSEG1 BIOS
+ * address: hand-written code keeps data in ra (Crash 2's rasterizer at 8003C360, `move ra,v1`
+ * with a jump offset in the top byte, 0x08..0xC8, read by `srl at,ra,24`), and GRET there sent
+ * 8003C448's `jr at` to 8003C459. KUSEG too: Lilo & Stitch runs at 00018000, and its code loaded
+ * at run time (interpreted) calls `jal 73178` at 000D9A1C; the translated callee saved the guest
+ * ra and its `jr ra` jumped to 0x000D9A24 as host code. */
 static void fix_ra(Cpu *c)
 {
     u32 ra = c->gpr[31], p = ra & 0x1FFFFFFFu;
-    if (ra >> 29 != 4 && ra >> 29 != 5)
+    if (ra >> 29 == 0 ? ra >= 0x800000 : ra >> 29 != 4 && ra >> 29 != 5)
         return;
     if (p < 0x800000) {
         u32 w = p >= 8 && !(ra & 3) ? ram_r32(P, ra - 8) : 0, op = w >> 26;
