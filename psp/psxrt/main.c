@@ -166,6 +166,13 @@ static int sites_log(char *buf, int len)
 /* psxrt.spu beside the EBOOT: "cpu" (0) the SPU mixes every voice; "both" (2) sceSasCore plays
  * its voices beside the SPU, for the level comparison; otherwise (1) sceSasCore plays them */
 static int spu_mode = 1;
+/* psxrt.wav beside the EBOOT: the channel's last REC_SECONDS kept in RAM, written to psxrt.wav
+ * (44100 Hz stereo) when HOME exits; what the hardware was given, after the resampler */
+#define REC_SECONDS 10
+static int rec_on;
+static s16 *rec_buf;
+static volatile u32 rec_w; /* stereo samples recorded */
+static void rec_save(void);
 static volatile int sas_on; /* spu_mode, once sceSasCore runs */
 /* psxrt.watch beside the EBOOT: PS1 RAM words logged once a second, last value and the sum of
  * the values seen at each display flip (a per-frame variable summed over the game's frames) */
@@ -323,6 +330,12 @@ static void open_log(const char *eboot)
         sceIoRead(fd, word, sizeof word - 1);
         sceIoClose(fd);
         spu_mode = !strncmp(word, "cpu", 3) ? 0 : !strncmp(word, "both", 4) ? 2 : 1;
+    }
+    snprintf(slash + 1, sizeof path - (size_t)(slash + 1 - path), "psxrt.wav");
+    fd = sceIoOpen(path, PSP_O_RDONLY, 0);
+    if (fd >= 0) {
+        sceIoClose(fd);
+        rec_on = 1;
     }
     snprintf(slash + 1, sizeof path - (size_t)(slash + 1 - path), "psxrt.bench");
     fd = sceIoOpen(path, PSP_O_RDONLY, 0);
@@ -829,7 +842,9 @@ static void present(Psx *psx, const char *status)
     us_pdraw += sceKernelGetSystemTimeLow() - t1;
 }
 
-/* ---- pad: PSP bits equal PS1 bits except L/R (PSP 8/9, PS1 L1/R1 10/11); active low ---- */
+/* ---- pad: PSP bits equal PS1 bits except L/R (PSP 8/9, PS1 L1/R1 10/11); active low.
+ * The PSP has no L2/R2: the analog stick pushed left or right past half way presses them
+ * (PS1 bits 8/9). Sheep Dog turns its camera with them. ---- */
 static u16 read_pad(u32 frame_no)
 {
     static u32 prev;
@@ -850,7 +865,8 @@ static u16 read_pad(u32 frame_no)
     prev = b;
     if ((b & snap) == snap)
         b &= ~snap;
-    return (u16) ~((b & 0xF0F9u) | ((b >> 8) & 3u) << 10);
+    u32 l2r2 = (d.Lx < 64 ? 1u : 0u) | (d.Lx > 192 ? 2u : 0u);
+    return (u16) ~((b & 0xF0F9u) | ((b >> 8) & 3u) << 10 | l2r2 << 8);
 }
 
 /* ---- the machine ---- */
@@ -860,6 +876,11 @@ static u32 frames;
 static int native;
 static u32 audio_drops, audio_gaps, audio_trims; /* per second; the audio ring below */
 static u32 audio_peak_in, audio_peak_out; /* per second: the largest sample from the SPU, to the channel */
+/* per second: blocks handed over more than a block's time after the last one was taken (the
+ * hardware may have run out), the longest such wait; output samples whose second difference
+ * passes POP_D2 (a step no 44.1 kHz sound of this level makes: a click), the largest one */
+#define POP_D2 6000
+static u32 audio_late, audio_late_max, audio_pops, audio_d2_max;
 
 static u32 watch_word(u32 a)
 {
@@ -916,14 +937,15 @@ static void frame(void)
                               (unsigned)(s->ra_scans - n0.ra_scans), (unsigned)(s->hooks - n0.hooks), (unsigned)(s->vsync_passes - n0.vsync_passes), (unsigned)(s->updates - n0.updates));
                 n += snprintf(line + n, sizeof line - (size_t)n,
                               "-- ms: interp %u io %u (draw %u mdec %u spu %u) update %u present %u (wait %u draw %u text %u rgb24 %u) sleep %u;"
-                              " audio drops %u gaps %u trims %u peak %u/%u; vsync wait %u (%u ms) late %u (avg %u max %u us) skipped %u short %u\n",
+                              " audio drops %u gaps %u trims %u peak %u/%u late %u (max %u us) pops %u (max d2 %u); vsync wait %u (%u ms) late %u (avg %u max %u us) skipped %u short %u\n",
                               ms_of(s->us_interp - n0.us_interp), ms_of(s->us_io - n0.us_io),
                               ms_of(psx.gpu.us_draw - draw0), ms_of(psx.mdec.us_decode - mdec0),
                               ms_of(psx.spu.us_mix - spu0),
                               ms_of(s->us_update - n0.us_update), ms_of(s->us_present - n0.us_present),
                               ms_of(us_pwait), ms_of(us_pdraw), ms_of(us_ptext),
                               ms_of(us_rgb24 - rgb0), ms_of(s->us_sleep - n0.us_sleep),
-                              (unsigned)audio_drops, (unsigned)audio_gaps, (unsigned)audio_trims, (unsigned)audio_peak_in, (unsigned)audio_peak_out, (unsigned)(s->vs_wait - n0.vs_wait),
+                              (unsigned)audio_drops, (unsigned)audio_gaps, (unsigned)audio_trims, (unsigned)audio_peak_in, (unsigned)audio_peak_out,
+                              (unsigned)audio_late, (unsigned)audio_late_max, (unsigned)audio_pops, (unsigned)audio_d2_max, (unsigned)(s->vs_wait - n0.vs_wait),
                               ms_of(s->us_vs_wait - n0.us_vs_wait), (unsigned)(s->vs_late - n0.vs_late),
                               (unsigned)((s->us_late - n0.us_late) / ((s->vs_late - n0.vs_late) | 1)), (unsigned)s->us_late_max,
                               (unsigned)(s->vs_adv - n0.vs_adv), (unsigned)(s->vs_short - n0.vs_short));
@@ -951,6 +973,7 @@ static void frame(void)
                 native_stats.us_late_max = 0;
                 us_pwait = us_pdraw = us_ptext = 0;
                 audio_drops = audio_gaps = audio_trims = audio_peak_in = audio_peak_out = 0;
+                audio_late = audio_late_max = audio_pops = audio_d2_max = 0;
                 static const char *const io_names[IO_KINDS] = IO_KIND_NAMES;
                 n += snprintf(line + n, sizeof line - (size_t)n, "-- io (n/ms):");
                 for (int k = 0; k < IO_KINDS; k++)
@@ -1038,6 +1061,8 @@ static void frame(void)
             if (bench_secs && bench_n > BENCH_SKIP && k >= bench_secs) {
                 char hot[1024];
                 sceIoWrite(log_fd, hot, native_hot_log(hot, sizeof hot));
+                if (rec_buf)
+                    rec_save();
                 halt("bench done");
             }
         }
@@ -1100,6 +1125,8 @@ static int audio_thread(SceSize args, void *argp)
     const s32 target = 3 * AUDIO_BLOCK;
     s32 avg = target; /* the fill, smoothed over ~16 blocks */
     u32 pos = 0;      /* 16.16: the fraction of a sample past rd */
+    s32 p1[2] = {0, 0}, p2[2] = {0, 0}; /* the last two samples out, per side */
+    u32 taken = 0;                       /* when the channel last took a block */
     for (;;) {
         u32 top = audio_wr; /* with sceSasCore playing voices: up to where it has mixed them in */
         if (sas_on) {
@@ -1131,12 +1158,32 @@ static int audio_thread(SceSize args, void *argp)
             audio_gaps += n > 0;
             pos = 0;
         }
-        for (u32 i = 0; i < AUDIO_BLOCK * 2; i++)
+        for (u32 i = 0; i < AUDIO_BLOCK * 2; i++) {
             if ((u32)abs(buf[i]) > audio_peak_out)
                 audio_peak_out = (u32)abs(buf[i]);
+            int c = i & 1;
+            u32 d2 = (u32)abs(buf[i] - 2 * p1[c] + p2[c]);
+            p2[c] = p1[c], p1[c] = buf[i];
+            if (d2 > audio_d2_max)
+                audio_d2_max = d2;
+            audio_pops += d2 > POP_D2;
+        }
+        if (rec_buf) {
+            u32 at = rec_w % (REC_SECONDS * 44100u); /* the buffer is no whole number of blocks: wrap per sample */
+            for (u32 i = 0; i < AUDIO_BLOCK; i++, at = at + 1 == REC_SECONDS * 44100u ? 0 : at + 1)
+                rec_buf[2 * at] = buf[2 * i], rec_buf[2 * at + 1] = buf[2 * i + 1];
+            rec_w += AUDIO_BLOCK;
+        }
         audio_rd = rd;
         sceKernelDcacheWritebackRange(buf, sizeof buf);
+        u32 now = sceKernelGetSystemTimeLow();
+        if (taken && now - taken > AUDIO_BLOCK * 1000000u / 44100u) {
+            audio_late++;
+            if (now - taken > audio_late_max)
+                audio_late_max = now - taken;
+        }
         sceAudioOutputBlocking(ch, PSP_AUDIO_VOLUME_MAX, buf);
+        taken = sceKernelGetSystemTimeLow();
     }
     return 0;
 }
@@ -1202,9 +1249,29 @@ static void host_vblank(void *user)
     }
 }
 
+/* psxrt.wav: the recorder's last REC_SECONDS, oldest first */
+static void rec_save(void)
+{
+    u32 w = rec_w, cap = REC_SECONDS * 44100u, n = w < cap ? w : cap;
+    char path[300];
+    snprintf(path, sizeof path, "%spsxrt.wav", base_dir);
+    SceUID fd = sceIoOpen(path, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
+    if (fd < 0)
+        return;
+    u32 h[11] = {0x46464952, 36 + n * 4, 0x45564157, 0x20746D66, 16, 0x00020001, 44100, 44100 * 4, 0x00100004, 0x61746164, n * 4};
+    sceIoWrite(fd, h, sizeof h);
+    u32 from = (w - n) % cap;
+    sceIoWrite(fd, rec_buf + 2 * from, (n < cap - from ? n : cap - from) * 4);
+    if (n > cap - from)
+        sceIoWrite(fd, rec_buf, (n - (cap - from)) * 4);
+    sceIoClose(fd);
+}
+
 static int exit_callback(int a, int b, void *c)
 {
     (void)a, (void)b, (void)c;
+    if (rec_buf)
+        rec_save();
     if (card_changed)
         card_save();
     log_flush();
@@ -1260,7 +1327,7 @@ int main(int argc, char **argv)
     pspDebugScreenInitEx((void *)(0x44000000u + GE_DISP_A), PSP_DISPLAY_PIXEL_FORMAT_565, 0);
     screen_init();
     sceCtrlSetSamplingCycle(0);
-    sceCtrlSetSamplingMode(PSP_CTRL_MODE_DIGITAL);
+    sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
     const char *eboot = argc > 0 ? argv[0] : "";
     open_log(eboot);
     say("PSX2PSP native runtime (psxrt) - S4, built %s %s", __DATE__, __TIME__);
@@ -1300,6 +1367,10 @@ int main(int argc, char **argv)
     host.usec = host_usec;
     host.gpu_dma = host_gpu_dma;
     host.audio = host_audio;
+    if (rec_on) {
+        rec_buf = palloc("psxrt rec", REC_SECONDS * 44100 * 4);
+        say(rec_buf ? "audio: the last %d s go to psxrt.wav when HOME exits" : "audio: no memory for %d s of recording", REC_SECONDS);
+    }
     int ath = sceKernelCreateThread("psxrt audio", audio_thread, 0x12, 0x2000, PSP_THREAD_ATTR_USER, NULL);
     if (ath >= 0)
         sceKernelStartThread(ath, 0, NULL);
