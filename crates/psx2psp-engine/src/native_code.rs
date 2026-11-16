@@ -148,6 +148,10 @@ pub struct Captured {
     /// The RAM it was taken from, at the address of its first byte (`at`'s segment): switch
     /// tables outside the code are read there.
     pub ram: Arc<Vec<u8>>,
+    /// Addresses where the guest started running code in it (empty for code found by its shape):
+    /// the code is taken with them whether it has a prologue or not, and they are entries of
+    /// every image holding these bytes there.
+    pub entries: Vec<u32>,
 }
 
 /// Smallest piece of captured code translated: one block of the runtime's code checks.
@@ -201,7 +205,12 @@ pub fn build(exes: Vec<(String, Vec<u8>)>, overlays: Vec<(String, Vec<u8>)>, cap
     // an executable and the slot its overlays are loaded into would call the overlay resident at
     // capture directly, and run it after another overlay is loaded there.
     let disc: Vec<(u32, u32)> = parsed.iter().map(|(_, x, ..)| (x.text_addr & 0x1FFF_FFFF, (x.text_addr & 0x1FFF_FFFF) + x.text.len() as u32)).collect();
-    let captured = captured.into_iter().flat_map(|Captured { at, bytes, ram, .. }| {
+    // Where code ran, with the bytes it ran: a seed of each image holding them there.
+    let ran: Vec<(u32, Vec<u8>)> = captured
+        .iter()
+        .flat_map(|c| c.entries.iter().filter_map(|&e| e.checked_sub(c.at).map(|o| (e, c.bytes[o as usize..(o as usize + 16).min(c.bytes.len())].to_vec()))))
+        .collect();
+    let captured = captured.into_iter().flat_map(|Captured { at, bytes, ram, entries, .. }| {
         let mut pieces = vec![(at & 0x1FFF_FFFF, (at & 0x1FFF_FFFF) + bytes.len() as u32)];
         for &(s, e) in &disc {
             pieces = pieces.into_iter().flat_map(|(a, b)| [(a, b.min(s)), (a.max(e), b)]).filter(|(a, b)| b > a).collect();
@@ -211,21 +220,45 @@ pub fn build(exes: Vec<(String, Vec<u8>)>, overlays: Vec<(String, Vec<u8>)>, cap
         pieces
             .into_iter()
             .filter(|(a, b)| b - a >= MIN_CAPTURED)
-            .map(|(a, b)| (format!("RAM {:08X}", seg | a), seg | a, bytes[(a - base) as usize..(b - base) as usize].to_vec(), (seg, ram.clone())))
+            .map(|(a, b)| (seg | a, bytes[(a - base) as usize..(b - base) as usize].to_vec(), (seg, ram.clone()), !entries.is_empty()))
             .collect::<Vec<_>>()
     });
-    for (name, at, bytes, far) in captured {
-        let held = |x: &PsxExe| at.checked_sub(x.text_addr).is_some_and(|o| x.text.get(o as usize..o as usize + bytes.len()) == Some(&bytes[..]));
-        if parsed.iter().any(|(_, x, ..)| held(x)) {
-            continue;
+    for (at, bytes, far, ran_code) in captured {
+        // Code taken where it ran also leaves out what an image taken before holds as it is:
+        // those entries seed that image.
+        let mut pieces = vec![(at, at + bytes.len() as u32)];
+        for (_, x, ..) in parsed.iter().filter(|_| ran_code) {
+            let (xs, xe) = (x.text_addr, x.text_addr + x.text.len() as u32);
+            pieces = pieces
+                .into_iter()
+                .flat_map(|(a, b)| {
+                    let (s, e) = (a.max(xs), b.min(xe));
+                    let same = s < e && bytes[(s - at) as usize..(e - at) as usize] == x.text[(s - xs) as usize..(e - xs) as usize];
+                    if same { [(a, s), (e, b)] } else { [(a, b), (b, b)] }
+                })
+                .filter(|(a, b)| b > a)
+                .collect();
         }
-        let Some(exe) = overlay::as_exe(&bytes, at) else { continue };
-        if parsed.len() >= MAX_IMAGES {
-            pack.skipped.push((name, format!("captured code at {at:#010x}: more than {MAX_IMAGES} images")));
-            continue;
-        }
-        if seen.insert((exe.text_addr, exe.text.len(), fnv1a32(&exe.text))) {
-            parsed.push((name, exe, true, Some(far)));
+        for (a, b) in pieces.into_iter().filter(|(a, b)| b - a >= MIN_CAPTURED) {
+            let (name, bytes) = (format!("RAM {a:08X}"), &bytes[(a - at) as usize..(b - at) as usize]);
+            let held = |x: &PsxExe| a.checked_sub(x.text_addr).is_some_and(|o| x.text.get(o as usize..o as usize + bytes.len()) == Some(bytes));
+            if parsed.iter().any(|(_, x, ..)| held(x)) {
+                continue;
+            }
+            let first = ran.iter().filter(|(e, m)| (a..b).contains(e) && bytes[(e - a) as usize..].starts_with(m)).map(|&(e, _)| e).min();
+            let exe = match (overlay::as_exe(bytes, a), first) {
+                (Some(x), None) => x,
+                (Some(x), Some(pc0)) => PsxExe { pc0, ..x },
+                (None, Some(pc0)) => PsxExe { pc0, gp0: 0, text_addr: a, text: bytes[..bytes.len() & !3].to_vec(), bss: (0, 0), stack: (0, 0) },
+                (None, None) => continue,
+            };
+            if parsed.len() >= MAX_IMAGES {
+                pack.skipped.push((name, format!("captured code at {a:#010x}: more than {MAX_IMAGES} images")));
+                continue;
+            }
+            if seen.insert((exe.text_addr, exe.text.len(), fnv1a32(&exe.text))) {
+                parsed.push((name, exe, true, Some(far.clone())));
+            }
         }
     }
     let discover = |exe: &PsxExe, far: &Option<(u32, Arc<Vec<u8>>)>, seeds: &BTreeSet<u32>| {
@@ -235,7 +268,10 @@ pub fn build(exes: Vec<(String, Vec<u8>)>, overlays: Vec<(String, Vec<u8>)>, cap
             None => Discovery::run_seeded(exe, &[], &seeds),
         }
     };
-    let mut seeds = vec![BTreeSet::new(); parsed.len()];
+    let mut seeds: Vec<BTreeSet<u32>> = parsed
+        .iter()
+        .map(|(_, x, ..)| ran.iter().filter(|(e, b)| x.contains(*e) && x.text.get((e - x.text_addr) as usize..).is_some_and(|t| t.starts_with(b))).map(|&(e, _)| e).collect())
+        .collect();
     let mut discs: Vec<Discovery> = parsed.par_iter().zip(&seeds).map(|((_, exe, _, far), s)| discover(exe, far, s)).collect();
     // A `jal` into the text of another image goes through that image's table: its target must be
     // an entry there even when nothing in that image calls it (Silent Hill's SetSp).
@@ -509,7 +545,7 @@ mod tests {
         let mut ram = vec![0u8; 0x20_0000];
         let o = (at & 0x1F_FFFF) as usize;
         ram[o..o + bytes.len()].copy_from_slice(&bytes);
-        Captured { name: format!("RAM {at:08X}"), at, bytes, ram: Arc::new(ram) }
+        Captured { name: format!("RAM {at:08X}"), at, bytes, ram: Arc::new(ram), entries: Vec::new() }
     }
 
     #[test]
@@ -547,6 +583,28 @@ mod tests {
         };
         assert_eq!(table(&[JR_RA, 0]), layout::MISS);
         assert_ne!(table(&[0x0C00_0000 | (set_sp >> 2 & 0x03FF_FFFF), 0, JR_RA, 0]), layout::MISS);
+    }
+
+    #[test]
+    fn code_that_ran_is_translated_without_a_prologue() {
+        // Crash 2's code in its NSF data: leaves with no prologue and nothing calling them in
+        // the image; a leaf at +0 and one at +0x10, after a `jr ra` and data.
+        let mut body = vec![ADDIU_V0_1, JR_RA, 0, 0xFFFF_FFFF, ADDIU_V0_1, JR_RA, 0];
+        body.resize(0x100, 0xFFFF_FFFF);
+        let body: Vec<u8> = body.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let at = 0x800A_0000;
+        let images = |entries: Vec<u32>| build(vec![], vec![], vec![Captured { entries, ..cap(at, body.clone()) }]).unwrap().images;
+        assert!(images(vec![]).is_empty());
+        let im = images(vec![at, at + 0x10]);
+        let slot = |i: usize| u32::from_le_bytes(im[0].table[4 * i..4 * i + 4].try_into().unwrap());
+        assert_eq!((im.len(), im[0].text_addr), (1, at));
+        assert!(slot(0) != layout::MISS && slot(4) != layout::MISS);
+        // The code an image already holds is left to it, its entries seeding it.
+        let main = [JR_RA, 0, 0, 0, ADDIU_V0_1, JR_RA, 0];
+        let words: Vec<u8> = main.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let pack = build(vec![("MAIN.EXE".into(), exe(0x8001_0000, &main))], vec![], vec![Captured { entries: vec![0x8001_0010], ..cap(0x8001_0000, words) }]).unwrap();
+        assert_eq!(pack.images.len(), 1);
+        assert_ne!(u32::from_le_bytes(pack.images[0].table[16..20].try_into().unwrap()), layout::MISS);
     }
 
     #[test]

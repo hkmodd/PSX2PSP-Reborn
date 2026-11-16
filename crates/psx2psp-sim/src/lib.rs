@@ -28,6 +28,8 @@ pub mod ffi {
         pub fn sim_trace(s: *mut Sim, flags: c_int);
         pub fn sim_trace_to(path: *const c_char, out: *mut u64) -> c_int;
         pub fn sim_poll_bound(s: *mut Sim, pc: u32, gpr: *const u32, raw: u32, room: u32) -> u32;
+        pub fn sim_ran() -> *const u8;
+        pub fn sim_ran_clear();
     }
 }
 
@@ -78,6 +80,8 @@ impl<'a> Machine<'a> {
             return None;
         }
         let m = Machine { sim, _read: read, _one: one };
+        // SAFETY: no core runs while this machine holds ONE.
+        unsafe { ffi::sim_ran_clear() };
         // SAFETY: `sim` is valid until drop.
         (unsafe { ffi::sim_boot(m.sim) } == 0).then_some(m)
     }
@@ -95,6 +99,18 @@ impl<'a> Machine<'a> {
     pub fn ram(&self) -> &[u8] {
         // SAFETY: the core's RAM is RAM bytes, valid until drop, written only inside `frame`.
         unsafe { std::slice::from_raw_parts(ffi::sim_ram(self.sim), RAM) }
+    }
+
+    /// The words of RAM the guest ran since boot or the last call, 1 byte per word (RAM / 4
+    /// bytes, nonzero where it ran); the map is cleared for the next frames.
+    pub fn take_ran(&mut self) -> Vec<u8> {
+        // SAFETY: the map is RAM / 4 bytes of the core's, written only inside `frame`, and this
+        // machine holds ONE.
+        unsafe {
+            let v = std::slice::from_raw_parts(ffi::sim_ran(), RAM / 4).to_vec();
+            ffi::sim_ran_clear();
+            v
+        }
     }
 }
 

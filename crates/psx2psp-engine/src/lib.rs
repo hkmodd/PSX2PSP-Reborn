@@ -947,7 +947,11 @@ const CAPTURE_EVERY: u32 = 300;
 /// the code runs of RAM above the kernel area ([`overlay::code_runs`]) that are unchanged at the
 /// next look are taken at their address. So is found the code a disc keeps compressed, encrypted
 /// or in an archive of a format of its own: Silent Hill's body, decompressed from SILENT to
-/// 8002DD08-800A8974. (name, address, bytes), each once; KUSEG addresses when `kuseg` (a game
+/// 8002DD08-800A8974. The core marks the words it runs: the stretches that ran between two
+/// looks and are unchanged at the second are taken too, with the addresses where running them
+/// started as entries ([`overlay::ran_runs`]), joined with those of the same bytes at earlier
+/// looks: so is found code with no prologue (Crash 2's, in its NSF data at 8013A000-8016F000).
+/// (name, address, bytes), each once; KUSEG addresses when `kuseg` (a game
 /// that runs there, as Lilo & Stitch does).
 pub fn captured_code(img: &DiscImage, patches: &[&dyn ImagePatch], kuseg: bool) -> Vec<native_code::Captured> {
     use psx2psp_recomp::overlay;
@@ -964,6 +968,8 @@ pub fn captured_code(img: &DiscImage, patches: &[&dyn ImagePatch], kuseg: bool) 
     };
     let Some(mut m) = Machine::boot(img.sectors(), read) else { return Vec::new() };
     let mut out = Vec::new();
+    let mut ran: Vec<native_code::Captured> = Vec::new();
+    let seg = if kuseg { 0 } else { 0x8000_0000 };
     let mut seen = std::collections::HashSet::new();
     let mut last: Option<std::sync::Arc<Vec<u8>>> = None;
     for f in 1..=CAPTURE_FRAMES {
@@ -976,6 +982,7 @@ pub fn captured_code(img: &DiscImage, patches: &[&dyn ImagePatch], kuseg: bool) 
         if f % CAPTURE_EVERY != 0 && alive {
             continue;
         }
+        let ran_now = m.take_ran();
         let ram = m.ram();
         if let Some(before) = &last {
             for (s, e) in overlay::code_runs(before).into_iter().filter(|&(s, _)| s >= 0x1_0000) {
@@ -983,8 +990,30 @@ pub fn captured_code(img: &DiscImage, patches: &[&dyn ImagePatch], kuseg: bool) 
                 if bytes != &ram[s as usize..e as usize] || !seen.insert((s, e, native_code::fnv1a32(bytes))) {
                     continue;
                 }
-                let at = if kuseg { s } else { 0x8000_0000 | s };
-                out.push(native_code::Captured { name: format!("RAM {at:08X}"), at, bytes: bytes.to_vec(), ram: before.clone() });
+                let at = seg | s;
+                out.push(native_code::Captured { name: format!("RAM {at:08X}"), at, bytes: bytes.to_vec(), ram: before.clone(), entries: Vec::new() });
+            }
+            // The code that ran since the last look and stayed as it was: one capture per piece
+            // of code, joined with the captures of the same bytes at earlier looks.
+            for (s, e, entries) in overlay::ran_runs(before, &ran_now).into_iter().filter(|&(s, ..)| s >= 0x1_0000) {
+                let (mut s, mut e) = (s as usize, e as usize);
+                if before[s..e] != ram[s..e] {
+                    continue;
+                }
+                let mut entries: std::collections::BTreeSet<u32> = entries.into_iter().map(|o| seg | o).collect();
+                loop {
+                    let joined = ran.iter().position(|c: &native_code::Captured| {
+                        let (cs, ce) = ((c.at & 0x1FFF_FFFF) as usize, (c.at & 0x1FFF_FFFF) as usize + c.bytes.len());
+                        cs <= e && s <= ce && before[cs..ce] == c.bytes[..]
+                    });
+                    let Some(i) = joined else { break };
+                    let c = ran.swap_remove(i);
+                    let cs = (c.at & 0x1FFF_FFFF) as usize;
+                    (s, e) = (s.min(cs), e.max(cs + c.bytes.len()));
+                    entries.extend(c.entries);
+                }
+                let at = seg | s as u32;
+                ran.push(native_code::Captured { name: format!("RAM {at:08X}"), at, bytes: before[s..e].to_vec(), ram: before.clone(), entries: entries.into_iter().collect() });
             }
         }
         last = Some(std::sync::Arc::new(ram.to_vec()));
@@ -992,6 +1021,7 @@ pub fn captured_code(img: &DiscImage, patches: &[&dyn ImagePatch], kuseg: bool) 
             break;
         }
     }
+    out.extend(ran);
     out
 }
 

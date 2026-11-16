@@ -168,6 +168,39 @@ pub fn code_runs(ram: &[u8]) -> Vec<(u32, u32)> {
         .collect()
 }
 
+/// The code the guest ran in a RAM image `ram` (offset 0 = physical address 0), from `ran`, one
+/// byte per word of `ram`, nonzero where an instruction ran: runs of 2 KB blocks holding a word
+/// that ran, gaps of up to two blocks inside, from the first word that ran to the last; with
+/// their entries, the words that ran after one that did not or after an unconditional jump's
+/// delay slot (function starts with or without a prologue: Crash 2's code in its NSF data has
+/// none). (start, end, entries) offsets, entries in ascending order.
+pub fn ran_runs(ram: &[u8], ran: &[u8]) -> Vec<(u32, u32, Vec<u32>)> {
+    const BLOCK: usize = 0x800 / 4;
+    const GAP: usize = 2;
+    let n = ran.len().min(ram.len() / 4);
+    let word = |i: usize| u32::from_le_bytes(ram[4 * i..4 * i + 4].try_into().unwrap());
+    let jump = |w: u32| w >> 26 == 2 || w & 0xFC1F_FFFF == 0x0000_0008;
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for b in (0..n.div_ceil(BLOCK)).filter(|&b| ran[b * BLOCK..((b + 1) * BLOCK).min(n)].iter().any(|&r| r != 0)) {
+        match runs.last_mut() {
+            Some((_, last)) if b - *last <= GAP + 1 => *last = b,
+            _ => runs.push((b, b)),
+        }
+    }
+    runs.into_iter()
+        .map(|(first, last)| {
+            let (lo, hi) = (first * BLOCK, ((last + 1) * BLOCK).min(n));
+            let start = (lo..hi).find(|&i| ran[i] != 0).unwrap();
+            let end = (lo..hi).rev().find(|&i| ran[i] != 0).unwrap() + 1;
+            let entries = (start..end)
+                .filter(|&i| ran[i] != 0 && (i == start || ran[i - 1] == 0 || (i >= 2 && jump(word(i - 2)))))
+                .map(|i| 4 * i as u32)
+                .collect();
+            (4 * start as u32, 4 * end as u32, entries)
+        })
+        .collect()
+}
+
 /// The overlay `bytes` as an executable at `base` for discovery and translation: its entry is
 /// its first prologue (discovery also starts from every other prologue and every pointer to its
 /// text, so the choice only names one function).
@@ -229,6 +262,27 @@ mod tests {
         put(0x4100, PROLOGUE);
         put(0x4200, 0x03E0_0008);
         assert!(code_runs(&ram).is_empty());
+    }
+
+    #[test]
+    fn ran_runs_group_the_words_that_ran_with_their_entries() {
+        let mut ram = vec![0u8; 0x8000];
+        let mut ran = vec![0u8; 0x2000];
+        let mut put = |o: usize, w: u32| ram[o..o + 4].copy_from_slice(&w.to_le_bytes());
+        // Block 1: f at 0x900 (5 words, `jr ra` at 0x90C), g right after it at 0x914, a skipped
+        // branch path inside g (0x918 not run). Block 3 (a gap of one block): h at 0x1A00.
+        put(0x90C, 0x03E0_0008);
+        for o in [0x900, 0x904, 0x908, 0x90C, 0x910, 0x914, 0x91C, 0x920, 0x1A00, 0x1A04] {
+            ran[o / 4] = 1;
+        }
+        // Block 12, far past a gap of data: k at 0x6000, after a `j` whose slot ran.
+        put(0x5FF8, 0x0800_0000);
+        for o in [0x5FF8, 0x5FFC, 0x6000] {
+            ran[o / 4] = 1;
+        }
+        let runs = ran_runs(&ram, &ran);
+        assert_eq!(runs, vec![(0x900, 0x1A08, vec![0x900, 0x914, 0x91C, 0x1A00]), (0x5FF8, 0x6004, vec![0x5FF8, 0x6000])]);
+        assert!(ran_runs(&ram, &vec![0u8; 0x2000]).is_empty());
     }
 
     #[test]

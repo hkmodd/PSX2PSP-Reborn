@@ -116,8 +116,17 @@ static void trace_put(void)
  * of RAM as 512k little-endian u32). */
 static u32 pc_count[RAM_SIZE / 4];
 
+/* Words of RAM the interpreter ran since sim_ran_clear, 1 byte per word: the converter's code
+ * capture takes code that ran. */
+static u8 ran[RAM_SIZE / 4];
+
+const u8 *sim_ran(void) { return ran; }
+void sim_ran_clear(void) { memset(ran, 0, sizeof ran); }
+
 void psxrt_pc_trace(u32 pc)
 {
+    if ((pc & 0x1FFFFFFFu) < RAM_SIZE)
+        ran[(pc & (RAM_SIZE - 1)) >> 2] = 1;
     if (!trace_file)
         return;
     if ((pc & 0x1FFFFFFFu) < RAM_SIZE)
