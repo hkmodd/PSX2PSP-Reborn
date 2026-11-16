@@ -40,7 +40,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use thiserror::Error;
 
-use crate::discover::{Discovery, JumpReg};
+use crate::discover::{Discovery, Image, JumpReg};
 use crate::exe::PsxExe;
 use crate::hazard::Hazards;
 use crate::hooks::{self, HOOK, Hook};
@@ -280,6 +280,8 @@ enum Fx {
     Branch,
     /// 26-bit `j`/`jal` target.
     Jump,
+    /// Host address in a `lui`/`ori` pair.
+    Abs,
 }
 
 /// A piece of host code with unresolved branches.
@@ -311,6 +313,12 @@ impl Code {
     fn jump(&mut self, op: u32, to: To, pc: u32) {
         self.fix.push((self.w.len(), Fx::Jump, to, pc));
         self.w.push(op << 26);
+    }
+    /// `reg` = the host address of `to`.
+    fn abs(&mut self, reg: u32, to: To, pc: u32) {
+        self.fix.push((self.w.len(), Fx::Abs, to, pc));
+        self.w.push(lui(reg, 0));
+        self.w.push(ori(reg, reg, 0));
     }
     fn def(&mut self, label: usize) {
         self.defs.push((label, self.w.len()));
@@ -525,6 +533,10 @@ impl Em<'_> {
                 Some((i, Beq | Bne | Blez | Bgtz | Bltz | Bgez | Bltzal | Bgezal)) => {
                     t.insert(i.branch_target(a));
                 }
+                Some((i, k @ (Addiu | Addi | Ori))) => {
+                    // A return point built in ra (ra_const) is entered as a call returns to it.
+                    t.extend(self.ra_const(a, i, k));
+                }
                 _ => {}
             }
         }
@@ -632,9 +644,36 @@ impl Em<'_> {
         falls.then_some(a + 4)
     }
 
+    /// The translated code address the `lui`/`addiu`/`ori` at `pc` completes in `ra`. Its host
+    /// address is written instead: a translated `jr ra` returns natively, and some hand-written
+    /// code makes its own return points (Crash 2's 8003B134 sets ra to its loop head 8003B38C).
+    /// Not a lone `lui`: its value is the high half of an address the next instruction completes.
+    fn ra_const(&self, pc: u32, i: Insn, k: Kind) -> Option<u32> {
+        if i.rt() != RA as usize {
+            return None;
+        }
+        let img = Image(self.exe);
+        let v = match k {
+            Kind::Addiu | Kind::Addi => img.const_of(i.rs(), pc)?.wrapping_add(i.simm()),
+            Kind::Ori => img.const_of(i.rs(), pc)? | i.imm(),
+            _ => return None,
+        };
+        self.d.code.contains(&v).then_some(v)
+    }
+
+    /// [`simple`], but not for an instruction [`Em::ra_const`] rewrites.
+    fn simple_at(&self, pc: u32, i: Insn, k: Kind) -> Option<u32> {
+        if self.ra_const(pc, i, k).is_some() { None } else { simple(i, k) }
+    }
+
     /// A non-transfer instruction. Returns its code and whether it continues at the next one.
     fn plain(&mut self, pc: u32, i: Insn, k: Kind) -> (Code, bool) {
         use Kind::*;
+        if let Some(t) = self.ra_const(pc, i, k) {
+            let mut c = Code::default();
+            c.abs(RA, To::Guest(t), pc);
+            return (c, true);
+        }
         if let Some(w) = simple(i, k) {
             let mut c = Code::default();
             c.simple(w, pc);
@@ -832,7 +871,7 @@ impl Em<'_> {
                 if u.write & (1 << base) != 0 {
                     break;
                 }
-            } else if simple(i, k).is_some() && u.write & (1 << base) == 0 {
+            } else if self.simple_at(p, i, k).is_some() && u.write & (1 << base) == 0 {
                 pcs.push(p);
             } else {
                 break;
@@ -1045,7 +1084,7 @@ impl Em<'_> {
             Jalr => 1 << i.rd(),
             _ => 0,
         };
-        let simple_slot = simple(si, sk);
+        let simple_slot = self.simple_at(s, si, sk);
         let clobbers = su.write & bu.read != 0;
         let why = if sk.has_delay_slot() {
             Some(Reason::BranchInSlot)
@@ -1211,6 +1250,10 @@ impl Em<'_> {
                     w[i] |= words as u16 as u32;
                 }
                 Fx::Jump => w[i] |= (host(t) >> 2) & 0x03FF_FFFF,
+                Fx::Abs => {
+                    w[i] |= host(t) >> 16;
+                    w[i + 1] |= host(t) & 0xFFFF;
+                }
             }
         }
         if !far.is_empty() {

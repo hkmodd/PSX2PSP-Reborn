@@ -961,6 +961,59 @@ fn delay_slot_that_is_also_a_target() {
     assert!(run.t.host(at(7)).is_some());
 }
 
+/// A code address built in `ra` (a hand-made return point, as Crash 2's) is the host address of
+/// its translation: the translated `jr ra` that takes it stays native.
+#[test]
+fn a_code_address_built_in_ra_is_a_host_return_point() {
+    let w = [
+        lui(RA, 0x8001),          // 0
+        addiu(RA, RA, 0x1C),      // 1  ra = word 7
+        addiu(T0, ZERO, 2),       // 2
+        b(5, ZERO, ZERO, 3, 7),   // 3  bne zero,zero,7 (never taken: 7 is code)
+        NOP,                      // 4
+        r(8, RA, 0, 0, 0),        // 5  jr ra
+        NOP,                      // 6
+        addiu(T0, T0, -1),        // 7  the return point
+        b(5, T0, ZERO, 8, 12),    // 8  bne t0,zero,12
+        NOP,                      // 9
+        j(2, 15),                 // 10 j end
+        addiu(RA, ZERO, 0),       // 11 slot: ra no longer compared as an address
+        r(8, RA, 0, 0, 0),        // 12 jr ra (again to 7)
+        addiu(T1, T1, 1),         // 13 slot
+        NOP,                      // 14
+        j(2, 15),                 // 15 end
+        NOP,                      // 16
+    ];
+    let run = check(&w, 15, |_| {}, false);
+    assert!(run.t.runtime.is_empty(), "{:?}", run.t.runtime);
+}
+
+/// A return point built in `ra` in the middle of a straight line (no branch goes there, as Sheep
+/// Dog's WHEEL.EXE 8001C108 -> 80036330) starts a block of its own.
+#[test]
+fn a_return_point_built_in_ra_mid_block_gets_a_label() {
+    let w = [
+        lui(RA, 0x8001),          // 0
+        addiu(RA, RA, 0x18),      // 1  ra = word 6
+        addiu(T0, ZERO, 2),       // 2
+        addiu(T1, T1, 1),         // 3
+        addiu(T2, T2, 1),         // 4
+        NOP,                      // 5
+        addiu(T0, T0, -1),        // 6  the return point, reached by falling through
+        b(5, T0, ZERO, 7, 11),    // 7  bne t0,zero,11
+        NOP,                      // 8
+        j(2, 13),                 // 9  j end
+        addiu(RA, ZERO, 0),       // 10 slot: ra no longer compared as an address
+        r(8, RA, 0, 0, 0),        // 11 jr ra (to 6)
+        NOP,                      // 12
+        j(2, 13),                 // 13 end
+        NOP,                      // 14
+    ];
+    let run = check(&w, 13, |_| {}, false);
+    assert!(run.t.runtime.is_empty(), "{:?}", run.t.runtime);
+    assert!(run.t.host(at(6)).is_some());
+}
+
 /// Branches whose host distance exceeds 16 bits, forward and backward, go through a `j`.
 #[test]
 fn far_branches_are_relaxed() {

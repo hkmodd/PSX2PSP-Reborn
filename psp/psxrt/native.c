@@ -731,12 +731,21 @@ static SceUInt alarm(void *common)
 
 /* ---- the interpreter, between translations ---- */
 
-/* A guest `ra` the translated code may return to: its translation, or GRET. */
+/* A guest `ra` the translated code may return to: its translation, or GRET. Only a return site, a
+ * KSEG0/KSEG1 word after a jal/jalr/bltzal/bgezal and its delay slot, or a BIOS address:
+ * hand-written code keeps data in ra (Crash 2's rasterizer at 8003C360, `move ra,v1` with a jump
+ * offset in the top byte, 0x08..0xC8, read by `srl at,ra,24`), and GRET there sent 8003C448's
+ * `jr at` to 8003C459. */
 static void fix_ra(Cpu *c)
 {
     u32 ra = c->gpr[31], p = ra & 0x1FFFFFFFu;
-    if (!ra || host_of(ra) == ra)
+    if (ra >> 29 != 4 && ra >> 29 != 5)
         return;
+    if (p < 0x800000) {
+        u32 w = p >= 8 && !(ra & 3) ? ram_r32(P, ra - 8) : 0, op = w >> 26;
+        if (op != 3 && !(op == 0 && (w & 63) == 9) && !(op == 1 && (w >> 17 & 15) == 8))
+            return;
+    }
     u32 h = host_of(ra);
     if (h) {
         c->gpr[31] = h;
@@ -744,6 +753,25 @@ static void fix_ra(Cpu *c)
         gret[gret_top++ % GRET_DEPTH] = ra;
         c->gpr[31] = STUB_GRET;
     }
+}
+
+/* After a call the interpreter ran at `at`: the link register gets the translation of the return
+ * site when there is one, as a translated call writes it. A callee whose prologue is interpreted
+ * (a function pointer the discovery missed) then saves an ra its translated epilogue can return
+ * to: Crash 2's 80041FAC keeps it in the scratchpad for 800420E4's `lw ra; jr ra`. */
+static void link_host(Cpu *c, u32 at)
+{
+    if (!c->in_delay || (at & 0x1FFFFFFFu) >= 0x800000)
+        return;
+    u32 w = ram_r32(P, at), op = w >> 26, rd, h;
+    if (op == 3 || (op == 1 && (w >> 17 & 15) == 8))
+        rd = 31;
+    else if (op == 0 && (w & 63) == 9)
+        rd = (w >> 11) & 31;
+    else
+        return;
+    if (rd && c->gpr[rd] == at + 8 && (h = host_of(at + 8)) != 0)
+        c->gpr[rd] = h;
 }
 
 /* Interprets from cpu.pc until an instruction boundary with a translation, and returns its host
@@ -801,13 +829,34 @@ static u32 run_guest(int mode)
     return h;
 }
 
+/* The interpreter's last steps (pc, ra, at after it) and where it was entered: the log of a fatal
+ * error shows how the guest got there. */
+#define HIST 16
+static u32 hist[HIST][3], hist_n, hist_entry, hist_mode;
+
+static void hist_log(const Cpu *c)
+{
+    psx_log(P, "interp entered at %08X (mode %u); last steps (pc ra at):", (unsigned)hist_entry, (unsigned)hist_mode);
+    for (u32 i = hist_n < HIST ? 0 : hist_n - HIST; i < hist_n; i++)
+        psx_log(P, "  %08X %08X %08X", (unsigned)hist[i % HIST][0], (unsigned)hist[i % HIST][1],
+                (unsigned)hist[i % HIST][2]);
+    for (int i = 0; i < 32; i += 8)
+        psx_log(P, "  r%02d %08X %08X %08X %08X %08X %08X %08X %08X", i, (unsigned)c->gpr[i], (unsigned)c->gpr[i + 1],
+                (unsigned)c->gpr[i + 2], (unsigned)c->gpr[i + 3], (unsigned)c->gpr[i + 4], (unsigned)c->gpr[i + 5],
+                (unsigned)c->gpr[i + 6], (unsigned)c->gpr[i + 7]);
+}
+
 static u32 interp(int mode)
 {
     static int isolated; /* the cache was isolated since the last return to translated code */
     Cpu *c = &P->cpu;
+    hist_entry = c->pc, hist_mode = (u32)mode;
     for (u32 n = 0;; n++) {
-        if (P->exiting)
+        if (P->exiting) {
+            if (P->exiting == 2)
+                hist_log(c);
             runtime_halt(P->exiting == 2 ? "the interpreter hit a fatal error" : "the game exited");
+        }
         if (!c->in_delay && mode != 2) {
             u32 pc = c->pc;
             if (pc == STUB_GRET) {
@@ -835,9 +884,12 @@ static u32 interp(int mode)
             sync_time();
         if (P->cycles >= P->next_event)
             update();
-        u32 p = c->pc & 0x1FFFFFFFu;
+        u32 at = c->pc, p = at & 0x1FFFFFFFu;
         if (cpu_step(P) < 0)
             P->exiting = 2;
+        link_host(c, at);
+        u32 *hs = hist[hist_n++ % HIST];
+        hs[0] = at, hs[1] = c->gpr[31], hs[2] = c->gpr[1];
         if (p == 0xA0 || p == 0xB0 || p == 0xC0)
             native_stats.bios++;
         else
