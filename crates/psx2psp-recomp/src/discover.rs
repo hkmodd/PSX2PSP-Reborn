@@ -333,10 +333,23 @@ impl Discovery {
     /// the code was captured from). A table only names the entries to translate: the jump goes
     /// through the dispatch table, so a stale or wrong word costs code, never a wrong jump.
     pub fn run_far(exe: &PsxExe, far: Far) -> Self {
+        Self::run_seeded(exe, far, &[])
+    }
+
+    /// [`Self::run_far`], with `seeds` called from outside the image (`jal` of another image into
+    /// this text): each one not reached otherwise is an entry if every path from it decodes, as
+    /// for a pointer (another overlay in the same slot may hold data there).
+    pub fn run_seeded(exe: &PsxExe, far: Far, seeds: &[u32]) -> Self {
         let img = Image(exe, far);
         let mut d = Discovery::default();
         d.entries.insert(exe.pc0, Origin::Entry);
         d.explore(img, vec![exe.pc0]);
+        for &s in seeds {
+            if exe.contains(s) && s & 3 == 0 && !d.code.contains(&s) && d.clean_from(img, s) {
+                d.entries.entry(s).or_insert(Origin::Call);
+                d.explore(img, vec![s]);
+            }
+        }
         let mut tried = HashSet::new();
         let mut pointed: HashSet<u32> = (exe.text_addr..exe.text_end())
             .step_by(4)

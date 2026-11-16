@@ -118,6 +118,31 @@ fn switch_tables_outside_the_text_are_read_from_far_data() {
     assert!(d.code.contains(&at(19)) && d.code.contains(&at(21)));
 }
 
+/// A leaf that nothing in the image calls, after a `jr` that is not `jr ra` (Silent Hill's SetSp
+/// after the BIOS stubs), is found only as a seed called from another image; a seed whose code
+/// does not decode is not taken.
+#[test]
+fn seeds_called_from_another_image_are_entries() {
+    const T2: u32 = 10;
+    let x = exe(&[
+        r(8, RA, 0, 0, 0),          // 0 jr ra
+        NOP,                        // 1
+        i(9, ZERO, T2, 0xB0),       // 2 addiu t2,zero,0xb0
+        r(8, T2, 0, 0, 0),          // 3 jr t2
+        i(9, ZERO, T1, 9),          // 4 addiu t1,zero,9
+        NOP,                        // 5
+        r(0x21, SP, ZERO, V0, 0),   // 6 SetSp: addu v0,sp,zero
+        r(8, RA, 0, 0, 0),          // 7 jr ra
+        r(0x21, A0, ZERO, SP, 0),   // 8 addu sp,a0,zero
+        r(2, 1, A0, A0, 8),         // 9 rotr (Allegrex): not code
+    ]);
+    assert!(!Discovery::run(&x).code.contains(&at(6)));
+    let d = Discovery::run_seeded(&x, &[], &[at(6), at(9)]);
+    assert_eq!(d.entries.get(&at(6)), Some(&Origin::Call));
+    assert!(d.code.contains(&at(8)));
+    assert!(!d.entries.contains_key(&at(9)) && !d.code.contains(&at(9)));
+}
+
 /// A handler that ends in a tail call, reached only through a pointer in data, is found; a
 /// pointer to a word that does not decode is not followed.
 #[test]

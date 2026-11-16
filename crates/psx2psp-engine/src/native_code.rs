@@ -228,13 +228,44 @@ pub fn build(exes: Vec<(String, Vec<u8>)>, overlays: Vec<(String, Vec<u8>)>, cap
             parsed.push((name, exe, true, Some(far)));
         }
     }
+    let discover = |exe: &PsxExe, far: &Option<(u32, Arc<Vec<u8>>)>, seeds: &BTreeSet<u32>| {
+        let seeds: Vec<u32> = seeds.iter().copied().collect();
+        match far {
+            Some((seg, ram)) => Discovery::run_seeded(exe, &[(*seg, &ram[..])], &seeds),
+            None => Discovery::run_seeded(exe, &[], &seeds),
+        }
+    };
+    let mut seeds = vec![BTreeSet::new(); parsed.len()];
+    let mut discs: Vec<Discovery> = parsed.par_iter().zip(&seeds).map(|((_, exe, _, far), s)| discover(exe, far, s)).collect();
+    // A `jal` into the text of another image goes through that image's table: its target must be
+    // an entry there even when nothing in that image calls it (Silent Hill's SetSp).
+    for _ in 0..3 {
+        let grown: Vec<BTreeSet<u32>> = (0..parsed.len())
+            .into_par_iter()
+            .map(|i| {
+                let x = &parsed[i].1;
+                let mut s = seeds[i].clone();
+                for (j, d) in discs.iter().enumerate().filter(|&(j, _)| j != i) {
+                    let y = &parsed[j].1;
+                    s.extend(d.calls.keys().copied().filter(|&t| x.contains(t) && !y.contains(t) && !discs[i].code.contains(&t)));
+                }
+                s
+            })
+            .collect();
+        let redo: Vec<usize> = (0..parsed.len()).filter(|&i| grown[i].len() > seeds[i].len()).collect();
+        if redo.is_empty() {
+            break;
+        }
+        seeds = grown;
+        let again: Vec<(usize, Discovery)> = redo.into_par_iter().map(|i| (i, discover(&parsed[i].1, &parsed[i].3, &seeds[i]))).collect();
+        for (i, d) in again {
+            discs[i] = d;
+        }
+    }
     let parsed: Vec<Parsed> = parsed
         .into_par_iter()
-        .map(|(name, exe, overlay, far)| {
-            let disc = match &far {
-                Some((seg, ram)) => Discovery::run_far(&exe, &[(*seg, &ram[..])]),
-                None => Discovery::run(&exe),
-            };
+        .zip(discs)
+        .map(|((name, exe, overlay, _), disc)| {
             let hz = Hazards::check(&exe, &disc);
             Parsed { name, exe, overlay, disc, hz }
         })
@@ -500,6 +531,22 @@ mod tests {
         assert_eq!(names, ["MAIN.EXE", "RAM 80030000"]);
         let o = &pack.images[1];
         assert_eq!((o.overlay, o.text_addr, o.hash), (true, 0x8003_0000, fnv1a32(&body[..4 * 139])));
+    }
+
+    #[test]
+    fn calls_from_another_image_are_entries_of_the_image_called() {
+        // Silent Hill's SetSp: a leaf after a BIOS stub (`jr t2`), called only from elsewhere.
+        let mut body = vec![0x27BD_FFF8, JR_RA, 0x27BD_0008, 0x240A_00B0, 0x0140_0008, 0x2409_0009, 0, 0x03A0_1021, JR_RA, 0x0080_E821];
+        body.resize(0x100, 0);
+        let body: Vec<u8> = body.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let set_sp = 0x800A_001Cu32;
+        let table = |main: &[u32]| {
+            let pack = build(vec![("MAIN.EXE".into(), exe(0x8001_0000, main))], vec![], vec![cap(0x800A_0000, body.clone())]).unwrap();
+            let o = pack.images.iter().find(|i| i.text_addr == 0x800A_0000).unwrap();
+            o.table.get(28..32).map_or(layout::MISS, |w| u32::from_le_bytes(w.try_into().unwrap()))
+        };
+        assert_eq!(table(&[JR_RA, 0]), layout::MISS);
+        assert_ne!(table(&[0x0C00_0000 | (set_sp >> 2 & 0x03FF_FFFF), 0, JR_RA, 0]), layout::MISS);
     }
 
     #[test]
