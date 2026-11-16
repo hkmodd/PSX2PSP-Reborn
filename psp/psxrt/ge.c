@@ -54,7 +54,9 @@ typedef struct {
     u32 slow_tex, slow_big, flat, clipped;        /* fast lane: turned away for texture or size; no area; cut at the origin */
     u32 ring_wb_us;                               /* writing the cached ring back */
     u32 kick_us, setup_us;                        /* stall moves, all timed; fl_setup, 1 in 16 timed */
+    u32 rb_why[3], rb_last;                       /* readbacks for the rest, a page, a CLUT; the last one's x | y << 10 | w << 20 */
 } GeStats;
+static int rb_why; /* what the next rd_read is for: 0 the rest, 1 a texture page, 2 a CLUT */
 
 /* A 4/8-bit texture page as a 256x256 T4/T8 texture. */
 #define PAGE_SLOTS 32
@@ -121,6 +123,30 @@ static struct {
     int clut_slot;              /* the slot clut() last returned; -1: a CLUT in the list */
     GeStats s;
 } ge;
+
+/* The texels the next textured primitive samples, U from tu_lo to tu_hi (0-255): prim_begin and
+ * the fast lane look for newer tiles under these columns of its page, not the whole page. A T8
+ * page at x 960 runs on past 1023 into x 0-63, a framebuffer the GE draws every frame; games use
+ * only its first half there (MediEvil: a whole-VRAM readback at every such switch, 190 ms/s). */
+static int tu_lo, tu_hi = 255;
+/* The last page check passed on those columns only: tiles under the rest of the page are newer,
+ * so nothing may keep the page as checked at this ge.nver. */
+static int tu_part;
+static int newer(s32 x, s32 y, s32 w, s32 h);
+
+/* The ge.nver a check just made holds for: one that will not come back when it was partial. */
+static u32 seen_ver(void) { return tu_part ? ge.nver - 1 : ge.nver; }
+
+/* A primitive samples U from lo to hi (0-255; anything else: the whole page), through its texture
+ * window: (u & and) | or lies between or and and | or. */
+static void tu_set(const GpuPrim *p, s32 lo, s32 hi)
+{
+    if (lo < 0 || hi > 255)
+        lo = 0, hi = 255;
+    if (p->tw_and_u != 0xFF || p->tw_or_u)
+        lo = (s32)p->tw_or_u, hi = (s32)((p->tw_and_u | p->tw_or_u) & 0xFF);
+    tu_lo = lo, tu_hi = hi;
+}
 
 /* The polygon fast lane (rd_poly): while a polygon command has the key of the one before (its
  * command bits, texpage, CLUT, mask bits and drawing area, with no tile changed or newly drawn
@@ -568,6 +594,7 @@ static void rd_read(void *self, s32 x, s32 y, s32 w, s32 h)
     newer_clear();
     ge.epoch++;
     ge.s.readbacks++;
+    ge.s.rb_why[rb_why]++, ge.s.rb_last = (u32)x | (u32)y << 10 | (u32)w << 20;
 }
 
 void ge_read(int x, int y, int w, int h) { rd_read(&ge, x, y, w, h); }
@@ -837,6 +864,7 @@ static void bind(const GpuPrim *p, const u8 *pg, const u32 *cl)
  * flags; 3 untextured), 0 when nothing would be drawn. No flush may follow until it is drawn. */
 static int prim_begin(const GpuPrim *p)
 {
+    tu_part = 0;
     if (!p->textured) {
         begin();
         return 3;
@@ -845,10 +873,15 @@ static int prim_begin(const GpuPrim *p)
     u32 tk = 1 + (p->tpx | p->tpy << 10 | p->depth << 20), ck = p->clut_x | p->clut_y << 10 | p->depth << 20;
     if (tk != ge.rk_tex || ck != ge.rk_clut || ge.nver != ge.rk_ver) {
         ge.s.rd_checks++;
-        rd_read(&ge, (s32)p->tpx, (s32)p->tpy, p->depth >= 2 ? 256 : p->depth ? 128 : 64, 256);
+        int sh = p->depth >= 2 ? 0 : p->depth ? 1 : 2;
+        rb_why = 1;
+        rd_read(&ge, (s32)p->tpx + (tu_lo >> sh), (s32)p->tpy, (tu_hi >> sh) - (tu_lo >> sh) + 1, 256);
+        rb_why = 2;
         if (p->depth < 2)
             rd_read(&ge, (s32)p->clut_x, (s32)p->clut_y, p->depth ? 256 : 16, 1);
-        ge.rk_tex = tk, ge.rk_clut = ck, ge.rk_ver = ge.nver;
+        rb_why = 0;
+        tu_part = newer((s32)p->tpx, (s32)p->tpy, 256 >> sh, 256);
+        ge.rk_tex = tu_part ? 0 : tk, ge.rk_clut = ck, ge.rk_ver = ge.nver;
     }
     begin();
     if (p->depth >= 2) {
@@ -947,6 +980,12 @@ static int polygon(const GpuPrim *p, const GpuVtx *const *v, int n)
     s32 bx1 = minx > x1 ? minx : x1, by1 = miny > y1 ? miny : y1, bx2 = maxx < x2 ? maxx : x2, by2 = maxy < y2 ? maxy : y2;
     if (bx1 > bx2 || by1 > by2)
         return DONE;
+    if (p->textured) {
+        s32 ulo = v[0]->u, uhi = v[0]->u;
+        for (int i = 1; i < n; i++)
+            ulo = v[i]->u < ulo ? v[i]->u : ulo, uhi = v[i]->u > uhi ? v[i]->u : uhi;
+        tu_set(p, ulo, uhi);
+    }
     int flags = prim_begin(p);
     if (!flags)
         return DONE;
@@ -1027,6 +1066,8 @@ static int rd_rect(void *self, const GpuPrim *p, s32 x, s32 y, s32 w, s32 h, con
     s32 bx2 = x + w - 1 < x2 ? x + w - 1 : x2, by2 = y + h - 1 < y2 ? y + h - 1 : y2;
     if (bx1 > bx2 || by1 > by2)
         return DONE;
+    if (p->textured) /* u0 + x, or u0 - x flipped, for x up to w - 1 */
+        tu_set(p, flip_x ? c->u - (w - 1) : c->u, flip_x ? c->u : c->u + w - 1);
     int flags = prim_begin(p);
     if (!flags)
         return DONE;
@@ -1205,12 +1246,17 @@ static u32 fl_mru_next;
 static u32 __attribute__((aligned(64))) fl_arena[FL_ARENA / 4];
 #define FL_ARENA_UNCACHED ((unsigned int *)((u32)fl_arena | 0x40000000u))
 
-/* A tile under a texpage's page or a CLUT is newer on the GE (prim_begin would read back). */
+/* A tile under the texels (tu_lo-tu_hi) of a texpage's page or under a CLUT is newer on the GE
+ * (prim_begin would read back). When not, tu_part tells whether the rest of the page is. */
 static int fl_newer(u32 tp, u32 clut)
 {
-    int d = tp >> 7 & 3;
-    return newer((s32)(tp & 0xF) * 64, (s32)(tp >> 4 & 1) * 256, d ? 128 : 64, 256) ||
-           newer((s32)(clut & 0x3F) * 16, (s32)(clut >> 6 & 0x1FF), d ? 256 : 16, 1);
+    int d = tp >> 7 & 3, sh = d ? 1 : 2;
+    s32 x = (s32)(tp & 0xF) * 64, y = (s32)(tp >> 4 & 1) * 256;
+    if (newer(x + (tu_lo >> sh), y, (tu_hi >> sh) - (tu_lo >> sh) + 1, 256) ||
+        newer((s32)(clut & 0x3F) * 16, (s32)(clut >> 6 & 0x1FF), d ? 256 : 16, 1))
+        return 1;
+    tu_part = newer(x, y, 256 >> sh, 256);
+    return 0;
 }
 
 /* A kept entry's page slot and CLUT slot still hold what it was built with, and are current. */
@@ -1300,7 +1346,7 @@ static void fl_miss(FlEntry *e, u32 cmd, u32 clut, s32 x1, s32 y1, s32 x2, s32 y
         } else
             e->k0 = ~0u, e->call[0] = 0; /* used this once, never found */
     }
-    e->syncs = ge.syncs, e->epoch = ge.epoch, e->nver = ge.nver; /* prim_begin may have run the list */
+    e->syncs = ge.syncs, e->epoch = ge.epoch, e->nver = seen_ver(); /* prim_begin may have run the list */
 }
 
 /* The key in fl.k0-a1 changed: the GE gets its state, from the cache when it holds. */
@@ -1317,12 +1363,13 @@ static __attribute__((noinline)) void fl_setup(u32 cmd, u32 clut)
             e = o;
     }
     e->use = ++fl_uses;
+    tu_part = 0;
     if (area(&x1, &y1, &x2, &y2)) {
         begin(); /* first: running the list ends its blocks */
         if (e->k0 == fl.k0 && e->k1 == fl.k1 && e->a0 == fl.a0 && e->a1 == fl.a1 &&
             (e->keep ? fl_current(e) : e->syncs == ge.syncs && e->epoch == ge.epoch) &&
             (e->nver == ge.nver || !(fl.k0 & 1) || !fl_newer(ge.psx->gpu.texpage, clut))) {
-            e->nver = ge.nver, e->syncs = ge.syncs;
+            e->nver = seen_ver(), e->syncs = ge.syncs;
             if (e->slot >= 0) { /* the open list draws with them: neither is written until it has run */
                 Page *s = &ge.pages[e->slot];
                 s->used = ge.syncs, s->age = ++ge.ages;
@@ -1345,7 +1392,7 @@ static __attribute__((noinline)) void fl_setup(u32 cmd, u32 clut)
     fl.two = flags && e->two, fl.n1 = e->n1, fl.n2 = e->n2, fl.pass1 = e->pass1, fl.pass2 = e->pass2;
     fl.x1 = x1, fl.y1 = y1, fl.x2 = x2, fl.y2 = y2;
     fl.base = flags && e->call[0] ? e->call[0] & 0xF0000 : ~0u; /* the block's CALL set it last */
-    fl.epoch = ge.epoch, fl.nver = ge.nver;
+    fl.epoch = ge.epoch, fl.nver = seen_ver();
     fl.valid = 1;
     ge.s.fast_setups++;
     if (flags && e->call[0] && e->k0 == fl.k0 && e->blk == ge.syncs) {
@@ -1355,7 +1402,7 @@ static __attribute__((noinline)) void fl_setup(u32 cmd, u32 clut)
         if (i == FL_MRU)
             i = fl_mru_next++ % FL_MRU;
         fl_mru[i].k0 = fl.k0, fl_mru[i].k1 = fl.k1, fl_mru[i].a0 = fl.a0, fl_mru[i].a1 = fl.a1, fl_mru[i].e = e;
-        fl_mru[i].syncs = ge.syncs, fl_mru[i].epoch = ge.epoch, fl_mru[i].nver = ge.nver;
+        fl_mru[i].syncs = ge.syncs, fl_mru[i].epoch = ge.epoch, fl_mru[i].nver = seen_ver();
         fl_mru[i].x1 = x1, fl_mru[i].y1 = y1, fl_mru[i].x2 = x2, fl_mru[i].y2 = y2;
     }
 }
@@ -1449,6 +1496,14 @@ static int rd_poly(void *self, const u32 *c)
         col[i] = cl;
         uv[i] = tex ? c[k++] : 0;
     }
+    if (tex) {
+        s32 ulo = (s32)(uv[0] & 0xFF), uhi = ulo;
+        for (int i = 1; i < n; i++) {
+            s32 u = (s32)(uv[i] & 0xFF);
+            ulo = u < ulo ? u : ulo, uhi = u > uhi ? u : uhi;
+        }
+        tu_lo = ulo, tu_hi = uhi; /* no texture window here */
+    }
     s32 minx = x[0], maxx = x[0], miny = y[0], maxy = y[0];
     for (int i = 1; i < n; i++) {
         minx = x[i] < minx ? x[i] : minx, maxx = x[i] > maxx ? x[i] : maxx;
@@ -1483,7 +1538,7 @@ static int rd_poly(void *self, const u32 *c)
         if (fl_newer(g->texpage, k1))
             fl_setup_timed(cmd, k1);
         else
-            fl.nver = ge.nver;
+            fl.nver = seen_ver();
     }
     if (!fl.flags)
         return DONE;
@@ -1816,7 +1871,7 @@ int ge_log(char *buf, int cap)
     int n = clampn(snprintf(buf, (size_t)cap,
                             "-- ge: tri %u+%u tex, rect %u+%u tex, fill %u, line %u (%u runs); sw tex15 %u texwin %u "
                             "copy %u+%u sw+%u null (%u kpx, %u from ge); pages %u+%u 15-bit, cluts %u+%u in list, readback %u (%u tiles, %u ms), upload %u "
-                            "(%u kpx, %u ms), flush %u; bind %u tex %u clut, kick %u (%u ms), rd check %u; fast %u (%u setups %u ms, %u cached, mru %u), slow tex %u big %u, flat %u, clipped %u; ring %s (wb %u ms), step %u\n",
+                            "(%u kpx, %u ms), flush %u; bind %u tex %u clut, kick %u (%u ms), rd check %u; fast %u (%u setups %u ms, %u cached, mru %u), slow tex %u big %u, flat %u, clipped %u; ring %s (wb %u ms), step %u; readback page/clut/other %u/%u/%u, last at %u,%u w %u\n",
                             (unsigned)s->tris, (unsigned)s->ttris, (unsigned)s->rects, (unsigned)s->trects,
                             (unsigned)s->fills, (unsigned)s->lines, (unsigned)s->line_runs, (unsigned)s->sw_tex15,
                             (unsigned)s->sw_texwin,
@@ -1825,7 +1880,9 @@ int ge_log(char *buf, int cap)
                             (unsigned)(s->read_us / 1000), (unsigned)s->uploads, (unsigned)(s->upload_px / 1000),
                             (unsigned)(s->upload_us / 1000), (unsigned)s->flushes, (unsigned)s->bind_tex, (unsigned)s->bind_clut, (unsigned)s->kicks, (unsigned)(kick_us / 1000),
                             (unsigned)s->rd_checks, (unsigned)s->fast, (unsigned)s->fast_setups, (unsigned)((s32)s->setup_us < 0 ? 0 : s->setup_us / 1000), (unsigned)s->fast_hits, (unsigned)s->mru_hits, (unsigned)s->slow_tex, (unsigned)s->slow_big, (unsigned)s->flat, (unsigned)s->clipped,
-                            fl.cached ? "cached" : "uncached", (unsigned)(s->ring_wb_us / 1000), (unsigned)stall_step),
+                            fl.cached ? "cached" : "uncached", (unsigned)(s->ring_wb_us / 1000), (unsigned)stall_step,
+                            (unsigned)s->rb_why[1], (unsigned)s->rb_why[2], (unsigned)s->rb_why[0], (unsigned)(s->rb_last & 1023),
+                            (unsigned)(s->rb_last >> 10 & 1023), (unsigned)(s->rb_last >> 20)),
                    cap);
     memset(&ge.s, 0, sizeof ge.s);
     if (ring_ab)
