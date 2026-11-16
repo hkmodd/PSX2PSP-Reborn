@@ -17,37 +17,17 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-#[repr(C)]
-struct Sim {
-    _opaque: [u8; 0],
-}
-
-type ReadFn = extern "C" fn(*mut c_void, u32, *mut u8) -> c_int;
-type TextFn = extern "C" fn(*mut c_void, *const c_char, c_int);
-
-unsafe extern "C" {
-    fn sim_new(user: *mut c_void, rd: ReadFn, disc_end: u32, tty: TextFn, log: TextFn) -> *mut Sim;
-    fn sim_free(s: *mut Sim);
-    fn sim_boot(s: *mut Sim) -> c_int;
-    fn sim_frame(s: *mut Sim) -> c_int;
-    fn sim_vram(s: *const Sim) -> *const u16;
-    fn sim_ram(s: *mut Sim) -> *mut u8;
-    fn sim_pad(s: *mut Sim, buttons: u16);
-    fn sim_display(s: *const Sim, out: *mut c_int);
-    fn sim_status(s: *const Sim, out: *mut u32);
-    fn sim_trace(s: *mut Sim, flags: c_int);
-    fn sim_trace_to(path: *const c_char, out: *mut u64) -> c_int;
-    #[cfg(test)]
-    fn sim_poll_bound(s: *mut Sim, pc: u32, gpr: *const u32, raw: u32, room: u32) -> u32;
-}
+#[cfg(test)]
+use psx2psp_sim::ffi::sim_poll_bound;
+use psx2psp_sim::ffi::{sim_boot, sim_display, sim_frame, sim_free, sim_new, sim_pad, sim_ram, sim_status, sim_trace, sim_trace_to, sim_vram};
+use psx2psp_sim::{PREGAP, RAM};
 
 struct Disc {
     file: File,
     sectors: u32,
 }
 
-const SECTOR: u64 = 2352;
-const PREGAP: u32 = 150;
+const SECTOR: u64 = psx2psp_sim::SECTOR as u64;
 
 extern "C" fn read_sector(user: *mut c_void, lba: u32, raw: *mut u8) -> c_int {
     // SAFETY: `user` is the `Disc` owned by `main` for the simulator's whole life, and `raw` points
@@ -107,8 +87,6 @@ struct Args {
     pokes: Vec<(u32, u32, Vec<u8>)>,
     dumps: Vec<u32>,
 }
-
-const RAM: usize = 2 << 20;
 
 /// `FRAME:ADDR:HEX` with ADDR in hex (KSEG0/1 or physical), HEX an even run of hex digits.
 fn poke(p: &str) -> Result<(u32, u32, Vec<u8>), String> {

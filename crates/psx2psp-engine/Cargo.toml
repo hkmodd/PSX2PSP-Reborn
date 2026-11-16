@@ -19,6 +19,7 @@ psx2psp-core.workspace = true
 psx2psp-patching.workspace = true
 psx2psp-media.workspace = true
 psx2psp-recomp.workspace = true
+psx2psp-sim.workspace = true
 thiserror.workspace = true
 miniz_oxide.workspace = true
 rayon.workspace = true

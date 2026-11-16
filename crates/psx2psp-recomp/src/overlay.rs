@@ -134,6 +134,40 @@ pub fn archive_entries(head: &[u8], len: u64) -> Vec<(u32, u32)> {
     out
 }
 
+/// Function-boundary words: a prologue, `jr ra`, or the save or restore of ra on the stack.
+fn is_boundary(w: u32) -> bool {
+    is_prologue(w) || w == 0x03E0_0008 || matches!(w >> 16, 0xAFBF | 0x8FBF)
+}
+
+/// The code in a RAM image `ram` (offset 0 = physical address 0): runs of 2 KB blocks with at
+/// least two function-boundary words each, gaps of up to two blocks inside, cut to its first
+/// prologue and its last `jr ra` with the delay slot; [`WEAK`] prologues at least. Data almost
+/// never holds these words in such numbers (Silent Hill's RAM in game: 5 runs, the EXE, the body
+/// it decompresses at 8002DD08-800A8974 in three, and the room's overlay). (start, end) offsets.
+pub fn code_runs(ram: &[u8]) -> Vec<(u32, u32)> {
+    const BLOCK: usize = 0x800;
+    const GAP: usize = 2;
+    let word = |o: usize| u32::from_le_bytes(ram[o..o + 4].try_into().unwrap());
+    let code = |b: usize| (b * BLOCK..(b + 1) * BLOCK).step_by(4).filter(|&o| is_boundary(word(o))).count() >= 2;
+    let blocks = ram.len() / BLOCK;
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for b in (0..blocks).filter(|&b| code(b)) {
+        match runs.last_mut() {
+            Some((_, last)) if b - *last <= GAP + 1 => *last = b,
+            _ => runs.push((b, b)),
+        }
+    }
+    runs.into_iter()
+        .filter_map(|(first, last)| {
+            let (lo, hi) = (first * BLOCK, (last + 1) * BLOCK);
+            let pro: Vec<usize> = (lo..hi).step_by(4).filter(|&o| is_prologue(word(o))).collect();
+            let ret = (lo..hi).step_by(4).rev().find(|&o| word(o) == 0x03E0_0008)?;
+            let start = *pro.first()?;
+            (pro.len() >= WEAK as usize && ret > start).then_some((start as u32, (ret + 8).min(hi) as u32))
+        })
+        .collect()
+}
+
 /// The overlay `bytes` as an executable at `base` for discovery and translation: its entry is
 /// its first prologue (discovery also starts from every other prologue and every pointer to its
 /// text, so the choice only names one function).
@@ -171,6 +205,30 @@ mod tests {
         assert_eq!(at[1], Some((B, 2)));
         // Without a slot fixed by another file the small one stays unplaced.
         assert_eq!(locate_all(&[&small]), vec![None]);
+    }
+
+    #[test]
+    fn code_runs_are_cut_to_their_functions() {
+        let mut ram = vec![0u8; 0x8000];
+        let mut put = |o: usize, w: u32| ram[o..o + 4].copy_from_slice(&w.to_le_bytes());
+        // Three functions over blocks 1 and 2 (a gap of data at block 3), one over block 5.
+        for f in [0x900, 0xC00, 0x1100] {
+            put(f, PROLOGUE);
+            put(f + 4, 0xAFBF_0010);
+            put(f + 0x40, 0x03E0_0008);
+        }
+        for f in [0x2900, 0x2A00, 0x2B00] {
+            put(f, PROLOGUE);
+            put(f + 0x40, 0x03E0_0008);
+        }
+        assert_eq!(code_runs(&ram), vec![(0x900, 0x2B48)]);
+        // Two prologues are too few for a run of its own.
+        let mut ram = vec![0u8; 0x8000];
+        let mut put = |o: usize, w: u32| ram[o..o + 4].copy_from_slice(&w.to_le_bytes());
+        put(0x4000, PROLOGUE);
+        put(0x4100, PROLOGUE);
+        put(0x4200, 0x03E0_0008);
+        assert!(code_runs(&ram).is_empty());
     }
 
     #[test]

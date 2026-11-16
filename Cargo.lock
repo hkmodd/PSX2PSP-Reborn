@@ -2803,6 +2803,7 @@ dependencies = [
  "psx2psp-media",
  "psx2psp-patching",
  "psx2psp-recomp",
+ "psx2psp-sim",
  "rayon",
  "serde",
  "serde_json",

@@ -149,8 +149,10 @@ pub const OVERLAY_MAX: u32 = 0x1F_0000;
 /// files of `overlays` that are not code are ignored; duplicates (same address and text) are
 /// translated once. Overlays never make the build fail: past [`MAX_IMAGES`], or when the code
 /// would not fit, they are left to the interpreter (the largest group first). Fails only when
-/// the executables alone do not fit between [`CODE_FLOOR`] and the PS1 RAM.
-pub fn build(exes: Vec<(String, Vec<u8>)>, overlays: Vec<(String, Vec<u8>)>) -> Result<CodePack, String> {
+/// the executables alone do not fit between [`CODE_FLOOR`] and the PS1 RAM. `captured` (name,
+/// address, bytes) is code taken from the guest's RAM ([`crate::captured_code`]), translated as
+/// overlays at its address unless an image already taken holds those bytes there.
+pub fn build(exes: Vec<(String, Vec<u8>)>, overlays: Vec<(String, Vec<u8>)>, captured: Vec<(String, u32, Vec<u8>)>) -> Result<CodePack, String> {
     let mut pack = CodePack::default();
     let mut seen = HashSet::new();
     let mut parsed = Vec::new();
@@ -180,6 +182,20 @@ pub fn build(exes: Vec<(String, Vec<u8>)>, overlays: Vec<(String, Vec<u8>)>) -> 
         }
         let hash = fnv1a32(&exe.text);
         if seen.insert((exe.text_addr, exe.text.len(), hash)) {
+            parsed.push((name, exe, true));
+        }
+    }
+    for (name, at, bytes) in captured {
+        let held = |x: &PsxExe| at.checked_sub(x.text_addr).is_some_and(|o| x.text.get(o as usize..o as usize + bytes.len()) == Some(&bytes[..]));
+        if parsed.iter().any(|(_, x, _)| held(x)) {
+            continue;
+        }
+        let Some(exe) = overlay::as_exe(&bytes, at) else { continue };
+        if parsed.len() >= MAX_IMAGES {
+            pack.skipped.push((name, format!("captured code at {at:#010x}: more than {MAX_IMAGES} images")));
+            continue;
+        }
+        if seen.insert((exe.text_addr, exe.text.len(), fnv1a32(&exe.text))) {
             parsed.push((name, exe, true));
         }
     }
@@ -344,6 +360,7 @@ mod tests {
             ("NOTES.TXT".into(), b"hello".to_vec()),
             ],
             vec![],
+            vec![],
         )
         .unwrap();
         assert_eq!(pack.images.len(), 3, "the copy of A is translated once");
@@ -368,7 +385,7 @@ mod tests {
     fn the_patch_table_lists_each_patchable_code_word_by_block() {
         const ADDIU_K0_5: u32 = 0x241A_0005; // uses the guest's k0: not one plain copy
         let text = [ADDIU_V0_1, ADDIU_K0_5, JR_RA, ADDIU_V0_1, 0x1234_5678];
-        let pack = build(vec![("P.EXE".into(), exe(0x8001_0FF8, &text))], vec![]).unwrap();
+        let pack = build(vec![("P.EXE".into(), exe(0x8001_0FF8, &text))], vec![], vec![]).unwrap();
         let p = &pack.images[0];
         let x = PsxExe::parse(&exe(0x8001_0FF8, &text)).unwrap();
         let d = Discovery::run(&x);
@@ -409,6 +426,7 @@ mod tests {
         let pack = build(
             vec![("MAIN.EXE".into(), exe(0x8001_0000, &[ADDIU_V0_1, JR_RA, 0]))],
             vec![("LEVEL.OVL".into(), overlay(0x800A_0000)), ("LEVEL.DAT".into(), vec![0x5A; 0x800])],
+            vec![],
         )
         .unwrap();
         assert!(pack.skipped.is_empty(), "{:?}", pack.skipped);
@@ -421,5 +439,26 @@ mod tests {
         assert!(o.host_base >= m.host_base + m.code.len() as u32, "disjoint regions");
         let word = |i: usize| u32::from_le_bytes(o.table[4 * i..4 * i + 4].try_into().unwrap());
         assert_ne!(word(36), layout::MISS, "each function is translated");
+    }
+
+    #[test]
+    fn captured_code_is_translated_where_no_image_holds_it() {
+        let main = [ADDIU_V0_1, JR_RA, 0, 0x27BD_FFF8, JR_RA, 0x27BD_0008];
+        let body = overlay(0x8003_0000);
+        let pack = build(
+            vec![("MAIN.EXE".into(), exe(0x8001_0000, &main))],
+            vec![],
+            vec![
+                // The executable's own functions, as RAM holds them: nothing new.
+                ("RAM 8001000C".into(), 0x8001_000C, main[3..].iter().flat_map(|w| w.to_le_bytes()).collect()),
+                // Code no disc file holds as it is (a decompressed body): taken at its address.
+                ("RAM 80030000".into(), 0x8003_0000, body.clone()),
+            ],
+        )
+        .unwrap();
+        let names: Vec<&str> = pack.images.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, ["MAIN.EXE", "RAM 80030000"]);
+        let o = &pack.images[1];
+        assert_eq!((o.overlay, o.text_addr, o.hash), (true, 0x8003_0000, fnv1a32(&body[..4 * 139])));
     }
 }

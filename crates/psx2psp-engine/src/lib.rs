@@ -936,6 +936,65 @@ pub fn disc_overlay_files(img: &DiscImage, patches: &[&dyn ImagePatch]) -> Vec<(
     out
 }
 
+/// Frames [`captured_code`] runs a disc for: a minute of game, ~13 s on the PC for Silent Hill.
+pub const CAPTURE_FRAMES: u32 = 3600;
+/// Frames between two looks at the RAM in [`captured_code`].
+const CAPTURE_EVERY: u32 = 300;
+
+/// The code a game puts in RAM by itself (S25): the disc, with `patches`, boots on the psxrt
+/// core (psx2psp-sim) and runs [`CAPTURE_FRAMES`] frames, Start and Cross pressed in turn every
+/// 150 frames from frame 600 (title screens and menus give way); every [`CAPTURE_EVERY`] frames
+/// the code runs of RAM above the kernel area ([`overlay::code_runs`]) that are unchanged at the
+/// next look are taken at their address. So is found the code a disc keeps compressed, encrypted
+/// or in an archive of a format of its own: Silent Hill's body, decompressed from SILENT to
+/// 8002DD08-800A8974. (name, address, bytes), each once; KUSEG addresses when `kuseg` (a game
+/// that runs there, as Lilo & Stitch does).
+pub fn captured_code(img: &DiscImage, patches: &[&dyn ImagePatch], kuseg: bool) -> Vec<(String, u32, Vec<u8>)> {
+    use psx2psp_recomp::overlay;
+    use psx2psp_sim::{CROSS, Machine, START};
+    let mut rd = img.reader();
+    let read = move |lba: u32, buf: &mut [u8]| {
+        let mut s = [0u8; SECTOR];
+        if img.read_sector(&mut rd, lba, &mut s).is_err() {
+            return false;
+        }
+        patches.iter().for_each(|p| p.apply(u64::from(lba) * SECTOR as u64, &mut s));
+        buf.copy_from_slice(&s);
+        true
+    };
+    let Some(mut m) = Machine::boot(img.sectors(), read) else { return Vec::new() };
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut last: Option<Vec<u8>> = None;
+    for f in 1..=CAPTURE_FRAMES {
+        let press = f.checked_sub(600).filter(|k| k % 150 < 6).map(|k| k / 150);
+        let alive = m.frame(match press {
+            Some(k) if k % 2 == 0 => START,
+            Some(_) => CROSS,
+            None => 0,
+        });
+        if f % CAPTURE_EVERY != 0 && alive {
+            continue;
+        }
+        let ram = m.ram();
+        if let Some(before) = &last {
+            for (s, e) in overlay::code_runs(before).into_iter().filter(|&(s, _)| s >= 0x1_0000) {
+                let bytes = &before[s as usize..e as usize];
+                if bytes != &ram[s as usize..e as usize] || !seen.insert((s, e, native_code::fnv1a32(bytes))) {
+                    continue;
+                }
+                let at = if kuseg { s } else { 0x8000_0000 | s };
+                out.push((format!("RAM {at:08X}"), at, bytes.to_vec()));
+            }
+        }
+        last = Some(ram.to_vec());
+        if !alive {
+            break;
+        }
+    }
+    out
+}
+
 /// An ISO9660 file of Mode 1 or Mode 2 Form 1 sectors, with `patches` applied to each sector.
 fn read_patched_file(img: &DiscImage, rd: &mut psx2psp_core::disc::DiscReader, f: &psx2psp_core::IsoFile, patches: &[&dyn ImagePatch]) -> psx2psp_core::Result<Vec<u8>> {
     read_patched_range(img, rd, f, 0, f.size, patches)
@@ -1127,7 +1186,11 @@ pub fn convert_native(req: &ConvertRequest, monitor: &dyn Monitor) -> Result<Con
         .collect();
     let exes = disc_executables(&img, &patches);
     let found = exes.len();
-    let code = native_code::build(exes, disc_overlay_files(&img, &patches)).map_err(EngineError::Input)?;
+    let kuseg = exes.iter().any(|(_, b)| psx2psp_recomp::exe::PsxExe::parse(b).is_ok_and(|x| x.text_addr >> 29 == 0));
+    let started = Instant::now();
+    let captured = captured_code(&img, &patches, kuseg);
+    monitor.log(&format!("Native: {} code runs captured in {CAPTURE_FRAMES} frames ({:.1} s)", captured.len(), started.elapsed().as_secs_f64()));
+    let code = native_code::build(exes, disc_overlay_files(&img, &patches), captured).map_err(EngineError::Input)?;
     for (name, why) in &code.skipped {
         monitor.log(&format!("Native: {name} left to the interpreter: {why}"));
     }
