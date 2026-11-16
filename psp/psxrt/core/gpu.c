@@ -717,9 +717,11 @@ static void reset(Psx *psx)
     Gpu *g = &psx->gpu;
     u16 *vram = g->vram;
     const GpuRenderer *r = g->renderer;
+    u32 flips = g->flips; /* never cleared: the runtime's fps is a difference of it */
     memset(g, 0, sizeof *g);
     g->vram = vram;
     g->renderer = r;
+    g->flips = flips;
     g->stat = 0x14802000u;
     g->disp_enabled = 0;
     g->hrange1 = 0x200, g->hrange2 = 0xC00;
