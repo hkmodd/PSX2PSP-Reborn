@@ -3,11 +3,12 @@
  *
  * The core (core/gpu.c) decodes the commands and offers each primitive here first. Triangles,
  * rectangles, fills and copies are drawn by the GE into its copy of PS1 VRAM (PSP VRAM 0x000000,
- * 5551, stride 1024); lines, overlapping copies, 15-bit textures and texture windows stay in
- * software on RAM's copy. The two copies are kept in step per 64x32 tile: `newer` marks tiles the GE drew since RAM
+ * 5551, stride 1024); lines, overlapping copies and texture windows stay in software on RAM's
+ * copy. The two copies are kept in step per 64x32 tile: `newer` marks tiles the GE drew since RAM
  * last saw them, `read` brings all of VRAM back (one block transfer) before the CPU reads one of
  * those, `wrote` sends the CPU's pixels up as textured sprites. Textures come from RAM's copy:
- * 4/8-bit pages are copied into a cache of T4/T8 textures, CLUTs are converted into a pool.
+ * 4/8-bit pages are copied into a cache of T4/T8 textures, CLUTs are converted into a pool,
+ * 15-bit pages are read from an 8888 copy of VRAM converted per tile.
  * The list is built in a GU_SEND context and enqueued when it opens; the GE runs behind it up to
  * a stall address moved every STALL_STEP bytes, not after every draw as GU_DIRECT would.
  */
@@ -70,10 +71,13 @@ typedef struct {
     u8 *data;
 } Page;
 
-/* A 15-bit page as a 256x256 8888 texture, alpha as in a converted CLUT (MediEvil's attract mode
- * drew 48-76 such sprites a second in software, 2M fragments). */
-#define PAGE15_SLOTS 2
-#define PAGE15_BYTES (256 * 256 * 4)
+/* 15-bit pages: an 8888 copy of the whole VRAM, alpha as in a converted CLUT, MIR_W texels a row
+ * (columns 1024-1279 repeat 0-255, for pages that run past x 1023); a page is a pointer into it.
+ * Each tile is converted when its generation moved on, only where a primitive samples. MediEvil's
+ * attract mode drew 48-76 such sprites a second in software; Exoddus's menu samples 12 pages a
+ * frame, which two page-sized slots converted again every frame (132 a second, ~400 ms/s). */
+#define MIR_W (VRAM_W + 256)
+#define MIR_BYTES (MIR_W * VRAM_H * 4)
 
 /* Games switch CLUTs per model, and models are drawn interleaved in depth order. A converted CLUT
  * is kept across lists in a slot of the pool, two ways per set, as long as its tiles' stamp holds
@@ -113,8 +117,10 @@ static struct {
     /* texture cache */
     Page pages[PAGE_SLOTS];
     int npages;
-    Page pages15[PAGE15_SLOTS];
-    int npages15;
+    u32 *mir, *mir_u;                /* the 15-bit copy, cached and uncached (written); NULL: none */
+    u32 mir_gen[TILES_Y][TILES_X];  /* the gen each tile was converted at; ~0: never */
+    u32 mir_used[TILES_Y][TILES_X]; /* the list (ge.syncs) that last sampled the tile */
+    u8 mir_flags[TILES_Y][TILES_X]; /* its texels, as clut()'s flags */
     u32 syncs, ages; /* syncs: counts the lists run */
     u32 epoch;       /* bumped whenever any tile's generation changes */
     Page *last_page; /* the page last used, current as of last_epoch */
@@ -662,7 +668,7 @@ static u32 stamp(s32 x, s32 y, s32 w, s32 h)
 /* What the GE can sample: pages without a texture window. */
 static int tex_ok(const GpuPrim *p)
 {
-    if (p->depth >= 2 ? !ge.npages15 : !ge.npages) {
+    if (p->depth >= 2 ? !ge.mir : !ge.npages) {
         ge.s.sw_tex15++;
         return 0;
     }
@@ -722,53 +728,56 @@ static const u8 *page(const GpuPrim *p)
     return s->data;
 }
 
-/* The 15-bit page as 8888 with its flags; RAM's copy of it is current. A stale slot the open list
- * draws with is left alone while another slot is free of it. */
+/* A tile of the 15-bit copy converted from RAM's VRAM (and its repeat past x 1023). */
+static void mir_tile(s32 tx, s32 ty)
+{
+    u32 fo = 0, fs = 0;
+    for (s32 y = ty * TILE_H; y < (ty + 1) * TILE_H; y++) {
+        const u16 *row = ge.psx->gpu.vram + y * VRAM_W + tx * TILE_W;
+        u32 *d = ge.mir_u + y * MIR_W + tx * TILE_W, *e = tx < 256 / TILE_W ? d + VRAM_W : NULL;
+        for (s32 x = 0; x < TILE_W; x++) {
+            u32 t = row[x];
+            u32 v = (t & 0x8000 ? 0x80000000u : t ? 0xFF000000u : 0) | (t >> 10 & 31) << 19 | (t >> 5 & 31) << 11 | (t & 31) << 3;
+            fo |= t & 0x8000 ? 0 : t, fs |= t & 0x8000;
+            d[x] = v;
+            if (e)
+                e[x] = v;
+        }
+    }
+    ge.mir_gen[ty][tx] = ge.gen[ty][tx];
+    ge.mir_flags[ty][tx] = (u8)((fo ? 1 : 0) | (fs ? 2 : 0));
+    ge.s.pages15++;
+}
+
+/* The 15-bit page as 8888 with the flags of the texels sampled (tu_lo-tu_hi, every row); RAM's
+ * copy of it is current. A tile the open list samples is converted again only after a flush. */
 static const u8 *page15(const GpuPrim *p, int *flags)
 {
-    u32 key = 1 + (p->tpx / 64 | p->tpy / 256 << 4);
-    Page *s = NULL;
-    for (int i = 0; i < ge.npages15 && !s; i++)
-        if (ge.pages15[i].key == key)
-            s = &ge.pages15[i];
-    u32 st = s && s->epoch == ge.epoch ? s->stamp : stamp((s32)p->tpx, (s32)p->tpy, 256, 256);
-    if (!s || s->stamp != st) {
-        Page *o = NULL;
-        for (int i = 0; i < ge.npages15; i++) {
-            Page *c = &ge.pages15[i];
-            if (c != s && (!o || (c->used != ge.syncs && (o->used == ge.syncs || c->age < o->age))))
-                o = c;
+    s32 c0 = ((s32)p->tpx + tu_lo) / TILE_W, c1 = ((s32)p->tpx + tu_hi) / TILE_W, r0 = (s32)p->tpy / TILE_H;
+    int stale = 0, f = 0;
+    for (s32 r = r0; r < r0 + 256 / TILE_H; r++)
+        for (s32 c = c0; c <= c1; c++) {
+            s32 ty = r & (TILES_Y - 1), tx = c & (TILES_X - 1);
+            if (ge.mir_gen[ty][tx] != ge.gen[ty][tx])
+                stale |= ge.mir_used[ty][tx] == ge.syncs ? 2 : 1;
         }
-        if (!s || (s->used == ge.syncs && o && o->used != ge.syncs)) {
-            if (s)
-                s->key = 0;
-            s = o;
-        }
-        if (s->used == ge.syncs && list_open) {
-            ge_sync();
-            ge.s.flushes++;
-            begin();
-        }
-        const u16 *vram = ge.psx->gpu.vram;
-        u32 *d = (u32 *)s->data, fo = 0, fs = 0;
-        for (s32 y = 0; y < 256; y++) {
-            const u16 *row = vram + (((s32)p->tpy + y) & (VRAM_H - 1)) * VRAM_W;
-            for (s32 x = 0; x < 256; x++) {
-                u32 t = row[(p->tpx + (u32)x) & (VRAM_W - 1)];
-                u32 a = t & 0x8000 ? 0x80000000u : t ? 0xFF000000u : 0;
-                fo |= t & 0x8000 ? 0 : t, fs |= t & 0x8000;
-                *d++ = a | (t >> 10 & 31) << 19 | (t >> 5 & 31) << 11 | (t & 31) << 3;
-            }
-        }
-        sceKernelDcacheWritebackRange(s->data, PAGE15_BYTES);
-        s->key = key, s->stamp = st, s->flags = (fo ? 1 : 0) | (fs ? 2 : 0), s->ver++;
-        if (ge.tex_sent == s->data)
-            ge.tex_sent = NULL;
-        ge.s.pages15++;
+    if (stale & 2 && list_open) {
+        ge_sync();
+        ge.s.flushes++;
+        begin();
     }
-    s->used = ge.syncs, s->age = ++ge.ages, s->epoch = ge.epoch;
-    *flags = s->flags;
-    return s->data;
+    if (stale)
+        ge.tex_sent = NULL; /* the GE's texture cache may hold the old texels */
+    for (s32 r = r0; r < r0 + 256 / TILE_H; r++)
+        for (s32 c = c0; c <= c1; c++) {
+            s32 ty = r & (TILES_Y - 1), tx = c & (TILES_X - 1);
+            if (ge.mir_gen[ty][tx] != ge.gen[ty][tx])
+                mir_tile(tx, ty);
+            ge.mir_used[ty][tx] = ge.syncs;
+            f |= ge.mir_flags[ty][tx];
+        }
+    *flags = f;
+    return (const u8 *)(ge.mir + ((s32)p->tpy & (VRAM_H - 1)) * MIR_W + p->tpx);
 }
 
 /* The CLUT as 8888, its alpha saying what the texel means: 0 for 0x0000 (not drawn), 0x80 with
@@ -847,7 +856,7 @@ static void bind(const GpuPrim *p, const u8 *pg, const u32 *cl)
     if (pg != ge.tex_sent) {
         sceGuTexMode(p->depth >= 2 ? GU_PSM_8888 : p->depth ? GU_PSM_T8 : GU_PSM_T4, 0, 0, 0);
         sceGuTexImage(0, 1, 1, 64, pg + 16); /* another address first: see upload_part */
-        sceGuTexImage(0, 256, 256, 256, pg);
+        sceGuTexImage(0, 256, 256, p->depth >= 2 ? MIR_W : 256, pg);
         sceGuTexFlush();
         ge.tex_sent = pg;
         ge.s.bind_tex++;
@@ -1791,15 +1800,13 @@ void ge_init(Psx *psx, int compare)
         sceKernelDcacheWritebackInvalidateRange(r, b); /* first written through the uncached mirror */
         fl.ring_c = r, fl.ring_u = fl.ring = (u8 *)((u32)r | 0x40000000u), fl.ring_bytes = b;
     }
-    for (int n = PAGE15_SLOTS; n >= 1 && !ge.npages15; n--) {
-        SceUID uid = sceKernelAllocPartitionMemory(2, "psxrt ge pages15", PSP_SMEM_Low, (SceSize)(n * PAGE15_BYTES + 64), NULL);
-        if (uid < 0)
-            continue;
-        u8 *b = (u8 *)(((u32)sceKernelGetBlockHeadAddr(uid) + 63) & ~63u);
-        for (int i = 0; i < n; i++)
-            ge.pages15[i].data = b + i * PAGE15_BYTES;
-        ge.npages15 = n;
+    SceUID mu = sceKernelAllocPartitionMemory(2, "psxrt ge 15-bit", PSP_SMEM_Low, MIR_BYTES + 64, NULL);
+    if (mu >= 0) {
+        ge.mir = (u32 *)(((u32)sceKernelGetBlockHeadAddr(mu) + 63) & ~63u);
+        sceKernelDcacheWritebackInvalidateRange(ge.mir, MIR_BYTES); /* written uncached from now on */
+        ge.mir_u = (u32 *)((u32)ge.mir | 0x40000000u);
     }
+    memset(ge.mir_gen, 0xFF, sizeof ge.mir_gen);
     if (fl.ring)
         ring_bench(psx), busy_bench(psx);
     for (int i = 0; i < 1 << FL_BITS; i++)
@@ -1808,7 +1815,8 @@ void ge_init(Psx *psx, int compare)
     ge.r = (GpuRenderer){&ge, rd_triangle, rd_quad, rd_rect, rd_line, rd_fill, rd_copy, rd_read, rd_wrote, fl.ring ? rd_poly : NULL,
                          fl.ring ? rd_packet : NULL};
     ge.syncs = 1; /* no slot (used 0) is in the list */
-    psx_log(psx, "ge: %d texture page slots, %d 15-bit, %u KB vertex ring", ge.npages, ge.npages15, (unsigned)(fl.ring_bytes / 1024));
+    psx_log(psx, "ge: %d texture page slots, 15-bit copy %s, %u KB vertex ring; %u KB free", ge.npages, ge.mir ? "on" : "OFF (software)",
+            (unsigned)(fl.ring_bytes / 1024), (unsigned)(sceKernelMaxFreeMemSize() / 1024));
     rd_fill(&ge, 0, 0, VRAM_W, VRAM_H, 0); /* also makes the oracle create the framebuffer */
     ge_sync();
     newer_clear(); /* both copies are zero */
@@ -1870,7 +1878,7 @@ int ge_log(char *buf, int cap)
     u32 kb = s->kicks * prof_bias / 16, kick_us = s->kick_us > kb ? s->kick_us - kb : 0; /* less one clock read each */
     int n = clampn(snprintf(buf, (size_t)cap,
                             "-- ge: tri %u+%u tex, rect %u+%u tex, fill %u, line %u (%u runs); sw tex15 %u texwin %u "
-                            "copy %u+%u sw+%u null (%u kpx, %u from ge); pages %u+%u 15-bit, cluts %u+%u in list, readback %u (%u tiles, %u ms), upload %u "
+                            "copy %u+%u sw+%u null (%u kpx, %u from ge); pages %u, 15-bit tiles %u, cluts %u+%u in list, readback %u (%u tiles, %u ms), upload %u "
                             "(%u kpx, %u ms), flush %u; bind %u tex %u clut, kick %u (%u ms), rd check %u; fast %u (%u setups %u ms, %u cached, mru %u), slow tex %u big %u, flat %u, clipped %u; ring %s (wb %u ms), step %u; readback page/clut/other %u/%u/%u, last at %u,%u w %u\n",
                             (unsigned)s->tris, (unsigned)s->ttris, (unsigned)s->rects, (unsigned)s->trects,
                             (unsigned)s->fills, (unsigned)s->lines, (unsigned)s->line_runs, (unsigned)s->sw_tex15,
