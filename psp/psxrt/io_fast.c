@@ -5,7 +5,8 @@
  * gp, ra and HI/LO. For that to hold nothing here calls other code, nor anything that becomes
  * a library call (no 64-bit division).
  *
- * Served: aligned reads of the pad port (SIO0, core/sio.c), I_STAT, I_MASK and the root
+ * Served: naturally aligned reads of the pad port (SIO0, core/sio.c), the DMA registers, GPUSTAT
+ * and GPUREAD outside a VRAM->CPU transfer, word reads of I_STAT, I_MASK and the root
  * counters' count, mode and target, for a counter on the system clock, timer 2's eighth of it or
  * timer 1's hblanks and not stopped, when no device event is due, no interrupt is pending and the
  * read raises none. What they return and
@@ -60,10 +61,10 @@ static int tmr_sync(Psx *psx, int i)
     return 0;
 }
 
-/* The word psx_read gives for the device register at physical `p` (word aligned, halfword on
- * the pad port) and what the
- * read leaves behind, before the size's mask; nonzero (tmr_sync's codes), with nothing changed,
- * if not served. */
+/* The word psx_read gives for the device register at physical `p` (word aligned for I_STAT,
+ * I_MASK and the counters) and what the read leaves behind, before the size's mask; nonzero
+ * (tmr_sync's codes; 1 for GPUREAD in a VRAM->CPU transfer), with nothing changed, if not
+ * served. */
 int io_fast_dev(Psx *psx, u32 p, u32 *v)
 {
     u32 s = p - 0x1F801040;
@@ -81,6 +82,32 @@ int io_fast_dev(Psx *psx, u32 p, u32 *v)
         case 0x14: *v = 0x5; break;
         default: *v = 0;
         }
+        return 0;
+    }
+    if (p - 0x1F801080 < 0x80) { /* core/dma.c dma_read, shifted as core/mem.c io_read */
+        const Dma *d = &psx->dma;
+        u32 w = p & ~3u, ch = (w - 0x1F801080) >> 4, r = 0;
+        if (w == 0x1F8010F0)
+            r = d->dpcr;
+        else if (w == 0x1F8010F4)
+            r = d->dicr;
+        else if (ch <= 6)
+            r = (w & 0xC) == 0 ? d->ch[ch].madr : (w & 0xC) == 4 ? d->ch[ch].bcr : (w & 0xC) == 8 ? d->ch[ch].chcr : 0;
+        *v = r >> (8 * (p & 3));
+        return 0;
+    }
+    if (p - 0x1F801810 < 8) { /* core/gpu.c gpu_read; GPUREAD of a VRAM->CPU transfer moves pixels */
+        const Gpu *g = &psx->gpu;
+        if (!(p & 4)) {
+            if (g->xfer == 2)
+                return 1;
+            *v = g->gpuread;
+            return 0;
+        }
+        u32 s = (g->stat | 0x1C000000u) & ~(1u << 25), dir = (s >> 29) & 3;
+        if (dir == 1 || dir == 2 || (dir == 3 && g->xfer == 2))
+            s |= 1u << 25;
+        *v = s;
         return 0;
     }
     if (p == 0x1F801070 || p == 0x1F801074) {
@@ -122,13 +149,13 @@ u32 native_io_read(u32 a)
     const u32 *site = (const u32 *)ctx[C_SITE];
     u32 insn = site[1], op = insn >> 26, p = a & 0x1FFFFFFFu, b = ctx[C_BUDGET];
     u32 size = op == 0x23 ? 4 : (op & 1) ? 2 : 1;
-    int sio = p - 0x1F801040 < 0x20;
-    if ((p & (size - 1)) || (!sio && ((p & 3) || (p - 0x1F801070 >= 8 && p - 0x1F801100 >= 0x30))) ||
+    int sio = p - 0x1F801040 < 0x20, dma = p - 0x1F801080 < 0x80, gpu = p - 0x1F801810 < 8;
+    if ((p & (size - 1)) || (!sio && !dma && !gpu && ((p & 3) || (p - 0x1F801070 >= 8 && p - 0x1F801100 >= 0x30))) ||
         (s32)b < -(s32)(NATIVE_FORCED / 2))
         return 1;
     psx->cycles += (u32)((s32)NATIVE_BUDGET - (s32)b) >> io_fast_shift;
     ctx[C_BUDGET] = NATIVE_BUDGET;
-    int timer = p >= 0x1F801100;
+    int timer = p - 0x1F801100 < 0x30;
     NativePoll q = native_poll;
     u32 v, tick = timer && !(p & 0xF) ? tmr_cpt(psx, (int)((p >> 4) & 3)) : 0;
     int fall = psx->cycles >= psx->next_event ? 0
@@ -156,7 +183,7 @@ u32 native_io_read(u32 a)
     ctx[(insn >> 16) & 31] = v;
     psx->cycles += 2;
     native_stats.calls++;
-    native_stats.n_io[timer ? IO_TIMER : sio ? IO_PAD : IO_IRQ]++;
+    native_stats.n_io[timer ? IO_TIMER : sio ? IO_PAD : dma ? IO_DMA : gpu ? IO_GPU : IO_IRQ]++;
     native_stats.io_lean++;
     return 0;
 }

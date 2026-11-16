@@ -1602,16 +1602,21 @@ static void gte_stubs(int asm_ok)
         stub(gte_ops[i].at, asm_ok ? gte_ops[i].fn : gte_ops[i].door);
 }
 
-/* io_fast_dev against psx_read on random counters, clock and interrupt registers: the number of
- * reads it serves (`*served`) with another value or leaving another state. The counters,
- * GPUSTAT, the clock and I_STAT/I_MASK are kept. */
+/* io_fast_dev against psx_read on random counters, clock, interrupt, pad, DMA and GPU registers:
+ * the number of reads it serves (`*served`) with another value or leaving another state. The
+ * device state it randomises is kept. */
 static int io_fast_check(Psx *psx, int n, int *served)
 {
     static const u32 regs[] = {0x1F801070, 0x1F801074, 0x1F801100, 0x1F801104, 0x1F801108, 0x1F80110C,
                                0x1F801110, 0x1F801114, 0x1F801118, 0x1F801120, 0x1F801124, 0x1F801128,
-                               0x1F801040, 0x1F801044, 0x1F801048, 0x1F80104A, 0x1F80104E, 0x1F801054, 0x1F801042};
+                               0x1F801040, 0x1F801044, 0x1F801048, 0x1F80104A, 0x1F80104E, 0x1F801054, 0x1F801042,
+                               0x1F8010A0, 0x1F8010A4, 0x1F8010A8, 0x1F8010AA, 0x1F8010E8, 0x1F8010EB, 0x1F8010AC,
+                               0x1F8010F0, 0x1F8010F4, 0x1F8010F6, 0x1F8010F8, 0x1F801810, 0x1F801814, 0x1F801816};
     Timers keep = psx->tmr;
     Sio sio = psx->sio;
+    Dma dma = psx->dma;
+    int xfer = psx->gpu.xfer;
+    u32 gpuread = psx->gpu.gpuread;
     u64 cycles = psx->cycles;
     u32 stat = psx->i_stat, mask = psx->i_mask, gpustat = psx->gpu.stat;
     int bad = 0;
@@ -1632,7 +1637,11 @@ static int io_fast_check(Psx *psx, int n, int *served)
         }
         u32 is = rnd() & 0x7FF, im = rnd() & 0x7FF, a = regs[rnd() % (sizeof regs / 4)], v, want;
         psx->tmr = in, psx->cycles = now, psx->i_stat = is, psx->i_mask = im;
-        psx->gpu.stat = (gpustat & ~(1u << 20)) | (rnd() & 1) << 20; /* PAL or NTSC hblanks */
+        psx->gpu.stat = rnd(); /* PAL or NTSC hblanks, any DMA direction */
+        psx->gpu.xfer = (int)(rnd() % 3), psx->gpu.gpuread = rnd();
+        for (int i = 0; i < 7; i++)
+            psx->dma.ch[i] = (DmaChan){rnd(), rnd(), rnd()};
+        psx->dma.dpcr = rnd(), psx->dma.dicr = rnd();
         Sio *o = &psx->sio;
         o->rx = (u8)rnd(), o->rx_full = (int)(rnd() & 1), o->stat = (u16)rnd16(), o->mode = (u16)rnd16(), o->ctrl = (u16)rnd16(), o->baud = (u16)rnd16();
         Sio sin = *o;
@@ -1653,7 +1662,7 @@ static int io_fast_check(Psx *psx, int n, int *served)
             say("native: device read %08X in io_fast: %08X, want %08X", (unsigned)a, (unsigned)v, (unsigned)want);
     }
     psx->tmr = keep, psx->cycles = cycles, psx->i_stat = stat, psx->i_mask = mask, psx->gpu.stat = gpustat;
-    psx->sio = sio;
+    psx->sio = sio, psx->dma = dma, psx->gpu.xfer = xfer, psx->gpu.gpuread = gpuread;
     return bad;
 }
 
@@ -1706,7 +1715,7 @@ const char *native_init(Psx *psx, const DiscInfo *info)
     bad = io_fast_check(psx, 65536, &served);
     stub(STUB_IO_READ, bad ? psxrt_rt_call : psxrt_io_read);
     stub(STUB_IO_WRITE, psxrt_io_write);
-    say("native: timer/IRQ/pad reads in io_fast, %d of %d served checks differ%s", bad, served, bad ? ": through the runtime" : "");
+    say("native: timer/IRQ/pad/DMA/GPU reads in io_fast, %d of %d served checks differ%s", bad, served, bad ? ": through the runtime" : "");
     flush_code();
     __asm__ volatile("move %0, $gp" : "=r"(native_host_gp));
     psx->call = native_call;
