@@ -45,7 +45,7 @@ typedef struct {
 #define TEX_VTX (GU_TEXTURE_32BITF | GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_2D)
 
 typedef struct {
-    u32 tris, ttris, rects, trects, fills, lines, line_runs, sw_tex15, sw_texwin, sw_copy, pages, cluts, clut_tmp;
+    u32 tris, ttris, rects, trects, fills, lines, line_runs, sw_tex15, sw_texwin, sw_copy, pages, pages15, cluts, clut_tmp;
     u32 readbacks, read_tiles, read_us, uploads, upload_px, upload_us, flushes;
     u32 ge_copy, null_copy, copy_px, copy_from_ge; /* copies: on the GE, onto themselves, pixels, read from the GE */
     u32 bind_tex, bind_clut, kicks, rd_checks;     /* textures and CLUTs sent, stall moves, readback checks */
@@ -64,8 +64,14 @@ typedef struct {
     u32 used, age;  /* used: the list (ge.syncs) that last drew with it */
     u32 epoch;      /* ge.epoch when the stamp was last found current */
     u32 ver;        /* bumped whenever data is written: what was built on it is stale */
+    int flags;      /* a 15-bit page's texels, as clut()'s flags */
     u8 *data;
 } Page;
+
+/* A 15-bit page as a 256x256 8888 texture, alpha as in a converted CLUT (MediEvil's attract mode
+ * drew 48-76 such sprites a second in software, 2M fragments). */
+#define PAGE15_SLOTS 2
+#define PAGE15_BYTES (256 * 256 * 4)
 
 /* Games switch CLUTs per model, and models are drawn interleaved in depth order. A converted CLUT
  * is kept across lists in a slot of the pool, two ways per set, as long as its tiles' stamp holds
@@ -105,6 +111,8 @@ static struct {
     /* texture cache */
     Page pages[PAGE_SLOTS];
     int npages;
+    Page pages15[PAGE15_SLOTS];
+    int npages15;
     u32 syncs, ages; /* syncs: counts the lists run */
     u32 epoch;       /* bumped whenever any tile's generation changes */
     Page *last_page; /* the page last used, current as of last_epoch */
@@ -624,10 +632,10 @@ static u32 stamp(s32 x, s32 y, s32 w, s32 h)
     return s;
 }
 
-/* What the GE can sample: 4/8-bit pages without a texture window. */
+/* What the GE can sample: pages without a texture window. */
 static int tex_ok(const GpuPrim *p)
 {
-    if (p->depth >= 2 || !ge.npages) {
+    if (p->depth >= 2 ? !ge.npages15 : !ge.npages) {
         ge.s.sw_tex15++;
         return 0;
     }
@@ -684,6 +692,55 @@ static const u8 *page(const GpuPrim *p)
     }
     s->used = ge.syncs, s->age = ++ge.ages, s->epoch = ge.epoch;
     ge.last_page = s, ge.last_epoch = ge.epoch;
+    return s->data;
+}
+
+/* The 15-bit page as 8888 with its flags; RAM's copy of it is current. A stale slot the open list
+ * draws with is left alone while another slot is free of it. */
+static const u8 *page15(const GpuPrim *p, int *flags)
+{
+    u32 key = 1 + (p->tpx / 64 | p->tpy / 256 << 4);
+    Page *s = NULL;
+    for (int i = 0; i < ge.npages15 && !s; i++)
+        if (ge.pages15[i].key == key)
+            s = &ge.pages15[i];
+    u32 st = s && s->epoch == ge.epoch ? s->stamp : stamp((s32)p->tpx, (s32)p->tpy, 256, 256);
+    if (!s || s->stamp != st) {
+        Page *o = NULL;
+        for (int i = 0; i < ge.npages15; i++) {
+            Page *c = &ge.pages15[i];
+            if (c != s && (!o || (c->used != ge.syncs && (o->used == ge.syncs || c->age < o->age))))
+                o = c;
+        }
+        if (!s || (s->used == ge.syncs && o && o->used != ge.syncs)) {
+            if (s)
+                s->key = 0;
+            s = o;
+        }
+        if (s->used == ge.syncs && list_open) {
+            ge_sync();
+            ge.s.flushes++;
+            begin();
+        }
+        const u16 *vram = ge.psx->gpu.vram;
+        u32 *d = (u32 *)s->data, fo = 0, fs = 0;
+        for (s32 y = 0; y < 256; y++) {
+            const u16 *row = vram + (((s32)p->tpy + y) & (VRAM_H - 1)) * VRAM_W;
+            for (s32 x = 0; x < 256; x++) {
+                u32 t = row[(p->tpx + (u32)x) & (VRAM_W - 1)];
+                u32 a = t & 0x8000 ? 0x80000000u : t ? 0xFF000000u : 0;
+                fo |= t & 0x8000 ? 0 : t, fs |= t & 0x8000;
+                *d++ = a | (t >> 10 & 31) << 19 | (t >> 5 & 31) << 11 | (t & 31) << 3;
+            }
+        }
+        sceKernelDcacheWritebackRange(s->data, PAGE15_BYTES);
+        s->key = key, s->stamp = st, s->flags = (fo ? 1 : 0) | (fs ? 2 : 0), s->ver++;
+        if (ge.tex_sent == s->data)
+            ge.tex_sent = NULL;
+        ge.s.pages15++;
+    }
+    s->used = ge.syncs, s->age = ++ge.ages, s->epoch = ge.epoch;
+    *flags = s->flags;
     return s->data;
 }
 
@@ -754,14 +811,14 @@ static int clut_current(ClutSlot *c)
 
 static void bind(const GpuPrim *p, const u8 *pg, const u32 *cl)
 {
-    if (cl != ge.clut_sent) {
+    if (cl && cl != ge.clut_sent) {
         sceGuClutMode(GU_PSM_8888, 0, 0xFF, 0);
         sceGuClutLoad(p->depth ? 32 : 2, cl); /* blocks of 8 entries */
         ge.clut_sent = cl;
         ge.s.bind_clut++;
     }
     if (pg != ge.tex_sent) {
-        sceGuTexMode(p->depth ? GU_PSM_T8 : GU_PSM_T4, 0, 0, 0);
+        sceGuTexMode(p->depth >= 2 ? GU_PSM_8888 : p->depth ? GU_PSM_T8 : GU_PSM_T4, 0, 0, 0);
         sceGuTexImage(0, 1, 1, 64, pg + 16); /* another address first: see upload_part */
         sceGuTexImage(0, 256, 256, 256, pg);
         sceGuTexFlush();
@@ -788,11 +845,19 @@ static int prim_begin(const GpuPrim *p)
     u32 tk = 1 + (p->tpx | p->tpy << 10 | p->depth << 20), ck = p->clut_x | p->clut_y << 10 | p->depth << 20;
     if (tk != ge.rk_tex || ck != ge.rk_clut || ge.nver != ge.rk_ver) {
         ge.s.rd_checks++;
-        rd_read(&ge, (s32)p->tpx, (s32)p->tpy, p->depth ? 128 : 64, 256);
-        rd_read(&ge, (s32)p->clut_x, (s32)p->clut_y, p->depth ? 256 : 16, 1);
+        rd_read(&ge, (s32)p->tpx, (s32)p->tpy, p->depth >= 2 ? 256 : p->depth ? 128 : 64, 256);
+        if (p->depth < 2)
+            rd_read(&ge, (s32)p->clut_x, (s32)p->clut_y, p->depth ? 256 : 16, 1);
         ge.rk_tex = tk, ge.rk_clut = ck, ge.rk_ver = ge.nver;
     }
     begin();
+    if (p->depth >= 2) {
+        int flags;
+        const u8 *pg = page15(p, &flags);
+        if (flags)
+            bind(p, pg, NULL);
+        return flags;
+    }
     const u8 *pg = page(p);
     int flags;
     const u32 *cl = clut(p, &flags);
@@ -1671,6 +1736,15 @@ void ge_init(Psx *psx, int compare)
         sceKernelDcacheWritebackInvalidateRange(r, b); /* first written through the uncached mirror */
         fl.ring_c = r, fl.ring_u = fl.ring = (u8 *)((u32)r | 0x40000000u), fl.ring_bytes = b;
     }
+    for (int n = PAGE15_SLOTS; n >= 1 && !ge.npages15; n--) {
+        SceUID uid = sceKernelAllocPartitionMemory(2, "psxrt ge pages15", PSP_SMEM_Low, (SceSize)(n * PAGE15_BYTES + 64), NULL);
+        if (uid < 0)
+            continue;
+        u8 *b = (u8 *)(((u32)sceKernelGetBlockHeadAddr(uid) + 63) & ~63u);
+        for (int i = 0; i < n; i++)
+            ge.pages15[i].data = b + i * PAGE15_BYTES;
+        ge.npages15 = n;
+    }
     if (fl.ring)
         ring_bench(psx), busy_bench(psx);
     for (int i = 0; i < 1 << FL_BITS; i++)
@@ -1679,7 +1753,7 @@ void ge_init(Psx *psx, int compare)
     ge.r = (GpuRenderer){&ge, rd_triangle, rd_quad, rd_rect, rd_line, rd_fill, rd_copy, rd_read, rd_wrote, fl.ring ? rd_poly : NULL,
                          fl.ring ? rd_packet : NULL};
     ge.syncs = 1; /* no slot (used 0) is in the list */
-    psx_log(psx, "ge: %d texture page slots, %u KB vertex ring", ge.npages, (unsigned)(fl.ring_bytes / 1024));
+    psx_log(psx, "ge: %d texture page slots, %d 15-bit, %u KB vertex ring", ge.npages, ge.npages15, (unsigned)(fl.ring_bytes / 1024));
     rd_fill(&ge, 0, 0, VRAM_W, VRAM_H, 0); /* also makes the oracle create the framebuffer */
     ge_sync();
     newer_clear(); /* both copies are zero */
@@ -1741,13 +1815,13 @@ int ge_log(char *buf, int cap)
     u32 kb = s->kicks * prof_bias / 16, kick_us = s->kick_us > kb ? s->kick_us - kb : 0; /* less one clock read each */
     int n = clampn(snprintf(buf, (size_t)cap,
                             "-- ge: tri %u+%u tex, rect %u+%u tex, fill %u, line %u (%u runs); sw tex15 %u texwin %u "
-                            "copy %u+%u sw+%u null (%u kpx, %u from ge); pages %u cluts %u+%u in list, readback %u (%u tiles, %u ms), upload %u "
+                            "copy %u+%u sw+%u null (%u kpx, %u from ge); pages %u+%u 15-bit, cluts %u+%u in list, readback %u (%u tiles, %u ms), upload %u "
                             "(%u kpx, %u ms), flush %u; bind %u tex %u clut, kick %u (%u ms), rd check %u; fast %u (%u setups %u ms, %u cached, mru %u), slow tex %u big %u, flat %u, clipped %u; ring %s (wb %u ms), step %u\n",
                             (unsigned)s->tris, (unsigned)s->ttris, (unsigned)s->rects, (unsigned)s->trects,
                             (unsigned)s->fills, (unsigned)s->lines, (unsigned)s->line_runs, (unsigned)s->sw_tex15,
                             (unsigned)s->sw_texwin,
                             (unsigned)s->ge_copy, (unsigned)s->sw_copy, (unsigned)s->null_copy, (unsigned)(s->copy_px / 1000), (unsigned)s->copy_from_ge,
-                            (unsigned)s->pages, (unsigned)s->cluts, (unsigned)s->clut_tmp, (unsigned)s->readbacks, (unsigned)s->read_tiles,
+                            (unsigned)s->pages, (unsigned)s->pages15, (unsigned)s->cluts, (unsigned)s->clut_tmp, (unsigned)s->readbacks, (unsigned)s->read_tiles,
                             (unsigned)(s->read_us / 1000), (unsigned)s->uploads, (unsigned)(s->upload_px / 1000),
                             (unsigned)(s->upload_us / 1000), (unsigned)s->flushes, (unsigned)s->bind_tex, (unsigned)s->bind_clut, (unsigned)s->kicks, (unsigned)(kick_us / 1000),
                             (unsigned)s->rd_checks, (unsigned)s->fast, (unsigned)s->fast_setups, (unsigned)((s32)s->setup_us < 0 ? 0 : s->setup_us / 1000), (unsigned)s->fast_hits, (unsigned)s->mru_hits, (unsigned)s->slow_tex, (unsigned)s->slow_big, (unsigned)s->flat, (unsigned)s->clipped,
