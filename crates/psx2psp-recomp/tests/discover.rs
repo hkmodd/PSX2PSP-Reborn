@@ -184,6 +184,32 @@ fn discovery_follows_pointers_built_in_code() {
     assert!(d.dead_ends.is_empty());
 }
 
+
+/// A word after a return that fails the leaf test is tried again as a pointer once the code
+/// building its address is found (Crash 2's rasterizer 8003E794, `lui`/`addiu` in a function
+/// found later by its prologue).
+#[test]
+fn a_failed_leaf_is_tried_again_as_a_built_pointer() {
+    let x = exe(&[
+        r(8, RA, 0, 0, 0),                       // 0 jr ra
+        NOP,                                     // 1
+        i(9, ZERO, V0, 1),                       // 2 h: addiu v0,zero,1
+        j(2, 0),                                 // 3 j 0: no jr ra, not a leaf
+        NOP,                                     // 4
+        r(2, 1, A0, A0, 8),                      // 5 rotr (Allegrex): not code
+        i(9, SP, SP, (-8i16) as u16),            // 6 g: addiu sp,sp,-8
+        i(0xF, ZERO, A1, (at(2) >> 16) as u16),  // 7 lui a1,hi(h)
+        i(9, A1, A1, at(2) as u16),              // 8 addiu a1,a1,lo(h)
+        i(0x2B, ZERO, A1, 0x100),                // 9 sw a1,0x100(zero)
+        r(8, RA, 0, 0, 0),                       // 10 jr ra
+        i(9, SP, SP, 8),                         // 11 addiu sp,sp,8
+    ]);
+    let d = Discovery::run(&x);
+    assert_eq!(d.entries.get(&at(6)), Some(&Origin::Prologue));
+    assert_eq!(d.entries.get(&at(2)), Some(&Origin::Pointer));
+    assert!(!d.code.contains(&at(5)));
+    assert!(d.dead_ends.is_empty());
+}
 #[test]
 fn hazards_in_sequence_and_across_returns() {
     let x = program();

@@ -363,7 +363,9 @@ impl Discovery {
                 let w = exe.word(a).unwrap_or(0);
                 let prologue = matches!(w >> 16, 0x27BD | 0x23BD) && w & 0x8000 != 0;
                 let pointer = pointed.contains(&a) && after_end(img, a);
-                if d.code.contains(&a) || !(prologue || pointer || after_return(exe, a)) || !tried.insert(a) {
+                // Tried again once it becomes a pointer: a leaf test may have failed before the code
+                // building it was found.
+                if d.code.contains(&a) || !(prologue || pointer || after_return(exe, a)) || !tried.insert((a, pointer)) {
                     continue;
                 }
                 if !prologue {
