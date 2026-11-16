@@ -1014,6 +1014,34 @@ fn a_return_point_built_in_ra_mid_block_gets_a_label() {
     assert!(run.t.host(at(6)).is_some());
 }
 
+/// A return address kept in memory and taken back through another register (Spyro 2's 8001E3E8:
+/// `sw ra,8(at)` ... `lw t7,8(at)` ... `jr t7`) is the host address the translated call wrote: the
+/// `jr t7` goes there as it is, not through the table slot that shares its low 21 bits.
+#[test]
+fn a_host_return_address_through_another_register_goes_as_it_is() {
+    let w = [
+        lui(A0, 0x8002),          // 0
+        j(3, 6),                  // 1  jal 6
+        NOP,                      // 2
+        addiu(T7, ZERO, 0),       // 3  the return point: t7 no longer an address
+        j(2, 14),                 // 4  j end
+        mem(SW, ZERO, 0, A0),     // 5  slot: the saved ra cleared
+        mem(SW, RA, 0, A0),       // 6  the callee keeps ra in memory
+        addiu(RA, ZERO, 0),       // 7  and uses ra as data
+        mem(LW, T7, 0, A0),       // 8
+        NOP,                      // 9
+        r(8, T7, 0, 0, 0),        // 10 jr t7
+        addiu(T1, T1, 1),         // 11 slot
+        NOP,                      // 12
+        NOP,                      // 13
+        j(2, 14),                 // 14 end
+        NOP,                      // 15
+    ];
+    let run = check(&w, 14, |_| {}, false);
+    assert!(run.t.runtime.is_empty(), "{:?}", run.t.runtime);
+    assert!(run.log.missed.is_empty(), "{:x?}", run.log.missed);
+}
+
 /// Branches whose host distance exceeds 16 bits, forward and backward, go through a `j`.
 #[test]
 fn far_branches_are_relaxed() {

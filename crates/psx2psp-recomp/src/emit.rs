@@ -1051,13 +1051,28 @@ impl Em<'_> {
         self.stub(s);
     }
 
-    /// `k1` <- host address for the guest address in `src` (also saved to `ctx::TARGET`).
-    fn dispatch(&mut self, src: u32) {
+    /// `k1` <- host address for the guest address in `src` (also saved to `ctx::TARGET`). With
+    /// `host`, a value that is already host code goes as it is, as the runtime's `host_of` does:
+    /// a translated call writes a host ra, and code that keeps ra in memory and returns through
+    /// another register (Spyro 2's 8001E3E8, `jr t7`) would index the table with it and land on
+    /// whatever guest address shares its low 21 bits. Host addresses are 0x08000000..0x0FFFFFFF,
+    /// top five bits 00001; no guest segment has them (00000, 00011, 10000, 10100, 10111).
+    fn dispatch(&mut self, src: u32, host: bool, pc: u32) {
+        let done = self.label();
         let o = &mut self.out;
         o.push(sw(src, k0_off(layout::CTX + ctx::TARGET), K0R));
+        if host {
+            o.push(srl(K1R, src, 27));
+            o.push(addiu(K1R, K1R, 0xFFFF));
+            o.branch(beq(K1R, 0), To::Label(done), pc);
+            o.push(addu(K1R, src, 0));
+        }
         o.push(ext(K1R, src, 0, 21));
         o.push(addu(K1R, K1R, K0R));
         o.push(lw(K1R, k0_off(layout::TABLE), K1R));
+        if host {
+            o.def(done);
+        }
     }
 
     /// The host delay slot after a transfer: the guest slot's simple word, or a `nop` when its
@@ -1132,18 +1147,20 @@ impl Em<'_> {
             Jr | Jalr => {
                 let fin = if k == Jr { jr(K1R) } else { jalr(i.rd() as u32, K1R) };
                 let rs = i.rs() as u32;
+                // A switch table holds guest addresses only.
+                let host = !matches!(self.d.jumps.get(&a), Some(JumpReg::Table { .. }));
                 if let Some(w) = simple_slot {
-                    self.dispatch(rs);
+                    self.dispatch(rs, host, a);
                     self.out.push(fin);
                     self.out.simple(w, s);
                 } else if !clobbers {
                     let c = slot(self);
                     self.out.append(c);
-                    self.dispatch(rs);
+                    self.dispatch(rs, host, a);
                     self.out.push(fin);
                     self.out.push(NOP);
                 } else {
-                    self.dispatch(rs);
+                    self.dispatch(rs, host, a);
                     self.out.push(sw(K1R, k0_off(layout::CTX + ctx::JUMP), K0R));
                     let c = slot(self);
                     self.out.append(c);
@@ -1165,7 +1182,7 @@ impl Em<'_> {
                 } else {
                     self.out.push(lui(K1R, (t >> 16) as u16));
                     self.out.push(ori(K1R, K1R, t as u16));
-                    self.dispatch(K1R);
+                    self.dispatch(K1R, false, a);
                     self.out.push(jalr(RA, K1R));
                 }
                 self.slot_word(simple_slot, s);
