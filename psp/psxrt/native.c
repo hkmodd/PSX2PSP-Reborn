@@ -16,7 +16,8 @@
  *   - guest calls made by the BIOS (interrupt handlers, callbacks): native_call() runs them
  *     to CALL_RET, natively when they have a translation.
  * A guest `ra` that has no translation becomes GRET when translated code takes over: its `jr ra`
- * comes back to the interpreter at the address saved on a small stack.
+ * comes back to the interpreter at the address saved on a small stack, the entry pushed at the
+ * same guest sp (gret_pop).
  *
  * Time: the PS1 cycle count advances with interpreted instructions and loops: each back-edge
  * charges its estimated PS1 cycles to CTX.BUDGET and enters the runtime when that goes negative,
@@ -171,8 +172,37 @@ static u32 vs_step(void)
 }
 
 #define GRET_DEPTH 64
-static u32 gret[GRET_DEPTH];
+static u32 gret[GRET_DEPTH], gret_sp[GRET_DEPTH]; /* gret_sp: the guest sp at the push */
 static u32 gret_top;
+
+static void gret_push(u32 ra, u32 sp)
+{
+    gret[gret_top % GRET_DEPTH] = ra, gret_sp[gret_top % GRET_DEPTH] = sp;
+    gret_top++;
+}
+
+/* The entry a GRET return at guest `sp` stands for, as the stack top just past it: the newest
+ * one pushed at that sp, the top when there is none. A call returns at the sp it was entered with
+ * (a push is at the callee's entry, or in a leaf), so the entries above it are dead: fix_ra also
+ * pushes an ra that is no longer live. Silent Hill's 8002E454 runs its switch cases in the
+ * interpreter (the table is outside the image) and leaves one with `j 8002E934`, its translated
+ * epilogue, with ra = 8002E6FC from the case's last `jal strcmp`: that push sat on top of the one
+ * 8002E454 was entered with (8002E334, in 8002E260), its `jr ra` took 8002E6FC and ran the case
+ * again in its caller's frame, and the epilogue returned to 801FFFF8. */
+static u32 gret_at(u32 sp)
+{
+    u32 n = gret_top < GRET_DEPTH ? gret_top : GRET_DEPTH;
+    for (u32 k = 0; k < n; k++)
+        if (gret_sp[(gret_top - 1 - k) % GRET_DEPTH] == sp)
+            return gret_top - k;
+    return gret_top;
+}
+
+static u32 gret_pop(u32 sp)
+{
+    gret_top = gret_at(sp) - 1;
+    return gret[gret_top % GRET_DEPTH];
+}
 
 static void say(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static void say(const char *fmt, ...)
@@ -752,7 +782,7 @@ static void fix_ra(Cpu *c)
     if (h) {
         c->gpr[31] = h;
     } else if (p < 0x800000 || (p & 0x1FF00000u) == 0x1FC00000u) {
-        gret[gret_top++ % GRET_DEPTH] = ra;
+        gret_push(ra, c->gpr[29]);
         c->gpr[31] = STUB_GRET;
     }
 }
@@ -862,7 +892,7 @@ static u32 interp(int mode)
         if (!c->in_delay && mode != 2) {
             u32 pc = c->pc;
             if (pc == STUB_GRET) {
-                jump(c, gret[--gret_top % GRET_DEPTH]);
+                jump(c, gret_pop(c->gpr[29]));
                 continue;
             }
             /* Cache isolated: only the interpreter keeps stores out of RAM. Its end is a flush. */
@@ -996,11 +1026,11 @@ static int gte_fast(u32 insn)
  * entry (polling loops return to a few sites, which may alternate), a found one checked against
  * the table again. 1 (no word can be read there) when it is host code that is not a return site. */
 #define RA_SEEN 16
-static u32 guest_ra(u32 ra)
+static u32 guest_ra(u32 ra, u32 sp)
 {
     static u32 seen_h[RA_SEEN], seen_g[RA_SEEN], next;
     if (ra == STUB_GRET)
-        return gret_top ? gret[(gret_top - 1) % GRET_DEPTH] : 1;
+        return gret_top ? gret[(gret_at(sp) - 1) % GRET_DEPTH] : 1;
     if (ra - code_lo >= code_hi - code_lo)
         return ra;
     int k = -1;
@@ -1041,7 +1071,7 @@ static void poll_skip(u32 pc, u32 addr, const u32 *gpr)
         u32 g[32], room, raw = timer_poll_count(P, addr, &room);
         for (int i = 0; i < 32; i++)
             g[i] = gpr[i];
-        g[31] = guest_ra(g[31]);
+        g[31] = guest_ra(g[31], g[29]);
         u32 t = poll_bound(P, pc, g, raw, room);
         if (t) {
             u64 to = timer_tick_at(P, addr, t);
@@ -1561,7 +1591,7 @@ u32 native_gret(void)
     Cpu *c = &P->cpu;
     from_ctx(c);
     charge();
-    jump(c, gret[--gret_top % GRET_DEPTH]);
+    jump(c, gret_pop(c->gpr[29]));
     return leave(c, run_guest(1));
 }
 
@@ -1854,6 +1884,7 @@ int native_load(int fd)
         sceIoRead(fd, st, n * 16) != (int)(n * 16) || sceIoRead(fd, &gret_top, 4) != 4 || sceIoRead(fd, gret, sizeof gret) != (int)sizeof gret ||
         sceIoRead(fd, table, TABLE_WORDS * 4) != (int)(TABLE_WORDS * 4))
         return -1;
+    memset(gret_sp, 0xFF, sizeof gret_sp); /* not in the snapshot: no entry matches, pops take the top */
     sceKernelDcacheWritebackInvalidateAll();
     blk_resum(0, RAM_SIZE); /* RAM and the table are the snapshot's already */
     for (u32 i = 0; i < n; i++) {
