@@ -103,7 +103,13 @@ Sim *sim_new(void *user, ReadFn rd, u32 disc_end, TextFn tty, TextFn log)
     return s;
 }
 
-void sim_free(Sim *s) { free(s); }
+static void watch_reset(void);
+
+void sim_free(Sim *s)
+{
+    watch_reset();
+    free(s);
+}
 
 /* --trace: the straight-line runs the interpreter executes, as (first pc, last pc) pairs of u32;
  * a run equal to the one before it is not written again (a loop of one run stays in the I-cache
@@ -132,13 +138,179 @@ static u32 pc_count[RAM_SIZE / 4];
  * capture takes code that ran. */
 static u8 ran[RAM_SIZE / 4];
 
+/* Static images watched as the native runtime takes them (native.c try_load, on_ram_loaded,
+ * cache_flushed): a word holds a translation from when the guest first runs in an image's text
+ * after boot, or after a load over it, and the image's head and text hash as the translation's,
+ * until a load over that word, or an I-cache flush that finds its 1 KB block changed beyond
+ * immediates and shift amounts. ran_held: words that ran while they held one. */
+#define WATCH_MAX 256 /* native_code::MAX_IMAGES */
+static struct Watch {
+    u32 at, size, head_len, head_hash, hash;
+    u8 *words; /* 1 per word with a translation */
+    u8 *miss;  /* the text at its last failed check, or the last whose head matched */
+    u32 checks;
+    u8 armed, live; /* live: matched at its last check */
+    u8 miss_head;   /* the head matched at that check */
+} watch[WATCH_MAX];
+static int nwatch;
+static const u8 *watch_ram;
+static u16 watch_page[RAM_SIZE >> 12]; /* armed images over each 4 KB page */
+static u8 held[RAM_SIZE / 4], ran_held[RAM_SIZE / 4];
+static u32 held_form[RAM_SIZE / 4]; /* form() of each held word when it took its translation */
+static const Cpu *watch_cpu;        /* for the end of a cache isolation, which is a flush */
+static u8 watch_isolated;
+
+/* native.c patchable and form: `w` without what the runtime's patch table rewrites in place. */
+static int patchable(u32 w)
+{
+    u32 op = w >> 26, f = w & 0x3F;
+    return (op >= 8 && op <= 0xF) || (op == 0 && (f == 0 || f == 2 || f == 3));
+}
+
+static u32 form(u32 w)
+{
+    if (!patchable(w))
+        return w;
+    if (!(w >> 26))
+        return w & ~(0x1Fu << 6);
+    return ((w >> 26) == 8 ? w | 1u << 26 : w) & 0xFFFF0000u;
+}
+
+static u32 ram_word(u32 j)
+{
+    u32 w;
+    memcpy(&w, watch_ram + 4 * j, 4);
+    return w;
+}
+
+static u32 fnv1a(const u8 *p, u32 n)
+{
+    u32 h = 0x811C9DC5u;
+    for (u32 i = 0; i < n; i++)
+        h = (h ^ p[i]) * 0x01000193u;
+    return h;
+}
+
+static void watch_arm(struct Watch *w, u8 on)
+{
+    if (w->armed == on)
+        return;
+    w->armed = on;
+    for (u32 pg = w->at >> 12; pg <= (w->at + w->size - 1) >> 12; pg++)
+        watch_page[pg] = (u16)(watch_page[pg] + (on ? 1 : -1));
+}
+
+static void watch_flushed(void);
+
+/* A load over [addr, addr+len): its words lose their translation and the images over it are
+ * checked again when next run. len 0: the I-cache was flushed. */
+static void watch_loaded(Psx *psx, u32 addr, u32 len)
+{
+    (void)psx;
+    if (!len) {
+        watch_flushed();
+        return;
+    }
+    u32 a = addr & (RAM_SIZE - 4), end = a + ((len + 3) & ~3u);
+    if (end > RAM_SIZE)
+        end = RAM_SIZE;
+    memset(held + a / 4, 0, (end - a) / 4);
+    for (int i = 0; i < nwatch; i++)
+        if (a < watch[i].at + watch[i].size && watch[i].at < end)
+            watch_arm(&watch[i], 1);
+}
+
+/* As native.c cache_flushed: a 1 KB block whose held words changed beyond immediates and shift
+ * amounts (which the runtime patches in place) is loaded over. */
+static void watch_flushed(void)
+{
+    for (u32 b = 0; b < RAM_SIZE >> 10; b++)
+        for (u32 j = b << 8; j < (b + 1) << 8; j++)
+            if (held[j] && form(ram_word(j)) != held_form[j]) {
+                watch_loaded(NULL, b << 10, 1024);
+                break;
+            }
+}
+
+static void watch_run(u32 p)
+{
+    for (int i = 0; i < nwatch; i++) {
+        struct Watch *w = &watch[i];
+        if (!w->armed || p < w->at || p - w->at >= w->size)
+            continue;
+        watch_arm(w, 0);
+        w->checks++;
+        u8 head = (u8)(fnv1a(watch_ram + w->at, w->head_len) == w->head_hash);
+        w->live = (u8)(head && fnv1a(watch_ram + w->at, w->size) == w->hash);
+        if (w->live)
+            for (u32 j = 0; j < w->size / 4; j++)
+                if (w->words[j])
+                    held[w->at / 4 + j] = 1, held_form[w->at / 4 + j] = form(ram_word(w->at / 4 + j));
+        else if ((head || !w->miss_head) && (w->miss || (w->miss = (u8 *)malloc(w->size)) != NULL))
+            memcpy(w->miss, watch_ram + w->at, w->size), w->miss_head = head;
+    }
+}
+
+/* Watches the image at `at` (RAM offset) of `size` bytes; `words` (size / 4 bytes) marks the
+ * words with a translation. Returns its number, -1 when full. */
+int sim_watch(Sim *s, u32 at, u32 size, u32 head_len, u32 head_hash, u32 hash, const u8 *words)
+{
+    if (nwatch == WATCH_MAX || !size || at + size > RAM_SIZE || (at | size) & 3)
+        return -1;
+    struct Watch *w = &watch[nwatch];
+    if (!(w->words = (u8 *)malloc(size / 4)))
+        return -1;
+    memcpy(w->words, words, size / 4);
+    w->at = at, w->size = size, w->head_len = head_len, w->head_hash = head_hash, w->hash = hash, w->armed = 0, w->live = 0, w->miss = NULL, w->checks = 0, w->miss_head = 0;
+    watch_ram = s->ram;
+    watch_cpu = &s->psx.cpu;
+    s->psx.ram_loaded = watch_loaded;
+    watch_arm(w, 1);
+    return nwatch++;
+}
+
+/* Whether watched image i matched at its last check. */
+int sim_watch_live(int i) { return watch[i].live; }
+
+/* Watched image i's text (size bytes) at its last failed check whose head matched, else at its
+ * last failed check; NULL when none failed. *checks: its checks, *head: whether that one's head
+ * matched. */
+const u8 *sim_watch_miss(int i, u32 *checks, int *head)
+{
+    *checks = watch[i].checks, *head = watch[i].miss_head;
+    return watch[i].miss;
+}
+
+static void watch_reset(void)
+{
+    for (int i = 0; i < nwatch; i++)
+        free(watch[i].words), free(watch[i].miss);
+    nwatch = 0;
+    watch_ram = NULL, watch_cpu = NULL, watch_isolated = 0;
+    memset(watch_page, 0, sizeof watch_page);
+    memset(held, 0, sizeof held);
+}
+
 const u8 *sim_ran(void) { return ran; }
-void sim_ran_clear(void) { memset(ran, 0, sizeof ran); }
+const u8 *sim_ran_held(void) { return ran_held; }
+void sim_ran_clear(void) { memset(ran, 0, sizeof ran), memset(ran_held, 0, sizeof ran_held); }
 
 void psxrt_pc_trace(u32 pc)
 {
-    if ((pc & 0x1FFFFFFFu) < RAM_SIZE)
-        ran[(pc & (RAM_SIZE - 1)) >> 2] = 1;
+    /* Cache isolated (SR bit 16): its end is a flush, as in native.c. */
+    if (watch_cpu) {
+        if (watch_cpu->sr & 0x10000)
+            watch_isolated = 1;
+        else if (watch_isolated)
+            watch_isolated = 0, watch_flushed();
+    }
+    if ((pc & 0x1FFFFFFFu) < RAM_SIZE) {
+        u32 p = pc & (RAM_SIZE - 4);
+        ran[p >> 2] = 1;
+        if (watch_page[p >> 12] && !held[p >> 2])
+            watch_run(p);
+        ran_held[p >> 2] |= held[p >> 2];
+    }
     if (!trace_file)
         return;
     if ((pc & 0x1FFFFFFFu) < RAM_SIZE)

@@ -32,7 +32,11 @@ pub mod ffi {
         pub fn sim_trace_to(path: *const c_char, out: *mut u64) -> c_int;
         pub fn sim_poll_bound(s: *mut Sim, pc: u32, gpr: *const u32, raw: u32, room: u32) -> u32;
         pub fn sim_ran() -> *const u8;
+        pub fn sim_ran_held() -> *const u8;
         pub fn sim_ran_clear();
+        pub fn sim_watch(s: *mut Sim, at: u32, size: u32, head_len: u32, head_hash: u32, hash: u32, words: *const u8) -> c_int;
+        pub fn sim_watch_live(i: c_int) -> c_int;
+        pub fn sim_watch_miss(i: c_int, checks: *mut u32, head: *mut c_int) -> *const u8;
     }
 }
 
@@ -114,6 +118,49 @@ impl<'a> Machine<'a> {
             ffi::sim_ran_clear();
             v
         }
+    }
+
+    /// Like [`Machine::take_ran`], with each word's second byte: nonzero where it ran while a
+    /// [`Machine::watch`]ed image held a translation of it. Returns (ran, ran_held).
+    pub fn take_ran_held(&mut self) -> (Vec<u8>, Vec<u8>) {
+        // SAFETY: as take_ran; both maps are RAM / 4 bytes.
+        unsafe {
+            let r = std::slice::from_raw_parts(ffi::sim_ran(), RAM / 4).to_vec();
+            let h = std::slice::from_raw_parts(ffi::sim_ran_held(), RAM / 4).to_vec();
+            ffi::sim_ran_clear();
+            (r, h)
+        }
+    }
+
+    /// Watches a translated image as the native runtime takes it: its translated words (`words`,
+    /// one byte per word of the `size` bytes at RAM offset `at`, nonzero with a translation) hold
+    /// from the first time the guest runs in it after boot or a load over it, when the first
+    /// `head_len` bytes and the whole text hash (FNV-1a) as `head_hash` and `hash`, until a load
+    /// over them. Returns its number, None when the core cannot watch more.
+    pub fn watch(&mut self, at: u32, size: u32, head_len: u32, head_hash: u32, hash: u32, words: &[u8]) -> Option<i32> {
+        if words.len() != size as usize / 4 {
+            return None;
+        }
+        // SAFETY: `sim` is valid until drop; the core copies `words` (size / 4 bytes).
+        let i = unsafe { ffi::sim_watch(self.sim, at, size, head_len, head_hash, hash, words.as_ptr()) };
+        (i >= 0).then_some(i)
+    }
+
+    /// Whether watched image `i` matched at its last check.
+    pub fn watch_live(&self, i: i32) -> bool {
+        // SAFETY: `i` came from watch on this machine, which holds ONE.
+        unsafe { ffi::sim_watch_live(i) != 0 }
+    }
+
+    /// Watched image `i`'s checks, and its text (`size` bytes, as given to [`Machine::watch`]) at
+    /// its last failed check whose head matched (true), else at its last failed check (false);
+    /// no text when none failed.
+    pub fn watch_miss(&self, i: i32, size: u32) -> (u32, Option<(Vec<u8>, bool)>) {
+        let (mut checks, mut head) = (0, 0);
+        // SAFETY: `i` came from watch on this machine, which holds ONE; the copy is `size` bytes
+        // of the core's, kept until the machine is dropped.
+        let p = unsafe { ffi::sim_watch_miss(i, &mut checks, &mut head) };
+        (checks, (!p.is_null()).then(|| (unsafe { std::slice::from_raw_parts(p, size as usize) }.to_vec(), head != 0)))
     }
 }
 

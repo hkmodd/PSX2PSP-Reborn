@@ -23,6 +23,9 @@ USAGE:
   psx2psp patches <disc.cue|disc.bin> [--id <code>] [--ppf <file>]
                                      the patch database's entries for the game, with hits
   psx2psp libs    <disc.cue|disc.bin>  the PsyQ library functions in each executable
+  psx2psp coverage <disc.cue|disc.bin> [--frames N] [--every N]
+                                     the code the game runs in the sim that the static
+                                     translation finds (no capture), and where it misses
   psx2psp clip    <video|audio|URL> [clip options] [-o <dir>]   → ICON1.PMF / SND0.AT3
   psx2psp art     <image> [--slot icon0|pic0|pic1|boot] [-o <dir>]
                                      frame any picture into the XMB slots (all by default)
@@ -117,6 +120,7 @@ fn main() -> ExitCode {
         Some("art") => cmd_art(&args[1..]),
         Some("patches") => cmd_patches(&args[1..]),
         Some("libs") if args.len() == 2 => cmd_libs(Path::new(&args[1])),
+        Some("coverage") => cmd_coverage(&args[1..]),
         Some("tools") if args.len() == 1 => cmd_tools(false),
         Some("tools") if args.len() == 2 && args[1] == "install" => cmd_tools(true),
         Some("update") if args.len() == 1 => cmd_update(false),
@@ -480,6 +484,57 @@ fn cmd_libs(disc: &Path) -> R {
         for (lib, fns) in libs {
             println!("  {lib} ({}): {}", fns.len(), fns.join(" "));
         }
+    }
+    Ok(())
+}
+
+fn cmd_coverage(args: &[String]) -> R {
+    let (mut disc, mut frames, mut every) = (None, psx2psp_engine::CAPTURE_FRAMES, 60);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let mut val = || it.next().ok_or_else(|| format!("{a} needs a value"));
+        match a.as_str() {
+            "--frames" => frames = val()?.parse()?,
+            "--every" => every = val()?.parse()?,
+            s if s.starts_with('-') => return Err(format!("unknown flag {s}").into()),
+            s => disc = Some(PathBuf::from(s)),
+        }
+    }
+    let disc = disc.ok_or("no disc image given")?;
+    let img = psx2psp_engine::core::DiscImage::open(&disc)?;
+    let t = std::time::Instant::now();
+    let c = psx2psp_engine::static_coverage(&img, &[], frames, every)?;
+    let pct = if c.ran == 0 { 100.0 } else { 100.0 * c.covered as f64 / c.ran as f64 };
+    println!(
+        "coverage {pct:.2}%: {} of {} instructions run are in the static translation ({} images, {} frames, {:.1} s); kernel area {} words, not counted",
+        c.covered,
+        c.ran,
+        c.images,
+        c.frames,
+        t.elapsed().as_secs_f64(),
+        c.kernel
+    );
+    for (name, at, size, words, live) in &c.image_list {
+        let live = live.map_or("never live".to_string(), |f| format!("live from frame {f}"));
+        println!("  image {at:08X}-{:08X} {words:6} words translated, {live}: {name}", at + size);
+    }
+    for (name, why) in &c.skipped {
+        println!("  skipped {name}: {why}");
+    }
+    for (name, checks, head, n, at, ram, disc) in &c.mismatched {
+        let which = if *head { "the last whose head matched" } else { "the last" };
+        println!("  never live {name}: {checks} checks; at {which}, {n} words differed, first {at:08X} = {ram:08X} (disc {disc:08X})");
+    }
+    let mut miss = c.missing.clone();
+    miss.sort_by_key(|&(a, n, ..)| (std::cmp::Reverse(n), a));
+    println!("missing: {} words in {} stretches", c.ran - c.covered, miss.len());
+    use psx2psp_engine::Miss;
+    for k in [Miss::Untranslated, Miss::NotHeld, Miss::Replaced, Miss::Outside] {
+        let (w, s) = miss.iter().filter(|m| m.3 == k).fold((0, 0), |(w, s), m| (w + m.1, s + 1));
+        println!("  {k:?}: {w} words in {s} stretches");
+    }
+    for (a, n, f, k) in miss.iter().take(40) {
+        println!("  {:08X}-{:08X} {n:6} words, first run by frame {f}: {k:?}", a | 0x8000_0000, (a + 4 * n) | 0x8000_0000);
     }
     Ok(())
 }

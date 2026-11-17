@@ -976,7 +976,7 @@ const CAPTURE_EVERY: u32 = 300;
 /// that runs there, as Lilo & Stitch does).
 pub fn captured_code(img: &DiscImage, patches: &[&dyn ImagePatch], kuseg: bool) -> Vec<native_code::Captured> {
     use psx2psp_recomp::overlay;
-    use psx2psp_sim::{CROSS, Machine, START};
+    use psx2psp_sim::Machine;
     let mut rd = img.reader();
     let read = move |lba: u32, buf: &mut [u8]| {
         let mut s = [0u8; SECTOR];
@@ -994,12 +994,7 @@ pub fn captured_code(img: &DiscImage, patches: &[&dyn ImagePatch], kuseg: bool) 
     let mut seen = std::collections::HashSet::new();
     let mut last: Option<std::sync::Arc<Vec<u8>>> = None;
     for f in 1..=CAPTURE_FRAMES {
-        let press = f.checked_sub(600).filter(|k| k % 150 < 6).map(|k| k / 150);
-        let alive = m.frame(match press {
-            Some(k) if k % 2 == 0 => START,
-            Some(_) => CROSS,
-            None => 0,
-        });
+        let alive = m.frame(capture_pad(f));
         if f % CAPTURE_EVERY != 0 && alive {
             continue;
         }
@@ -1053,6 +1048,171 @@ pub fn captured_code(img: &DiscImage, patches: &[&dyn ImagePatch], kuseg: bool) 
     }
     out.extend(ran);
     out
+}
+
+/// Why an instruction that ran had no static translation held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Miss {
+    /// A word of an image's text, as on the disc, that discovery did not translate.
+    Untranslated,
+    /// Translated in an image that did not hold it when it ran (its text did not hash as built).
+    NotHeld,
+    /// Inside an image's text with other bytes: code made or loaded at run time over it.
+    Replaced,
+    /// Outside every image: code loaded from a file the translation does not place, or made.
+    Outside,
+}
+
+/// What [`static_coverage`] measured.
+#[derive(Debug, Default)]
+pub struct Coverage {
+    /// Frames the game ran (fewer than asked when it stopped).
+    pub frames: u32,
+    /// Images (executables and overlays) the static translation made.
+    pub images: usize,
+    /// Distinct (address, instruction) the guest ran above the kernel area.
+    pub ran: usize,
+    /// Those a static image held, live and with a translation of that word, when they ran.
+    pub covered: usize,
+    /// Distinct addresses of the kernel area (below 0x10000) that ran: the BIOS's, not counted.
+    pub kernel: usize,
+    /// What ran without a static translation, by stretch of RAM of one [`Miss`]: (first
+    /// address, words, frame it was first seen, cause).
+    pub missing: Vec<(u32, u32, u32, Miss)>,
+    /// Per image: name, text address, text bytes, translated words, first frame it was live.
+    pub image_list: Vec<(String, u32, u32, usize, Option<u32>)>,
+    /// Executables and overlays the translation left out, and why.
+    pub skipped: Vec<(String, String)>,
+    /// Images never live: name, checks, whether the head matched at the failed check shown (the
+    /// last whose head did, else the last), words of RAM that differed from the disc text then,
+    /// and the first of them (address, RAM word, disc word).
+    pub mismatched: Vec<(String, u32, bool, usize, u32, u32, u32)>,
+}
+
+/// The goal's measure of the static analysis (AGENTS.md §1.1): the code a game runs on the
+/// psxrt core in the sim, against what the translation of its disc finds without running it
+/// (executables and overlays placed on the disc, [`native_code::build`] with no
+/// [`captured_code`]). The game runs `frames` frames with the input of [`captured_code`]; each
+/// instruction is covered when it ran while a static image held a translation of its word, as the
+/// runtime takes images ([`psx2psp_sim::Machine::watch`]: checked at the first run in the text
+/// after a load, held until a load over the word). Words rewritten inside a held image count as
+/// covered (the runtime patches them or sends their block to the interpreter): a measure of
+/// discovery, not of self-modifying code. `every` sets how often the maps are read.
+pub fn static_coverage(img: &DiscImage, patches: &[&dyn ImagePatch], frames: u32, every: u32) -> std::result::Result<Coverage, String> {
+    use psx2psp_sim::{Machine, RAM};
+    let (exes, overlays) = (disc_executables(img, patches), disc_overlay_files(img, patches));
+    // Each file's text as on the disc, by name: what an image holds where its words ran.
+    let texts: std::collections::HashMap<String, Vec<u8>> = exes
+        .iter()
+        .filter_map(|(n, b)| psx2psp_recomp::PsxExe::parse(b).ok().map(|x| (n.clone(), x.text)))
+        .chain(overlays.iter().map(|(n, b)| (n.clone(), b.clone())))
+        .collect();
+    let pack = native_code::build(exes, overlays, Vec::new())?;
+    let mut rd = img.reader();
+    let read = move |lba: u32, buf: &mut [u8]| {
+        let mut s = [0u8; SECTOR];
+        if img.read_sector(&mut rd, lba, &mut s).is_err() {
+            return false;
+        }
+        patches.iter().for_each(|p| p.apply(u64::from(lba) * SECTOR as u64, &mut s));
+        buf.copy_from_slice(&s);
+        true
+    };
+    let mut m = Machine::boot(img.sectors(), read).ok_or("the disc does not boot on the core")?;
+    let mut cov = Coverage { images: pack.images.len(), skipped: pack.skipped.clone(), ..Coverage::default() };
+    let mut ids = Vec::new();
+    for i in &pack.images {
+        let (size, words) = (i.text_size & !3, &i.code_words[..i.text_size as usize / 4]);
+        let head = i.text_size.min(native_code::HEAD_LEN as u32);
+        let id = m.watch(i.text_addr & 0x1F_FFFF, size, head, i.head_hash, i.hash, words).ok_or_else(|| format!("{} ({:#010x}, {} bytes, image {}): the sim cannot watch it", i.name, i.text_addr, i.text_size, ids.len()))?;
+        ids.push(id);
+        cov.image_list.push((i.name.clone(), i.text_addr, i.text_size, words.iter().filter(|&&t| t != 0).count(), None));
+    }
+    let mut seen = std::collections::HashMap::new();
+    let mut kernel = std::collections::BTreeSet::new();
+    let every = every.max(1);
+    for f in 1..=frames {
+        let alive = m.frame(capture_pad(f));
+        cov.frames = f;
+        for (k, &id) in ids.iter().enumerate() {
+            if cov.image_list[k].4.is_none() && m.watch_live(id) {
+                cov.image_list[k].4 = Some(f);
+            }
+        }
+        if f % every != 0 && f != frames && alive {
+            continue;
+        }
+        let (ran, held) = m.take_ran_held();
+        let ram = m.ram();
+        for w in (0..RAM / 4).filter(|&w| ran[w] != 0) {
+            let a = (w * 4) as u32;
+            if a < 0x1_0000 {
+                kernel.insert(a);
+                continue;
+            }
+            // Per (address, instruction): the frame it first ran by, and whether it ever ran held.
+            let e = seen.entry((a, u32::from_le_bytes(ram[w * 4..w * 4 + 4].try_into().unwrap()))).or_insert((f, false));
+            e.1 |= held[w] != 0;
+        }
+        if !alive {
+            break;
+        }
+    }
+    for (k, (&id, i)) in ids.iter().zip(&pack.images).enumerate() {
+        let (checks, miss) = m.watch_miss(id, i.text_size & !3);
+        let (Some((snap, head)), Some(text), None) = (miss, texts.get(&i.name), cov.image_list[k].4) else { continue };
+        let word = |b: &[u8], j: usize| b.get(4 * j..4 * j + 4).map_or(0, |w| u32::from_le_bytes(w.try_into().unwrap()));
+        let diff: Vec<usize> = (0..snap.len() / 4).filter(|&j| word(&snap, j) != word(text, j)).collect();
+        if let Some(&j) = diff.first() {
+            cov.mismatched.push((i.name.clone(), checks, head, diff.len(), i.text_addr + 4 * j as u32, word(&snap, j), word(text, j)));
+        }
+    }
+    cov.ran = seen.len();
+    cov.covered = seen.values().filter(|v| v.1).count();
+    // The cause of each miss: the least of those its images give (an image whose disc text has
+    // that instruction there decides between Untranslated and NotHeld).
+    let cause = |a: u32, insn: u32| {
+        let mut c = Miss::Outside;
+        for i in &pack.images {
+            let Some(o) = a.checked_sub(i.text_addr & 0x1F_FFFF).filter(|&o| o < i.text_size) else { continue };
+            let o = o as usize;
+            let same = texts.get(&i.name).and_then(|t| t.get(o..o + 4)).is_some_and(|w| w == insn.to_le_bytes());
+            let translated = i.code_words.get(o / 4).is_some_and(|&c| c != 0);
+            c = c.min(match (same, translated) {
+                (true, false) => Miss::Untranslated,
+                (true, true) => Miss::NotHeld,
+                (false, _) => Miss::Replaced,
+            });
+        }
+        c
+    };
+    let mut missing = std::collections::BTreeMap::new();
+    for (&(a, insn), &(f, _)) in seen.iter().filter(|(_, v)| !v.1) {
+        let e = missing.entry(a).or_insert((f, Miss::Outside));
+        *e = (e.0.min(f), e.1.min(cause(a, insn)));
+    }
+    cov.kernel = kernel.len();
+    for (&a, &(f, c)) in &missing {
+        match cov.missing.last_mut() {
+            Some((s, n, f0, c0)) if *s + 4 * *n == a && *c0 == c => {
+                *n += 1;
+                *f0 = (*f0).min(f);
+            }
+            _ => cov.missing.push((a, 1, f, c)),
+        }
+    }
+    Ok(cov)
+}
+
+/// The input of [`captured_code`] and [`static_coverage`] at frame `f`: Start and Cross pressed
+/// in turn, 6 frames every 150 from frame 600.
+fn capture_pad(f: u32) -> u16 {
+    use psx2psp_sim::{CROSS, START};
+    match f.checked_sub(600).filter(|k| k % 150 < 6).map(|k| k / 150) {
+        Some(k) if k % 2 == 0 => START,
+        Some(_) => CROSS,
+        None => 0,
+    }
 }
 
 /// An ISO9660 file of Mode 1 or Mode 2 Form 1 sectors, with `patches` applied to each sector.

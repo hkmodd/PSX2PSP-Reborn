@@ -51,6 +51,10 @@ pub struct CodeImage {
     pub patch: Vec<Vec<u8>>,
     /// A file without a PS-X EXE header, placed by [`overlay::locate_all`].
     pub overlay: bool,
+    /// One byte per word of the text up to `text_size`, nonzero where discovery found code
+    /// (delay slots and fused words included, which have no table entry): the words the
+    /// translation runs natively. Not written to the EBOOT.
+    pub code_words: Vec<u8>,
 }
 
 /// Bytes of RAM per block of the runtime's rewrite check (`psp/psxrt/native.c`, BLK_SHIFT).
@@ -392,6 +396,7 @@ pub fn build(exes: Vec<(String, Vec<u8>)>, overlays: Vec<(String, Vec<u8>)>, cap
                 runtime_calls: t.runtime.len(),
                 patch: patch_groups(&p.exe, &p.disc, &t),
                 overlay: p.overlay,
+                code_words: (0..text_size.div_ceil(4)).map(|w| u8::from(p.disc.code.contains(&(p.exe.text_addr + 4 * w)))).collect(),
             })
         })
         .collect();
