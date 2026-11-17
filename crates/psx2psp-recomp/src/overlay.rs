@@ -84,7 +84,9 @@ fn best(votes: &HashMap<u32, u32>, among: impl Fn(u32) -> bool) -> Option<((u32,
 /// [`WEAK`] and more than any other address, or [`TIED`] with no address above and no other
 /// slot as high. A file no slot takes keeps its own best address with [`WEAK`] votes and three
 /// times the runner-up's, without making it a slot (Silent Hill's ciphered module at 800CB3A4:
-/// 6 functions, 3 votes there, 1 anywhere else). A wrong slot costs nothing at run time: the runtime
+/// 6 functions, 3 votes there, 1 anywhere else). Only then a file takes a slot by its span
+/// ([`at_slot_by_span`]): that module's span also fits the slot 800CB354, 0x50 below its own
+/// address. A wrong slot costs nothing at run time: the runtime
 /// takes a translation only when the RAM there holds exactly the file.
 pub fn locate_all(files: &[&[u8]]) -> Vec<Option<(u32, u32)>> {
     let tallies: Vec<Option<HashMap<u32, u32>>> = files.iter().map(|f| tally(f)).collect();
@@ -99,27 +101,51 @@ pub fn locate_all(files: &[&[u8]]) -> Vec<Option<(u32, u32)>> {
     tallies
         .iter()
         .zip(strong)
-        .map(|(t, s)| {
+        .zip(files)
+        .map(|((t, s), f)| {
             s.or_else(|| {
-                let t = t.as_ref()?;
-                let at_slot = best(t, |b| slots.contains(&b)).and_then(|((b, v), slot2)| {
+                let at_slot = t.as_ref().and_then(|t| {
+                    let ((b, v), slot2) = best(t, |b| slots.contains(&b))?;
                     let other = best(t, |b| !slots.contains(&b)).map_or(0, |((_, v), _)| v);
                     (v >= WEAK && v > other || v >= TIED && v >= other && v > slot2).then_some((b, v))
                 });
-                at_slot.or_else(|| {
-                    let ((b, v), second) = best(t, |_| true)?;
-                    (v >= WEAK && v >= 3 * second).then_some((b, v))
-                })
+                at_slot
+                    .or_else(|| {
+                        let ((b, v), second) = best(t.as_ref()?, |_| true)?;
+                        (v >= WEAK && v >= 3 * second).then_some((b, v))
+                    })
+                    .or_else(|| at_slot_by_span(f, &slots))
             })
         })
         .collect()
 }
 
+/// The slot whose span `[slot, slot + len)` holds [`STRONG`] at least, one per KB of the span at
+/// least, and 15 in 16 of the RAM addresses `bytes` names by `j` or by a pointer word, with that
+/// count: code whose functions have no prologue to vote with (Spyro 2's level overlays at
+/// 800728F8: 16 prologues, no `jal` into themselves, but 477 to 601 `j` and 392 to 571 pointers,
+/// all into their slot; its other entries of 76 KB to 1.8 MB, data, under 88%, as a span that
+/// wide takes in other RAM too, or a few words in hundreds of KB).
+fn at_slot_by_span(bytes: &[u8], slots: &BTreeSet<u32>) -> Option<(u32, u32)> {
+    let len = (bytes.len() & !3) as u32;
+    let mut refs: Vec<u32> = bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .map(|w| if w >> 26 == 2 { 0x8000_0000 | (w & 0x03FF_FFFF) << 2 } else { w })
+        .filter(|&t| t & 3 == 0 && (LOW..HIGH).contains(&t))
+        .collect();
+    refs.sort_unstable();
+    let within = |b: u32| (refs.partition_point(|&t| t < b + len) - refs.partition_point(|&t| t < b)) as u32;
+    let (n, b) = slots.iter().filter(|&&b| b <= HIGH - len).map(|&b| (within(b), b)).max_by_key(|&(n, b)| (n, std::cmp::Reverse(b)))?;
+    (n >= STRONG && 16 * n as usize >= 15 * refs.len() && n >= len / 0x400).then_some((b, n))
+}
+
 /// The entries (offset, size) of an archive of `len` bytes whose `head` is a table of contents:
 /// little-endian (offset, size) pairs up to the first offset, each entry starting where the one
-/// before ends or at the next 2 KB sector. Games pack their level overlays so (Spyro 2's WAD.WAD:
-/// 196 entries, the level code among them), and an overlay is then an entry, not a file. Empty
-/// unless the table holds at least two entries; it ends at the first pair that breaks the rule.
+/// before ends or at the next 2 KB sector; an empty entry there is skipped (Spyro 2's 72nd).
+/// Games pack their level overlays so (Spyro 2's WAD.WAD: 196 entries, the level code among
+/// them), and an overlay is then an entry, not a file. Empty unless the table holds at least two
+/// entries; it ends at the first pair that breaks the rule.
 pub fn archive_entries(head: &[u8], len: u64) -> Vec<(u32, u32)> {
     let pair = |i: usize| head.get(i..i + 8).map(|p| (u32::from_le_bytes(p[..4].try_into().unwrap()), u32::from_le_bytes(p[4..].try_into().unwrap())));
     let Some((first, _)) = pair(0) else { return Vec::new() };
@@ -130,6 +156,10 @@ pub fn archive_entries(head: &[u8], len: u64) -> Vec<(u32, u32)> {
     let mut i = 0;
     while let Some((o, s)) = pair(i).filter(|_| i < first as usize) {
         let after = out.last().map_or(first as u64, |&(po, ps)| po as u64 + ps as u64);
+        if s == 0 && o as u64 == after {
+            i += 8;
+            continue;
+        }
         if s == 0 || (o as u64) < after || o as u64 - after >= 0x800 || o as u64 + s as u64 > len {
             break;
         }
@@ -354,6 +384,15 @@ mod tests {
         // no slot (`small` stays unplaced beside it).
         let alone = file(&[0, 10, 50], &[x, x + 40, x + 200]);
         assert_eq!(locate_all(&[&alone, &small]), vec![Some((x, 3)), None]);
+        // No prologue: 16 `j` and pointers into B's span of 2 KB, and one word elsewhere, take
+        // slot B; with a second word elsewhere (15 in 17) it stays unplaced.
+        let mut refs: Vec<u32> = (0..8).map(|k| 0x0800_0000 | (B + 64 * k) >> 2 & 0x03FF_FFFF).chain((0..8).map(|k| B + 4 + 64 * k)).collect();
+        refs.push(x);
+        let flat = file(&[], &refs);
+        assert_eq!(locate_all(&[&strong, &flat])[1], Some((B, 16)));
+        refs.push(x + 4);
+        assert_eq!(locate_all(&[&strong, &file(&[], &refs)])[1], None);
+        assert_eq!(locate_all(&[&flat]), vec![None]);
     }
 
     #[test]
@@ -436,6 +475,9 @@ mod tests {
         // Sector padding between entries is allowed; the table stops at the first odd pair.
         let padded = [(0x18, 0x100), (0x800, 0x10), (0x1000, 4), (0, 0), (0x1000, 4)];
         assert_eq!(archive_entries(&toc(&padded), 0x2000), padded[..3].to_vec());
+        // An empty entry where the next would start is skipped (Spyro 2's 72nd).
+        let empty = [(0x800, 0x20000), (0x20800, 0), (0x20800, 0x13000)];
+        assert_eq!(archive_entries(&toc(&empty), 0xA2000), vec![empty[0], empty[2]]);
         // An entry past the end of the file, a single entry, or a head that is not a table.
         assert!(archive_entries(&toc(&wad), 0xA1FFF).len() == 2);
         assert!(archive_entries(&toc(&wad[..1]), 0xA2000).is_empty());

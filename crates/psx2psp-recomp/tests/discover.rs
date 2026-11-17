@@ -301,6 +301,33 @@ fn unknown_jumps_and_invalid_words_are_reported() {
     assert_eq!(h.merged_pairs, 1);
 }
 
+/// A `jr` into the `j` right after it (a table of jumps indexed by eight bytes) reaches each
+/// of them and their targets; one `j` alone is no table.
+#[test]
+fn a_table_of_jumps_after_a_jump_register_is_followed() {
+    let x = exe(&[
+        r(0, 0, AT, AT, 3),   // 0 sll at,at,3
+        r(0x21, AT, A0, AT, 0), // 1 addu at,at,a0
+        r(8, AT, 0, 0, 0),    // 2 jr at
+        NOP,                  // 3
+        j(2, 10),             // 4 j 10
+        NOP,                  // 5
+        j(2, 12),             // 6 j 12
+        NOP,                  // 7
+        r(8, RA, 0, 0, 0),    // 8 jr ra (not reached)
+        NOP,                  // 9
+        r(8, RA, 0, 0, 0),    // 10 jr ra
+        NOP,                  // 11
+        r(8, RA, 0, 0, 0),    // 12 jr ra
+        NOP,                  // 13
+    ]);
+    let d = Discovery::run(&x);
+    assert_eq!(d.jumps[&at(2)], JumpReg::Table { table: at(4), targets: vec![at(4), at(6)], bounded: false });
+    assert!([4, 5, 6, 7, 10, 11, 12, 13].iter().all(|&n| d.code.contains(&at(n))));
+    let one = exe(&[r(8, AT, 0, 0, 0), NOP, j(2, 4), NOP, r(8, RA, 0, 0, 0), NOP]);
+    assert!(matches!(Discovery::run(&one).jumps[&at(0)], JumpReg::Unresolved(_)));
+}
+
 /// Runs discovery and the hazard check on real executables:
 /// `PSX2PSP_EXES=<dir> cargo test -p psx2psp-recomp --test discover -- --ignored --nocapture`.
 #[test]

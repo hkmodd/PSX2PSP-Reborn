@@ -273,11 +273,28 @@ impl Image<'_> {
         let rs = self.at(pc).map_or(0, |(i, _)| i.rs());
         match self.switch_table(rs, pc) {
             Ok(t) => t,
-            Err(why) => match self.const_of(rs, pc) {
-                Some(c) => JumpReg::Const(c),
-                None => JumpReg::Unresolved(why),
+            Err(why) => match (self.const_of(rs, pc), self.jump_list(pc)) {
+                (Some(c), _) => JumpReg::Const(c),
+                (None, Some(targets)) => JumpReg::Table { table: pc.wrapping_add(8), targets, bounded: false },
+                (None, None) => JumpReg::Unresolved(why),
             },
         }
+    }
+
+    /// The `j` into the text, each with its delay slot, that follow the `jr` at `pc` and its slot,
+    /// two at least: a table of jumps the register indexes by eight bytes (Spyro 2's
+    /// `sll at,at,3 / addu at,at,a0 / jr at` at 8002BDF0, into eight `j` and `nop`).
+    fn jump_list(self, pc: u32) -> Option<Vec<u32>> {
+        let mut out = Vec::new();
+        let mut a = pc.wrapping_add(8);
+        while let (Some(Flow::Goto(t)), Some(_)) = (self.flow_at(a).filter(|_| self.at(a).is_some_and(|(_, k)| k == Kind::J)), self.at(a.wrapping_add(4))) {
+            if !self.0.contains(t) {
+                break;
+            }
+            out.push(a);
+            a = a.wrapping_add(8);
+        }
+        (out.len() >= 2).then_some(out)
     }
 
     /// `sltiu at,idx,N / … / sll t,idx,2 / lui b,hi / addu b,b,t / lw r,lo(b) / jr r`.
