@@ -531,12 +531,12 @@ fn cmd_coverage(args: &[String]) -> R {
     miss.sort_by_key(|&(a, n, ..)| (std::cmp::Reverse(n), a));
     println!("missing: {} words in {} stretches", c.ran - c.covered, miss.len());
     use psx2psp_engine::Miss;
-    for k in [Miss::Untranslated, Miss::NotHeld, Miss::Replaced, Miss::Outside] {
+    for k in [Miss::Untranslated, Miss::NotHeld, Miss::Replaced, Miss::Outside, Miss::Floating, Miss::Unlisted] {
         let (w, s) = miss.iter().filter(|m| m.3 == k).fold((0, 0), |(w, s), m| (w + m.1, s + 1));
         println!("  {k:?}: {w} words in {s} stretches");
     }
-    // The 40 largest, and every one the translator could hold (not Outside): discovery's holes.
-    for (_, (a, n, f, k)) in miss.iter().enumerate().filter(|(i, m)| *i < 40 || m.3 != Miss::Outside) {
+    // The 40 largest, and every one the translator could hold (in an image): discovery's holes.
+    for (_, (a, n, f, k)) in miss.iter().enumerate().filter(|(i, m)| *i < 40 || m.3 < Miss::Outside) {
         println!("  {:08X}-{:08X} {n:6} words, first run by frame {f}: {k:?}", a | 0x8000_0000, (a + 4 * n) | 0x8000_0000);
     }
     Ok(())

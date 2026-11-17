@@ -1107,6 +1107,47 @@ pub enum Miss {
     Replaced,
     /// Outside every image: code loaded from a file the translation does not place, or made.
     Outside,
+    /// Outside every image, with the words of a disc file the translation does not place, or
+    /// the same instructions with other addresses in them: code a file holds at an address the
+    /// game picks as it runs ([`floating_in`]).
+    Floating,
+    /// Outside every image, Floating but in a disc file no overlay candidate holds that part of
+    /// ([`disc_overlay_files`] cut it out).
+    Unlisted,
+}
+
+/// Whether `run` (consecutive instructions) is in one of `files` at a word boundary: each
+/// instruction the file's, or the same one with another address in it (`j`/`jal` target, or the
+/// immediate of a `lui`, `addiu`, `ori`, load or store: the loader relocated it), and at least
+/// half of them the file's exactly. The run is looked for by its first instruction that holds
+/// no address. Answers per run.
+pub fn floating_in(runs: &[Vec<u32>], files: impl IntoIterator<Item = impl AsRef<[u8]>>) -> Vec<bool> {
+    let addr = |w: u32| matches!(w >> 26, 2 | 3 | 0x09 | 0x0D | 0x0F | 0x20..=0x2E);
+    let same = |r: u32, f: u32| r == f || (r >> 26 == f >> 26 && addr(r) && (r >> 26 <= 3 || r >> 16 == f >> 16));
+    let mut by: std::collections::HashMap<u32, Vec<(usize, usize)>> = std::collections::HashMap::new();
+    for (n, r) in runs.iter().enumerate() {
+        if let Some(k) = r.iter().position(|&w| w != 0 && !addr(w)) {
+            by.entry(r[k]).or_default().push((n, k));
+        }
+    }
+    let mut found = vec![false; runs.len()];
+    for f in files {
+        let f = f.as_ref();
+        let word = |j: usize| u32::from_le_bytes(f[4 * j..4 * j + 4].try_into().unwrap());
+        for p in 0..f.len() / 4 {
+            let Some(list) = by.get(&word(p)) else { continue };
+            for &(n, k) in list {
+                let r = &runs[n];
+                if found[n] || p < k || p - k + r.len() > f.len() / 4 {
+                    continue;
+                }
+                let q = p - k;
+                let exact = (0..r.len()).filter(|&i| r[i] == word(q + i)).count();
+                found[n] = 2 * exact >= r.len() && (0..r.len()).all(|i| same(r[i], word(q + i)));
+            }
+        }
+    }
+    found
 }
 
 /// What [`static_coverage`] measured.
@@ -1236,6 +1277,42 @@ pub fn static_coverage(img: &DiscImage, patches: &[&dyn ImagePatch], cipher: Opt
     for (&(a, insn), &(f, _)) in seen.iter().filter(|(_, v)| !v.1) {
         let e = missing.entry(a).or_insert((f, Miss::Outside));
         *e = (e.0.min(f), e.1.min(cause(a, insn)));
+    }
+    // Runs of Outside words an overlay candidate holds unplaced become Floating; then those a
+    // disc file holds, Unlisted. A run is one version of the words: the same first frame (files
+    // loaded at one address in turn give it other words later), consecutive addresses. An
+    // address takes the category when every version of it does.
+    let mut outside: Vec<(u32, u32, u32)> = seen.iter().filter(|&(k, v)| !v.1 && missing[&k.0].1 == Miss::Outside).map(|(k, v)| (v.0, k.0, k.1)).collect();
+    outside.sort_unstable();
+    let mut runs: Vec<Vec<(u32, u32)>> = Vec::new();
+    let mut last = None;
+    for &(f, a, i) in &outside {
+        if last != Some((f, a.wrapping_sub(4))) {
+            runs.push(Vec::new());
+        }
+        runs.last_mut().unwrap().push((a, i));
+        last = Some((f, a));
+    }
+    let mut rd = img.reader();
+    let files = img.iso_files().unwrap_or_default();
+    let all = files.iter().filter_map(|f| read_patched_file(img, &mut rd, f, patches).ok());
+    let mut fate: std::collections::HashMap<u32, Miss> = std::collections::HashMap::new();
+    let words = |r: &[(u32, u32)]| r.iter().map(|w| w.1).collect::<Vec<_>>();
+    let listed = floating_in(&runs.iter().map(|r| words(r)).collect::<Vec<_>>(), texts.values());
+    let left: Vec<usize> = (0..runs.len()).filter(|&k| !listed[k]).collect();
+    let on_disc = floating_in(&left.iter().map(|&k| words(&runs[k])).collect::<Vec<_>>(), all);
+    let mut kind = vec![Miss::Floating; runs.len()];
+    for (j, &k) in left.iter().enumerate() {
+        kind[k] = if on_disc[j] { Miss::Unlisted } else { Miss::Outside };
+    }
+    for (r, k) in runs.iter().zip(kind) {
+        for &(a, _) in r {
+            let e = fate.entry(a).or_insert(Miss::Floating);
+            *e = (*e).min(k);
+        }
+    }
+    for (a, k) in fate {
+        missing.get_mut(&a).unwrap().1 = k;
     }
     cov.kernel = kernel.len();
     for (&a, &(f, c)) in &missing {
