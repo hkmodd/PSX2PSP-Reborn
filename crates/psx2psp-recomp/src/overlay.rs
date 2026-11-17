@@ -139,25 +139,71 @@ fn is_boundary(w: u32) -> bool {
     is_prologue(w) || w == 0x03E0_0008 || matches!(w >> 16, 0xAFBF | 0x8FBF)
 }
 
+/// Size of the blocks [`code_block`] judges: a CD sector's user data.
+pub const CODE_BLOCK: usize = 0x800;
+
+/// Whether a [`CODE_BLOCK`] holds code: two function-boundary words at least.
+pub fn code_block(block: &[u8]) -> bool {
+    block.chunks_exact(4).filter(|c| is_boundary(u32::from_le_bytes((*c).try_into().unwrap()))).nth(1).is_some()
+}
+
+/// The runs (first, last) of the blocks `code` marks, with gaps of up to two blocks inside.
+pub fn block_runs(code: impl IntoIterator<Item = bool>) -> Vec<(usize, usize)> {
+    const GAP: usize = 2;
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for (b, _) in code.into_iter().enumerate().filter(|&(_, c)| c) {
+        match runs.last_mut() {
+            Some((_, last)) if b - *last <= GAP + 1 => *last = b,
+            _ => runs.push((b, b)),
+        }
+    }
+    runs
+}
+
+/// A cipher of a game's files, from the database (`patches.ini` `cipher = xor_lcg ADD MUL`):
+/// each little-endian word of a file XORed with a keystream `s = (s + add) * mul` (mod 2^32,
+/// `s` = 0 at the file's start, stepped before each word). Silent Hill keeps its body so in
+/// SILENT (add 0x01309125, mul 0x03A452F7), and its code is found only deciphered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct XorLcg {
+    pub add: u32,
+    pub mul: u32,
+}
+
+impl XorLcg {
+    /// Deciphers `data`, the bytes of a file from its start.
+    pub fn apply(self, data: &mut [u8]) {
+        let mut s = 0u32;
+        for c in data.chunks_exact_mut(4) {
+            s = s.wrapping_add(self.add).wrapping_mul(self.mul);
+            let w = u32::from_le_bytes((*c).try_into().unwrap()) ^ s;
+            c.copy_from_slice(&w.to_le_bytes());
+        }
+    }
+
+    /// Whether `sector` (a [`CODE_BLOCK`]) starts a file so ciphered: deciphered from there, an
+    /// eighth of its words have a top byte 00 or FF (code and data: about half; anything else
+    /// deciphered with a keystream it was not ciphered with is noise, 2 in 256). Silent Hill's
+    /// SILENT: its two ciphered files score 149 and 124 of 512 words, its other 47108 sectors
+    /// under 16.
+    pub fn starts(self, sector: &[u8]) -> bool {
+        let mut d = sector[..sector.len() & !3].to_vec();
+        self.apply(&mut d);
+        d.chunks_exact(4).filter(|c| matches!(c[3], 0 | 0xFF)).count() * 8 >= d.len() / 4
+    }
+}
+
 /// The code in a RAM image `ram` (offset 0 = physical address 0): runs of 2 KB blocks with at
 /// least two function-boundary words each, gaps of up to two blocks inside, cut to its first
 /// prologue and its last `jr ra` with the delay slot; [`WEAK`] prologues at least. Data almost
 /// never holds these words in such numbers (Silent Hill's RAM in game: 5 runs, the EXE, the body
 /// it decompresses at 8002DD08-800A8974 in three, and the room's overlay). (start, end) offsets.
 pub fn code_runs(ram: &[u8]) -> Vec<(u32, u32)> {
-    const BLOCK: usize = 0x800;
-    const GAP: usize = 2;
+    const BLOCK: usize = CODE_BLOCK;
     let word = |o: usize| u32::from_le_bytes(ram[o..o + 4].try_into().unwrap());
-    let code = |b: usize| (b * BLOCK..(b + 1) * BLOCK).step_by(4).filter(|&o| is_boundary(word(o))).count() >= 2;
     let blocks = ram.len() / BLOCK;
-    let mut runs: Vec<(usize, usize)> = Vec::new();
-    for b in (0..blocks).filter(|&b| code(b)) {
-        match runs.last_mut() {
-            Some((_, last)) if b - *last <= GAP + 1 => *last = b,
-            _ => runs.push((b, b)),
-        }
-    }
-    runs.into_iter()
+    block_runs((0..blocks).map(|b| code_block(&ram[b * BLOCK..(b + 1) * BLOCK])))
+        .into_iter()
         .filter_map(|(first, last)| {
             let (lo, hi) = (first * BLOCK, (last + 1) * BLOCK);
             let pro: Vec<usize> = (lo..hi).step_by(4).filter(|&o| is_prologue(word(o))).collect();
@@ -262,6 +308,30 @@ mod tests {
         put(0x4100, PROLOGUE);
         put(0x4200, 0x03E0_0008);
         assert!(code_runs(&ram).is_empty());
+    }
+
+    #[test]
+    fn a_ciphered_file_is_found_by_its_start_and_deciphered() {
+        let k = XorLcg { add: 0x0130_9125, mul: 0x03A4_52F7 };
+        // The keystream: s1 = 0x01309125 * 0x03A452F7, s2 = (s1 + 0x01309125) * 0x03A452F7.
+        let s1 = 0x0130_9125u32.wrapping_mul(0x03A4_52F7);
+        let s2 = s1.wrapping_add(0x0130_9125).wrapping_mul(0x03A4_52F7);
+        let mut two = [0u8; 8];
+        k.apply(&mut two);
+        assert_eq!(two, [s1.to_le_bytes(), s2.to_le_bytes()].concat()[..]);
+        // A sector of code ciphered from its start is a start; it plain is not, nor is it
+        // ciphered from elsewhere in its file (the keystream a sector further on).
+        let code = file(&[0, 40, 80, 120], &[]);
+        let mut ciphered = [vec![0u8; 0x800], code.clone()].concat();
+        k.apply(&mut ciphered);
+        let (head, tail) = ciphered.split_at(0x800);
+        assert!(k.starts(head) && !k.starts(&code) && !k.starts(tail));
+        let mut back = ciphered.clone();
+        k.apply(&mut back);
+        assert_eq!(&back[0x800..], &code[..]);
+        // block_runs: gaps of two blocks join, of three split.
+        let marks = |s: &str| s.chars().map(|c| c == '#').collect::<Vec<_>>();
+        assert_eq!(block_runs(marks("#..#...#.#")), vec![(0, 3), (7, 9)]);
     }
 
     #[test]

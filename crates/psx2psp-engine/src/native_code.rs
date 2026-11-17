@@ -321,19 +321,40 @@ pub fn build(exes: Vec<(String, Vec<u8>)>, overlays: Vec<(String, Vec<u8>)>, cap
         .par_iter()
         .map(|p| translate(&p.exe, &p.disc, &p.hz, PROVISIONAL).map(|t| t.words.len() as u32 * 4).map_err(|e| e.to_string()))
         .collect();
-    // Group: region size, and whether an executable is in it.
-    let mut groups: BTreeMap<u32, (u32, bool)> = BTreeMap::new();
     let mut ok = Vec::new();
     for (p, size) in parsed.into_iter().zip(sizes) {
         match size {
-            Ok(n) => {
-                let g = groups.entry(p.exe.text_addr).or_default();
-                g.0 = g.0.max(n.next_multiple_of(ALIGN));
-                g.1 |= !p.overlay;
-                ok.push((p, n));
-            }
+            Ok(n) => ok.push((p, n, 0)),
             Err(e) => pack.skipped.push((p.name, e)),
         }
+    }
+    // Texts that share an address are never in RAM together: the levels of a game at one
+    // address, the rooms of an overlay slot that each start at their own first function (Silent
+    // Hill: 246 runs of SILENT from 800CB370 on). They share a host region, as large as the
+    // largest. A group is every text left that holds one address, the last byte of the text
+    // that ends first among them (the fewest groups), and is keyed by it. Texts that share no
+    // address get disjoint regions, so they can be resident together.
+    let span = |x: &PsxExe| (x.text_addr & 0x1FFF_FFFF, (x.text_addr & 0x1FFF_FFFF) + x.text.len().max(1) as u32);
+    let mut order: Vec<usize> = (0..ok.len()).collect();
+    order.sort_by_key(|&i| span(&ok[i].0.exe).1);
+    for &i in &order {
+        if ok[i].2 != 0 {
+            continue;
+        }
+        let at = span(&ok[i].0.exe).1 - 1;
+        for o in ok.iter_mut().filter(|o| o.2 == 0) {
+            let (a, b) = span(&o.0.exe);
+            if a <= at && at < b {
+                o.2 = at | 0x8000_0000;
+            }
+        }
+    }
+    // Group: region size, and whether an executable is in it.
+    let mut groups: BTreeMap<u32, (u32, bool)> = BTreeMap::new();
+    for (p, n, at) in &ok {
+        let g = groups.entry(*at).or_default();
+        g.0 = g.0.max(n.next_multiple_of(ALIGN));
+        g.1 |= !p.overlay;
     }
     let base_for = |groups: &BTreeMap<u32, (u32, bool)>| {
         let total: u32 = groups.values().map(|g| g.0).sum();
@@ -342,10 +363,10 @@ pub fn build(exes: Vec<(String, Vec<u8>)>, overlays: Vec<(String, Vec<u8>)>, cap
     while base_for(&groups).1.is_none() {
         let Some((&at, &(size, _))) = groups.iter().filter(|(_, g)| !g.1).max_by_key(|(_, g)| g.0) else { break };
         groups.remove(&at);
-        for (p, _) in ok.iter().filter(|(p, _)| p.exe.text_addr == at) {
-            pack.skipped.push((p.name.clone(), format!("overlay at {at:#010x}: its {size} B of code do not fit")));
+        for (p, ..) in ok.iter().filter(|o| o.2 == at) {
+            pack.skipped.push((p.name.clone(), format!("overlay at {:#010x}: the {size} B of code of the texts over {at:#010x} do not fit", p.exe.text_addr)));
         }
-        ok.retain(|(p, _)| p.exe.text_addr != at);
+        ok.retain(|o| o.2 != at);
     }
     if ok.is_empty() {
         return Ok(pack);
@@ -365,8 +386,8 @@ pub fn build(exes: Vec<(String, Vec<u8>)>, overlays: Vec<(String, Vec<u8>)>, cap
 
     let images: Vec<Result<CodeImage, String>> = ok
         .into_par_iter()
-        .map(|(p, len)| {
-            let host_base = groups[&p.exe.text_addr].0;
+        .map(|(p, len, at)| {
+            let host_base = groups[&at].0;
             let t = translate(&p.exe, &p.disc, &p.hz, host_base).map_err(|e| e.to_string())?;
             if t.words.len() as u32 * 4 != len {
                 return Err(format!("translation at {host_base:#010x} is {} words, {} at first", t.words.len(), len / 4));
@@ -488,6 +509,29 @@ mod tests {
         assert_eq!(c.hash, fnv1a32(&[JR_RA.to_le_bytes(), [0; 4]].concat()));
         assert_eq!(c.head_hash, c.hash); // text shorter than HEAD_LEN
         assert!((0..3).all(|i| word(&a.table, i) == layout::MISS || (a.host_base..a.host_base + a.code.len() as u32).contains(&word(&a.table, i))));
+    }
+
+    #[test]
+    fn texts_that_share_an_address_share_a_host_region() {
+        // Silent Hill's rooms: one slot, each text from its own first function. R1 and R2 hold
+        // 800CB378, R3 overlaps R2 only: a group of its own. M shares nothing.
+        let pack = build(
+            vec![
+                ("R1.EXE".into(), exe(0x800C_B370, &[JR_RA, 0, JR_RA, 0])),
+                ("R2.EXE".into(), exe(0x800C_B378, &[ADDIU_V0_1, JR_RA, 0])),
+                ("R3.EXE".into(), exe(0x800C_B380, &[JR_RA, 0])),
+                ("M.EXE".into(), exe(0x8001_0000, &[JR_RA, 0])),
+            ],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let [m, r1, r2, r3] = &pack.images[..] else { panic!("{} images", pack.images.len()) };
+        assert_eq!((m.name.as_str(), r1.name.as_str(), r3.name.as_str()), ("M.EXE", "R1.EXE", "R3.EXE"));
+        assert_eq!(r1.host_base, r2.host_base);
+        let region = |i: &CodeImage| i.host_base..i.host_base + i.code.len() as u32;
+        let apart = |a: &CodeImage, b: &CodeImage| region(a).end <= region(b).start || region(b).end <= region(a).start;
+        assert!(apart(m, r1) && apart(m, r2) && apart(m, r3) && apart(r1, r3) && apart(r2, r3));
     }
 
     #[test]

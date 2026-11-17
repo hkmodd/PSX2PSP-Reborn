@@ -918,43 +918,75 @@ pub fn disc_executables(img: &DiscImage, patches: &[&dyn ImagePatch]) -> Vec<(St
 }
 
 /// The files of the disc that could be overlays (S24): not a PS-X EXE, and from 0x800 to
-/// [`native_code::OVERLAY_MAX`] bytes; and the entries of that size of an archive of any size
-/// ([`overlay::archive_entries`]), named `FILE+offset`. Which of them are code, and where, is
+/// [`native_code::OVERLAY_MAX`] bytes; the entries of that size of an archive of any size
+/// ([`overlay::archive_entries`]), named `FILE+offset`; in a larger file with no such table
+/// (Silent Hill's SILENT, 96 MB of rooms one after the other), each run of code
+/// ([`overlay::code_runs`]), named `FILE+offset` too. With the game's `cipher` (database), the
+/// code of each file so ciphered, deciphered from the sector it starts at to the next such start
+/// ([`overlay::XorLcg::starts`]), named `FILE^offset` and listed first: a game's body before its
+/// rooms when [`native_code::MAX_IMAGES`] cuts. Which of them are code, and where, is
 /// [`native_code::build`]'s to find.
-pub fn disc_overlay_files(img: &DiscImage, patches: &[&dyn ImagePatch]) -> Vec<(String, Vec<u8>)> {
-    use psx2psp_recomp::overlay;
+pub fn disc_overlay_files(img: &DiscImage, patches: &[&dyn ImagePatch], cipher: Option<psx2psp_recomp::overlay::XorLcg>) -> Vec<(String, Vec<u8>)> {
+    use psx2psp_recomp::overlay::{self, CODE_BLOCK};
     const HEAD: u32 = 0x1_0000;
+    /// Sectors read at once from a file too large to read whole.
+    const CHUNK: u32 = 0x200;
     let Ok(files) = img.iso_files() else { return Vec::new() };
     let fits = |n: u32| (0x800..=native_code::OVERLAY_MAX).contains(&n);
     let mut rd = img.reader();
-    let mut out = Vec::new();
+    let (mut first, mut out) = (Vec::new(), Vec::new());
     for f in files.iter().filter(|f| f.size >= 0x800) {
         if img.read_file(&mut rd, f, 8).is_ok_and(|h| h == b"PS-X EXE") {
             continue;
         }
         let name = f.path.rsplit('/').next().unwrap_or(&f.path).to_string();
         let whole = if fits(f.size) { read_patched_range(img, &mut rd, f, 0, f.size, patches).ok() } else { None };
-        let head = match &whole {
-            Some(b) => b[..b.len().min(HEAD as usize)].to_vec(),
-            None => read_patched_range(img, &mut rd, f, 0, f.size.min(HEAD), patches).unwrap_or_default(),
+        let mut read = |o: u32, n: u32| match &whole {
+            Some(b) => Some(b[o as usize..(o + n) as usize].to_vec()),
+            None => read_patched_range(img, &mut rd, f, o, n, patches).ok(),
         };
-        for (o, s) in overlay::archive_entries(&head, u64::from(f.size)) {
-            if !fits(s) {
-                continue;
-            }
-            let bytes = match &whole {
-                Some(b) => Ok(b[o as usize..(o + s) as usize].to_vec()),
-                None => read_patched_range(img, &mut rd, f, o, s, patches),
-            };
-            if let Ok(bytes) = bytes {
+        let head = read(0, f.size.min(HEAD)).unwrap_or_default();
+        let entries = overlay::archive_entries(&head, u64::from(f.size));
+        for &(o, s) in entries.iter().filter(|e| fits(e.1)) {
+            if let Some(bytes) = read(o, s) {
                 out.push((format!("{name}+{o:X}"), bytes));
             }
+        }
+        // Each sector once: whether it is code, whether it starts a ciphered file.
+        let big = whole.is_none() && entries.is_empty();
+        let (mut code, mut starts) = (Vec::new(), Vec::new());
+        if big || cipher.is_some() {
+            for c in (0..f.size.div_ceil(2048)).step_by(CHUNK as usize) {
+                let Some(b) = read(2048 * c, (f.size - 2048 * c).min(2048 * CHUNK)) else { break };
+                for (i, s) in b.chunks_exact(CODE_BLOCK).enumerate() {
+                    code.push(big && overlay::code_block(s));
+                    if cipher.is_some_and(|k| k.starts(s)) {
+                        starts.push(c + i as u32);
+                    }
+                }
+            }
+        }
+        for (k, &s) in starts.iter().enumerate() {
+            let (o, cipher) = (2048 * s, cipher.unwrap());
+            let end = starts.get(k + 1).map_or(f.size, |&n| 2048 * n).min(o + native_code::OVERLAY_MAX);
+            let Some(mut b) = read(o, end - o) else { continue };
+            cipher.apply(&mut b);
+            first.extend(overlay::code_runs(&b).into_iter().map(|(a, e)| (format!("{name}^{:X}", o + a), b[a as usize..e as usize].to_vec())));
+        }
+        for (a, z) in overlay::block_runs(code) {
+            let (o, n) = (2048 * a as u32, 2048 * (z - a + 1) as u32);
+            if n > native_code::OVERLAY_MAX {
+                continue;
+            }
+            let Some(b) = read(o, n) else { continue };
+            out.extend(overlay::code_runs(&b).into_iter().map(|(s, e)| (format!("{name}+{:X}", o + s), b[s as usize..e as usize].to_vec())));
         }
         if let Some(bytes) = whole {
             out.push((name, bytes));
         }
     }
-    out
+    first.extend(out);
+    first
 }
 
 /// Frames [`captured_code`] runs a disc for: a minute of game, ~13 s on the PC for Silent Hill.
@@ -1098,9 +1130,9 @@ pub struct Coverage {
 /// after a load, held until a load over the word). Words rewritten inside a held image count as
 /// covered (the runtime patches them or sends their block to the interpreter): a measure of
 /// discovery, not of self-modifying code. `every` sets how often the maps are read.
-pub fn static_coverage(img: &DiscImage, patches: &[&dyn ImagePatch], frames: u32, every: u32) -> std::result::Result<Coverage, String> {
+pub fn static_coverage(img: &DiscImage, patches: &[&dyn ImagePatch], cipher: Option<psx2psp_recomp::overlay::XorLcg>, frames: u32, every: u32) -> std::result::Result<Coverage, String> {
     use psx2psp_sim::{Machine, RAM};
-    let (exes, overlays) = (disc_executables(img, patches), disc_overlay_files(img, patches));
+    let (exes, overlays) = (disc_executables(img, patches), disc_overlay_files(img, patches, cipher));
     // Each file's text as on the disc, by name: what an image holds where its words ran.
     let texts: std::collections::HashMap<String, Vec<u8>> = exes
         .iter()
@@ -1481,6 +1513,10 @@ pub fn convert_native(req: &ConvertRequest, monitor: &dyn Monitor) -> Result<Con
     if manual_disc {
         monitor.log("Native: the player changes the disc (L+R+SELECT), not the runtime (disc_swap = manual)");
     }
+    let cipher = id0.as_ref().and_then(|id| req.patches.cipher(&req.patches.pops_id(id)));
+    if cipher.is_some() {
+        monitor.log("Native: the code of the game's ciphered files is looked for deciphered (cipher)");
+    }
     let discs = req.discs.iter().enumerate().map(|(n, d)| native_disc(req, d, n, pal60, monitor)).collect::<Result<Vec<_>>>()?;
     let disc_id = discs[0].disc_id.clone();
 
@@ -1498,7 +1534,7 @@ pub fn convert_native(req: &ConvertRequest, monitor: &dyn Monitor) -> Result<Con
                 exes.push(e);
             }
         }
-        for o in disc_overlay_files(&d.img, &patches) {
+        for o in disc_overlay_files(&d.img, &patches, cipher) {
             if !overlays.iter().any(|x| x.1 == o.1) {
                 overlays.push(o);
             }

@@ -136,6 +136,9 @@ pub struct Game {
     /// that way for something else. `auto` (the default) undoes a built-in `manual`.
     pub manual_disc: Option<bool>,
     pub origin: Origin,
+    /// `cipher = xor_lcg ADD MUL`: the cipher of the game's files that hold code (native
+    /// conversion: its code is found deciphered, [`psx2psp_recomp::overlay::XorLcg`]).
+    pub cipher: Option<psx2psp_recomp::overlay::XorLcg>,
 }
 
 /// Games and patches in priority order: user entries first ([`PatchDb::with_user`]).
@@ -454,10 +457,21 @@ impl Section<'_> {
                 _ => return Err(self.err(l, format!("disc_swap `{v}`: auto or manual"))),
             },
         };
+        let cipher = match self.take("cipher") {
+            None => None,
+            Some((v, l)) => {
+                let w: Vec<&str> = v.split_whitespace().collect();
+                let hex = |s: &str| u32::from_str_radix(s.trim_start_matches("0x").trim_start_matches("0X"), 16).ok();
+                match (w.first().map(|k| k.to_ascii_lowercase()), w.get(1).and_then(|s| hex(s)), w.get(2).and_then(|s| hex(s))) {
+                    (Some(k), Some(add), Some(mul)) if k == "xor_lcg" && w.len() == 3 => Some(psx2psp_recomp::overlay::XorLcg { add, mul }),
+                    _ => return Err(self.err(l, format!("cipher `{v}`: xor_lcg ADD MUL (hex)"))),
+                }
+            }
+        };
         let mut text = |k: &str| self.take(k).map(|v| v.0).unwrap_or_default();
         let (title, source, note) = (text("title"), text("source"), text("note"));
         self.finish()?;
-        Ok(Game { ids, title, config, source, note, switches, libcrypt, pops_id, min_level, pal60, manual_disc, origin })
+        Ok(Game { ids, title, config, source, note, switches, libcrypt, pops_id, min_level, pal60, manual_disc, origin, cipher })
     }
 
     fn patch(mut self, origin: Origin) -> Result<Patch, ParseError> {
@@ -640,6 +654,11 @@ impl PatchDb {
         self.game_field(id, |g| g.manual_disc).unwrap_or(false)
     }
 
+    /// The cipher of `id`'s files that hold code ([`Game::cipher`]), if it has one.
+    pub fn cipher(&self, id: &str) -> Option<psx2psp_recomp::overlay::XorLcg> {
+        self.game_field(id, |g| g.cipher)
+    }
+
     /// LibCrypt magic word of `id`, if it is protected.
     pub fn libcrypt(&self, id: &str) -> Option<u16> {
         self.game_field(id, |g| g.libcrypt)
@@ -728,7 +747,7 @@ const USER_HEADER: &str = "\
 ;                  [default], [md5], [note]
 ;   [game ID…]     title, config (POPS config, hex), source, [default (fix fps 60hz)],
 ;                  [libcrypt], [pops_id], [min_level (1-9)], [pal60 (yes|no)],
-;                  [disc_swap (auto|manual)], note
+;                  [disc_swap (auto|manual)], [cipher (xor_lcg ADD MUL)], note
 ; Entries here win over the built-in ones: patches by name, games by ID.
 ";
 
@@ -993,6 +1012,12 @@ pub(crate) mod tests {
         let swap = |ini: &str| PatchDb::builtin().with_user(PatchDb::parse(ini, Origin::User).unwrap()).manual_disc("SLES-11480");
         assert_eq!((swap(""), swap("[game SLES11480]\ndisc_swap = MANUAL\n"), swap("[game SLES11480]\ndisc_swap = auto\n")), (false, true, false));
 
+        // cipher: Silent Hill's built in; a user entry with its own constants.
+        use psx2psp_recomp::overlay::XorLcg;
+        assert_eq!(PatchDb::builtin().cipher("SLES_015.14"), Some(XorLcg { add: 0x0130_9125, mul: 0x03A4_52F7 }));
+        let db = PatchDb::parse("[game SLUS00001]\ncipher = XOR_LCG 0x10 ff\n", Origin::User).unwrap();
+        assert_eq!((db.cipher("SLUS-00001"), db.cipher("SLUS-00002")), (Some(XorLcg { add: 0x10, mul: 0xFF }), None));
+
         for (bad, line, what) in [
             ("name = x\n", 1, "before any"),
             ("[foo X]\n", 1, "unknown section"),
@@ -1017,6 +1042,8 @@ pub(crate) mod tests {
             ("[game X]\nmin_level = five\n", 2, "1..=9"),
             ("[game X]\npal60 = on\n", 2, "yes or no"),
             ("[game X]\ndisc_swap = maybe\n", 2, "auto or manual"),
+            ("[game X]\ncipher = xor_lcg 1\n", 2, "xor_lcg ADD MUL"),
+            ("[game X]\ncipher = rc4 1 2\n", 2, "xor_lcg ADD MUL"),
         ] {
             let e = PatchDb::parse(bad, Origin::User).unwrap_err();
             assert_eq!(e.line, line, "{bad:?}: {e}");

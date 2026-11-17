@@ -503,7 +503,9 @@ fn cmd_coverage(args: &[String]) -> R {
     let disc = disc.ok_or("no disc image given")?;
     let img = psx2psp_engine::core::DiscImage::open(&disc)?;
     let t = std::time::Instant::now();
-    let c = psx2psp_engine::static_coverage(&img, &[], frames, every)?;
+    let db = load_patches();
+    let cipher = img.probe().disc_id.and_then(|id| db.cipher(&db.pops_id(&id)));
+    let c = psx2psp_engine::static_coverage(&img, &[], cipher, frames, every)?;
     let pct = if c.ran == 0 { 100.0 } else { 100.0 * c.covered as f64 / c.ran as f64 };
     println!(
         "coverage {pct:.2}%: {} of {} instructions run are in the static translation ({} images, {} frames, {:.1} s); kernel area {} words, not counted",
