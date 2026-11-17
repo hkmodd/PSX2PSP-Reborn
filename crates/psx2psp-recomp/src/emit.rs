@@ -1090,10 +1090,10 @@ impl Em<'_> {
     /// whatever guest address shares its low 21 bits. Host addresses are 0x08000000..0x0FFFFFFF,
     /// top five bits 00001; no guest segment has them (00000, 00011, 10000, 10100, 10111).
     fn dispatch(&mut self, src: u32, host: bool, pc: u32) {
-        let done = self.label();
+        let done = host.then(|| self.label());
         let o = &mut self.out;
         o.push(sw(src, k0_off(layout::CTX + ctx::TARGET), K0R));
-        if host {
+        if let Some(done) = done {
             o.push(srl(K1R, src, 27));
             o.push(addiu(K1R, K1R, 0xFFFF));
             o.branch(beq(K1R, 0), To::Label(done), pc);
@@ -1102,7 +1102,7 @@ impl Em<'_> {
         o.push(ext(K1R, src, 0, 21));
         o.push(addu(K1R, K1R, K0R));
         o.push(lw(K1R, k0_off(layout::TABLE), K1R));
-        if host {
+        if let Some(done) = done {
             o.def(done);
         }
     }
