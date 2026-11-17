@@ -92,3 +92,53 @@ void fl_place(const Floating *f, u32 u, u32 *dst, u32 guest, u32 host)
         }
     }
 }
+
+int fl_holds(const Floating *f, const u8 *ram, const FlPlace *q)
+{
+    const FlUnit *x = fl_unit(f, q->unit);
+    return q->at <= RAM_SIZE - 4 * x->g_len && !memcmp(ram + q->at, f->w + x->g_off, 4 * x->g_len);
+}
+
+int fl_placed(const Floating *f, const FlArena *a, const u8 *ram, u32 p, u32 base)
+{
+    for (u32 i = 0; i < a->n; i++) {
+        const FlPlace *q = &a->p[i];
+        const FlUnit *x = fl_unit(f, q->unit);
+        if (p - q->at < 4 * x->g_len && q->guest == q->at + base && f->w[x->t_off + (p - q->at) / 4] != FL_NONE && fl_holds(f, ram, q))
+            return (int)i;
+    }
+    return -1;
+}
+
+/* The first free slot of `len` bytes, and *k the index it takes; 0 when none. */
+static u32 gap(const FlArena *a, u32 len, u32 *k)
+{
+    if (a->n == FL_PLACES)
+        return 0;
+    u32 from = a->lo;
+    for (u32 i = 0; i < a->n; from = a->p[i].host + a->p[i].len, i++)
+        if (a->p[i].host - from >= len)
+            return *k = i, from;
+    return a->hi - from >= len ? (*k = a->n, from) : 0;
+}
+
+int fl_alloc(const Floating *f, FlArena *a, const u8 *ram, u32 u, u32 at, u32 guest, void (*gone)(const FlPlace *q))
+{
+    u32 len = (4 * fl_unit(f, u)->h_len + 63) & ~63u, k, host = gap(a, len, &k);
+    if (!host) {
+        for (u32 i = a->n; i-- > 0;)
+            if (!fl_holds(f, ram, &a->p[i])) {
+                if (gone)
+                    gone(&a->p[i]);
+                memmove(a->p + i, a->p + i + 1, (a->n - i - 1) * sizeof *a->p);
+                a->n--;
+            }
+        host = gap(a, len, &k);
+    }
+    if (!host)
+        return -1;
+    memmove(a->p + k + 1, a->p + k, (a->n - k) * sizeof *a->p);
+    a->n++;
+    a->p[k] = (FlPlace){at, u, host, len, guest};
+    return (int)k;
+}

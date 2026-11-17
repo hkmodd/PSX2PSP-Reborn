@@ -42,12 +42,22 @@ dispatch table (one word per PS1 RAM word) with MISS.
   whichever shared its range). No match: the interpreter runs it. A MISS entry inside an
   executable whose slice is installed is code the translator did not find: interpreted, no
   hashing.
+* Floating code (code the game runs wherever it loads it, as Crash 2's native GOOL pieces) is a
+  blob of units translated once (`floating.h`), read below the code range. On a miss no
+  executable serves, the runtime looks the two words there up in the blob's index and, when RAM
+  holds a whole unit around them, copies its code into an arena slot (at the start of the code
+  range), relocates it to that guest and host address and installs its table entries. A
+  placement whose words RAM still holds is reinstalled after a disc load; one whose words are
+  gone gives its slot back when the arena is full. A live one is never moved: when the arena has
+  no room the interpreter runs the code.
 * Code the game's own stores rewrite is checked at each I-cache flush (FlushCache, end of a
-  cache isolation), per 1 KB block of code words (translated words and their delay slots). A
-  block that changed only in immediates and shift amounts keeps its translation: the patch
-  table (below) gives every host word that copies each such instruction, and the runtime writes
-  the new immediate there (`addi` as `addiu`). Any other change, or a word that is not one plain
-  copy, sends the block to the interpreter (DIRTY).
+  cache isolation), per 1 KB block of code words (translated words and their delay slots). In a
+  block whose words changed, the patch table (below) says which: a word changed only in its
+  immediate or shift amount keeps its translation, and the runtime writes the new immediate in
+  every host word that copies it (`addi` as `addiu`). Any other changed word goes to the
+  interpreter (DIRTY), with the translated words of the block and the block below that reach it
+  without the runtime, by falling through or by a direct branch, jump or call (`coderun.c`,
+  shared with the simulator); the rest of the block keeps its translation.
 * Translated code enters the runtime through host calls (I/O, COP0, GTE, syscalls, resumes),
   dispatch misses and loop back-edges; the runtime interprets until an address with a
   translation and goes back there.
@@ -105,7 +115,7 @@ The log's `-- sas` line counts, per second:
 
 In `both` mode it also gives the RMS of both mixes.
 
-## DATA.PSAR (version 4)
+## DATA.PSAR (version 7)
 
 Little endian, written by `write_native_psar` in `crates/psx2psp-engine`; offsets are from the
 start of DATA.PSAR:
@@ -113,13 +123,13 @@ start of DATA.PSAR:
 | Offset | Size | Field |
 |---|---|---|
 | 0x00 | 8 | `PSXRTDAT` |
-| 0x08 | 4 | version (4) |
-| 0x0C | 4 | header length (0xD0) |
+| 0x08 | 4 | version (6) |
+| 0x0C | 4 | header length (0xE4) |
 | 0x10 | 16 | disc ID, NUL padded (`SLES02895`) |
 | 0x20 | 128 | title, UTF-8, NUL padded |
 | 0xA0 | 4 | raw sectors of the disc image (2352 bytes each; sector 0 is LBA 150) |
 | 0xA4 | 4 | sectors per block (16) |
-| 0xA8 | 4 | offset of the block index (0xD0) |
+| 0xA8 | 4 | offset of the block index of disc 1 (0xE4) |
 | 0xAC | 4 | blocks = ceil(sectors / 16) |
 | 0xB0 | 4 | offset of the code directory (0: no translated code) |
 | 0xB4 | 4 | entries in the code directory |
@@ -127,7 +137,17 @@ start of DATA.PSAR:
 | 0xBC | 4 | size of the code range |
 | 0xC0 | 4 | flags: bit 0 PAL60 (a PAL picture at 60 vblanks a second: patch database `pal60` with the 60 Hz switch) |
 | 0xC4 | 4 | CPU shift: translated loops charge their PS1 cycles >> this (at most 8; 0 = R3000A cost). The converter writes 0; a `psxrt.cpu` file beside the EBOOT (decimal) overrides it for measurements |
-| 0xC8 | 8 | zero |
+| 0xC8 | 4 | offset of the disc table (0: one disc) |
+| 0xCC | 4 | discs in the table (0: one disc; else 2..5) |
+| 0xD0 | 4 | offset of the floating code blob (0: none) |
+| 0xD4 | 4 | its stored length (equal to the raw length: stored as is) |
+| 0xD8 | 4 | its raw length (0: no floating code) |
+| 0xDC | 4 | host address the runtime loads the blob at |
+| 0xE0 | 4 | bytes from the code range's start where floating translations are placed |
+
+A game of more than one disc has a disc table of 0x20 bytes per disc (disc 1 first): disc ID
+(16, NUL padded), raw sectors, offset of its block index, blocks, zero. Each disc's blocks and
+index are stored as disc 1's.
 
 The index holds blocks + 1 offsets: block i is `index[i]..index[i+1]`. A block is raw deflate,
 or stored as is when deflate would not make it smaller (its length is then the raw length; only
@@ -135,7 +155,9 @@ the last block may be shorter than 16 sectors).
 
 The blocks are followed by each translated executable's code, dispatch-table slice (one word
 per text word: a host address, or MISS) and patch table, stored the same way, then the
-directory, 0x40 bytes per executable (`CodeEntry` in `disc.h`).
+directory, 0x40 bytes per executable (`CodeEntry` in `disc.h`), then the floating code blob
+(`floating.h`): code the game runs wherever it loads it, translated once and moved where RAM
+holds its words.
 
 | Offset | Size | Field |
 |---|---|---|
@@ -156,10 +178,10 @@ directory, 0x40 bytes per executable (`CodeEntry` in `disc.h`).
 The patch table is one group per 4 KB of RAM from the 1 KB block of the text's first word: a
 (offset from the table, stored length, raw length) triple per group, then the groups, each
 deflated or stored. A group's words: 5 offsets (in words, from the group's start) where each
-1 KB block's entries start and the last ones end, then the entries, for each code word whose
-rewrite could be patched (an I-type ALU immediate or a constant shift): `index | n << 8`
-(`index` the word in its block), then `n` host addresses of its copies, or for `n` 0 the word as
-translated (any rewrite of it goes to the interpreter).
+1 KB block's entries start and the last ones end, then one entry per code word: `index | n << 8`
+(`index` the word in its block), then `n` host addresses of its copies when its rewrite could be
+patched (an I-type ALU immediate or a constant shift), or for `n` 0 the word as translated (any
+rewrite of it is a change). A group that would pass 32 KB has only `n` 0 entries.
 
 ## Build
 

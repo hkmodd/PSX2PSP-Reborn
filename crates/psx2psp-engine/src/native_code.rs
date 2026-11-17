@@ -65,15 +65,17 @@ pub const PATCH_GROUP_BLOCKS: u32 = 4;
 pub const PATCH_GROUP_MAX: usize = 32 * 1024;
 
 /// The patch table of a translation (GOAL.MD S20d): for every word of the text that is code
-/// (discovered, or a delay slot) and whose rewrite [`patchable`] could take, where the runtime
-/// writes its new immediate or shift amount when the game rewrites it.
+/// (discovered, or a delay slot), where the runtime writes its new immediate or shift amount
+/// when the game rewrites it and [`patchable`] can take that, or else the word as translated,
+/// which tells the runtime which words a rewrite changed (`psp/psxrt/coderun.h`: those words
+/// and the runs of translated code into them go to the interpreter, the rest of the block stays).
 ///
 /// Group `g` covers RAM blocks `first + 4g ..` (`first`: the block of the text's first word).
 /// Its words: [`PATCH_GROUP_BLOCKS`] + 1 offsets (in words, from the group's start) where each
 /// block's entries start and the last one ends, then the entries. An entry is a word
 /// `index | n << 8` (`index`: the word's in its block), then either `n` host addresses (the
-/// copies to patch, [`Translation::patch`]) or, for `n` 0, the word as translated: it is not
-/// one plain copy (it uses `k0`/`k1`, say), and any rewrite sends its block to the interpreter.
+/// copies to patch, [`Translation::patch`]) or, for `n` 0, the word as translated: not
+/// patchable, or not one plain copy (it uses `k0`/`k1`, say); any rewrite of it is a change.
 pub fn patch_groups(exe: &PsxExe, d: &Discovery, t: &Translation) -> Vec<Vec<u8>> {
     let ram = exe.text_addr & 0x1F_FFFF;
     let len = exe.text.len() as u32;
@@ -89,9 +91,9 @@ pub fn patch_groups(exe: &PsxExe, d: &Discovery, t: &Translation) -> Vec<Vec<u8>
             let lo = (first + g * PATCH_GROUP_BLOCKS + k) * PATCH_BLOCK;
             for o in (lo.max(ram)..(lo + PATCH_BLOCK).min(ram + len)).step_by(4) {
                 let pc = exe.text_addr + (o - ram);
-                let Some(word) = exe.word(pc).filter(|&x| code.contains(&pc) && patchable(x)) else { continue };
+                let Some(word) = exe.word(pc).filter(|_| code.contains(&pc)) else { continue };
                 let index = (o - lo) / 4;
-                match t.patch.get(&pc).filter(|h| !pin && h.len() < 256) {
+                match t.patch.get(&pc).filter(|h| !pin && h.len() < 256 && patchable(word)) {
                     Some(h) => {
                         w.push(index | (h.len() as u32) << 8);
                         w.extend(h);
@@ -129,6 +131,9 @@ pub struct CodePack {
     pub floating: Vec<FloatingCode>,
     /// Bytes at `base` where the runtime places [`CodePack::floating`] (0 without it).
     pub arena: u32,
+    /// Host address where the runtime reads [`floating_blob`] of [`CodePack::floating`], below
+    /// `base` (0 without it).
+    pub blob_host: u32,
 }
 
 /// Most bytes of host code the runtime keeps for floating code at once.
@@ -139,11 +144,9 @@ pub const FLOATING_ARENA_MAX: u32 = 4 << 20;
 pub fn floating_blob(codes: &[FloatingCode]) -> Vec<u32> {
     let mut index: Vec<[u32; 3]> = Vec::new();
     for (u, c) in codes.iter().enumerate() {
-        for e in 0..c.unit.words.len() {
-            if e + 2 <= c.unit.words.len() && c.table[e] != u32::MAX {
-                let b: Vec<u8> = c.unit.words[e..e + 2].iter().flat_map(|w| w.to_le_bytes()).collect();
-                index.push([fnv1a32(&b), u as u32, e as u32]);
-            }
+        for e in c.indexed() {
+            let b: Vec<u8> = c.unit.words[e..e + 2].iter().flat_map(|w| w.to_le_bytes()).collect();
+            index.push([fnv1a32(&b), u as u32, e as u32]);
         }
     }
     index.sort_unstable();
@@ -206,6 +209,23 @@ impl FloatingCode {
         let relocs = t.relocs.iter().map(|&(h, r)| at(h) << 2 | reloc_kind(r)).collect();
         Ok(Self { unit, code: t.words, table, relocs })
     }
+
+    /// The words [`floating_blob`] indexes: each translated one with a word after it.
+    fn indexed(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.unit.words.len().saturating_sub(1)).filter(|&e| self.table[e] != u32::MAX)
+    }
+
+    /// Its words in [`floating_blob`]: unit header, index entries, guest words, code, table and
+    /// relocations.
+    pub fn blob_words(&self) -> usize {
+        7 + 3 * self.indexed().count() + 2 * self.unit.words.len() + self.code.len() + self.relocs.len()
+    }
+}
+
+/// The arena for floating code of `host` bytes: room for each unit twice, at most
+/// [`FLOATING_ARENA_MAX`].
+fn floating_arena(host: u64) -> u64 {
+    (2 * host + 0x1_0000).next_multiple_of(0x1_0000).min(u64::from(FLOATING_ARENA_MAX))
 }
 
 /// Where floating code is discovered and translated before it is moved ([`Translation::moved`]):
@@ -532,6 +552,7 @@ pub fn build(exes: Vec<(String, Vec<u8>)>, overlays: Vec<Overlay>, captured: Vec
         ok.retain(|o| o.2 != at);
     }
     if ok.is_empty() {
+        pack.floating.clear();
         return Ok(pack);
     }
     let Some(base) = base_for(&groups).1 else {
@@ -544,15 +565,31 @@ pub fn build(exes: Vec<(String, Vec<u8>)>, overlays: Vec<Overlay>, captured: Vec
         g.0 = at;
         at += len;
     }
-    // The floating code's arena below the images: room for each unit twice, as much as fits.
-    let host: u32 = pack.floating.iter().map(|c| 4 * c.code.len() as u32).sum();
-    let largest = pack.floating.iter().map(|c| 4 * c.code.len() as u32).max().unwrap_or(0);
-    let arena = (2 * host + 0x1_0000).next_multiple_of(0x1_0000).min(FLOATING_ARENA_MAX).min(base - CODE_FLOOR);
-    if !pack.floating.is_empty() && arena < largest {
-        pack.skipped.push(("floating code".into(), format!("{largest} B for a unit, {arena} B free below the images")));
-        pack.floating.clear();
+    // Below the images, the floating code: the arena where the runtime places units, and below
+    // it the blob it reads them from. Units go in by blob size, smallest first, while both fit
+    // over CODE_FLOOR (the runtime's own memory is under it).
+    let room = u64::from(base - CODE_FLOOR);
+    let blob_room = |words: u64| (4 * words).next_multiple_of(0x1_0000);
+    let mut order: Vec<(usize, usize)> = pack.floating.iter().map(FloatingCode::blob_words).enumerate().map(|(k, w)| (w, k)).collect();
+    order.sort_unstable();
+    let (mut keep, mut words, mut host) = (vec![false; pack.floating.len()], 4u64, 0u64);
+    for (w, k) in order {
+        let code = 4 * pack.floating[k].code.len() as u64;
+        let (w2, h2) = (words + w as u64, host + code);
+        if code <= floating_arena(h2) && blob_room(w2) + floating_arena(h2) <= room {
+            (keep[k], words, host) = (true, w2, h2);
+        }
     }
-    pack.arena = if pack.floating.is_empty() { 0 } else { arena };
+    let left = keep.iter().filter(|&&k| !k).count();
+    if left > 0 {
+        pack.skipped.push(("floating code".into(), format!("{left} of {} units do not fit in the {room} B below the images", keep.len())));
+    }
+    let mut keep = keep.into_iter();
+    pack.floating.retain(|_| keep.next() == Some(true));
+    if !pack.floating.is_empty() {
+        pack.arena = floating_arena(host) as u32;
+        pack.blob_host = base - pack.arena - blob_room(words) as u32;
+    }
     pack.base = base - pack.arena;
     pack.size = at - pack.base;
 
@@ -748,7 +785,8 @@ mod tests {
         want.extend(h(0x8001_0FF8));
         want.extend([0xFF, ADDIU_K0_5]);
         want[1] = want.len() as u32;
-        want.extend([1 | (h(0x8001_1004).len() as u32) << 8]); // the jr slot, in the next block
+        want.extend([0, JR_RA]); // in the next block: not patchable, the word as translated
+        want.extend([1 | (h(0x8001_1004).len() as u32) << 8]); // the jr slot
         want.extend(h(0x8001_1004));
         want[2] = want.len() as u32;
         want[3] = want.len() as u32;
@@ -975,6 +1013,23 @@ mod tests {
         }
         assert_eq!(psx2psp_sim::floating_place(&blob, 1, FLOATING_BASE, FLOATING_HOST), None, "no unit 1");
         assert_eq!(psx2psp_sim::floating_place(&blob[..blob.len() - 1], 0, FLOATING_BASE, FLOATING_HOST), None, "a short blob");
+    }
+
+    /// The blob holds what [`FloatingCode::blob_words`] counts, and a pack with floating code
+    /// lays out blob, arena and images upwards, over [`CODE_FLOOR`].
+    #[test]
+    fn floating_code_is_laid_out_below_the_images() {
+        let code = FloatingCode::translate(FloatingUnit { words: floating_program(), entries: vec![0] }).unwrap();
+        let mut two = code.clone();
+        two.unit.words[0] ^= 1;
+        assert_eq!(floating_blob(&[code.clone(), two.clone()]).len(), 4 + code.blob_words() + two.blob_words());
+        let bytes: Vec<u8> = floating_program().iter().flat_map(|w| w.to_le_bytes()).collect();
+        let pack = build(vec![("MAIN.EXE".into(), exe(0x8001_0000, &[ADDIU_V0_1, JR_RA, 0]))], vec![Overlay { name: "GOOL.BIN".into(), bytes, file: None }], vec![]).unwrap();
+        assert_eq!(pack.floating.len(), 1, "{:?}", pack.skipped);
+        let blob = 4 * floating_blob(&pack.floating).len() as u32;
+        assert!(pack.blob_host >= CODE_FLOOR && pack.blob_host + blob <= pack.base, "{:08X} {blob} {:08X}", pack.blob_host, pack.base);
+        assert!(pack.arena >= 4 * pack.floating[0].code.len() as u32);
+        assert_eq!(pack.images[0].host_base, pack.base + pack.arena);
     }
 
     /// The runtime finds a unit in RAM from any word it translates, at the place RAM holds it,

@@ -9,7 +9,7 @@
  * sizes; anything else is refused and the disc boots.
  *
  * File (native endianness): header, Psx, PS1 RAM, scratchpad, VRAM, SPU RAM, MDEC input words,
- * then native.c's part (context, images, GRET stack, dispatch table).
+ * then native.c's part (context, images, GRET stack, dispatch table, floating placements).
  */
 #include "snap.h"
 
@@ -20,7 +20,7 @@
 #include "native.h"
 
 #define SPU_RAM_SIZE (512u * 1024u)
-#define SNAP_VERSION 1u
+#define SNAP_VERSION 2u
 
 typedef struct {
     char magic[8];
@@ -47,7 +47,7 @@ static void header(SnapHeader *h, const DiscInfo *info)
     u32 l[10] = {sizeof(Psx), sizeof(Cpu), sizeof(Gte), sizeof(Dma), sizeof(Timers), sizeof(Cdrom), sizeof(Gpu), sizeof(Spu), sizeof(Sio), sizeof(Mdec) | sizeof(Bios) << 16};
     memcpy(h->layout, l, sizeof l);
     memcpy(h->disc_id, info->disc_id, sizeof h->disc_id);
-    u32 range[3] = {info->code_base, info->code_size, info->flags};
+    u32 range[8] = {info->code_base, info->code_size, info->flags, info->fl_offset, info->fl_stored, info->fl_len, info->fl_host, info->fl_arena};
     h->dir_hash = fnv(fnv(0x811C9DC5u, range, sizeof range), info->dir, info->images * (u32)sizeof(CodeEntry));
 }
 

@@ -2,6 +2,7 @@
  * interpreter by frames, and exposes VRAM and the display mode to the Rust driver. */
 #include "psx.h"
 #include "floating.h"
+#include "coderun.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -228,16 +229,27 @@ static void watch_loaded(Psx *psx, u32 addr, u32 len)
             watch_arm(&watch[i], 1);
 }
 
-/* As native.c cache_flushed: a 1 KB block whose held words changed beyond immediates and shift
- * amounts (which the runtime patches in place) is loaded over. */
+/* As native.c cache_flushed: a held word changed beyond immediates and shift amounts (which the
+ * runtime patches in place) is loaded over, and with it the held words whose translation reaches
+ * its one without the runtime (coderun.h), block by block from the top. The rest keeps its
+ * translation. */
+static u8 bad_buf[CR_WORDS + RAM_SIZE / 4], *const bad = bad_buf + CR_WORDS;
+static int held_at(void *ctx, u32 j) { return (void)ctx, held[j]; }
 static void watch_flushed(void)
 {
-    for (u32 b = 0; b < RAM_SIZE >> 10; b++)
-        for (u32 j = b << 8; j < (b + 1) << 8; j++)
-            if (held[j] && form(ram_word(j)) != held_form[j]) {
-                watch_loaded(NULL, b << 10, 1024);
-                break;
-            }
+    int any = 0;
+    for (u32 j = 0; j < RAM_SIZE / 4; j++)
+        any |= bad[j] = (u8)(held[j] && form(ram_word(j)) != held_form[j]);
+    if (!any)
+        return;
+    for (u32 lo = RAM_SIZE / 4; lo;) {
+        lo -= CR_WORDS;
+        if (memchr(bad + lo, 1, CR_WORDS))
+            cr_spread((const u32 *)watch_ram, lo, bad + lo - CR_WORDS, held_at, NULL);
+    }
+    for (u32 j = 0; j < RAM_SIZE / 4; j++)
+        if (bad[j])
+            watch_loaded(NULL, j << 2, 4);
 }
 
 static void watch_run(u32 p)
@@ -289,28 +301,42 @@ const u8 *sim_watch_miss(int i, u32 *checks, int *head)
     return watch[i].miss;
 }
 
-/* Floating code (floating.h) placed as native.c places it: a word the guest runs that no image
- * holds takes the translation of the unit with an entry there whose words RAM holds, until a
- * load over it. fl_stat: placements, and the words they gave a translation. */
+/* Floating code (floating.h) placed as native.c places it, in an arena of the runtime's size: a
+ * word the guest runs that no image holds takes the translation of the placement there whose
+ * words RAM holds, or of a new placement of the unit with an entry there whose words RAM holds,
+ * until a load over it. fl_stat: placements, the words they gave a translation, placements the
+ * arena had no room for. */
 static Floating fl;
-static u32 *fl_blob, fl_stat[2];
+static FlArena fl_ar;
+static u32 *fl_blob, fl_stat[3];
 
-static void fl_run(u32 p)
+/* A placement gives its slot back: its words are the interpreter's, as the runtime makes its
+ * entries DIRTY (a watched image there takes them back when it runs them). */
+static void fl_gone(const FlPlace *q) { memset(held + q->at / 4, 0, fl_unit(&fl, q->unit)->g_len); }
+
+static void fl_run(u32 pc, u32 p)
 {
-    u32 at;
-    int u = fl_find(&fl, watch_ram, p, &at);
-    if (u < 0)
-        return;
-    const FlUnit *x = fl_unit(&fl, (u32)u);
-    fl_stat[0]++;
-    for (u32 j = 0; j < x->g_len; j++) /* every word of a unit is code its translation runs */
-        if (!held[at / 4 + j])
-            held[at / 4 + j] = 1, held_form[at / 4 + j] = form(ram_word(at / 4 + j)), fl_stat[1]++;
+    u32 at, base = pc - p;
+    int i = fl_placed(&fl, &fl_ar, watch_ram, p, base);
+    if (i < 0) {
+        int u = fl_find(&fl, watch_ram, p, &at);
+        if (u < 0)
+            return;
+        if ((i = fl_alloc(&fl, &fl_ar, watch_ram, (u32)u, at, at + base, fl_gone)) < 0) {
+            fl_stat[2]++;
+            return;
+        }
+        fl_stat[0]++;
+    }
+    const FlPlace *q = &fl_ar.p[i];
+    for (u32 j = 0, n = fl_unit(&fl, q->unit)->g_len; j < n; j++) /* every word of a unit is code its translation runs */
+        if (!held[q->at / 4 + j])
+            held[q->at / 4 + j] = 1, held_form[q->at / 4 + j] = form(ram_word(q->at / 4 + j)), fl_stat[1]++;
 }
 
-/* Takes the floating code `blob` (`words` words, copied) for the machine `s`: 0, or -1 when it
- * is damaged. */
-int sim_floating(Sim *s, const u32 *blob, u32 words)
+/* Takes the floating code `blob` (`words` words, copied) for the machine `s`, with an arena of
+ * `arena` bytes (0: no limit but the placements'): 0, or -1 when it is damaged. */
+int sim_floating(Sim *s, const u32 *blob, u32 words, u32 arena)
 {
     free(fl_blob);
     fl.w = NULL, fl_blob = NULL;
@@ -319,6 +345,7 @@ int sim_floating(Sim *s, const u32 *blob, u32 words)
     memcpy(fl_blob, blob, 4 * (size_t)words);
     if (fl_open(&fl, fl_blob, words) < 0)
         return free(fl_blob), fl_blob = NULL, -1;
+    fl_ar.lo = 0x08800000u, fl_ar.hi = fl_ar.lo + (arena ? arena : 0x70000000u), fl_ar.n = 0;
     watch_ram = s->ram;
     watch_cpu = &s->psx.cpu;
     s->psx.ram_loaded = watch_loaded;
@@ -342,12 +369,12 @@ int sim_fl_find(const u32 *blob, u32 words, const u8 *ram, u32 p, u32 *at)
     return fl_open(&f, blob, words) < 0 ? -2 : fl_find(&f, ram, p, at);
 }
 
-void sim_fl_stats(u32 *out) { out[0] = fl_stat[0], out[1] = fl_stat[1]; }
+void sim_fl_stats(u32 *out) { out[0] = fl_stat[0], out[1] = fl_stat[1], out[2] = fl_stat[2]; }
 
 static void watch_reset(void)
 {
     free(fl_blob);
-    fl.w = NULL, fl_blob = NULL, fl_stat[0] = fl_stat[1] = 0;
+    fl.w = NULL, fl_blob = NULL, fl_stat[0] = fl_stat[1] = fl_stat[2] = 0, fl_ar.n = 0;
     for (int i = 0; i < nwatch; i++)
         free(watch[i].words), free(watch[i].miss);
     nwatch = 0;
@@ -380,7 +407,7 @@ void psxrt_pc_trace(u32 pc)
         if (watch_page[p >> 12] && !held[p >> 2])
             watch_run(p);
         if (fl.w && !held[p >> 2])
-            fl_run(p);
+            fl_run(pc, p);
         ran_held[p >> 2] |= held[p >> 2];
     }
     if (!trace_file)

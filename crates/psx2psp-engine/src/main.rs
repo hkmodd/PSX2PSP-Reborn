@@ -543,8 +543,8 @@ fn cmd_coverage(args: &[String]) -> R {
     }
     if c.floating_pack.0 > 0 {
         let (n, w, h, r) = c.floating_pack;
-        let (p, held) = c.floating_placed;
-        println!("  floating pack: {n} units, {w} guest words, {h} host words, {r} relocations; {p} placements, {held} words translated by them");
+        let (p, held, full) = c.floating_placed;
+        println!("  floating pack: {n} units, {w} guest words, {h} host words, {r} relocations; {p} placements, {held} words translated by them, {full} refused (arena full)");
     }
     if c.units.0 > 0 {
         let (n, u, w, h, held) = c.units;

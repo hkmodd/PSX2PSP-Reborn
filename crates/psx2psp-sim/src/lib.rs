@@ -38,11 +38,28 @@ pub mod ffi {
         pub fn sim_watch(s: *mut Sim, at: u32, size: u32, head_len: u32, head_hash: u32, hash: u32, words: *const u8) -> c_int;
         pub fn sim_watch_live(i: c_int) -> c_int;
         pub fn sim_watch_miss(i: c_int, checks: *mut u32, head: *mut c_int) -> *const u8;
-        pub fn sim_floating(s: *mut Sim, blob: *const u32, words: u32) -> c_int;
+        pub fn sim_floating(s: *mut Sim, blob: *const u32, words: u32, arena: u32) -> c_int;
         pub fn sim_fl_place(blob: *const u32, words: u32, u: u32, dst: *mut u32, cap: u32, guest: u32, host: u32) -> c_int;
         pub fn sim_fl_find(blob: *const u32, words: u32, ram: *const u8, p: u32, at: *mut u32) -> c_int;
         pub fn sim_fl_stats(out: *mut u32);
+        pub fn cr_spread(ram: *const u32, lo: u32, bad: *mut u8, held: extern "C" fn(*mut c_void, u32) -> c_int, ctx: *mut c_void) -> u32;
     }
+}
+
+/// The words the runtime takes from translated code when RAM words change under it
+/// (`psp/psxrt/coderun.h` `cr_spread`): `bad` marks RAM words `lo - 256 .. lo + 256` (the block
+/// before block `lo` and the block), `held[j]` says RAM word `j` has a translation that runs.
+/// Marks the words of the window that reach a marked one without the runtime; their count.
+pub fn code_runs_cut(ram: &[u32], lo: u32, bad: &mut [u8; 512], held: &[bool]) -> u32 {
+    extern "C" fn at(ctx: *mut c_void, j: u32) -> c_int {
+        // SAFETY: ctx is the `held` slice below, alive for the call.
+        let h = unsafe { &*(ctx as *const &[bool]) };
+        h.get(j as usize).copied().unwrap_or(false) as c_int
+    }
+    assert!(ram.len() == RAM / 4 && lo % 256 == 0 && (lo as usize) < ram.len());
+    let mut h = held;
+    // SAFETY: the core reads RAM words of the window (in `ram`) and writes the 512 marks.
+    unsafe { ffi::cr_spread(ram.as_ptr(), lo, bad.as_mut_ptr(), at, &mut h as *mut &[bool] as *mut c_void) }
 }
 
 /// The runtime's move of unit `u` of the floating code `blob` (`psp/psxrt/floating.c`
@@ -181,20 +198,21 @@ impl<'a> Machine<'a> {
     }
 
     /// Takes floating code (`psp/psxrt/floating.h`, engine `native_code::floating_blob`) as the
-    /// native runtime places it: a word the guest runs that no watched image holds takes the
-    /// translation of the unit with an entry there whose words RAM holds, until a load over it.
-    /// False when the blob is damaged.
-    pub fn floating(&mut self, blob: &[u32]) -> bool {
+    /// native runtime places it, in an arena of `arena` bytes (0: no limit): a word the guest runs
+    /// that no watched image holds takes the translation of the unit with an entry there whose
+    /// words RAM holds, until a load over it. False when the blob is damaged.
+    pub fn floating(&mut self, blob: &[u32], arena: u32) -> bool {
         // SAFETY: `sim` is valid until drop; the core copies the blob's words.
-        unsafe { ffi::sim_floating(self.sim, blob.as_ptr(), blob.len() as u32) == 0 }
+        unsafe { ffi::sim_floating(self.sim, blob.as_ptr(), blob.len() as u32, arena) == 0 }
     }
 
-    /// The floating code's placements so far, and the words they gave a translation.
-    pub fn floating_stats(&self) -> (u32, u32) {
-        let mut s = [0u32; 2];
-        // SAFETY: two words out; this machine holds ONE.
+    /// The floating code's placements so far, the words they gave a translation, and the
+    /// placements the arena had no room for.
+    pub fn floating_stats(&self) -> (u32, u32, u32) {
+        let mut s = [0u32; 3];
+        // SAFETY: three words out; this machine holds ONE.
         unsafe { ffi::sim_fl_stats(s.as_mut_ptr()) };
-        (s[0], s[1])
+        (s[0], s[1], s[2])
     }
 
     /// Whether watched image `i` matched at its last check.
@@ -219,5 +237,29 @@ impl Drop for Machine<'_> {
     fn drop(&mut self) {
         // SAFETY: `sim` came from sim_new and is freed once.
         unsafe { ffi::sim_free(self.sim) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const JR_RA: u32 = 0x03E0_0008;
+
+    #[test]
+    fn a_rewrite_cuts_what_falls_or_branches_into_it_and_nothing_past_a_jump() {
+        let (lo, base) = (512u32, 256usize);
+        let mut ram = vec![0u32; RAM / 4];
+        let mut held = vec![false; RAM / 4];
+        held[440..=530].iter_mut().for_each(|h| *h = true);
+        ram[517] = JR_RA; // 518 is its slot: the run ends there, before 519
+        ram[450] = 0x1440_0045; // bne v0,zero to 450 + 1 + 0x45 = 520
+        ram[300] = 0x0C00_0000 | 520; // jal 520, with no translation: not cut
+        let mut bad = [0u8; 512];
+        bad[520 - base] = 1;
+        assert_eq!(code_runs_cut(&ram, lo, &mut bad, &held), 12);
+        let cut: Vec<usize> = (0..512).filter(|&k| bad[k] != 0).map(|k| k + base).collect();
+        let want: Vec<usize> = (440..=450).chain([519, 520]).collect();
+        assert_eq!(cut, want, "the branch and what falls into it; 519 falls into 520; 517-518 end before it");
     }
 }

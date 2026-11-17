@@ -44,4 +44,36 @@ int fl_find(const Floating *f, const u8 *ram, u32 p, u32 *at);
  * `host`: written to `dst` (h_len words). */
 void fl_place(const Floating *f, u32 u, u32 *dst, u32 guest, u32 host);
 
+/* A unit placed for one RAM address: its code in a slot of the arena. */
+typedef struct FlPlace {
+    u32 at;    /* RAM offset of the unit's first word */
+    u32 unit;
+    u32 host;  /* the slot */
+    u32 len;   /* bytes of the slot: the code's, rounded up to 64 */
+    u32 guest; /* address of the unit's first word as the guest ran it */
+} FlPlace;
+
+/* The slots of [lo, hi) (lo > 0): the placements, by host address. A placement stays while RAM
+ * holds its words; one whose words are gone gives its slot back when the arena is full. A live one
+ * is never moved for room: translated calls leave host return addresses in the guest's registers
+ * and stack, and a frame in it would return into whatever took its slot. */
+#define FL_PLACES 1024
+typedef struct FlArena {
+    u32 lo, hi, n;
+    FlPlace p[FL_PLACES];
+} FlArena;
+
+/* Whether `ram` holds q's unit at q->at. */
+int fl_holds(const Floating *f, const u8 *ram, const FlPlace *q);
+
+/* The placement over RAM offset `p` that translates the word there, was placed for guest
+ * addresses `base` + offset and whose words RAM holds: its index, or -1. */
+int fl_placed(const Floating *f, const FlArena *a, const u8 *ram, u32 p, u32 base);
+
+/* A slot for unit `u` at RAM offset `at` and guest address `guest`: the index of the new
+ * placement (its code is the caller's to write), or -1 when the arena has no room even after the
+ * placements whose words are gone gave theirs back (each passed to `gone`, when not NULL, before
+ * it goes). */
+int fl_alloc(const Floating *f, FlArena *a, const u8 *ram, u32 u, u32 at, u32 guest, void (*gone)(const FlPlace *q));
+
 #endif
