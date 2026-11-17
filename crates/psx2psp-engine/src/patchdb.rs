@@ -131,6 +131,10 @@ pub struct Game {
     /// runtime's "60 Hz" gives its PAL picture 60 vblanks a second instead of applying its `60hz`
     /// patches (an NTSC branch that shows 240 lines of 256-line PAL art).
     pub pal60: Option<bool>,
+    /// `disc_swap = manual`: the native runtime leaves the disc change to the player (L+R+SELECT)
+    /// instead of changing it when the game waits for a disc; for a game that polls the drive
+    /// that way for something else. `auto` (the default) undoes a built-in `manual`.
+    pub manual_disc: Option<bool>,
     pub origin: Origin,
 }
 
@@ -442,10 +446,18 @@ impl Section<'_> {
                 _ => return Err(self.err(l, format!("pal60 `{v}`: yes or no"))),
             },
         };
+        let manual_disc = match self.take("disc_swap") {
+            None => None,
+            Some((v, l)) => match v.to_ascii_lowercase().as_str() {
+                "auto" => Some(false),
+                "manual" => Some(true),
+                _ => return Err(self.err(l, format!("disc_swap `{v}`: auto or manual"))),
+            },
+        };
         let mut text = |k: &str| self.take(k).map(|v| v.0).unwrap_or_default();
         let (title, source, note) = (text("title"), text("source"), text("note"));
         self.finish()?;
-        Ok(Game { ids, title, config, source, note, switches, libcrypt, pops_id, min_level, pal60, origin })
+        Ok(Game { ids, title, config, source, note, switches, libcrypt, pops_id, min_level, pal60, manual_disc, origin })
     }
 
     fn patch(mut self, origin: Origin) -> Result<Patch, ParseError> {
@@ -623,6 +635,11 @@ impl PatchDb {
         self.game_field(id, |g| g.pal60).unwrap_or(false)
     }
 
+    /// Whether the native runtime leaves `id`'s disc change to the player ([`Game::manual_disc`]).
+    pub fn manual_disc(&self, id: &str) -> bool {
+        self.game_field(id, |g| g.manual_disc).unwrap_or(false)
+    }
+
     /// LibCrypt magic word of `id`, if it is protected.
     pub fn libcrypt(&self, id: &str) -> Option<u16> {
         self.game_field(id, |g| g.libcrypt)
@@ -710,7 +727,8 @@ const USER_HEADER: &str = "\
 ;   [patch ID…|*]  name, kind (fix|fps|60hz|other), search + replace [+ align] or ppf (hex),
 ;                  [default], [md5], [note]
 ;   [game ID…]     title, config (POPS config, hex), source, [default (fix fps 60hz)],
-;                  [libcrypt], [pops_id], [min_level (1-9)], [pal60 (yes|no)], note
+;                  [libcrypt], [pops_id], [min_level (1-9)], [pal60 (yes|no)],
+;                  [disc_swap (auto|manual)], note
 ; Entries here win over the built-in ones: patches by name, games by ID.
 ";
 
@@ -971,6 +989,9 @@ pub(crate) mod tests {
         // A user `pal60 = no` turns the built-in one off; one without it keeps it.
         let sheep = |ini: &str| PatchDb::builtin().with_user(PatchDb::parse(ini, Origin::User).unwrap()).pal60("SLES02895");
         assert_eq!((sheep("[game SLES02895]\npal60 = NO\n"), sheep("[game SLES02895]\nmin_level = 9\n")), (false, true));
+        // disc_swap: manual for a game that asks for it, auto by default and when undone.
+        let swap = |ini: &str| PatchDb::builtin().with_user(PatchDb::parse(ini, Origin::User).unwrap()).manual_disc("SLES-11480");
+        assert_eq!((swap(""), swap("[game SLES11480]\ndisc_swap = MANUAL\n"), swap("[game SLES11480]\ndisc_swap = auto\n")), (false, true, false));
 
         for (bad, line, what) in [
             ("name = x\n", 1, "before any"),
@@ -995,6 +1016,7 @@ pub(crate) mod tests {
             ("[game X]\nmin_level = 10\n", 2, "1..=9"),
             ("[game X]\nmin_level = five\n", 2, "1..=9"),
             ("[game X]\npal60 = on\n", 2, "yes or no"),
+            ("[game X]\ndisc_swap = maybe\n", 2, "auto or manual"),
         ] {
             let e = PatchDb::parse(bad, Origin::User).unwrap_err();
             assert_eq!(e.line, line, "{bad:?}: {e}");

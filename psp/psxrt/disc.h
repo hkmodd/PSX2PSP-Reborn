@@ -23,7 +23,7 @@ typedef struct DiscInfo {
     /* translated code: `images` entries, run from code_base..+code_size; none for 0 */
     u32 images, code_base, code_size;
     CodeEntry *dir;
-    u32 flags; /* DISC_PAL60 */
+    u32 flags; /* DISC_PAL60, DISC_MANUAL_DISC */
     /* translated loops charge their PS1 cycles >> cpu_shift (patch database `cpu_shift`, as
      * POPS config word 19): the game gets more CPU per frame */
     u32 cpu_shift;
@@ -34,6 +34,8 @@ typedef struct DiscInfo {
 
 /* DiscInfo.flags: a PAL picture runs at 60 vblanks a second (patch database `pal60`). */
 #define DISC_PAL60 1u
+/* DiscInfo.flags: the player changes the disc, not the core (patch database `disc_swap = manual`). */
+#define DISC_MANUAL_DISC 2u
 
 /* Disc blocks since boot: inflated by the CPU thread, inflated ahead by the worker (and how many
  * of those the CPU thread had to wait for); microseconds reading the file and inflating, by the

@@ -847,6 +847,8 @@ pub const NATIVE_DISC_ENTRY_LEN: usize = 0x20;
 pub const NATIVE_MAX_DISCS: usize = 5;
 /// Flag: a PAL picture runs at 60 vblanks a second (patch database `pal60`, "60 Hz" switch on).
 pub const NATIVE_FLAG_PAL60: u32 = 1;
+/// Flag: the player changes the disc, the runtime does not (patch database `disc_swap = manual`).
+pub const NATIVE_FLAG_MANUAL_DISC: u32 = 2;
 /// Bytes per entry of the code directory.
 pub const NATIVE_CODE_ENTRY_LEN: usize = 0x40;
 /// Raw sectors per block of a native DATA.PSAR (as PSISOIMG: 0x9300 bytes).
@@ -1311,9 +1313,13 @@ pub fn convert_native(req: &ConvertRequest, monitor: &dyn Monitor) -> Result<Con
         Some(id) if !id.trim().is_empty() => Some(normalise_id(id)),
         _ => DiscImage::open(&d0.path)?.probe().disc_id,
     };
-    let pal60 = d0.ntsc_60hz && id0.is_some_and(|id| req.patches.pal60(&req.patches.pops_id(&id)));
+    let pal60 = d0.ntsc_60hz && id0.as_ref().is_some_and(|id| req.patches.pal60(&req.patches.pops_id(id)));
     if pal60 {
         monitor.log("Native: the PAL picture runs at 60 Hz (PAL60), the 60hz patches stay off");
+    }
+    let manual_disc = req.discs.len() > 1 && id0.as_ref().is_some_and(|id| req.patches.manual_disc(&req.patches.pops_id(id)));
+    if manual_disc {
+        monitor.log("Native: the player changes the disc (L+R+SELECT), not the runtime (disc_swap = manual)");
     }
     let discs = req.discs.iter().enumerate().map(|(n, d)| native_disc(req, d, n, pal60, monitor)).collect::<Result<Vec<_>>>()?;
     let disc_id = discs[0].disc_id.clone();
@@ -1380,7 +1386,7 @@ pub fn convert_native(req: &ConvertRequest, monitor: &dyn Monitor) -> Result<Con
     let level = req.level.clamp(*LEVELS.start(), *LEVELS.end()) as u8;
     let mut stats = PsarStats::default();
     write_pbp(&mut w, &sections, 0x10, |w, psar| {
-        let flags = if pal60 { NATIVE_FLAG_PAL60 } else { 0 };
+        let flags = if pal60 { NATIVE_FLAG_PAL60 } else { 0 } | if manual_disc { NATIVE_FLAG_MANUAL_DISC } else { 0 };
         stats = write_native_psar(w, psar, &discs, &req.title, flags, level, &code, monitor)?;
         Ok(())
     })?;
@@ -1958,6 +1964,12 @@ mod tests {
         let two = ConvertRequest { discs: vec![req.discs[0].clone(), disc2], ..req.clone() };
         let rep = convert_native(&two, &()).unwrap();
         assert_eq!(rep.disc_ids, ["SLES02895", "SLES12895"]);
+        let psar_flags = || u32::from_le_bytes(PbpFile::open(File::open(&output).unwrap()).unwrap().read(Section::DataPsar).unwrap()[0xC0..0xC4].try_into().unwrap());
+        assert_eq!(psar_flags(), 0, "two discs change by themselves");
+        let manual = ConvertRequest { patches: PatchDb::parse("[game SLES-02895]\ndisc_swap = manual\n", patchdb::Origin::User).unwrap(), ..two.clone() };
+        convert_native(&manual, &()).unwrap();
+        assert_eq!(psar_flags(), NATIVE_FLAG_MANUAL_DISC);
+        convert_native(&two, &()).unwrap();
         let psar = PbpFile::open(File::open(&output).unwrap()).unwrap().read(Section::DataPsar).unwrap();
         let word = |at: usize| u32::from_le_bytes(psar[at..at + 4].try_into().unwrap()) as usize;
         assert_eq!(psar[..NATIVE_PSAR_HEADER_LEN - 8], head[..NATIVE_PSAR_HEADER_LEN - 8], "the first disc's header as for one disc");

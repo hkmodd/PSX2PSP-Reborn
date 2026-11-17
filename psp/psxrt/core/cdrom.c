@@ -184,7 +184,7 @@ static void swap_poll(Psx *psx, u8 c)
 {
     Cdrom *cd = &psx->cd;
     const PsxHost *h = psx->host;
-    if (!h->disc_select || h->discs < 2 || cd->lid != CD_LID_CLOSED || cd->swap_on)
+    if (!h->auto_swap || !h->disc_select || h->discs < 2 || cd->lid != CD_LID_CLOSED || cd->swap_on)
         return;
     if (c != 0x01 || (cd->stat & (ST_READ | ST_SEEK | ST_PLAY))) {
         cd->poll_n = 0, cd->poll_hot = 0, cd->poll_t0 = psx->cycles;

@@ -1482,6 +1482,9 @@ int main(int argc, char **argv)
     host.disc_end = 150 + disc_info.sectors;
     host.disc_select = host_disc_select;
     host.discs = disc_info.discs;
+    host.auto_swap = !(disc_info.flags & DISC_MANUAL_DISC);
+    if (disc_info.discs > 1)
+        say("disc: %u discs, %s", (unsigned)disc_info.discs, host.auto_swap ? "changed when the game asks (L+R+SELECT by hand)" : "changed by hand: L+R+SELECT");
     host.tty = host_tty;
     host.log = host_log;
     host.vblank = host_vblank;

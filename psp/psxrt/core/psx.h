@@ -71,6 +71,7 @@ typedef struct PsxHost {
      * read_sector source and disc_end; nonzero on success. Through cd_insert only. */
     int (*disc_select)(void *user, u32 n);
     u32 discs;
+    int auto_swap; /* nonzero: the core changes the disc when the game waits for one (cdrom.c) */
 } PsxHost;
 
 /* ---- CPU state, shared by the interpreter and the translated code's context ---- */

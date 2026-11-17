@@ -258,6 +258,7 @@ void sim_discs(Sim *s, SelectFn sel, u32 n)
     rust_select = sel;
     s->host.disc_select = select_fwd;
     s->host.discs = n;
+    s->host.auto_swap = getenv("PSX2PSP_SIM_MANUAL_DISC") == NULL;
 }
 
 /* The shell opens, or closes after disc `disc` (0-based; < 0: the same) goes in. */
