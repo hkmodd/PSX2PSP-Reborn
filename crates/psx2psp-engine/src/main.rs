@@ -541,6 +541,11 @@ fn cmd_coverage(args: &[String]) -> R {
             at.join(" ")
         );
     }
+    if c.floating_pack.0 > 0 {
+        let (n, w, h, r) = c.floating_pack;
+        let (p, held) = c.floating_placed;
+        println!("  floating pack: {n} units, {w} guest words, {h} host words, {r} relocations; {p} placements, {held} words translated by them");
+    }
     if c.units.0 > 0 {
         let (n, u, w, h, held) = c.units;
         println!("  floating units: {n}, {u} distinct, {w} words, {h} host words; {held} Floating addresses in one");

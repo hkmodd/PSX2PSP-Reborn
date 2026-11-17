@@ -1,6 +1,7 @@
 /* The simulator's side of the psxrt core: owns the machine and its memories, runs the
  * interpreter by frames, and exposes VRAM and the display mode to the Rust driver. */
 #include "psx.h"
+#include "floating.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -288,8 +289,65 @@ const u8 *sim_watch_miss(int i, u32 *checks, int *head)
     return watch[i].miss;
 }
 
+/* Floating code (floating.h) placed as native.c places it: a word the guest runs that no image
+ * holds takes the translation of the unit with an entry there whose words RAM holds, until a
+ * load over it. fl_stat: placements, and the words they gave a translation. */
+static Floating fl;
+static u32 *fl_blob, fl_stat[2];
+
+static void fl_run(u32 p)
+{
+    u32 at;
+    int u = fl_find(&fl, watch_ram, p, &at);
+    if (u < 0)
+        return;
+    const FlUnit *x = fl_unit(&fl, (u32)u);
+    fl_stat[0]++;
+    for (u32 j = 0; j < x->g_len; j++) /* every word of a unit is code its translation runs */
+        if (!held[at / 4 + j])
+            held[at / 4 + j] = 1, held_form[at / 4 + j] = form(ram_word(at / 4 + j)), fl_stat[1]++;
+}
+
+/* Takes the floating code `blob` (`words` words, copied) for the machine `s`: 0, or -1 when it
+ * is damaged. */
+int sim_floating(Sim *s, const u32 *blob, u32 words)
+{
+    free(fl_blob);
+    fl.w = NULL, fl_blob = NULL;
+    if (!(fl_blob = (u32 *)malloc(4 * (size_t)words + 4)))
+        return -1;
+    memcpy(fl_blob, blob, 4 * (size_t)words);
+    if (fl_open(&fl, fl_blob, words) < 0)
+        return free(fl_blob), fl_blob = NULL, -1;
+    watch_ram = s->ram;
+    watch_cpu = &s->psx.cpu;
+    s->psx.ram_loaded = watch_loaded;
+    return 0;
+}
+
+/* For tests, on a blob of its own: fl_place of unit `u` at guest and host addresses into `dst`
+ * of `cap` words (its host words, or -1), and fl_find in `ram` (RAM_SIZE bytes). */
+int sim_fl_place(const u32 *blob, u32 words, u32 u, u32 *dst, u32 cap, u32 guest, u32 host)
+{
+    Floating f;
+    if (fl_open(&f, blob, words) < 0 || u >= f.units || fl_unit(&f, u)->h_len > cap)
+        return -1;
+    fl_place(&f, u, dst, guest, host);
+    return (int)fl_unit(&f, u)->h_len;
+}
+
+int sim_fl_find(const u32 *blob, u32 words, const u8 *ram, u32 p, u32 *at)
+{
+    Floating f;
+    return fl_open(&f, blob, words) < 0 ? -2 : fl_find(&f, ram, p, at);
+}
+
+void sim_fl_stats(u32 *out) { out[0] = fl_stat[0], out[1] = fl_stat[1]; }
+
 static void watch_reset(void)
 {
+    free(fl_blob);
+    fl.w = NULL, fl_blob = NULL, fl_stat[0] = fl_stat[1] = 0;
     for (int i = 0; i < nwatch; i++)
         free(watch[i].words), free(watch[i].miss);
     nwatch = 0;
@@ -321,6 +379,8 @@ void psxrt_pc_trace(u32 pc)
         ran[p >> 2] = 1, ran_word[p >> 2] = w;
         if (watch_page[p >> 12] && !held[p >> 2])
             watch_run(p);
+        if (fl.w && !held[p >> 2])
+            fl_run(p);
         ran_held[p >> 2] |= held[p >> 2];
     }
     if (!trace_file)

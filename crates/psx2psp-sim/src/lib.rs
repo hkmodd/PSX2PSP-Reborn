@@ -38,6 +38,36 @@ pub mod ffi {
         pub fn sim_watch(s: *mut Sim, at: u32, size: u32, head_len: u32, head_hash: u32, hash: u32, words: *const u8) -> c_int;
         pub fn sim_watch_live(i: c_int) -> c_int;
         pub fn sim_watch_miss(i: c_int, checks: *mut u32, head: *mut c_int) -> *const u8;
+        pub fn sim_floating(s: *mut Sim, blob: *const u32, words: u32) -> c_int;
+        pub fn sim_fl_place(blob: *const u32, words: u32, u: u32, dst: *mut u32, cap: u32, guest: u32, host: u32) -> c_int;
+        pub fn sim_fl_find(blob: *const u32, words: u32, ram: *const u8, p: u32, at: *mut u32) -> c_int;
+        pub fn sim_fl_stats(out: *mut u32);
+    }
+}
+
+/// The runtime's move of unit `u` of the floating code `blob` (`psp/psxrt/floating.c`
+/// `fl_place`) to guest address `guest` and host address `host`: its host words; None when the
+/// blob is damaged or has no such unit.
+pub fn floating_place(blob: &[u32], u: u32, guest: u32, host: u32) -> Option<Vec<u32>> {
+    let mut out = vec![0u32; blob.len()];
+    // SAFETY: the core reads the blob's words and writes at most `out.len()` words.
+    let n = unsafe { ffi::sim_fl_place(blob.as_ptr(), blob.len() as u32, u, out.as_mut_ptr(), out.len() as u32, guest, host) };
+    out.truncate(usize::try_from(n).ok()?);
+    Some(out)
+}
+
+/// The runtime's search of the floating code `blob` (`fl_find`) for an entry at RAM offset `p`
+/// of `ram` ([`RAM`] bytes): the unit and the RAM offset of its first word. Err when the blob is
+/// damaged or `ram` is not RAM bytes.
+pub fn floating_find(blob: &[u32], ram: &[u8], p: u32) -> Result<Option<(u32, u32)>, ()> {
+    if ram.len() != RAM {
+        return Err(());
+    }
+    let mut at = 0;
+    // SAFETY: the core reads the blob's words and RAM bytes of `ram`.
+    match unsafe { ffi::sim_fl_find(blob.as_ptr(), blob.len() as u32, ram.as_ptr(), p, &mut at) } {
+        -2 => Err(()),
+        u => Ok(u32::try_from(u).ok().map(|u| (u, at))),
     }
 }
 
@@ -148,6 +178,23 @@ impl<'a> Machine<'a> {
         // SAFETY: `sim` is valid until drop; the core copies `words` (size / 4 bytes).
         let i = unsafe { ffi::sim_watch(self.sim, at, size, head_len, head_hash, hash, words.as_ptr()) };
         (i >= 0).then_some(i)
+    }
+
+    /// Takes floating code (`psp/psxrt/floating.h`, engine `native_code::floating_blob`) as the
+    /// native runtime places it: a word the guest runs that no watched image holds takes the
+    /// translation of the unit with an entry there whose words RAM holds, until a load over it.
+    /// False when the blob is damaged.
+    pub fn floating(&mut self, blob: &[u32]) -> bool {
+        // SAFETY: `sim` is valid until drop; the core copies the blob's words.
+        unsafe { ffi::sim_floating(self.sim, blob.as_ptr(), blob.len() as u32) == 0 }
+    }
+
+    /// The floating code's placements so far, and the words they gave a translation.
+    pub fn floating_stats(&self) -> (u32, u32) {
+        let mut s = [0u32; 2];
+        // SAFETY: two words out; this machine holds ONE.
+        unsafe { ffi::sim_fl_stats(s.as_mut_ptr()) };
+        (s[0], s[1])
     }
 
     /// Whether watched image `i` matched at its last check.

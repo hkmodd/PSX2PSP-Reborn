@@ -18,10 +18,11 @@ fn main() {
     // ge.c, the PSP's GE translator, with its PC host (PSX2PSP_SIM_GE: list hashes in the log)
     let psxrt = core.join("..");
     build.define("GEL_ADDR", "geh_addr");
-    for f in ["ge.c", "ge_host_pc.c", "gel_hash.c"] {
+    for f in ["ge.c", "ge_host_pc.c", "gel_hash.c", "floating.c"] {
         build.file(psxrt.join(f));
     }
-    for f in ["ge.c", "ge.h", "ge_host.h", "ge_host_pc.c", "gel.h", "gel_hash.c", "gel_hash.h"] {
+    build.include(&psxrt);
+    for f in ["ge.c", "ge.h", "ge_host.h", "ge_host_pc.c", "gel.h", "gel_hash.c", "gel_hash.h", "floating.c", "floating.h"] {
         println!("cargo:rerun-if-changed={}", psxrt.join(f).display());
     }
     println!("cargo:rerun-if-changed=csrc/sim.c");

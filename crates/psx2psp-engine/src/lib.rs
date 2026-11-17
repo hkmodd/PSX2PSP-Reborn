@@ -1207,6 +1207,11 @@ pub struct Coverage {
     /// their host words ([`psx2psp_recomp::emit::translate_floating`] of each on its own), and the
     /// Floating words that ran in a distinct unit (where it is in a file that holds the run).
     pub units: (usize, usize, usize, usize, usize),
+    /// [`native_code::CodePack::floating`]: units, their guest words, host words, relocations.
+    pub floating_pack: (usize, usize, usize, usize),
+    /// Its placements in the run, as the runtime makes them, and the words they gave a
+    /// translation ([`psx2psp_sim::Machine::floating`]).
+    pub floating_placed: (u32, u32),
 }
 
 /// An overlay candidate that holds code the game runs at addresses it picks ([`Miss::Floating`]).
@@ -1256,7 +1261,9 @@ pub fn static_coverage(img: &DiscImage, patches: &[&dyn ImagePatch], cipher: Opt
         true
     };
     let mut m = Machine::boot(img.sectors(), read).ok_or("the disc does not boot on the core")?;
-    let mut cov = Coverage { images: pack.images.len(), skipped: pack.skipped.clone(), ..Coverage::default() };
+    let fp = &pack.floating;
+    let floating_pack = (fp.len(), fp.iter().map(|c| c.unit.words.len()).sum(), fp.iter().map(|c| c.code.len()).sum(), fp.iter().map(|c| c.relocs.len()).sum());
+    let mut cov = Coverage { images: pack.images.len(), skipped: pack.skipped.clone(), floating_pack, ..Coverage::default() };
     let mut ids = Vec::new();
     for i in &pack.images {
         let (size, words) = (i.text_size & !3, &i.code_words[..i.text_size as usize / 4]);
@@ -1264,6 +1271,9 @@ pub fn static_coverage(img: &DiscImage, patches: &[&dyn ImagePatch], cipher: Opt
         let id = m.watch(i.text_addr & 0x1F_FFFF, size, head, i.head_hash, i.hash, words).ok_or_else(|| format!("{} ({:#010x}, {} bytes, image {}): the sim cannot watch it", i.name, i.text_addr, i.text_size, ids.len()))?;
         ids.push(id);
         cov.image_list.push((i.name.clone(), i.text_addr, i.text_size, words.iter().filter(|&&t| t != 0).count(), None));
+    }
+    if !pack.floating.is_empty() && !m.floating(&native_code::floating_blob(&pack.floating)) {
+        return Err("the sim refuses the floating code".into());
     }
     let mut seen = std::collections::HashMap::new();
     let mut kernel = std::collections::BTreeSet::new();
@@ -1295,6 +1305,7 @@ pub fn static_coverage(img: &DiscImage, patches: &[&dyn ImagePatch], cipher: Opt
             break;
         }
     }
+    cov.floating_placed = m.floating_stats();
     for (k, (&id, i)) in ids.iter().zip(&pack.images).enumerate() {
         let (checks, miss) = m.watch_miss(id, i.text_size & !3);
         let (Some((snap, head)), Some(text), None) = (miss, texts.get(&i.name), cov.image_list[k].4) else { continue };
