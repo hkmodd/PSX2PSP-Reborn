@@ -81,7 +81,9 @@ fn best(votes: &HashMap<u32, u32>, among: impl Fn(u32) -> bool) -> Option<((u32,
 /// addresses so fixed are the disc's overlay slots; a file with fewer votes (a small overlay
 /// that only calls into the executable, say) takes the slot it gives most votes, with at least
 /// [`WEAK`] and more than any other address, or [`TIED`] with no address above and no other
-/// slot as high. A wrong slot costs nothing at run time: the runtime
+/// slot as high. A file no slot takes keeps its own best address with [`WEAK`] votes and three
+/// times the runner-up's, without making it a slot (Silent Hill's ciphered module at 800CB3A4:
+/// 6 functions, 3 votes there, 1 anywhere else). A wrong slot costs nothing at run time: the runtime
 /// takes a translation only when the RAM there holds exactly the file.
 pub fn locate_all(files: &[&[u8]]) -> Vec<Option<(u32, u32)>> {
     let tallies: Vec<Option<HashMap<u32, u32>>> = files.iter().map(|f| tally(f)).collect();
@@ -99,9 +101,14 @@ pub fn locate_all(files: &[&[u8]]) -> Vec<Option<(u32, u32)>> {
         .map(|(t, s)| {
             s.or_else(|| {
                 let t = t.as_ref()?;
-                let ((b, v), slot2) = best(t, |b| slots.contains(&b))?;
-                let other = best(t, |b| !slots.contains(&b)).map_or(0, |((_, v), _)| v);
-                (v >= WEAK && v > other || v >= TIED && v >= other && v > slot2).then_some((b, v))
+                let at_slot = best(t, |b| slots.contains(&b)).and_then(|((b, v), slot2)| {
+                    let other = best(t, |b| !slots.contains(&b)).map_or(0, |((_, v), _)| v);
+                    (v >= WEAK && v > other || v >= TIED && v >= other && v > slot2).then_some((b, v))
+                });
+                at_slot.or_else(|| {
+                    let ((b, v), second) = best(t, |_| true)?;
+                    (v >= WEAK && v >= 3 * second).then_some((b, v))
+                })
             })
         })
         .collect()
@@ -284,6 +291,10 @@ mod tests {
         assert_eq!(at[1], Some((B, 2)));
         // Without a slot fixed by another file the small one stays unplaced.
         assert_eq!(locate_all(&[&small]), vec![None]);
+        // Alone, three votes at one address and one at any other place a file there; it fixes
+        // no slot (`small` stays unplaced beside it).
+        let alone = file(&[0, 10, 50], &[x, x + 40, x + 200]);
+        assert_eq!(locate_all(&[&alone, &small]), vec![Some((x, 3)), None]);
     }
 
     #[test]
