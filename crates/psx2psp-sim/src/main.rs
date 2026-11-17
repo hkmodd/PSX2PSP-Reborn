@@ -82,12 +82,9 @@ fn bin_path(arg: &Path) -> Result<PathBuf, String> {
     if !arg.extension().is_some_and(|e| e.eq_ignore_ascii_case("cue")) {
         return Ok(arg.to_path_buf());
     }
-    let cue = std::fs::read_to_string(arg).map_err(|e| format!("{}: {e}", arg.display()))?;
-    let name = cue
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("FILE ").and_then(|r| r.split('"').nth(1)))
-        .ok_or("cue sheet without a FILE line")?;
-    Ok(arg.with_file_name(name))
+    // as the converter reads it, renamed dumps included
+    let files = psx2psp_core::disc::cue_files(arg).map_err(|e| format!("{}: {e}", arg.display()))?;
+    files.into_iter().next().ok_or_else(|| format!("{}: cue sheet without a FILE line", arg.display()))
 }
 
 fn button(name: &str) -> Option<u16> {

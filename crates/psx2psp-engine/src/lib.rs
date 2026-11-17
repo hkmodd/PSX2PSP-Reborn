@@ -92,12 +92,19 @@ fn path_key(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
-/// Files a `.cue` references, as identity keys (empty if the sheet can't be read).
+/// Files a `.cue` uses, as identity keys: its FILE names, or the files they resolve to when the
+/// dump was renamed (empty if the sheet can't be read or resolved).
 fn cue_members(cue: &Path) -> Vec<PathBuf> {
-    let base = cue.parent().unwrap_or(Path::new(""));
-    std::fs::read(cue)
-        .map(|t| psx2psp_core::disc::cue_file_names(&String::from_utf8_lossy(&t)).iter().map(|n| path_key(&base.join(n))).collect())
-        .unwrap_or_default()
+    psx2psp_core::disc::cue_files(cue).map(|f| f.iter().map(|p| path_key(p)).collect()).unwrap_or_default()
+}
+
+/// Opens disc `n` (1-based) and says which files stand in for the names its sheet gives.
+fn open_disc(path: &Path, n: usize, monitor: &dyn Monitor) -> Result<DiscImage> {
+    let img = DiscImage::open(path)?;
+    for (named, used) in &img.renamed {
+        monitor.log(&format!("Disc {n}: the cue names “{named}”, which is not in its folder: using “{used}”"));
+    }
+    Ok(img)
 }
 
 /// The `.cue` next to `bin` that references it: same stem first, then any other sheet in the folder.
@@ -676,7 +683,7 @@ pub fn convert(req: &ConvertRequest, monitor: &dyn Monitor) -> Result<ConvertRep
     let mut subqs: Vec<Option<Vec<u8>>> = Vec::with_capacity(req.discs.len());
     let mut crcs: Vec<Option<SectorWrites>> = Vec::with_capacity(req.discs.len());
     for (n, d) in req.discs.iter().enumerate() {
-        let img = DiscImage::open(&d.path)?;
+        let img = open_disc(&d.path, n + 1, monitor)?;
         let disc_id = match &d.disc_id {
             Some(id) if !id.trim().is_empty() => normalise_id(id),
             _ => img.probe().disc_id.ok_or_else(|| {
@@ -1096,7 +1103,7 @@ impl NativeDisc {
 /// Opens disc `n` of a native set and works out its patches; `pal60` is the set's (its 60hz
 /// patches stay off).
 fn native_disc(req: &ConvertRequest, d: &DiscInput, n: usize, pal60: bool, monitor: &dyn Monitor) -> Result<NativeDisc> {
-    let img = DiscImage::open(&d.path)?;
+    let img = open_disc(&d.path, n + 1, monitor)?;
     let disc_id = match &d.disc_id {
         Some(id) if !id.trim().is_empty() => normalise_id(id),
         _ => img.probe().disc_id.ok_or_else(|| EngineError::Input(format!("disc {}: no SYSTEM.CNF game ID found — enter it manually", n + 1)))?,
