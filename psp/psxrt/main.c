@@ -453,6 +453,11 @@ static int reserve_fixed(void)
 /* ---- screen: PSP VRAM holds the GE's PS1 VRAM and two 565 display buffers (ge.h) ---- */
 static void *draw_buf; /* relative to the start of the PSP's VRAM */
 static int show_text; /* the log lines over the picture: drawn by the CPU, so off at start */
+static DiscInfo disc_info;
+/* The disc change of a game of more than one disc: L+R+SELECT opens the shell, LEFT/RIGHT pick
+ * the disc, CROSS closes it. read_pad sets the requests, frame() carries them out. */
+static int lid_open, lid_req; /* lid_req: 1 open, 2 close on lid_pick */
+static u32 lid_pick, lid_disc; /* disc chosen, disc in the drive (0-based) */
 
 typedef struct {
     u16 u, v;
@@ -878,9 +883,26 @@ static u16 read_pad(u32 frame_no)
     for (int i = 0; i < pad_n; i++)
         if (frame_no - pad_script[i].frame < pad_script[i].frames)
             b |= pad_script[i].buttons;
-    u32 combo = PSP_CTRL_LTRIGGER | PSP_CTRL_RTRIGGER | PSP_CTRL_SELECT;
-    if ((b & combo) == combo && (prev & combo) != combo)
-        show_text = !show_text;
+    u32 combo = PSP_CTRL_LTRIGGER | PSP_CTRL_RTRIGGER | PSP_CTRL_SELECT, press = b & ~prev;
+    if (lid_open) { /* the disc menu has the pad; the game sees nothing pressed */
+        u32 n = disc_info.discs;
+        if (press & PSP_CTRL_LEFT)
+            lid_pick = (lid_pick + n - 1) % n;
+        if (press & PSP_CTRL_RIGHT)
+            lid_pick = (lid_pick + 1) % n;
+        if (press & PSP_CTRL_TRIANGLE)
+            show_text = !show_text;
+        if (press & PSP_CTRL_CROSS)
+            lid_req = 2;
+        prev = b;
+        return 0xFFFF;
+    }
+    if ((b & combo) == combo && (prev & combo) != combo) {
+        if (disc_info.discs > 1)
+            lid_req = 1, lid_pick = lid_disc;
+        else
+            show_text = !show_text;
+    }
     /* L+R+START: a snapshot (native.c takes it at its next host call); the game does not see
      * the three buttons */
     u32 snap = PSP_CTRL_LTRIGGER | PSP_CTRL_RTRIGGER | PSP_CTRL_START;
@@ -924,6 +946,18 @@ static void frame(void)
     static u32 draw0, mdec0, spu0, rgb0;
     static char status[64];
     psx.sio.buttons[0] = read_pad(frames);
+    if (lid_req == 1) {
+        lid_req = 0, lid_open = 1;
+        cd_lid(&psx, 1);
+        say("disc: shell open, disc %u (%s) in the drive", (unsigned)lid_disc + 1, disc_name(lid_disc));
+    } else if (lid_req == 2) {
+        lid_req = 0, lid_open = 0;
+        u32 s = disc_select(lid_pick);
+        if (s)
+            lid_disc = lid_pick, host.disc_end = 150 + s;
+        cd_lid(&psx, 0);
+        say("disc: shell closed on disc %u (%s)", (unsigned)lid_disc + 1, disc_name(lid_disc));
+    }
     if (watch_n && psx.gpu.flips != watch_flips) {
         watch_flips = psx.gpu.flips;
         for (u32 k = 0; k < watch_n; k++)
@@ -1107,8 +1141,12 @@ static void frame(void)
     }
     if (!status[0])
         snprintf(status, sizeof status, "booting");
+    char lid[64];
+    if (lid_open)
+        snprintf(lid, sizeof lid, "SHELL OPEN  < disc %u/%u %s >  X: close", (unsigned)lid_pick + 1, (unsigned)disc_info.discs,
+                 disc_name(lid_pick));
     u32 tp = sceKernelGetSystemTimeLow();
-    present(&psx, status);
+    present(&psx, lid_open ? lid : status);
     native_stats.us_present += sceKernelGetSystemTimeLow() - tp;
 }
 
@@ -1371,8 +1409,6 @@ static void halt(const char *why)
 }
 
 void runtime_halt(const char *why) { halt(why); }
-
-static DiscInfo disc_info;
 
 static void snap_path(char *path, size_t cap) { snprintf(path, cap, "%spsxrt.snap", base_dir); }
 

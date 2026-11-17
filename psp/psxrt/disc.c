@@ -9,7 +9,8 @@
  * inflate both. Above it, the worker's file read overlaps the frame (the thread blocks in the
  * driver) and only the inflate takes the CPU. If the CPU thread needs the block in flight it waits
  * for it. After the blocks come the translated executables (native.c), read with
- * disc_blob().
+ * disc_blob(). A game of more than one disc has each disc's blocks and index, listed in the disc
+ * table; disc_select() changes the one in the drive.
  */
 #include "disc.h"
 
@@ -43,6 +44,12 @@ typedef struct {
     u32 disc_table, discs; /* 0, 0 for one disc; else discs entries of 0x20 B (ID, sectors, index offset, blocks, 0) */
 } Header;
 
+/* The disc table of a game of more than one disc (README.md, "DATA.PSAR"); entry 0 is disc 1. */
+typedef struct {
+    char id[16];
+    u32 sectors, index_offset, blocks, zero;
+} DiscEntry;
+
 typedef struct {
     int block; /* -1 empty */
     u32 used;  /* last use, for LRU */
@@ -62,7 +69,9 @@ DiscStats disc_stats;
 static Reader rd = {.fd = -1}, pf_rd = {.fd = -1, .quiet = 1, .who = 1};
 static u32 psar; /* file offset of DATA.PSAR */
 static u32 sectors, blocks;
-static u32 *offsets; /* blocks + 1 offsets */
+static u32 *offsets; /* blocks + 1 offsets of the disc in the drive */
+static DiscEntry table[DISC_MAX];
+static u32 ndiscs, cur;
 static Cached *cache;
 static u32 clock;
 /* The worker's request. `pf_slot` is the worker's while `pf_busy`; `pf_done` is signalled when
@@ -121,7 +130,24 @@ const char *disc_open(const char *path, DiscInfo *info)
         return "DATA.PSAR version mismatch: rebuild the EBOOT";
     if (!h.sectors || h.blocks != (h.sectors + BLOCK_SECTORS - 1) / BLOCK_SECTORS)
         return "DATA.PSAR has no disc";
-    offsets = alloc("psxrt index", (h.blocks + 1) * 4);
+    memcpy(table[0].id, h.disc_id, sizeof table[0].id);
+    table[0].sectors = h.sectors, table[0].index_offset = h.index_offset, table[0].blocks = h.blocks;
+    ndiscs = 1, cur = 0;
+    if (h.discs) {
+        if (h.discs < 2 || h.discs > DISC_MAX || !read_at(&rd, h.disc_table, table, h.discs * (u32)sizeof *table) ||
+            table[0].sectors != h.sectors || table[0].index_offset != h.index_offset)
+            return "DATA.PSAR disc table is damaged";
+        ndiscs = h.discs;
+    }
+    u32 most = 0;
+    for (u32 k = 0; k < ndiscs; k++) {
+        DiscEntry *e = &table[k];
+        e->id[sizeof e->id - 1] = 0;
+        if (!e->sectors || e->blocks != (e->sectors + BLOCK_SECTORS - 1) / BLOCK_SECTORS)
+            return "DATA.PSAR disc table is damaged";
+        most = e->blocks > most ? e->blocks : most;
+    }
+    offsets = alloc("psxrt index", (most + 1) * 4);
     cache = alloc("psxrt cache", SLOTS * sizeof(Cached));
     if (!offsets || !cache)
         return "out of memory";
@@ -150,6 +176,7 @@ const char *disc_open(const char *path, DiscInfo *info)
     info->code_size = h.code_size;
     info->flags = h.flags;
     info->cpu_shift = h.cpu_shift;
+    info->discs = ndiscs;
     if (h.images) {
         u32 len = h.images * (u32)sizeof(CodeEntry);
         if (h.images > 256 || sizeof(CodeEntry) != 0x40)
@@ -160,6 +187,35 @@ const char *disc_open(const char *path, DiscInfo *info)
         info->images = h.images;
     }
     return NULL;
+}
+
+const char *disc_name(u32 n) { return n < ndiscs ? table[n].id : ""; }
+
+u32 disc_select(u32 n)
+{
+    if (n >= ndiscs)
+        return 0;
+    if (n == cur)
+        return sectors;
+    if (pf_busy) { /* the worker reads with the index about to change: let it finish */
+        SceUInt t = 2000000;
+        if (sceKernelWaitSema(pf_done, 1, &t) < 0) {
+            disc_log("disc: read-ahead still busy, the disc stays");
+            return 0;
+        }
+        pf_busy = 0;
+    }
+    const DiscEntry *e = &table[n];
+    if (!read_at(&rd, e->index_offset, offsets, (e->blocks + 1) * 4)) {
+        disc_log("disc: cannot read the new disc's index, the disc stays");
+        if (!read_at(&rd, table[cur].index_offset, offsets, (table[cur].blocks + 1) * 4))
+            pf_req = -1, sectors = 0; /* neither index: every read fails, as with no disc */
+        return 0;
+    }
+    for (int k = 0; k < SLOTS; k++)
+        cache[k].block = -1;
+    sectors = e->sectors, blocks = e->blocks, cur = n;
+    return sectors;
 }
 
 int disc_blob(u32 off, u32 stored, void *dst, u32 raw_len)

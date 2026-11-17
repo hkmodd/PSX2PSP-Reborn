@@ -2,9 +2,12 @@
 //! links), printing the guest's TTY and the core's log and saving the screen as PNG.
 //!
 //! ```text
-//! psx2psp-sim <disc.cue|disc.bin> [--frames N] [--every N] [--out DIR] [--press FRAME:BUTTON,...]
-//!             [--poke FRAME:ADDR:HEX,...] [--dump FRAME,...] [--pad FILE] [--trace FROM:TO:FILE]
+//! psx2psp-sim <disc.cue|disc.bin> [--disc DISC]... [--swap FRAME:DISC[:OPEN],...] [--frames N] [--every N]
+//!             [--out DIR] [--press FRAME:BUTTON,...] [--poke FRAME:ADDR:HEX,...] [--dump FRAME,...] [--pad FILE]
+//!             [--trace FROM:TO:FILE]
 //! ```
+//! `--disc` adds discs 2, 3, ... of the game; a swap opens the shell at FRAME and closes it OPEN
+//! frames later (60 if not given) on disc DISC (1-based), as a player changing discs.
 //! Buttons: select start up right down left l2 r2 l1 r1 triangle circle cross square; each press
 //! holds for 6 frames. `--pad` reads a runtime `psxrt.pad` script. `--trace` writes the
 //! straight-line runs the guest executes in frames FROM..=TO (the I-cache model's input,
@@ -19,7 +22,7 @@ use std::process::ExitCode;
 
 #[cfg(test)]
 use psx2psp_sim::ffi::sim_poll_bound;
-use psx2psp_sim::ffi::{sim_boot, sim_display, sim_frame, sim_free, sim_new, sim_pad, sim_ram, sim_status, sim_trace, sim_trace_to, sim_vram};
+use psx2psp_sim::ffi::{sim_boot, sim_display, sim_frame, sim_free, sim_lid, sim_new, sim_pad, sim_ram, sim_status, sim_trace, sim_trace_to, sim_vram};
 use psx2psp_sim::{PREGAP, RAM};
 
 struct Disc {
@@ -27,12 +30,19 @@ struct Disc {
     sectors: u32,
 }
 
+/// The discs of the game and the one in the drive.
+struct Drive {
+    discs: Vec<Disc>,
+    cur: usize,
+}
+
 const SECTOR: u64 = psx2psp_sim::SECTOR as u64;
 
 extern "C" fn read_sector(user: *mut c_void, lba: u32, raw: *mut u8) -> c_int {
-    // SAFETY: `user` is the `Disc` owned by `main` for the simulator's whole life, and `raw` points
+    // SAFETY: `user` is the `Drive` owned by `main` for the simulator's whole life, and `raw` points
     // at a 2352-byte buffer the core owns.
-    let disc = unsafe { &mut *(user as *mut Disc) };
+    let drive = unsafe { &mut *(user as *mut Drive) };
+    let disc = &mut drive.discs[drive.cur];
     let buf = unsafe { std::slice::from_raw_parts_mut(raw, SECTOR as usize) };
     if lba < PREGAP || lba - PREGAP >= disc.sectors {
         return -1;
@@ -76,7 +86,10 @@ fn button(name: &str) -> Option<u16> {
 }
 
 struct Args {
-    disc: PathBuf,
+    /// Disc 1, then the `--disc` ones.
+    discs: Vec<PathBuf>,
+    /// Frame the shell opens, disc (0-based) it closes on, frames it stays open.
+    swaps: Vec<(u32, usize, u32)>,
     frames: u32,
     every: u32,
     out: PathBuf,
@@ -105,7 +118,8 @@ fn poke(p: &str) -> Result<(u32, u32, Vec<u8>), String> {
 fn args() -> Result<Args, String> {
     let mut it = std::env::args().skip(1);
     let mut a = Args {
-        disc: PathBuf::new(),
+        discs: Vec::new(),
+        swaps: Vec::new(),
         frames: 600,
         every: 60,
         out: PathBuf::from("D:/Temp/PSX2PSP-Reborn/sim"),
@@ -160,12 +174,31 @@ fn args() -> Result<Args, String> {
                     a.dumps.push(f.parse::<u32>().map_err(|_| format!("bad dump frame {f}"))?);
                 }
             }
-            _ if a.disc.as_os_str().is_empty() => a.disc = PathBuf::from(arg),
+            "--disc" => {
+                if a.discs.is_empty() {
+                    return Err("--disc comes after disc 1".into());
+                }
+                a.discs.push(PathBuf::from(it.next().ok_or("--disc needs a .cue or .bin")?));
+            }
+            "--swap" => {
+                for s in it.next().ok_or("--swap needs FRAME:DISC[:OPEN_FRAMES],...")?.split(',') {
+                    let v = s.split(':').map(|x| x.parse::<u32>()).collect::<Result<Vec<_>, _>>().map_err(|_| format!("bad swap {s}"))?;
+                    match v[..] {
+                        [f, d] if d >= 1 => a.swaps.push((f, d as usize - 1, 60)),
+                        [f, d, n] if d >= 1 && n >= 1 => a.swaps.push((f, d as usize - 1, n)),
+                        _ => return Err(format!("bad swap {s}")),
+                    }
+                }
+            }
+            _ if a.discs.is_empty() => a.discs.push(PathBuf::from(arg)),
             _ => return Err(format!("unexpected argument {arg}")),
         }
     }
-    if a.disc.as_os_str().is_empty() {
-        return Err("usage: psx2psp-sim <disc.cue|disc.bin> [--frames N] [--every N] [--out DIR] [--press FRAME:BUTTON,...]".into());
+    if a.discs.is_empty() {
+        return Err("usage: psx2psp-sim <disc.cue|disc.bin> [--disc DISC]... [--swap FRAME:DISC[:OPEN],...] [--frames N] [--every N] [--out DIR] [--press FRAME:BUTTON,...]".into());
+    }
+    if let Some(s) = a.swaps.iter().find(|s| s.1 >= a.discs.len()) {
+        return Err(format!("--swap to disc {}: only {} given", s.1 + 1, a.discs.len()));
     }
     Ok(a)
 }
@@ -206,29 +239,28 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let bin = match bin_path(&a.disc) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::from(2);
+    let mut discs = Vec::new();
+    for path in &a.discs {
+        let opened = bin_path(path).and_then(|bin| File::open(&bin).map_err(|e| format!("{}: {e}", bin.display())));
+        match opened {
+            Ok(file) => {
+                let sectors = (file.metadata().map(|m| m.len()).unwrap_or(0) / SECTOR) as u32;
+                discs.push(Disc { file, sectors });
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::from(2);
+            }
         }
-    };
-    let file = match File::open(&bin) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("{}: {e}", bin.display());
-            return ExitCode::from(2);
-        }
-    };
-    let sectors = (file.metadata().map(|m| m.len()).unwrap_or(0) / SECTOR) as u32;
+    }
     if let Err(e) = std::fs::create_dir_all(&a.out) {
         eprintln!("{}: {e}", a.out.display());
         return ExitCode::from(2);
     }
-    let mut disc = Box::new(Disc { file, sectors });
-    let user = &mut *disc as *mut Disc as *mut c_void;
-    // SAFETY: `disc` outlives the simulator, which is freed before main returns.
-    let sim = unsafe { sim_new(user, read_sector, sectors + PREGAP, tty, log) };
+    let mut drive = Box::new(Drive { discs, cur: 0 });
+    let user = &mut *drive as *mut Drive as *mut c_void;
+    // SAFETY: `drive` outlives the simulator, which is freed before main returns.
+    let sim = unsafe { sim_new(user, read_sector, drive.discs[0].sectors + PREGAP, tty, log) };
     if sim.is_null() {
         eprintln!("out of memory");
         return ExitCode::FAILURE;
@@ -249,6 +281,17 @@ fn main() -> ExitCode {
         let ram = sim_ram(sim);
         let mut held: Vec<(u32, u16)> = Vec::new();
         for frame in 1..=a.frames {
+            for &(f, d, open) in &a.swaps {
+                if f == frame {
+                    sim_lid(sim, 1, 0);
+                    println!("[sim] frame {frame} shell open");
+                } else if f + open == frame {
+                    let drive = &mut *(user as *mut Drive); // the core reads through `user` only inside sim_frame
+                    drive.cur = d;
+                    sim_lid(sim, 0, drive.discs[d].sectors + PREGAP);
+                    println!("[sim] frame {frame} shell closed on disc {}", d + 1);
+                }
+            }
             for (_, addr, bytes) in a.pokes.iter().filter(|p| p.0 == frame) {
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), ram.add(*addr as usize), bytes.len());
                 println!("[sim] frame {frame} poke {addr:06X} {} B", bytes.len());

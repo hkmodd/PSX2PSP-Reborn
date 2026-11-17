@@ -156,7 +156,12 @@ typedef struct Cdrom {
     u8 vol[4]; /* LL LR RL RR */
     u8 vol_next[4];
     int muted;
+    /* the shell (cd_lid): CD_LID_CLOSED, CD_LID_OPEN, or CD_LID_SPINUP until lid_due */
+    u8 lid;
+    u64 lid_due;
 } Cdrom;
+
+enum { CD_LID_CLOSED, CD_LID_OPEN, CD_LID_SPINUP };
 
 #define GPU_FIFO 16
 
@@ -526,6 +531,11 @@ u8 cd_read(Psx *psx, int reg);
 void cd_write(Psx *psx, int reg, u8 v);
 void cd_update(Psx *psx);
 u32 cd_dma_word(Psx *psx);
+/* The shell opens (1) or closes (0). The host changes the disc while it is open: read_sector's
+ * source and disc_end, before the close. Opening stops the drive with INT5 (11h, 08h); commands
+ * that need the disc fail with INT5 (11h, 80h) while it is open; after the close the motor spins
+ * up for a second, and the next Getstat clears the shell bit (psx-spx "CDROM Drive"). */
+void cd_lid(Psx *psx, int open);
 /* The next n 44100 Hz stereo samples of the CD audio (XA), through the CD volume matrix; 0 where
  * nothing is queued. */
 void cd_audio(Psx *psx, s32 *l, s32 *r, int n);

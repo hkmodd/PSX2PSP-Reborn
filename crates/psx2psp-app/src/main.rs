@@ -1403,8 +1403,6 @@ impl App {
             Some(format!("{}: no game ID detected — type it (e.g. SLUS00594)", file_name(&d.path)))
         } else if self.title.trim().is_empty() {
             Some("Enter a title".to_owned())
-        } else if self.native && self.discs.len() > 1 {
-            Some(format!("Native builds one disc; {} are selected — use POPS for multi-disc games", self.discs.len()))
         } else if self.media_bytes() > tools::SND0_BUDGET {
             Some(format!("ICON1 + SND0 take {} KB; the XMB allows 500 KB — make a shorter clip", self.media_bytes().div_ceil(1024)))
         } else {
@@ -3133,21 +3131,6 @@ mod tests {
             assert_eq!((m.width, m.height, m.frames.len()), (144, 80, 605));
         }
         assert!(load_snd0(p).is_err(), "a PMF is not an AT3");
-    }
-
-    /// Native mode refuses more than one disc before any work starts.
-    #[test]
-    fn native_takes_one_disc() {
-        let mut app = App::boot().0;
-        app.title = "Game".into();
-        for (n, id) in [(1, "SLUS00001"), (2, "SLUS00002")] {
-            app.discs.push(Disc::new(n, PathBuf::from(format!("d{n}.cue"))));
-            app.discs.last_mut().unwrap().id = id.into();
-        }
-        let _ = app.update(Message::Native(true));
-        let _ = app.convert();
-        assert!(app.job.is_none());
-        assert!(app.toasts.last().unwrap().text.contains("Native builds one disc"), "{}", app.toasts.last().unwrap().text);
     }
 
     /// The GUI's Native build produces an EBOOT.PBP (needs a local disc image).

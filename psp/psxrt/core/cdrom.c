@@ -3,7 +3,8 @@
  * the controller's acknowledge delay; commands with a second phase answer INT2 later; reads
  * deliver one INT1 per sector at 75/150 sectors per second. Responses wait in a small queue
  * while the guest has not acknowledged the previous interrupt, as the hardware holds them.
- * One data track (the disc image's), so GetTN/GetTD describe a single track.
+ * One data track (the disc image's), so GetTN/GetTD describe a single track. The shell opens and
+ * closes for a disc change (cd_lid).
  */
 #include "psx.h"
 
@@ -14,8 +15,9 @@
 #define SEEK_TIME 100000u
 #define ACK_GAP 1500u        /* a queued response follows an acknowledge after this */
 #define SECTOR_1X (PSX_CLOCK / 75)
+#define SPINUP_TIME PSX_CLOCK /* shell closed to motor on: DuckStation's one second */
 
-enum { ST_ERROR = 0x01, ST_MOTOR = 0x02, ST_READ = 0x20, ST_SEEK = 0x40, ST_PLAY = 0x80 };
+enum { ST_ERROR = 0x01, ST_MOTOR = 0x02, ST_SHELL = 0x10, ST_READ = 0x20, ST_SEEK = 0x40, ST_PLAY = 0x80 };
 
 static u8 bcd(u32 v) { return (u8)((v / 10) << 4 | v % 10); }
 static u32 unbcd(u8 v) { return (v >> 4) * 10 + (v & 15); }
@@ -94,6 +96,8 @@ static void start_read(Psx *psx)
     cd->reading = 1;
     cd->stat = (u8)((cd->stat & ~(ST_SEEK | ST_PLAY)) | ST_MOTOR | ST_READ);
     cd->read_due = psx->cycles + ACK_DELAY + delay;
+    if (cd->lid == CD_LID_SPINUP && cd->read_due < cd->lid_due + delay)
+        cd->read_due = cd->lid_due + delay;
     psx_schedule(psx, cd->read_due);
 }
 
@@ -174,10 +178,17 @@ static void command(Psx *psx, u8 c)
     if (psx->trace & 2)
         psx_log(psx, "cd %02X %02X %02X %02X (%d) stat %02X mode %02X", c, p[0], p[1], p[2], cd->nparams, cd->stat, cd->mode);
     cd->stat &= (u8)~ST_ERROR;
+    if (cd->lid == CD_LID_OPEN && (c == 0x03 || c == 0x06 || c == 0x07 || c == 0x15 || c == 0x16 || c == 0x1A || c == 0x1B || c == 0x1E)) {
+        CdResp *r = push(psx, 5, ack); /* Play, ReadN, MotorOn, SeekL/P, GetID, ReadS, ReadTOC: no disc */
+        r->b[0] = cd->stat | ST_ERROR, r->b[1] = 0x80, r->n = 2;
+        cd->nparams = 0;
+        return;
+    }
     switch (c) {
     case 0x01: /* Getstat */
         resp_stat(psx, 3, ack);
-        cd->stat &= (u8)~0x10; /* shell-open latch clears once reported */
+        if (cd->lid != CD_LID_OPEN)
+            cd->stat &= (u8)~ST_SHELL; /* shell-open latch clears once reported with the shell closed */
         break;
     case 0x02: /* Setloc */
         cd->setloc = (unbcd(p[0]) * 60 + unbcd(p[1])) * 75 + unbcd(p[2]);
@@ -208,7 +219,7 @@ static void command(Psx *psx, u8 c)
     case 0x0A: /* Init */
         stop_reading(cd);
         cd->mode = 0;
-        cd->stat = ST_MOTOR;
+        cd->stat = cd->lid == CD_LID_OPEN ? ST_SHELL : ST_MOTOR;
         resp_stat(psx, 3, psx->cycles + INIT_ACK);
         later = 0x2000;
         ack = psx->cycles + INIT_ACK;
@@ -302,9 +313,37 @@ static void command(Psx *psx, u8 c)
     if (later) {
         cd->cmd2 = c;
         cd->cmd2_due = ack + later;
+        if (cd->lid == CD_LID_SPINUP && cd->cmd2_due < cd->lid_due + later)
+            cd->cmd2_due = cd->lid_due + later; /* the drive answers once spun up */
         psx_schedule(psx, cd->cmd2_due);
     }
     cd->nparams = 0;
+}
+
+void cd_lid(Psx *psx, int open)
+{
+    Cdrom *cd = &psx->cd;
+    if (open) {
+        if (cd->lid == CD_LID_OPEN)
+            return;
+        cd->lid = CD_LID_OPEN;
+        stop_reading(cd);
+        cd->cmd2 = 0;
+        int k = 0; /* sectors still waiting are the old disc's */
+        for (int i = 0; i < cd->nq; i++)
+            if (!cd->q[i].sector)
+                cd->q[k++] = cd->q[i];
+        cd->nq = k;
+        cd->stat = ST_SHELL | ST_ERROR; /* psx-spx: every bit but shell open and error clears */
+        CdResp *r = push(psx, 5, psx->cycles);
+        r->b[0] = cd->stat, r->b[1] = 0x08, r->n = 2;
+        psx_log(psx, "cd: shell open");
+    } else if (cd->lid == CD_LID_OPEN) {
+        cd->lid = CD_LID_SPINUP;
+        cd->lid_due = psx->cycles + SPINUP_TIME;
+        psx_schedule(psx, cd->lid_due);
+        psx_log(psx, "cd: shell closed, disc end LBA %u", psx->host->disc_end);
+    }
 }
 
 u8 cd_read(Psx *psx, int reg)
@@ -383,6 +422,8 @@ void cd_write(Psx *psx, int reg, u8 v)
 void cd_update(Psx *psx)
 {
     Cdrom *cd = &psx->cd;
+    if (cd->lid == CD_LID_SPINUP && psx->cycles >= cd->lid_due)
+        cd->lid = CD_LID_CLOSED, cd->stat |= ST_MOTOR;
     if (cd->cmd2 && psx->cycles >= cd->cmd2_due)
         second(psx);
     if (cd->reading && psx->cycles >= cd->read_due)
@@ -395,6 +436,8 @@ void cd_update(Psx *psx)
         psx_schedule(psx, cd->read_due);
     if (cd->nq && !(cd->irq_flags & 7))
         psx_schedule(psx, cd->q_due);
+    if (cd->lid == CD_LID_SPINUP)
+        psx_schedule(psx, cd->lid_due);
 }
 
 u32 cd_dma_word(Psx *psx)

@@ -26,6 +26,7 @@ pub mod ffi {
         pub fn sim_display(s: *const Sim, out: *mut c_int);
         pub fn sim_status(s: *const Sim, out: *mut u32);
         pub fn sim_trace(s: *mut Sim, flags: c_int);
+        pub fn sim_lid(s: *mut Sim, open: c_int, disc_end: u32);
         pub fn sim_trace_to(path: *const c_char, out: *mut u64) -> c_int;
         pub fn sim_poll_bound(s: *mut Sim, pc: u32, gpr: *const u32, raw: u32, room: u32) -> u32;
         pub fn sim_ran() -> *const u8;

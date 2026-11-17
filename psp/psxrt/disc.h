@@ -27,7 +27,10 @@ typedef struct DiscInfo {
     /* translated loops charge their PS1 cycles >> cpu_shift (patch database `cpu_shift`, as
      * POPS config word 19): the game gets more CPU per frame */
     u32 cpu_shift;
+    u32 discs; /* discs of the game, 1..DISC_MAX; disc_id and title are disc 1's */
 } DiscInfo;
+
+#define DISC_MAX 5
 
 /* DiscInfo.flags: a PAL picture runs at 60 vblanks a second (patch database `pal60`). */
 #define DISC_PAL60 1u
@@ -44,6 +47,12 @@ extern DiscStats disc_stats;
 /* Opens the EBOOT at `path` and checks its DATA.PSAR, and starts the read-ahead worker. NULL, or
  * what is wrong. */
 const char *disc_open(const char *path, DiscInfo *info);
+/* Puts disc `n` (0-based) in the drive: its index replaces the current one and the cache empties.
+ * Its sector count, or 0 when `n` is not a disc of the game or its index cannot be read (the
+ * drive keeps the disc it had). CPU thread only, with the shell open (cd_lid). */
+u32 disc_select(u32 n);
+/* The ID of disc `n` (0-based), "" past the last. */
+const char *disc_name(u32 n);
 /* PsxHost.read_sector: 0, or -1 outside the image or on a read error (reported to disc_log). */
 int disc_read_sector(void *user, u32 lba, u8 *raw);
 /* Reads `raw_len` bytes stored at `off` (`stored` bytes, raw deflate unless equal) into `dst`:

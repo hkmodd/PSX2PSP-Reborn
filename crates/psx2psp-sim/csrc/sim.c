@@ -240,6 +240,15 @@ void sim_pad(Sim *s, u16 buttons) { s->psx.sio.buttons[0] = buttons; }
 
 void sim_trace(Sim *s, int flags) { s->psx.trace = flags; }
 
+/* The shell opens, or closes on the disc whose lead-out is at LBA `disc_end` (the caller's
+ * read_sector already reads it). */
+void sim_lid(Sim *s, int open, u32 disc_end)
+{
+    if (!open)
+        s->host.disc_end = disc_end;
+    cd_lid(&s->psx, open);
+}
+
 /* Display area: x, y, width, height, 24-bit flag, enabled. */
 void sim_display(const Sim *s, int *out)
 {
