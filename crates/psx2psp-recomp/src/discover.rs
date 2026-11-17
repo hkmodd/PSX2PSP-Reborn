@@ -20,6 +20,12 @@ const RA: usize = 31;
 const JR_RA: u32 = 0x03E0_0008;
 /// Instructions a leaf found after a return may run straight before its own `jr ra`.
 const LEAF_MAX: u32 = 64;
+/// Instructions an island of code ([`island`]) holds at least and at most.
+const ISLAND_MIN: usize = 6;
+const ISLAND_MAX: usize = 4096;
+/// Non-zero words an island holds at least: Crash 2's shortest GOOL native code (a load, two
+/// stores, an add, its `jalr s5,ra`).
+const ISLAND_SOLID: usize = 5;
 
 /// `a` holds a non-zero word right after a `jr ra`, its delay slot and up to 3 zero words.
 fn after_return(exe: &PsxExe, a: u32) -> bool {
@@ -47,7 +53,8 @@ fn after_end(img: Image, a: u32) -> bool {
     }
     for pad in 0.. {
         let slot = a.wrapping_sub(4 * (pad + 1));
-        if matches!(img.flow_at(slot.wrapping_sub(4)), Some(Flow::Return | Flow::Goto(_) | Flow::JumpReg)) {
+        let end = img.at(slot.wrapping_sub(4)).is_some_and(|(i, k)| ends_here(i, flow(i, k, slot.wrapping_sub(4))));
+        if end || matches!(img.flow_at(slot.wrapping_sub(4)), Some(Flow::Goto(_))) {
             return true;
         }
         if img.0.word(slot) != Some(0) {
@@ -81,6 +88,113 @@ fn tabled(exe: &PsxExe, file: Far, entries: &BTreeMap<u32, Origin>) -> HashSet<u
 /// The little-endian words of `b`.
 fn words(b: &[u8]) -> impl Iterator<Item = u32> + '_ {
     b.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+}
+
+/// `a` is in the text, at its start or right after a word that is not an instruction: code that
+/// starts after data (Crash 2's GOOL entries: the interpreter's op words, then the native code it
+/// jumps to, often from a `nop`; a run of them cut from a file starts at its code).
+fn after_invalid(img: Image, a: u32) -> bool {
+    let p = a.wrapping_sub(4);
+    img.0.contains(a) && (!img.0.contains(p) || img.at(p).is_none())
+}
+
+/// From `a`, every path decodes, stays in the text and ends in a transfer that does not fall
+/// through ([`ends_here`]) through a register other than `zero`, over [`ISLAND_MAX`] instructions
+/// at most: a piece of code nothing in the image reaches, entered from outside it. An island when
+/// it holds [`ISLAND_MIN`] instructions, [`ISLAND_SOLID`] of them non-zero (zeros decode as
+/// `nop`, small numbers as `jr zero`: data so is not one), or when every transfer it ends in is
+/// one word of `exits`, those of the image's islands of that size ([`island_exits`]): Crash 2's
+/// shortest GOOL native code, `lw; beq; jalr s5,ra`, ends as its longer ones do. Its span (first,
+/// past the last).
+fn island(img: Image, a: u32, exits: &HashSet<u32>) -> Option<(u32, u32)> {
+    island_walk(img, a).and_then(|w| (w.big || w.ends.iter().all(|e| exits.contains(e))).then_some(w.span))
+}
+
+/// What [`island`] finds from an address.
+struct Walk {
+    span: (u32, u32),
+    /// The words of the transfers it ends in.
+    ends: Vec<u32>,
+    /// [`ISLAND_MIN`] instructions, [`ISLAND_SOLID`] non-zero.
+    big: bool,
+}
+
+/// The words of the transfers the islands of the image of [`ISLAND_MIN`] instructions end in.
+fn island_exits(img: Image) -> HashSet<u32> {
+    let exe = img.0;
+    (exe.text_addr..exe.text_end())
+        .step_by(4)
+        .filter(|&a| after_invalid(img, a))
+        .filter_map(|a| island_walk(img, a).filter(|w| w.big))
+        .flat_map(|w| w.ends)
+        .collect()
+}
+
+fn island_walk(img: Image, a: u32) -> Option<Walk> {
+    let (mut seen, mut work, mut ends) = (HashSet::new(), vec![a], Vec::new());
+    while let Some(mut pc) = work.pop() {
+        while seen.insert(pc) {
+            if seen.len() > ISLAND_MAX {
+                return None;
+            }
+            let Some((i, k)) = img.at(pc) else { return None };
+            let f = flow(i, k, pc);
+            if f == Flow::Next {
+                pc = pc.wrapping_add(4);
+                continue;
+            }
+            if img.at(pc.wrapping_add(4)).is_none() {
+                return None;
+            }
+            seen.insert(pc.wrapping_add(4));
+            pc = match f {
+                Flow::Branch(t) | Flow::Goto(t) if !img.0.contains(t) => return None,
+                Flow::Branch(t) => {
+                    work.push(t);
+                    pc.wrapping_add(8)
+                }
+                Flow::Goto(t) => t,
+                _ if ends_here(i, f) && i.rs() == 0 => return None,
+                _ if ends_here(i, f) => {
+                    ends.push(i.0);
+                    break;
+                }
+                _ => pc.wrapping_add(8),
+            };
+        }
+    }
+    let span = (*seen.iter().min()?, seen.iter().max()?.wrapping_add(4));
+    let solid = seen.iter().filter(|&&a| img.0.word(a) != Some(0)).count();
+    (!ends.is_empty()).then_some(Walk { span, ends, big: seen.len() >= ISLAND_MIN && solid >= ISLAND_SOLID })
+}
+
+/// The islands of code in `bytes` (a file, or a piece of one) that discovery finds as
+/// [`Origin::Island`] entries: code after a word that is not an instruction, entered from outside
+/// ([`island`]). (start, end) byte offsets, in order, disjoint. Crash 2's GOOL native code, in
+/// NSF files too large to read whole, between the interpreter's op words.
+pub fn islands(bytes: &[u8]) -> Vec<(u32, u32)> {
+    const BASE: u32 = 0x8000_0000;
+    let exe = PsxExe { pc0: BASE, gp0: 0, text_addr: BASE, text: bytes[..bytes.len() & !3].to_vec(), bss: (0, 0), stack: (0, 0) };
+    let img = Image(&exe, &[]);
+    let exits = island_exits(img);
+    let (mut out, mut a, end) = (Vec::new(), BASE, BASE + exe.text.len() as u32);
+    while a < end {
+        match after_invalid(img, a).then(|| island(img, a, &exits)).flatten() {
+            Some((s, e)) if s >= a => {
+                out.push((s - BASE, e - BASE));
+                a = e;
+            }
+            _ => a += 4,
+        }
+    }
+    out
+}
+
+/// A transfer after which control does not come back to the next instruction by itself: `jr`,
+/// and `jalr` through `ra` (a return that leaves a link: Crash 2's GOOL native code ends in
+/// `jalr s5,ra`, its interpreter reads on at s5).
+fn ends_here(i: Insn, f: Flow) -> bool {
+    matches!(f, Flow::Return | Flow::JumpReg) || (f == Flow::CallReg && i.rs() == RA)
 }
 
 /// From `a`, every word decodes up to a `jr ra` (and its delay slot) within [`LEAF_MAX`].
@@ -142,6 +256,9 @@ pub enum Origin {
     /// padding), and every path from it decodes: a handler in a table of function pointers or
     /// stored in a state variable.
     Pointer,
+    /// Right after a word that is not an instruction, and every path from it decodes to a
+    /// transfer that does not fall through ([`island`]): code entered from outside the image.
+    Island,
 }
 
 /// A `jr` through a register other than `ra`.
@@ -420,6 +537,7 @@ impl Discovery {
             }
         }
         let mut tried = HashSet::new();
+        let exits = island_exits(img);
         let mut pointed: HashSet<u32> = (exe.text_addr..exe.text_end())
             .step_by(4)
             .filter_map(|a| exe.word(a))
@@ -436,7 +554,8 @@ impl Discovery {
                 let pointer = pointed.contains(&a) && (after_end(img, a) || tabled.contains(&a));
                 // Tried again once it becomes a pointer: a leaf test may have failed before the code
                 // building it was found.
-                if d.code.contains(&a) || !(prologue || pointer || after_return(exe, a)) || !tried.insert((a, pointer)) {
+                let isle = after_invalid(img, a);
+                if d.code.contains(&a) || !(prologue || pointer || isle || after_return(exe, a)) || !tried.insert((a, pointer)) {
                     continue;
                 }
                 if !prologue {
@@ -446,6 +565,10 @@ impl Discovery {
                         changed = true;
                     } else if pointer && d.clean_from(img, a) {
                         d.entries.entry(a).or_insert(Origin::Pointer);
+                        d.explore(img, vec![a]);
+                        changed = true;
+                    } else if isle && island(img, a, &exits).is_some() {
+                        d.entries.entry(a).or_insert(Origin::Island);
                         d.explore(img, vec![a]);
                         changed = true;
                     }
@@ -522,7 +645,10 @@ impl Discovery {
                         if let Some(c) = c {
                             self.call(exe, c, pc, &mut work);
                         }
-                        work.push(after);
+                        // Through ra it returns: what follows is code only if found as such.
+                        if !ends_here(i, Flow::CallReg) {
+                            work.push(after);
+                        }
                     }
                     Flow::Next => unreachable!(),
                 }

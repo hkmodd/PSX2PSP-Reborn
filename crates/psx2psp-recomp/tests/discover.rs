@@ -486,3 +486,45 @@ fn real_overlays() {
     println!("TOTAL {found} of {} located, {code} B of code; largest translation per base: {host_max:x?}", paths.len());
     assert!(!paths.is_empty());
 }
+
+/// Code after words that are not instructions, entered from outside the image: an interpreter's
+/// op words, then native code that returns through `jalr s5,ra` (Crash 2's GOOL entries). What
+/// follows the `jalr` through ra is not code by itself, nor a run too short to be an island.
+#[test]
+fn an_island_of_code_after_data_is_found() {
+    const S0: u32 = 16;
+    const S5: u32 = 21;
+    const S6: u32 = 22;
+    let w = [
+        r(8, RA, 0, 0, 0),           // 0  entry: jr ra
+        NOP,                         // 1
+        0x1C30_184E,                 // 2  op words: not instructions
+        0x49BE_0BE0,                 // 3
+        NOP,                         // 4  entered at a nop
+        i(0x23, S6, V0, 0xFFFC),     // 5  lw v0,-4(s6)
+        i(9, S6, S6, 0xFFFC),        // 6  addiu s6,s6,-4
+        i(0x2B, S0, V0, 372),        // 7  sw v0,372(s0)
+        i(0x2B, S0, S6, 188),        // 8  sw s6,188(s0)
+        r(9, RA, 0, S5, 0),          // 9  jalr s5,ra
+        NOP,                         // 10
+        0x1C30_1851,                 // 11 op words
+        0x49BE_0BE0,                 // 12
+        i(0x23, SP, A0, 0),          // 13 lw a0,0(sp): three words, no island
+        r(8, RA, 0, 0, 0),           // 14 jr ra
+        NOP,                         // 15
+        0x49BE_0BE0,                 // 16 op word
+        i(0x23, S0, V0, 352),        // 17 lw v0,352(s0): short, but it ends as the island at 4
+        NOP,                         // 18
+        r(9, RA, 0, S5, 0),          // 19 jalr s5,ra
+        NOP,                         // 20
+    ];
+    let d = Discovery::run(&exe(&w));
+    assert_eq!(d.entries.get(&at(4)), Some(&Origin::Island));
+    assert!((4..=10).all(|n| d.code.contains(&at(n))));
+    assert!(!d.code.contains(&at(11)) && !d.code.contains(&at(13)));
+    assert_eq!(d.entries.get(&at(17)), Some(&Origin::Island));
+    assert!((17..=20).all(|n| d.code.contains(&at(n))));
+    // The same islands in a file's bytes, at their offsets.
+    let bytes: Vec<u8> = w.iter().flat_map(|w| w.to_le_bytes()).collect();
+    assert_eq!(psx2psp_recomp::discover::islands(&bytes), vec![(16, 44), (68, 84)]);
+}

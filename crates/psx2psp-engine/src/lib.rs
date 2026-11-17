@@ -936,6 +936,8 @@ pub fn disc_overlay_files(img: &DiscImage, patches: &[&dyn ImagePatch], cipher: 
     /// Data blocks beside a run of code in a file too large to read whole that its discovery
     /// reads tables in: 128 KB, a room's tables of Silent Hill and its header.
     const AROUND: usize = 64;
+    /// Bytes between two islands of code of one candidate at most: a 64 KB NSF page of Crash 2.
+    const ISLE_GAP: u32 = 0x1_0000;
     let Ok(files) = img.iso_files() else { return Vec::new() };
     let fits = |n: u32| (0x800..=native_code::OVERLAY_MAX).contains(&n);
     let mut rd = img.reader();
@@ -959,10 +961,13 @@ pub fn disc_overlay_files(img: &DiscImage, patches: &[&dyn ImagePatch], cipher: 
         }
         // Each sector once: whether it is code, whether it starts a ciphered file.
         let big = whole.is_none() && entries.is_empty();
-        let (mut code, mut starts) = (Vec::new(), Vec::new());
+        let (mut code, mut starts, mut isles) = (Vec::new(), Vec::new(), Vec::new());
         if big || cipher.is_some() {
             for c in (0..f.size.div_ceil(2048)).step_by(CHUNK as usize) {
                 let Some(b) = read(2048 * c, (f.size - 2048 * c).min(2048 * CHUNK)) else { break };
+                if big {
+                    isles.extend(psx2psp_recomp::discover::islands(&b).into_iter().map(|(s, e)| (2048 * c + s, 2048 * c + e)));
+                }
                 for (i, s) in b.chunks_exact(CODE_BLOCK).enumerate() {
                     code.push(if big { overlay::code_block(s) } else { overlay::Block::Data });
                     if cipher.is_some_and(|k| k.starts(s)) {
@@ -994,6 +999,20 @@ pub fn disc_overlay_files(img: &DiscImage, patches: &[&dyn ImagePatch], cipher: 
                 let (s, e) = (at + s as usize, at + e as usize);
                 Overlay { name: format!("{name}+{:X}", 2048 * lo + s), bytes: b[s..e].to_vec(), file: Some((s as u32, b.clone())) }
             }));
+        }
+        // Islands of code without prologues ([`discover::islands`]), joined across ISLE_GAP:
+        // code a file holds between data, as Crash 2's GOOL entries hold their native code.
+        let mut k = 0;
+        while k < isles.len() {
+            let (s, mut e, mut n) = (isles[k].0, isles[k].1, k + 1);
+            while n < isles.len() && isles[n].0 - e <= ISLE_GAP && isles[n].1 - s <= native_code::OVERLAY_MAX {
+                e = isles[n].1;
+                n += 1;
+            }
+            if let Some(bytes) = read(s, e - s) {
+                out.push(Overlay::whole(format!("{name}~{s:X}"), bytes));
+            }
+            k = n;
         }
         if let Some(bytes) = whole {
             out.push(Overlay::whole(name, bytes));
@@ -1107,21 +1126,27 @@ pub enum Miss {
     Replaced,
     /// Outside every image: code loaded from a file the translation does not place, or made.
     Outside,
-    /// Outside every image, with the words of a disc file the translation does not place, or
-    /// the same instructions with other addresses in them: code a file holds at an address the
-    /// game picks as it runs ([`floating_in`]).
+    /// Outside every image, with the words of an overlay candidate the translation does not
+    /// place, or the same instructions with other addresses in them ([`floating_in`]), that its
+    /// discovery at [`FLOATING_BASE`] translates: code a file holds at an address the game picks
+    /// as it runs.
     Floating,
-    /// Outside every image, Floating but in a disc file no overlay candidate holds that part of
-    /// ([`disc_overlay_files`] cut it out).
+    /// Outside every image, with the words of a disc file ([`floating_in`]) that no discovery
+    /// translates: not in an overlay candidate, or not found as code in it.
     Unlisted,
 }
+
+/// Where [`static_coverage`] translates an overlay candidate it finds code of that ran
+/// elsewhere: the start of RAM, as the modules linked at 0 that a loader relocates (Spider-Man's).
+pub const FLOATING_BASE: u32 = 0x8000_0000;
 
 /// Whether `run` (consecutive instructions) is in one of `files` at a word boundary: each
 /// instruction the file's, or the same one with another address in it (`j`/`jal` target, or the
 /// immediate of a `lui`, `addiu`, `ori`, load or store: the loader relocated it), and at least
 /// half of them the file's exactly. The run is looked for by its first instruction that holds
-/// no address. Answers per run.
-pub fn floating_in(runs: &[Vec<u32>], files: impl IntoIterator<Item = impl AsRef<[u8]>>) -> Vec<bool> {
+/// no address. Answers per run: every place it is at, the file (its index in `files`) and the
+/// word the run starts at.
+pub fn floating_in(runs: &[Vec<u32>], files: impl IntoIterator<Item = impl AsRef<[u8]>>) -> Vec<Vec<(usize, usize)>> {
     let addr = |w: u32| matches!(w >> 26, 2 | 3 | 0x09 | 0x0D | 0x0F | 0x20..=0x2E);
     let same = |r: u32, f: u32| r == f || (r >> 26 == f >> 26 && addr(r) && (r >> 26 <= 3 || r >> 16 == f >> 16));
     let mut by: std::collections::HashMap<u32, Vec<(usize, usize)>> = std::collections::HashMap::new();
@@ -1130,20 +1155,22 @@ pub fn floating_in(runs: &[Vec<u32>], files: impl IntoIterator<Item = impl AsRef
             by.entry(r[k]).or_default().push((n, k));
         }
     }
-    let mut found = vec![false; runs.len()];
-    for f in files {
+    let mut found = vec![Vec::new(); runs.len()];
+    for (n_file, f) in files.into_iter().enumerate() {
         let f = f.as_ref();
         let word = |j: usize| u32::from_le_bytes(f[4 * j..4 * j + 4].try_into().unwrap());
         for p in 0..f.len() / 4 {
             let Some(list) = by.get(&word(p)) else { continue };
             for &(n, k) in list {
                 let r = &runs[n];
-                if found[n] || p < k || p - k + r.len() > f.len() / 4 {
+                if p < k || p - k + r.len() > f.len() / 4 {
                     continue;
                 }
                 let q = p - k;
                 let exact = (0..r.len()).filter(|&i| r[i] == word(q + i)).count();
-                found[n] = 2 * exact >= r.len() && (0..r.len()).all(|i| same(r[i], word(q + i)));
+                if 2 * exact >= r.len() && (0..r.len()).all(|i| same(r[i], word(q + i))) {
+                    found[n].push((n_file, q));
+                }
             }
         }
     }
@@ -1298,17 +1325,35 @@ pub fn static_coverage(img: &DiscImage, patches: &[&dyn ImagePatch], cipher: Opt
     let all = files.iter().filter_map(|f| read_patched_file(img, &mut rd, f, patches).ok());
     let mut fate: std::collections::HashMap<u32, Miss> = std::collections::HashMap::new();
     let words = |r: &[(u32, u32)]| r.iter().map(|w| w.1).collect::<Vec<_>>();
-    let listed = floating_in(&runs.iter().map(|r| words(r)).collect::<Vec<_>>(), texts.values());
-    let left: Vec<usize> = (0..runs.len()).filter(|&k| !listed[k]).collect();
-    let on_disc = floating_in(&left.iter().map(|&k| words(&runs[k])).collect::<Vec<_>>(), all);
-    let mut kind = vec![Miss::Floating; runs.len()];
-    for (j, &k) in left.iter().enumerate() {
-        kind[k] = if on_disc[j] { Miss::Unlisted } else { Miss::Outside };
+    let cands: Vec<&Vec<u8>> = texts.values().collect();
+    let listed = floating_in(&runs.iter().map(|r| words(r)).collect::<Vec<_>>(), cands.iter().copied());
+    // Each candidate that holds a run, discovered at FLOATING_BASE: the runs' words it translates.
+    let mut code = std::collections::HashMap::new();
+    for &(f, _) in listed.iter().flatten() {
+        code.entry(f).or_insert_with(|| {
+            let b = cands[f];
+            let exe = psx2psp_recomp::overlay::as_exe(b, FLOATING_BASE).unwrap_or(psx2psp_recomp::PsxExe { pc0: FLOATING_BASE, gp0: 0, text_addr: FLOATING_BASE, text: b[..b.len() & !3].to_vec(), bss: (0, 0), stack: (0, 0) });
+            psx2psp_recomp::Discovery::run_file(&exe, &[], &[], &[]).code
+        });
     }
-    for (r, k) in runs.iter().zip(kind) {
-        for &(a, _) in r {
-            let e = fate.entry(a).or_insert(Miss::Floating);
-            *e = (*e).min(k);
+    let left: Vec<usize> = (0..runs.len()).filter(|&k| listed[k].is_empty()).collect();
+    let on_disc = floating_in(&left.iter().map(|&k| words(&runs[k])).collect::<Vec<_>>(), all);
+    for (k, r) in runs.iter().enumerate() {
+        for (i, &(a, _)) in r.iter().enumerate() {
+            // Floating when a discovery of a file that holds it translates it.
+            let kind = if listed[k].iter().any(|&(f, q)| code[&f].contains(&(FLOATING_BASE + 4 * (q + i) as u32))) {
+                Miss::Floating
+            } else if !listed[k].is_empty() || left.binary_search(&k).is_ok_and(|j| !on_disc[j].is_empty()) {
+                Miss::Unlisted
+            } else {
+                Miss::Outside
+            };
+            // The farthest from a translation of every version: Outside, then Unlisted.
+            let far = |m: Miss| [Miss::Floating, Miss::Unlisted, Miss::Outside].iter().position(|&x| x == m);
+            let e = fate.entry(a).or_insert(kind);
+            if far(kind) > far(*e) {
+                *e = kind;
+            }
         }
     }
     for (a, k) in fate {
