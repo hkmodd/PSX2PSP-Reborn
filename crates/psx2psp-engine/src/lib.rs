@@ -926,11 +926,16 @@ pub fn disc_executables(img: &DiscImage, patches: &[&dyn ImagePatch]) -> Vec<(St
 /// ([`overlay::XorLcg::starts`]), named `FILE^offset` and listed first: a game's body before its
 /// rooms when [`native_code::MAX_IMAGES`] cuts. Which of them are code, and where, is
 /// [`native_code::build`]'s to find.
-pub fn disc_overlay_files(img: &DiscImage, patches: &[&dyn ImagePatch], cipher: Option<psx2psp_recomp::overlay::XorLcg>) -> Vec<(String, Vec<u8>)> {
+pub fn disc_overlay_files(img: &DiscImage, patches: &[&dyn ImagePatch], cipher: Option<psx2psp_recomp::overlay::XorLcg>) -> Vec<native_code::Overlay> {
+    use native_code::Overlay;
     use psx2psp_recomp::overlay::{self, CODE_BLOCK};
+    use std::sync::Arc;
     const HEAD: u32 = 0x1_0000;
     /// Sectors read at once from a file too large to read whole.
     const CHUNK: u32 = 0x200;
+    /// Data blocks beside a run of code in a file too large to read whole that its discovery
+    /// reads tables in: 128 KB, a room's tables of Silent Hill and its header.
+    const AROUND: usize = 64;
     let Ok(files) = img.iso_files() else { return Vec::new() };
     let fits = |n: u32| (0x800..=native_code::OVERLAY_MAX).contains(&n);
     let mut rd = img.reader();
@@ -949,7 +954,7 @@ pub fn disc_overlay_files(img: &DiscImage, patches: &[&dyn ImagePatch], cipher: 
         let entries = overlay::archive_entries(&head, u64::from(f.size));
         for &(o, s) in entries.iter().filter(|e| fits(e.1)) {
             if let Some(bytes) = read(o, s) {
-                out.push((format!("{name}+{o:X}"), bytes));
+                out.push(Overlay::whole(format!("{name}+{o:X}"), bytes));
             }
         }
         // Each sector once: whether it is code, whether it starts a ciphered file.
@@ -959,7 +964,7 @@ pub fn disc_overlay_files(img: &DiscImage, patches: &[&dyn ImagePatch], cipher: 
             for c in (0..f.size.div_ceil(2048)).step_by(CHUNK as usize) {
                 let Some(b) = read(2048 * c, (f.size - 2048 * c).min(2048 * CHUNK)) else { break };
                 for (i, s) in b.chunks_exact(CODE_BLOCK).enumerate() {
-                    code.push(big && overlay::code_block(s));
+                    code.push(if big { overlay::code_block(s) } else { overlay::Block::Data });
                     if cipher.is_some_and(|k| k.starts(s)) {
                         starts.push(c + i as u32);
                     }
@@ -971,18 +976,27 @@ pub fn disc_overlay_files(img: &DiscImage, patches: &[&dyn ImagePatch], cipher: 
             let end = starts.get(k + 1).map_or(f.size, |&n| 2048 * n).min(o + native_code::OVERLAY_MAX);
             let Some(mut b) = read(o, end - o) else { continue };
             cipher.apply(&mut b);
-            first.extend(overlay::code_runs(&b).into_iter().map(|(a, e)| (format!("{name}^{:X}", o + a), b[a as usize..e as usize].to_vec())));
+            let b = Arc::new(b);
+            first.extend(overlay::code_runs(&b).into_iter().map(|(a, e)| Overlay { name: format!("{name}^{:X}", o + a), bytes: b[a as usize..e as usize].to_vec(), file: Some((a, b.clone())) }));
         }
-        for (a, z) in overlay::block_runs(code) {
-            let (o, n) = (2048 * a as u32, 2048 * (z - a + 1) as u32);
+        // A run's file: the data blocks up to the runs beside it, AROUND at most on each side.
+        let runs = overlay::block_runs(code.iter().copied());
+        for (k, &(a, z)) in runs.iter().enumerate() {
+            let n = 2048 * (z - a + 1) as u32;
             if n > native_code::OVERLAY_MAX {
                 continue;
             }
-            let Some(b) = read(o, n) else { continue };
-            out.extend(overlay::code_runs(&b).into_iter().map(|(s, e)| (format!("{name}+{:X}", o + s), b[s as usize..e as usize].to_vec())));
+            let lo = k.checked_sub(1).map_or(0, |p| runs[p].1 + 1).max(a.saturating_sub(AROUND));
+            let hi = runs.get(k + 1).map_or(code.len(), |r| r.0).min(z + 1 + AROUND);
+            let Some(b) = read(2048 * lo as u32, 2048 * (hi - lo) as u32) else { continue };
+            let (b, at) = (Arc::new(b), 2048 * (a - lo));
+            out.extend(overlay::code_runs(&b[at..at + n as usize]).into_iter().map(|(s, e)| {
+                let (s, e) = (at + s as usize, at + e as usize);
+                Overlay { name: format!("{name}+{:X}", 2048 * lo + s), bytes: b[s..e].to_vec(), file: Some((s as u32, b.clone())) }
+            }));
         }
         if let Some(bytes) = whole {
-            out.push((name, bytes));
+            out.push(Overlay::whole(name, bytes));
         }
     }
     first.extend(out);
@@ -1137,7 +1151,7 @@ pub fn static_coverage(img: &DiscImage, patches: &[&dyn ImagePatch], cipher: Opt
     let texts: std::collections::HashMap<String, Vec<u8>> = exes
         .iter()
         .filter_map(|(n, b)| psx2psp_recomp::PsxExe::parse(b).ok().map(|x| (n.clone(), x.text)))
-        .chain(overlays.iter().map(|(n, b)| (n.clone(), b.clone())))
+        .chain(overlays.iter().map(|o| (o.name.clone(), o.bytes.clone())))
         .collect();
     let pack = native_code::build(exes, overlays, Vec::new())?;
     let mut rd = img.reader();
@@ -1522,7 +1536,7 @@ pub fn convert_native(req: &ConvertRequest, monitor: &dyn Monitor) -> Result<Con
 
     // The code of every disc, each piece once: a disc change keeps the translations that run.
     let mut exes: Vec<(String, Vec<u8>)> = Vec::new();
-    let mut overlays: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut overlays: Vec<native_code::Overlay> = Vec::new();
     let mut captured: Vec<native_code::Captured> = Vec::new();
     let mut found = 0;
     for d in &discs {
@@ -1535,7 +1549,7 @@ pub fn convert_native(req: &ConvertRequest, monitor: &dyn Monitor) -> Result<Con
             }
         }
         for o in disc_overlay_files(&d.img, &patches, cipher) {
-            if !overlays.iter().any(|x| x.1 == o.1) {
+            if !overlays.iter().any(|x| x.bytes == o.bytes) {
                 overlays.push(o);
             }
         }

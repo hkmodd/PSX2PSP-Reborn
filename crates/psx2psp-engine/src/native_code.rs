@@ -160,6 +160,30 @@ pub struct Captured {
     pub seeds_only: bool,
 }
 
+/// A disc file, or a run of code cut from one, that [`overlay::locate_all`] may place.
+pub struct Overlay {
+    pub name: String,
+    pub bytes: Vec<u8>,
+    /// The file `bytes` were cut from and their offset in it (deciphered when they are): switch
+    /// and pointer tables outside the code are read there.
+    pub file: Option<(u32, Arc<Vec<u8>>)>,
+}
+
+impl Overlay {
+    /// A whole file, or an archive entry: nothing around it.
+    pub fn whole(name: impl Into<String>, bytes: Vec<u8>) -> Self {
+        Self { name: name.into(), bytes, file: None }
+    }
+}
+
+/// The data discovery reads around an image's text.
+enum Around {
+    /// The RAM a captured run was taken from, at the address of its first byte.
+    Ram(u32, Arc<Vec<u8>>),
+    /// The disc file an overlay was cut from, at the address of its first byte.
+    File(u32, Arc<Vec<u8>>),
+}
+
 /// Smallest piece of code found by its shape translated: one block of the runtime's code checks.
 /// Code taken where it ran has no false finds: a piece of it is translated at any size if it
 /// holds an entry (Crash 2 runs 0x130 bytes of GOOL native code alone at 8016F4B4).
@@ -176,7 +200,7 @@ pub const OVERLAY_MAX: u32 = 0x1F_0000;
 /// the executables alone do not fit between [`CODE_FLOOR`] and the PS1 RAM. `captured` is code
 /// taken from the guest's RAM, translated as overlays at its address unless an image already
 /// taken holds those bytes there.
-pub fn build(exes: Vec<(String, Vec<u8>)>, overlays: Vec<(String, Vec<u8>)>, captured: Vec<Captured>) -> Result<CodePack, String> {
+pub fn build(exes: Vec<(String, Vec<u8>)>, overlays: Vec<Overlay>, captured: Vec<Captured>) -> Result<CodePack, String> {
     let mut pack = CodePack::default();
     let mut seen = HashSet::new();
     let mut parsed = Vec::new();
@@ -197,16 +221,16 @@ pub fn build(exes: Vec<(String, Vec<u8>)>, overlays: Vec<(String, Vec<u8>)>, cap
             parsed.push((name, exe, false, None));
         }
     }
-    let at = overlay::locate_all(&overlays.iter().map(|(_, b)| b.as_slice()).collect::<Vec<_>>());
-    for ((name, bytes), at) in overlays.into_iter().zip(at) {
-        let Some(exe) = at.and_then(|(base, _)| overlay::as_exe(&bytes, base)) else { continue };
+    let at = overlay::locate_all(&overlays.iter().map(|o| o.bytes.as_slice()).collect::<Vec<_>>());
+    for (Overlay { name, bytes, file }, at) in overlays.into_iter().zip(at) {
+        let Some((base, exe)) = at.and_then(|(base, _)| Some((base, overlay::as_exe(&bytes, base)?))) else { continue };
         if parsed.len() >= MAX_IMAGES {
             pack.skipped.push((name, format!("overlay at {:#010x}: more than {MAX_IMAGES} images", exe.text_addr)));
             continue;
         }
         let hash = fnv1a32(&exe.text);
         if seen.insert((exe.text_addr, exe.text.len(), hash)) {
-            parsed.push((name, exe, true, None));
+            parsed.push((name, exe, true, file.map(|(o, f)| Around::File(base.wrapping_sub(o), f))));
         }
     }
     // A captured run keeps only what lies outside the text of every disc image: one image across
@@ -266,15 +290,16 @@ pub fn build(exes: Vec<(String, Vec<u8>)>, overlays: Vec<(String, Vec<u8>)>, cap
                 continue;
             }
             if seen.insert((exe.text_addr, exe.text.len(), fnv1a32(&exe.text))) {
-                parsed.push((name, exe, true, Some(far.clone())));
+                parsed.push((name, exe, true, Some(Around::Ram(far.0, far.1.clone()))));
             }
         }
     }
-    let discover = |exe: &PsxExe, far: &Option<(u32, Arc<Vec<u8>>)>, seeds: &BTreeSet<u32>| {
+    let discover = |exe: &PsxExe, around: &Option<Around>, seeds: &BTreeSet<u32>| {
         let seeds: Vec<u32> = seeds.iter().copied().collect();
-        match far {
-            Some((seg, ram)) => Discovery::run_seeded(exe, &[(*seg, &ram[..])], &seeds),
-            None => Discovery::run_seeded(exe, &[], &seeds),
+        match around {
+            Some(Around::Ram(seg, ram)) => Discovery::run_file(exe, &[(*seg, &ram[..])], &[], &seeds),
+            Some(Around::File(at, file)) => Discovery::run_file(exe, &[], &[(*at, &file[..])], &seeds),
+            None => Discovery::run_file(exe, &[], &[], &seeds),
         }
     };
     let mut seeds: Vec<BTreeSet<u32>> = parsed
@@ -578,7 +603,7 @@ mod tests {
     fn overlays_are_translated_at_the_address_their_calls_name() {
         let pack = build(
             vec![("MAIN.EXE".into(), exe(0x8001_0000, &[ADDIU_V0_1, JR_RA, 0]))],
-            vec![("LEVEL.OVL".into(), overlay(0x800A_0000)), ("LEVEL.DAT".into(), vec![0x5A; 0x800])],
+            vec![Overlay::whole("LEVEL.OVL", overlay(0x800A_0000)), Overlay::whole("LEVEL.DAT", vec![0x5A; 0x800])],
             vec![],
         )
         .unwrap();

@@ -60,19 +60,27 @@ fn after_end(img: Image, a: u32) -> bool {
 /// The members of every table of text pointers in the text (two or more aligned words in a row,
 /// each pointing into it) that holds a function already found: a constructor list or a handler
 /// table, whose other members are functions too wherever they sit (Sheep Dog's constructor list
-/// 8008C9AC: its first member follows data, not a return).
-fn tabled(exe: &PsxExe, entries: &BTreeMap<u32, Origin>) -> HashSet<u32> {
-    let ptr = |a: u32| exe.word(a).filter(|&w| w & 3 == 0 && exe.contains(w));
+/// 8008C9AC: its first member follows data, not a return). The tables of `file` (the disc file
+/// the text was cut from) count as well.
+fn tabled(exe: &PsxExe, file: Far, entries: &BTreeMap<u32, Origin>) -> HashSet<u32> {
     let mut out = HashSet::new();
-    let mut a = exe.text_addr;
-    while a < exe.text_end() {
-        let run: Vec<u32> = (0..).map_while(|k| ptr(a.wrapping_add(4 * k))).collect();
-        if run.len() >= 2 && run.iter().any(|w| entries.contains_key(w)) {
-            out.extend(&run);
+    for b in std::iter::once(&exe.text[..]).chain(file.iter().map(|&(_, b)| b)) {
+        let w: Vec<u32> = words(b).collect();
+        let mut k = 0;
+        while k < w.len() {
+            let run: Vec<u32> = w[k..].iter().copied().take_while(|&w| w & 3 == 0 && exe.contains(w)).collect();
+            if run.len() >= 2 && run.iter().any(|w| entries.contains_key(w)) {
+                out.extend(&run);
+            }
+            k += run.len().max(1);
         }
-        a = a.wrapping_add(4 * (run.len() as u32).max(1));
     }
     out
+}
+
+/// The little-endian words of `b`.
+fn words(b: &[u8]) -> impl Iterator<Item = u32> + '_ {
+    b.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap()))
 }
 
 /// From `a`, every word decodes up to a `jr ra` (and its delay slot) within [`LEAF_MAX`].
@@ -359,7 +367,16 @@ impl Discovery {
     /// this text): each one not reached otherwise is an entry if every path from it decodes, as
     /// for a pointer (another overlay in the same slot may hold data there).
     pub fn run_seeded(exe: &PsxExe, far: Far, seeds: &[u32]) -> Self {
-        let img = Image(exe, far);
+        Self::run_file(exe, far, &[], seeds)
+    }
+
+    /// [`Self::run_seeded`] for a text cut from a disc file, `file` at the address of its first
+    /// byte: switch tables are read there too, and its tables of pointers into the text name
+    /// functions as the text's own do (Silent Hill's body keeps its switch and handler tables
+    /// in the 34 KB of data before its code, 621 words of code run in the first minute).
+    pub fn run_file(exe: &PsxExe, far: Far, file: Far, seeds: &[u32]) -> Self {
+        let around: Vec<(u32, &[u8])> = far.iter().chain(file).copied().collect();
+        let img = Image(exe, &around);
         let mut d = Discovery::default();
         d.entries.insert(exe.pc0, Origin::Entry);
         d.explore(img, vec![exe.pc0]);
@@ -373,11 +390,12 @@ impl Discovery {
         let mut pointed: HashSet<u32> = (exe.text_addr..exe.text_end())
             .step_by(4)
             .filter_map(|a| exe.word(a))
+            .chain(file.iter().flat_map(|&(_, b)| words(b)))
             .filter(|&w| w & 3 == 0 && exe.contains(w))
             .collect();
         loop {
             pointed.extend(d.built_pointers(img));
-            let tabled = tabled(exe, &d.entries);
+            let tabled = tabled(exe, file, &d.entries);
             let mut changed = false;
             for a in (exe.text_addr..exe.text_end()).step_by(4) {
                 let w = exe.word(a).unwrap_or(0);

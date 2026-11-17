@@ -8,6 +8,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use crate::exe::PsxExe;
+use crate::insn::{decode, Insn, Isa, Kind};
 
 /// Lowest load address considered: below it are the BIOS and kernel areas.
 const LOW: u32 = 0x8001_0000;
@@ -149,19 +150,60 @@ fn is_boundary(w: u32) -> bool {
 /// Size of the blocks [`code_block`] judges: a CD sector's user data.
 pub const CODE_BLOCK: usize = 0x800;
 
-/// Whether a [`CODE_BLOCK`] holds code: two function-boundary words at least.
-pub fn code_block(block: &[u8]) -> bool {
-    block.chunks_exact(4).filter(|c| is_boundary(u32::from_le_bytes((*c).try_into().unwrap()))).nth(1).is_some()
+/// What a [`CODE_BLOCK`] holds, as [`code_block`] judges it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Block {
+    Data,
+    /// The middle of a long function: no function boundary, but nothing else than code.
+    Body,
+    /// Two function-boundary words at least.
+    Code,
 }
 
-/// The runs (first, last) of the blocks `code` marks, with gaps of up to two blocks inside.
-pub fn block_runs(code: impl IntoIterator<Item = bool>) -> Vec<(usize, usize)> {
+/// What a [`CODE_BLOCK`] holds. [`Block::Body`]: its nonzero words are, all but one in 20,
+/// canonical R3000 instructions (jumps into the 2 MB of RAM) with ten opcodes or more among them.
+/// Silent Hill's RAM in game: 301 blocks so, every one code (its body's longest functions span
+/// six blocks without a boundary word); data reaches 95% only as tables of one to six opcodes
+/// (pointers decode as `lb`), mixed code and data stays under 90%.
+pub fn code_block(block: &[u8]) -> Block {
+    let words = || block.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap()));
+    if words().filter(|&w| is_boundary(w)).nth(1).is_some() {
+        return Block::Code;
+    }
+    let (mut nonzero, mut valid, mut ops) = (0usize, 0usize, 0u64);
+    for w in words().filter(|&w| w != 0) {
+        nonzero += 1;
+        let k = decode(Insn(w), Isa::R3000A);
+        if k != Kind::Invalid && (!matches!(k, Kind::J | Kind::Jal) || w & 0x03FF_FFFF < 0x0008_0000) {
+            valid += 1;
+            ops |= 1 << (w >> 26);
+        }
+    }
+    if nonzero >= block.len() / 16 && valid * 20 >= nonzero * 19 && ops.count_ones() >= 10 {
+        Block::Body
+    } else {
+        Block::Data
+    }
+}
+
+/// The runs (first, last) of the [`Block::Code`] blocks, joined across a gap of up to two blocks
+/// or of [`Block::Body`] blocks only. A body block never shortens a gap of data: files packed back
+/// to back in an archive (Silent Hill's SILENT) stay apart by three data blocks or more.
+pub fn block_runs(blocks: impl IntoIterator<Item = Block>) -> Vec<(usize, usize)> {
     const GAP: usize = 2;
     let mut runs: Vec<(usize, usize)> = Vec::new();
-    for (b, _) in code.into_iter().enumerate().filter(|&(_, c)| c) {
-        match runs.last_mut() {
-            Some((_, last)) if b - *last <= GAP + 1 => *last = b,
-            _ => runs.push((b, b)),
+    let mut body = true;
+    for (b, k) in blocks.into_iter().enumerate() {
+        match k {
+            Block::Code => {
+                match runs.last_mut() {
+                    Some((_, last)) if body || b - *last <= GAP + 1 => *last = b,
+                    _ => runs.push((b, b)),
+                }
+                body = true;
+            }
+            Block::Body => {}
+            Block::Data => body = false,
         }
     }
     runs
@@ -279,6 +321,23 @@ mod tests {
     }
 
     #[test]
+    fn the_middle_of_a_long_function_is_code() {
+        let block = |w: &dyn Fn(usize) -> u32| (0..512).flat_map(|i| w(i).to_le_bytes()).collect::<Vec<u8>>();
+        // No boundary word: lw, addu, sll, beq, addiu, sw, lui, ori, jal 8001xxxx, andi, slt, lbu.
+        let body = [0x8C82_0004, 0x0043_1021, 0x0002_1080, 0x1040_0010, 0x2484_0001, 0xAC82_0008, 0x3C02_800C, 0x3442_00FF, 0x0C00_4000, 0x3063_00FF, 0x0062_102A, 0x9083_0000];
+        assert_eq!(code_block(&block(&|i| body[i % body.len()])), Block::Body);
+        // With two prologues: function boundaries.
+        assert_eq!(code_block(&block(&|i| if i % 200 == 0 { PROLOGUE } else { body[i % body.len()] })), Block::Code);
+        // Pointers decode as lb: valid, but of one opcode.
+        assert_eq!(code_block(&block(&|i| 0x8010_0000 + 16 * i as u32)), Block::Data);
+        // One word in eight not an instruction; a jal out of RAM.
+        assert_eq!(code_block(&block(&|i| if i % 8 == 7 { 0x0000_0005 } else { body[i % body.len()] })), Block::Data);
+        assert_eq!(code_block(&block(&|i| if i % 8 == 7 { 0x0FFF_FFFF } else { body[i % body.len()] })), Block::Data);
+        // Mostly zeros: too little to judge.
+        assert_eq!(code_block(&block(&|i| if i < 16 { body[i % body.len()] } else { 0 })), Block::Data);
+    }
+
+    #[test]
     fn a_small_overlay_takes_a_fixed_slot_on_a_tie() {
         // Strong: prologues at 2^k - 1 (distinct differences), each pointed at once: 9 votes at B.
         let pro: Vec<usize> = (0..9).map(|k| (1 << k) - 1).collect();
@@ -340,9 +399,11 @@ mod tests {
         let mut back = ciphered.clone();
         k.apply(&mut back);
         assert_eq!(&back[0x800..], &code[..]);
-        // block_runs: gaps of two blocks join, of three split.
-        let marks = |s: &str| s.chars().map(|c| c == '#').collect::<Vec<_>>();
+        // block_runs: gaps of two blocks join, of three split; a gap of body blocks only joins
+        // at any length, a body block in a gap of data does not shorten it.
+        let marks = |s: &str| s.chars().map(|c| [Block::Data, Block::Body, Block::Code]["=#".find(c).map_or(0, |i| i + 1)]).collect::<Vec<_>>();
         assert_eq!(block_runs(marks("#..#...#.#")), vec![(0, 3), (7, 9)]);
+        assert_eq!(block_runs(marks("#=====#=..#..=.#=")), vec![(0, 6), (10, 10), (15, 15)]);
     }
 
     #[test]
