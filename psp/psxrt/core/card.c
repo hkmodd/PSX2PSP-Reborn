@@ -17,7 +17,11 @@
 #define FRAME 128u
 #define BLOCK 0x2000u
 enum { ST_FIRST = 0x51, ST_MID = 0x52, ST_LAST = 0x53, ST_FREE = 0xA0 };
-enum { HW_CARD = 0xF0000011u, SW_CARD = 0xF4000001u, SP_IOE = 0x0004, SP_TIMEOUT = 0x0100 };
+/* Event class/spec: u32 constants, since an enum constant must fit an int (C99 6.7.2.2). */
+#define HW_CARD 0xF0000011u
+#define SW_CARD 0xF4000001u
+#define SP_IOE 0x0004u
+#define SP_TIMEOUT 0x0100u
 enum { O_RD = 1, O_WR = 2, O_CREAT = 0x200, O_ASYNC = 0x8000 };
 #define FD_FIRST 2 /* 0 and 1 are the console */
 #define FD_COUNT 16
