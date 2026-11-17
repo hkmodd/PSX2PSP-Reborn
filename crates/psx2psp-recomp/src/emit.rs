@@ -122,6 +122,24 @@ pub struct Translation {
     /// run through it executes (a group's span covers its guest words; out-of-line code is not in
     /// it). The I-cache model's map (`examples/icache.rs`).
     pub spans: Vec<(u32, u32, u32)>,
+    /// The words that depend on where the code is: host address of the word, and what it holds.
+    /// [`Translation::moved`] applies them.
+    pub relocs: Vec<(u32, Reloc)>,
+}
+
+/// What a word of a [`Translation`] holds that changes with the guest or host address of the code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reloc {
+    /// A guest address (a host call's `.word pc`): plus the guest delta.
+    Guest,
+    /// A guest address in the `lui`/`ori` pair that starts at the word (a link a+8 written to a
+    /// register other than ra, the target of a `bal` outside the code): plus the guest delta.
+    GuestPair,
+    /// A `j`/`jal` to host code of the translation: its target plus the host delta.
+    Jump,
+    /// A host address of the translation in the `lui`/`ori` pair that starts at the word: plus
+    /// the host delta.
+    HostPair,
 }
 
 /// The host word for `guest` written where the simple instruction translated to `host` was, if
@@ -295,6 +313,8 @@ struct Code {
     defs: Vec<(usize, usize)>,
     /// Word index -> guest pc of the simple instruction it copies.
     pat: Vec<(usize, u32)>,
+    /// Word index -> the guest address it holds ([`Reloc::Guest`], [`Reloc::GuestPair`]).
+    rel: Vec<(usize, Reloc)>,
 }
 
 impl Code {
@@ -324,19 +344,33 @@ impl Code {
     fn def(&mut self, label: usize) {
         self.defs.push((label, self.w.len()));
     }
+    /// `.word a`, a guest address.
+    fn guest(&mut self, a: u32) {
+        self.rel.push((self.w.len(), Reloc::Guest));
+        self.w.push(a);
+    }
+    /// `reg` = the guest address `a`, which moves with the code when `moves`.
+    fn guest_pair(&mut self, reg: u32, a: u32, moves: bool) {
+        if moves {
+            self.rel.push((self.w.len(), Reloc::GuestPair));
+        }
+        self.w.push(lui(reg, (a >> 16) as u16));
+        self.w.push(ori(reg, reg, a as u16));
+    }
     fn append(&mut self, o: Code) {
         let b = self.w.len();
         self.w.extend(o.w);
         self.fix.extend(o.fix.into_iter().map(|(a, f, t, p)| (a + b, f, t, p)));
         self.defs.extend(o.defs.into_iter().map(|(l, a)| (l, a + b)));
         self.pat.extend(o.pat.into_iter().map(|(a, p)| (a + b, p)));
+        self.rel.extend(o.rel.into_iter().map(|(a, r)| (a + b, r)));
     }
     /// Host call for the guest instruction `word` at `pc` (`pc | RESUME` to hand over).
     fn host_call(&mut self, pc: u32, word: u32) {
         self.push(sw(RA, k0_off(layout::CTX + ctx::GPR + 4 * RA), K0R));
         self.push(jal(RT_CALL));
         self.push(NOP);
-        self.push(pc);
+        self.guest(pc);
         self.push(word);
     }
 }
@@ -373,6 +407,8 @@ struct Em<'a> {
     hooks: &'a BTreeMap<u32, Hook>,
     /// [`leaf_returns`].
     leaf: &'a BTreeSet<u32>,
+    /// [`translate_floating`]: absolute targets are never in the code.
+    floating: bool,
 }
 
 enum Fail {
@@ -404,13 +440,31 @@ pub fn translate_with(
     base: u32,
     hooks: &BTreeMap<u32, Hook>,
 ) -> Result<Translation, EmitError> {
+    translate_as(exe, d, hz, base, hooks, false)
+}
+
+/// [`translate`] of code that runs wherever the game puts it (Crash 2's native GOOL code is
+/// position-independent): `j`, `jal` and the `lui` constants are never taken as addresses in it,
+/// and no hooks. [`Translation::moved`] places it at another guest and host address.
+pub fn translate_floating(exe: &PsxExe, d: &Discovery, hz: &Hazards, base: u32) -> Result<Translation, EmitError> {
+    translate_as(exe, d, hz, base, &BTreeMap::new(), true)
+}
+
+fn translate_as(
+    exe: &PsxExe,
+    d: &Discovery,
+    hz: &Hazards,
+    base: u32,
+    hooks: &BTreeMap<u32, Hook>,
+    floating: bool,
+) -> Result<Translation, EmitError> {
     if base & 3 != 0 || (base ^ RT_CALL) & 0xF000_0000 != 0 {
         return Err(EmitError::Base(base));
     }
     let mut long = BTreeSet::new();
     let leaf = leaf_returns(exe, d);
     loop {
-        match emit(exe, d, hz, base, &long, hooks, &leaf) {
+        match emit(exe, d, hz, base, &long, hooks, &leaf, floating) {
             Ok(t) => return Ok(t),
             Err(Fail::Error(e)) => return Err(e),
             Err(Fail::Far(far)) => {
@@ -459,6 +513,7 @@ fn emit(
     long: &BTreeSet<u32>,
     hooks: &BTreeMap<u32, Hook>,
     leaf: &BTreeSet<u32>,
+    floating: bool,
 ) -> Result<Translation, Fail> {
     let mut em = Em {
         exe,
@@ -467,6 +522,7 @@ fn emit(
         long,
         hooks,
         leaf,
+        floating,
         out: Code::default(),
         stubs: Vec::new(),
         stub_words: 0,
@@ -559,7 +615,7 @@ impl Em<'_> {
         }
         for &a in &d.code {
             match self.at(a) {
-                Some((i, J | Jal)) => {
+                Some((i, J | Jal)) if !self.floating => {
                     t.insert(i.jump_target(a));
                 }
                 Some((i, Beq | Bne | Blez | Bgtz | Bltz | Bgez | Bltzal | Bgezal)) => {
@@ -681,7 +737,7 @@ impl Em<'_> {
     /// code makes its own return points (Crash 2's 8003B134 sets ra to its loop head 8003B38C).
     /// Not a lone `lui`: its value is the high half of an address the next instruction completes.
     fn ra_const(&self, pc: u32, i: Insn, k: Kind) -> Option<u32> {
-        if i.rt() != RA as usize {
+        if self.floating || i.rt() != RA as usize {
             return None;
         }
         let img = Image(self.exe, &[]);
@@ -1000,7 +1056,7 @@ impl Em<'_> {
             s.push(sw(RA, k0_off(layout::CTX + ctx::GPR + 4 * RA), K0R));
             s.push(jal(layout::IO_READ));
             s.push(addiu(K1R, rs, off));
-            s.push(pc);
+            s.guest(pc);
             s.push(i.0);
             s.jump(2, To::Label(back), pc);
             s.push(lw(rt, k0_off(layout::CTX + ctx::GPR + 4 * rt), K0R));
@@ -1017,7 +1073,7 @@ impl Em<'_> {
             s.push(sw(RA, k0_off(layout::CTX + ctx::GPR + 4 * RA), K0R));
             s.push(jal(layout::IO_WRITE));
             s.push(addiu(K1R, rs, off));
-            s.push(pc);
+            s.guest(pc);
             s.push(i.0);
             s.jump(2, To::Label(back), pc);
             s.push(NOP);
@@ -1049,7 +1105,7 @@ impl Em<'_> {
         let mut skipped = Vec::new();
         for w in (t..a).step_by(4).filter(|w| self.d.code.contains(w)) {
             let to = match self.at(w) {
-                Some((i, J)) => i.jump_target(w),
+                Some((i, J)) if !self.floating => i.jump_target(w),
                 Some((i, Beq | Bne | Blez | Bgtz | Bltz | Bgez)) => i.branch_target(w),
                 _ => continue,
             };
@@ -1184,8 +1240,7 @@ impl Em<'_> {
                 let fin = if rd == RA { jalr(RA, K1R) } else { jr(K1R) };
                 let link = |o: &mut Code| {
                     if rd != ZR && rd != RA {
-                        o.push(lui(rd, ((a + 8) >> 16) as u16));
-                        o.push(ori(rd, rd, (a + 8) as u16));
+                        o.guest_pair(rd, a + 8, true);
                     }
                 };
                 let rs = i.rs() as u32;
@@ -1217,7 +1272,7 @@ impl Em<'_> {
             }
             Jal | Bgezal if k == Jal || bal => {
                 let t = if k == Jal { i.jump_target(a) } else { i.branch_target(a) };
-                let inside = self.d.code.contains(&t);
+                let inside = !(self.floating && k == Jal) && self.d.code.contains(&t);
                 if simple_slot.is_none() {
                     let c = slot(self);
                     self.out.append(c);
@@ -1225,8 +1280,7 @@ impl Em<'_> {
                 if inside {
                     self.out.jump(3, To::Guest(t), a);
                 } else {
-                    self.out.push(lui(K1R, (t >> 16) as u16));
-                    self.out.push(ori(K1R, K1R, t as u16));
+                    self.out.guest_pair(K1R, t, k != Jal);
                     self.dispatch(K1R, false, a);
                     self.out.push(jalr(RA, K1R));
                 }
@@ -1235,7 +1289,7 @@ impl Em<'_> {
             }
             _ => {
                 let t = if k == J { i.jump_target(a) } else { i.branch_target(a) };
-                if !self.d.code.contains(&t) {
+                if (self.floating && k == J) || !self.d.code.contains(&t) {
                     let c = self.resume(a, Reason::Outside);
                     self.out.append(c);
                     return None;
@@ -1284,7 +1338,7 @@ impl Em<'_> {
 
     fn finish(self, base: u32) -> Result<Translation, Fail> {
         let Em { out, mut map, map_at, runtime, labels, cold, spans, .. } = self;
-        let Code { mut w, fix, defs, pat } = out;
+        let Code { mut w, fix, defs, pat, rel } = out;
         let mut at = vec![usize::MAX; labels];
         for (l, i) in defs {
             at[l] = i;
@@ -1293,6 +1347,7 @@ impl Em<'_> {
         debug_assert!(!at.contains(&usize::MAX), "label used but never placed");
         let host = |i: usize| base + 4 * i as u32;
         let mut far = Vec::new();
+        let mut relocs: Vec<(u32, Reloc)> = rel.into_iter().map(|(i, r)| (host(i), r)).collect();
         for (i, fx, to, pc) in fix {
             let t = match to {
                 To::Guest(g) => *map
@@ -1311,10 +1366,14 @@ impl Em<'_> {
                     }
                     w[i] |= words as u16 as u32;
                 }
-                Fx::Jump => w[i] |= (host(t) >> 2) & 0x03FF_FFFF,
+                Fx::Jump => {
+                    w[i] |= (host(t) >> 2) & 0x03FF_FFFF;
+                    relocs.push((host(i), Reloc::Jump));
+                }
                 Fx::Abs => {
                     w[i] |= host(t) >> 16;
                     w[i + 1] |= host(t) & 0xFFFF;
+                    relocs.push((host(i), Reloc::HostPair));
                 }
             }
         }
@@ -1333,6 +1392,10 @@ impl Em<'_> {
             patch,
             cold,
             spans: spans.into_iter().map(|(g, s, e)| (g, host(s), host(e))).collect(),
+            relocs: {
+                relocs.sort_unstable_by_key(|r| r.0);
+                relocs
+            },
         })
     }
 }
@@ -1341,6 +1404,44 @@ impl Translation {
     /// Host address of the translation of guest `pc`.
     pub fn host(&self, pc: u32) -> Option<u32> {
         self.map.get(&pc).copied()
+    }
+
+    /// This code with its guest addresses `guest` bytes further and its host code at `base`: what
+    /// [`translate`] of the same words at those addresses gives, for code that does not name
+    /// itself by absolute address ([`translate_floating`]). A `j`/`jal` stays in its 256 MB
+    /// segment, so `base` must be in the one of [`Translation::base`].
+    pub fn moved(&self, guest: u32, base: u32) -> Translation {
+        let host = base.wrapping_sub(self.base);
+        let at = |h: u32| h.wrapping_add(host);
+        let mut words = self.words.clone();
+        let pair = |w: &mut [u32], i: usize, d: u32| {
+            let v = (w[i] << 16 | w[i + 1] & 0xFFFF).wrapping_add(d);
+            w[i] = w[i] & 0xFFFF_0000 | v >> 16;
+            w[i + 1] = w[i + 1] & 0xFFFF_0000 | v & 0xFFFF;
+        };
+        for &(h, r) in &self.relocs {
+            let i = ((h - self.base) / 4) as usize;
+            match r {
+                Reloc::Guest => words[i] = words[i].wrapping_add(guest),
+                Reloc::GuestPair => pair(&mut words, i, guest),
+                Reloc::HostPair => pair(&mut words, i, host),
+                Reloc::Jump => {
+                    let t = (words[i] & 0x03FF_FFFF) << 2 | self.base & 0xF000_0000;
+                    words[i] = words[i] & 0xFC00_0000 | (at(t) >> 2) & 0x03FF_FFFF;
+                }
+            }
+        }
+        let g = |a: u32| a.wrapping_add(guest);
+        Translation {
+            base,
+            words,
+            map: self.map.iter().map(|(&a, &h)| (g(a), at(h))).collect(),
+            runtime: self.runtime.iter().map(|(&a, &r)| (g(a), r)).collect(),
+            patch: self.patch.iter().map(|(&a, v)| (g(a), v.iter().map(|&h| at(h)).collect())).collect(),
+            cold: self.cold,
+            spans: self.spans.iter().map(|&(a, s, e)| (g(a), at(s), at(e))).collect(),
+            relocs: self.relocs.iter().map(|&(h, r)| (at(h), r)).collect(),
+        }
     }
 
     /// Dispatch-table entries: (host address of the entry, value).
