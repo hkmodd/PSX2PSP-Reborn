@@ -184,6 +184,27 @@ fn discovery_follows_pointers_built_in_code() {
     assert!(d.dead_ends.is_empty());
 }
 
+/// A callback whose `addiu` is the delay slot of the call it is passed to is found (Spider-Man's
+/// `lui a2 / jal 8002DADC / addiu a2,a2,0x1E90` at 8002DC40).
+#[test]
+fn a_pointer_built_in_a_delay_slot_is_found() {
+    let x = exe(&[
+        i(0xF, ZERO, 6, (at(7) >> 16) as u16), // 0 lui a2,hi(h)
+        j(3, 5),                                // 1 jal 5
+        i(9, 6, 6, at(7) as u16),               // 2 addiu a2,a2,lo(h)
+        r(8, RA, 0, 0, 0),                      // 3 jr ra
+        i(0x2B, ZERO, A1, 0x100),               // 4 sw a1,0x100(zero)
+        r(8, RA, 0, 0, 0),                      // 5 jr ra
+        i(0x2B, ZERO, A1, 0x104),               // 6 sw a1,0x104(zero)
+        i(9, ZERO, V0, 1),                      // 7 h: addiu v0,zero,1
+        j(2, 0),                                // 8 j 0
+        NOP,                                    // 9
+    ]);
+    let d = Discovery::run(&x);
+    assert_eq!(d.entries.get(&at(7)), Some(&Origin::Pointer));
+    assert!([7, 8, 9].iter().all(|&n| d.code.contains(&at(n))));
+}
+
 
 /// A word after a return that fails the leaf test is tried again as a pointer once the code
 /// building its address is found (Crash 2's rasterizer 8003E794, `lui`/`addiu` in a function
@@ -312,7 +333,7 @@ fn a_table_of_jumps_after_a_jump_register_is_followed() {
         NOP,                  // 3
         j(2, 10),             // 4 j 10
         NOP,                  // 5
-        j(2, 12),             // 6 j 12
+        i(1, ZERO, 1, 5),     // 6 b 12 (bgez zero)
         NOP,                  // 7
         r(8, RA, 0, 0, 0),    // 8 jr ra (not reached)
         NOP,                  // 9
@@ -326,6 +347,28 @@ fn a_table_of_jumps_after_a_jump_register_is_followed() {
     assert!([4, 5, 6, 7, 10, 11, 12, 13].iter().all(|&n| d.code.contains(&at(n))));
     let one = exe(&[r(8, AT, 0, 0, 0), NOP, j(2, 4), NOP, r(8, RA, 0, 0, 0), NOP]);
     assert!(matches!(Discovery::run(&one).jumps[&at(0)], JumpReg::Unresolved(_)));
+}
+
+/// Blocks of `1 << s` bytes after the `jr`, indexed by `x << s` (Crash 2's copy tails at
+/// 8003BB14, 32 bytes each), are followed up to the first block that does not end in a jump.
+#[test]
+fn a_table_of_blocks_after_a_jump_register_is_followed() {
+    let mut w = vec![
+        i(0xF, ZERO, T0, (at(6) >> 16) as u16), // 0 lui t0,hi(tails)
+        i(9, T0, T0, at(6) as u16),              // 1 addiu t0,t0,lo(tails)
+        r(0, 0, 6, V0, 5),                       // 2 sll v0,a2,5
+        r(0x21, T0, V0, T0, 0),                  // 3 addu t0,t0,v0
+        r(8, T0, 0, 0, 0),                       // 4 jr t0
+        NOP,                                     // 5
+        r(8, RA, 0, 0, 0),                       // 6 tails: jr ra
+    ];
+    w.resize(14, NOP);
+    w.extend([i(9, ZERO, V0, 1), r(8, RA, 0, 0, 0)]); // 14 addiu v0,zero,1 / 15 jr ra
+    w.resize(30, NOP);
+    let d = Discovery::run(&exe(&w));
+    assert_eq!(d.jumps[&at(4)], JumpReg::Table { table: at(6), targets: vec![at(6), at(14)], bounded: false });
+    assert!([6, 7, 14, 15, 16].iter().all(|&n| d.code.contains(&at(n))));
+    assert!(!d.code.contains(&at(22)));
 }
 
 /// Runs discovery and the hazard check on real executables:

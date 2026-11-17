@@ -281,19 +281,35 @@ impl Image<'_> {
         }
     }
 
-    /// The `j` into the text, each with its delay slot, that follow the `jr` at `pc` and its slot,
-    /// two at least: a table of jumps the register indexes by eight bytes (Spyro 2's
-    /// `sll at,at,3 / addu at,at,a0 / jr at` at 8002BDF0, into eight `j` and `nop`).
+    /// The blocks that follow the `jr` at `pc` and its slot, two at least: a table of code the
+    /// register indexes by the block size. With the register `(x << s) + base` and the base the
+    /// constant `pc + 8`, a block is `1 << s` bytes ending in any jump that does not fall through
+    /// (`j` into the text, a branch always taken, `jr`) with its delay slot in the block: Crash
+    /// 2's copy tails `8003BB14 + (at << 5)` after the `jr s4` at 8003BB0C, five blocks of 32
+    /// bytes, the first `jr ra / nop`, the others moves and `jr ra`; its clipper's `8003C3AC +
+    /// (v0 << 3)`, seven `b` and `nop`. Otherwise a block is a `j` into the text or a branch
+    /// always taken, and its slot (Spyro 2's `sll at,at,3 / addu at,at,a0 / jr at` at 8002BDF0,
+    /// into eight `j` and `nop`): leaves after a `jr` (`jr ra / nop`) are no table.
     fn jump_list(self, pc: u32) -> Option<Vec<u32>> {
-        let mut out = Vec::new();
-        let mut a = pc.wrapping_add(8);
-        while let (Some(Flow::Goto(t)), Some(_)) = (self.flow_at(a).filter(|_| self.at(a).is_some_and(|(_, k)| k == Kind::J)), self.at(a.wrapping_add(4))) {
-            if !self.0.contains(t) {
-                break;
-            }
-            out.push(a);
-            a = a.wrapping_add(8);
-        }
+        let rs = self.at(pc)?.0.rs();
+        let sized = self.find_def(rs, pc).and_then(|d| {
+            let (i, _) = self.at(d).filter(|&(_, k)| k == Kind::Addu)?;
+            let by = |r: usize| self.find_def(r, d).and_then(|e| self.at(e)).filter(|&(_, k)| k == Kind::Sll).map(|(i, _)| i.sa());
+            let here = |r: usize| self.const_of(r, d) == Some(pc.wrapping_add(8));
+            let s = if here(i.rs()) { by(i.rt()) } else if here(i.rt()) { by(i.rs()) } else { None }?;
+            (3..=7).contains(&s).then_some(1u32 << s)
+        });
+        let stride = sized.unwrap_or(8);
+        let ends = |a: u32| {
+            (a..a.wrapping_add(stride).wrapping_sub(4)).step_by(4).find_map(|x| match self.flow_at(x) {
+                None => Some(false),
+                Some(Flow::Goto(t)) => Some(self.0.contains(t) && self.at(x.wrapping_add(4)).is_some()),
+                Some(Flow::Return | Flow::JumpReg) if sized.is_some() => Some(self.at(x.wrapping_add(4)).is_some()),
+                Some(_) if sized.is_none() => Some(false),
+                Some(_) => None,
+            }) == Some(true)
+        };
+        let out: Vec<u32> = (0..).map(|k| pc.wrapping_add(8).wrapping_add(k * stride)).take_while(|&a| self.0.contains(a) && ends(a)).collect();
         (out.len() >= 2).then_some(out)
     }
 
@@ -516,12 +532,14 @@ impl Discovery {
     }
 
     /// Text addresses the discovered code builds with `lui` and `addiu`/`ori` (a handler stored
-    /// in a state variable, a callback passed as an argument).
+    /// in a state variable, a callback passed as an argument). The value is the one the
+    /// instruction writes, read at itself: in the delay slot of a call it is the argument.
     fn built_pointers(&self, img: Image) -> Vec<u32> {
         self.code
             .iter()
             .filter_map(|&a| match img.at(a)? {
-                (i, Kind::Addiu | Kind::Ori) if i.rs() != 0 => img.const_of(i.rt(), a.wrapping_add(4)),
+                (i, Kind::Addiu) if i.rs() != 0 => Some(img.const_of(i.rs(), a)?.wrapping_add(i.simm())),
+                (i, Kind::Ori) if i.rs() != 0 => Some(img.const_of(i.rs(), a)? | i.imm()),
                 _ => None,
             })
             .filter(|&c| c & 3 == 0 && img.0.contains(c))

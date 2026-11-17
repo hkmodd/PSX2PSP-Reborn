@@ -221,9 +221,13 @@ pub fn build(exes: Vec<(String, Vec<u8>)>, overlays: Vec<Overlay>, captured: Vec
             parsed.push((name, exe, false, None));
         }
     }
+    // An overlay runs in the segment of the executables that call it: kuseg when they are linked
+    // there (Lilo & Stitch at 00018000 calls its overlay's 000DA070), its `jal` and links with it.
+    let segs: BTreeSet<u32> = parsed.iter().map(|(_, x, ..): &(_, PsxExe, _, _)| x.text_addr & !0x1FFF_FFFF).collect();
+    let seg = if segs.len() == 1 { segs.into_iter().next().unwrap() } else { 0x8000_0000 };
     let at = overlay::locate_all(&overlays.iter().map(|o| o.bytes.as_slice()).collect::<Vec<_>>());
     for (Overlay { name, bytes, file }, at) in overlays.into_iter().zip(at) {
-        let Some((base, exe)) = at.and_then(|(base, _)| Some((base, overlay::as_exe(&bytes, base)?))) else { continue };
+        let Some((base, exe)) = at.map(|(b, _)| seg | b & 0x1FFF_FFFF).and_then(|base| Some((base, overlay::as_exe(&bytes, base)?))) else { continue };
         if parsed.len() >= MAX_IMAGES {
             pack.skipped.push((name, format!("overlay at {:#010x}: more than {MAX_IMAGES} images", exe.text_addr)));
             continue;
