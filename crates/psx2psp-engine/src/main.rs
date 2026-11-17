@@ -527,6 +527,24 @@ fn cmd_coverage(args: &[String]) -> R {
         let which = if *head { "the last whose head matched" } else { "the last" };
         println!("  never live {name}: {checks} checks; at {which}, {n} words differed, first {at:08X} = {ram:08X} (disc {disc:08X})");
     }
+    for f in &c.floating {
+        let host = f.host_words.as_ref().map_or_else(|e| format!("does not translate: {e}"), |w| format!("{w} host words"));
+        let at: Vec<String> = f.places.iter().take(8).map(|a| format!("{a:06X}")).collect();
+        println!(
+            "  floating {}: {} bytes, {} code words, {} of them ran ({} as on the disc), {host}, at {} places {}",
+            f.name,
+            f.bytes,
+            f.code_words,
+            f.ran_words,
+            f.exact_words,
+            f.places.len(),
+            at.join(" ")
+        );
+    }
+    if c.units.0 > 0 {
+        let (n, u, w, h, held) = c.units;
+        println!("  floating units: {n}, {u} distinct, {w} words, {h} host words; {held} Floating addresses in one");
+    }
     let mut miss = c.missing.clone();
     miss.sort_by_key(|&(a, n, ..)| (std::cmp::Reverse(n), a));
     println!("missing: {} words in {} stretches", c.ran - c.covered, miss.len());

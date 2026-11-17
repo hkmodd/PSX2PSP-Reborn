@@ -126,6 +126,53 @@ pub struct CodePack {
     pub skipped: Vec<(String, String)>,
 }
 
+/// Where floating code is discovered and translated before it is moved ([`Translation::moved`]):
+/// the start of RAM, where no game's code is at a fixed address above the kernel area.
+pub const FLOATING_BASE: u32 = 0x8000_0000;
+
+/// A piece of code the game runs wherever it loads it: words, and where in them the guest may
+/// enter (word offsets).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FloatingUnit {
+    pub words: Vec<u32>,
+    pub entries: Vec<u32>,
+}
+
+impl FloatingUnit {
+    /// The unit's code discovered on its own at [`FLOATING_BASE`].
+    pub fn discover(&self) -> (PsxExe, Discovery) {
+        let exe = PsxExe { pc0: FLOATING_BASE, gp0: 0, text_addr: FLOATING_BASE, text: self.words.iter().flat_map(|w| w.to_le_bytes()).collect(), bss: (0, 0), stack: (0, 0) };
+        let seeds: Vec<u32> = self.entries.iter().map(|&o| FLOATING_BASE + 4 * o).collect();
+        let d = Discovery::run_file(&exe, &[], &[], &seeds);
+        (exe, d)
+    }
+}
+
+/// The floating units of `bytes`, a file or a piece of one whose code the game places where it
+/// wants (Crash 2's native GOOL pieces sit in the bytecode of entries it loads in any page): each
+/// run of consecutive words that the file's discovery at [`FLOATING_BASE`] finds as code, with its
+/// byte offset in `bytes`. A run is loaded whole wherever the file is (the words around it are
+/// what the file holds there); runs are apart, as the pages of a file may be.
+pub fn floating_units(bytes: &[u8]) -> Vec<(usize, FloatingUnit)> {
+    let exe = overlay::as_exe(bytes, FLOATING_BASE).unwrap_or(PsxExe { pc0: FLOATING_BASE, gp0: 0, text_addr: FLOATING_BASE, text: bytes[..bytes.len() & !3].to_vec(), bss: (0, 0), stack: (0, 0) });
+    let d = Discovery::run_file(&exe, &[], &[], &[]);
+    let word = |a: u32| exe.word(a).unwrap_or(0);
+    let mut out: Vec<(usize, FloatingUnit)> = Vec::new();
+    let mut last = None;
+    for &a in &d.code {
+        if last != Some(a.wrapping_sub(4)) {
+            out.push(((a - FLOATING_BASE) as usize, FloatingUnit { words: Vec::new(), entries: Vec::new() }));
+        }
+        let u = &mut out.last_mut().unwrap().1;
+        if u.words.is_empty() || d.entries.contains_key(&a) || d.calls.contains_key(&a) {
+            u.entries.push(u.words.len() as u32);
+        }
+        u.words.push(word(a));
+        last = Some(a);
+    }
+    out
+}
+
 /// Bytes of text covered by [`CodeImage::head_hash`] (fewer when the text is shorter).
 pub const HEAD_LEN: usize = 2048;
 
@@ -707,5 +754,49 @@ mod tests {
         let names: Vec<&str> = pack.images.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(names, ["MAIN.EXE", "RAM 80010018"]);
         assert_eq!(pack.images[1].hash, fnv1a32(&body[..4 * 139]));
+    }
+
+    /// Crash 2's GOOL native pieces between bytecode words (the island test of discovery): each
+    /// run of code is a unit at its offset, and discovered on its own it is all code again.
+    #[test]
+    fn floating_units_are_the_runs_of_code_of_a_file() {
+        const NOP: u32 = 0;
+        let (s0, s5, s6, v0, a0, sp, ra) = (16, 21, 22, 2, 4, 29, 31);
+        let i = |op: u32, rs: u32, rt: u32, imm: u32| op << 26 | rs << 21 | rt << 16 | imm;
+        let jr_ra = JR_RA;
+        let jalr_s5_ra = ra << 21 | s5 << 11 | 9;
+        let w = [
+            jr_ra,
+            NOP,
+            0x1C30_184E, // bytecode
+            0x49BE_0BE0,
+            NOP,
+            i(0x23, s6, v0, 0xFFFC),
+            i(9, s6, s6, 0xFFFC),
+            i(0x2B, s0, v0, 372),
+            i(0x2B, s0, s6, 188),
+            jalr_s5_ra,
+            NOP,
+            0x1C30_1851, // bytecode
+            0x49BE_0BE0,
+            i(0x23, sp, a0, 0),
+            jr_ra,
+            NOP,
+            0x49BE_0BE0, // bytecode
+            i(0x23, s0, v0, 352),
+            NOP,
+            jalr_s5_ra,
+            NOP,
+        ];
+        let bytes: Vec<u8> = w.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let units = floating_units(&bytes);
+        let at: Vec<(usize, usize)> = units.iter().map(|(o, u)| (*o, u.words.len())).collect();
+        assert_eq!(at, [(0, 2), (16, 7), (68, 4)]);
+        for (o, u) in &units {
+            assert_eq!(u.words, w[o / 4..o / 4 + u.words.len()]);
+            assert_eq!(u.entries[0], 0);
+            let (_, d) = u.discover();
+            assert_eq!(d.code.len(), u.words.len(), "unit at {o}");
+        }
     }
 }

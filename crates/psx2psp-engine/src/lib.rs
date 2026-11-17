@@ -1136,9 +1136,8 @@ pub enum Miss {
     Unlisted,
 }
 
-/// Where [`static_coverage`] translates an overlay candidate it finds code of that ran
-/// elsewhere: the start of RAM, as the modules linked at 0 that a loader relocates (Spider-Man's).
-pub const FLOATING_BASE: u32 = 0x8000_0000;
+/// Where [`static_coverage`] translates an overlay candidate it finds code of that ran elsewhere.
+pub use native_code::FLOATING_BASE;
 
 /// Whether `run` (consecutive instructions) is in one of `files` at a word boundary: each
 /// instruction the file's, or the same one with another address in it (`j`/`jal` target, or the
@@ -1201,6 +1200,30 @@ pub struct Coverage {
     /// last whose head did, else the last), words of RAM that differed from the disc text then,
     /// and the first of them (address, RAM word, disc word).
     pub mismatched: Vec<(String, u32, bool, usize, u32, u32, u32)>,
+    /// Per overlay candidate whose discovery translates [`Miss::Floating`] words: what packing it
+    /// as floating code takes.
+    pub floating: Vec<FloatingFile>,
+    /// [`native_code::floating_units`] of those candidates: units, distinct units, their words,
+    /// their host words ([`psx2psp_recomp::emit::translate_floating`] of each on its own), and the
+    /// Floating words that ran in a distinct unit (where it is in a file that holds the run).
+    pub units: (usize, usize, usize, usize, usize),
+}
+
+/// An overlay candidate that holds code the game runs at addresses it picks ([`Miss::Floating`]).
+#[derive(Debug)]
+pub struct FloatingFile {
+    pub name: String,
+    pub bytes: usize,
+    /// Words its discovery at [`FLOATING_BASE`] finds as code.
+    pub code_words: usize,
+    /// Words of the Floating runs it translates.
+    pub ran_words: usize,
+    /// Those of runs it holds exactly (none relocated by the game).
+    pub exact_words: usize,
+    /// RAM addresses (physical) its start was at for the runs it holds exactly.
+    pub places: std::collections::BTreeSet<u32>,
+    /// Host words of [`psx2psp_recomp::emit::translate_floating`], or why it fails.
+    pub host_words: std::result::Result<usize, String>,
 }
 
 /// The goal's measure of the static analysis (AGENTS.md §1.1): the code a game runs on the
@@ -1325,23 +1348,29 @@ pub fn static_coverage(img: &DiscImage, patches: &[&dyn ImagePatch], cipher: Opt
     let all = files.iter().filter_map(|f| read_patched_file(img, &mut rd, f, patches).ok());
     let mut fate: std::collections::HashMap<u32, Miss> = std::collections::HashMap::new();
     let words = |r: &[(u32, u32)]| r.iter().map(|w| w.1).collect::<Vec<_>>();
-    let cands: Vec<&Vec<u8>> = texts.values().collect();
-    let listed = floating_in(&runs.iter().map(|r| words(r)).collect::<Vec<_>>(), cands.iter().copied());
+    let cands: Vec<(&String, &Vec<u8>)> = texts.iter().collect();
+    let listed = floating_in(&runs.iter().map(|r| words(r)).collect::<Vec<_>>(), cands.iter().map(|c| c.1));
     // Each candidate that holds a run, discovered at FLOATING_BASE: the runs' words it translates.
     let mut code = std::collections::HashMap::new();
     for &(f, _) in listed.iter().flatten() {
         code.entry(f).or_insert_with(|| {
-            let b = cands[f];
+            let b = cands[f].1;
             let exe = psx2psp_recomp::overlay::as_exe(b, FLOATING_BASE).unwrap_or(psx2psp_recomp::PsxExe { pc0: FLOATING_BASE, gp0: 0, text_addr: FLOATING_BASE, text: b[..b.len() & !3].to_vec(), bss: (0, 0), stack: (0, 0) });
-            psx2psp_recomp::Discovery::run_file(&exe, &[], &[], &[]).code
+            let d = psx2psp_recomp::Discovery::run_file(&exe, &[], &[], &[]);
+            (exe, d)
         });
     }
+    let codes = &code;
+    let floats = |k: usize, f: usize, q: usize| {
+        let c = &codes[&f].1.code;
+        (0..runs[k].len()).filter(move |&i| c.contains(&(FLOATING_BASE + 4 * (q + i) as u32)))
+    };
     let left: Vec<usize> = (0..runs.len()).filter(|&k| listed[k].is_empty()).collect();
     let on_disc = floating_in(&left.iter().map(|&k| words(&runs[k])).collect::<Vec<_>>(), all);
     for (k, r) in runs.iter().enumerate() {
         for (i, &(a, _)) in r.iter().enumerate() {
             // Floating when a discovery of a file that holds it translates it.
-            let kind = if listed[k].iter().any(|&(f, q)| code[&f].contains(&(FLOATING_BASE + 4 * (q + i) as u32))) {
+            let kind = if listed[k].iter().any(|&(f, q)| floats(k, f, q).any(|j| j == i)) {
                 Miss::Floating
             } else if !listed[k].is_empty() || left.binary_search(&k).is_ok_and(|j| !on_disc[j].is_empty()) {
                 Miss::Unlisted
@@ -1359,6 +1388,57 @@ pub fn static_coverage(img: &DiscImage, patches: &[&dyn ImagePatch], cipher: Opt
     for (a, k) in fate {
         missing.get_mut(&a).unwrap().1 = k;
     }
+    let mut fl: std::collections::BTreeMap<usize, FloatingFile> = std::collections::BTreeMap::new();
+    for (k, r) in runs.iter().enumerate() {
+        for &(f, q) in &listed[k] {
+            let n = floats(k, f, q).count();
+            if n == 0 {
+                continue;
+            }
+            let b = cands[f].1;
+            let exact = r.iter().enumerate().all(|(i, w)| b.get(4 * (q + i)..4 * (q + i) + 4) == Some(&w.1.to_le_bytes()[..]));
+            let e = fl.entry(f).or_insert_with(|| {
+                let (exe, d) = &code[&f];
+                let hz = psx2psp_recomp::Hazards::check(exe, d);
+                let host = psx2psp_recomp::emit::translate_floating(exe, d, &hz, 0x0880_0000);
+                FloatingFile { name: cands[f].0.clone(), bytes: b.len(), code_words: d.code.len(), exact_words: 0, host_words: host.map(|t| t.words.len()).map_err(|e| e.to_string()), ran_words: 0, places: Default::default() }
+            });
+            e.ran_words += n;
+            if exact {
+                e.exact_words += n;
+                e.places.insert(r[0].0.wrapping_sub(4 * q as u32));
+            }
+        }
+    }
+    // The distinct units of those files, and the Floating words a unit holds.
+    let mut uniq: std::collections::HashMap<native_code::FloatingUnit, ()> = std::collections::HashMap::new();
+    let mut in_unit = std::collections::HashSet::new();
+    for &f in fl.keys() {
+        let units = native_code::floating_units(cands[f].1);
+        cov.units.0 += units.len();
+        for (k, r) in runs.iter().enumerate() {
+            for &(g, q) in listed[k].iter().filter(|&&(g, _)| g == f) {
+                for i in floats(k, g, q) {
+                    let o = 4 * (q + i);
+                    if units.iter().any(|(at, u)| (*at..at + 4 * u.words.len()).contains(&o)) {
+                        in_unit.insert(r[i].0);
+                    }
+                }
+            }
+        }
+        uniq.extend(units.into_iter().map(|(_, u)| (u, ())));
+    }
+    cov.units.1 = uniq.len();
+    cov.units.2 = uniq.keys().map(|u| u.words.len()).sum();
+    cov.units.3 = uniq
+        .keys()
+        .map(|u| {
+            let (exe, d) = u.discover();
+            psx2psp_recomp::emit::translate_floating(&exe, &d, &psx2psp_recomp::Hazards::check(&exe, &d), 0x0880_0000).map_or(0, |t| t.words.len())
+        })
+        .sum();
+    cov.units.4 = in_unit.len();
+    cov.floating = fl.into_values().collect();
     cov.kernel = kernel.len();
     for (&a, &(f, c)) in &missing {
         match cov.missing.last_mut() {
