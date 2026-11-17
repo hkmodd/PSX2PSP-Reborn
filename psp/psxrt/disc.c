@@ -22,8 +22,8 @@
 #include <zlib.h>
 
 #define MAGIC "PSXRTDAT"
-#define VERSION 8
-#define HEADER_LEN 0xE4
+#define VERSION 9
+#define HEADER_LEN 0xE8
 #define BLOCK_SECTORS 16
 #define RAW 2352
 #define BLOCK_LEN (BLOCK_SECTORS * RAW)
@@ -43,6 +43,7 @@ typedef struct {
     u32 cpu_shift;
     u32 disc_table, discs; /* 0, 0 for one disc; else discs entries of 0x20 B (ID, sectors, index offset, blocks, 0) */
     u32 fl_offset, fl_stored, fl_len, fl_host, fl_arena; /* floating code, 0 for none */
+    u32 fl_bodies;                                       /* its units' bodies */
 } Header;
 
 /* The disc table of a game of more than one disc (README.md, "DATA.PSAR"); entry 0 is disc 1. */
@@ -179,7 +180,7 @@ const char *disc_open(const char *path, DiscInfo *info)
     info->cpu_shift = h.cpu_shift;
     info->discs = ndiscs;
     info->fl_offset = h.fl_offset, info->fl_stored = h.fl_stored, info->fl_len = h.fl_len;
-    info->fl_host = h.fl_host, info->fl_arena = h.fl_arena;
+    info->fl_host = h.fl_host, info->fl_arena = h.fl_arena, info->fl_bodies = h.fl_bodies;
     if (h.fl_len && (h.fl_len & 3 || h.fl_stored > h.fl_len || h.fl_host & 3))
         return "DATA.PSAR floating code is damaged";
     if (h.images) {

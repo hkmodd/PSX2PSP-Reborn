@@ -28,10 +28,11 @@ typedef struct DiscInfo {
      * POPS config word 19): the game gets more CPU per frame */
     u32 cpu_shift;
     u32 discs; /* discs of the game, 1..DISC_MAX; disc_id and title are disc 1's */
-    /* floating code (floating.h): the blob at fl_offset, fl_stored bytes (deflate, or as is when
-     * fl_len), fl_len raw bytes loaded at fl_host; its translations are placed in the fl_arena
-     * bytes from code_base. fl_len 0 for none. */
+    /* floating code (floating.h): the head at fl_offset, fl_stored bytes (deflate, or as is when
+     * fl_len), fl_len raw bytes loaded at fl_host; the units' bodies from fl_bodies, read into the
+     * fl_arena bytes from code_base where they are placed. fl_len 0 for none. */
     u32 fl_offset, fl_stored, fl_len, fl_host, fl_arena;
+    u32 fl_bodies;
 } DiscInfo;
 
 #define DISC_MAX 5

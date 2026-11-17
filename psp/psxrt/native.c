@@ -306,6 +306,7 @@ static void blk_resum(u32 a, u32 len)
  * The table entries of a placement's translated words point into its slot. */
 static Floating fl;
 static FlArena ar; /* from code_lo; the executables' code is above it */
+static u32 fl_bodies; /* DATA.PSAR offset of the units' bodies */
 
 static u32 pl_words(const FlPlace *q) { return fl_unit(&fl, q->unit)->g_len; }
 
@@ -314,7 +315,7 @@ static u32 pl_words(const FlPlace *q) { return fl_unit(&fl, q->unit)->g_len; }
 static void fl_install(const FlPlace *q)
 {
     const FlUnit *x = fl_unit(&fl, q->unit);
-    const u32 *t = fl.w + x->t_off;
+    const u32 *t = (const u32 *)q->host + x->h_len; /* the body's table, after the code */
     u32 *e = &table[q->at >> 2];
     for (u32 j = 0; j < x->g_len; j++) {
         if (e[j] - ar.hi < code_hi - ar.hi)
@@ -336,6 +337,18 @@ static void fl_gone(const FlPlace *q)
             e[j] = STUB_DIRTY;
     blk_resum(q->at, 4 * pl_words(q));
     native_stats.fl_drops++;
+}
+
+/* q's unit read from DATA.PSAR into its slot and placed there: 0, or -1 when it cannot be. */
+static int fl_load(const FlPlace *q)
+{
+    const FlUnit *x = fl_unit(&fl, q->unit);
+    if (disc_blob(fl_bodies + x->b_off, x->b_len, (void *)q->host, 4 * fl_body_words(x)) < 0 ||
+        fl_place(&fl, q->unit, (u32 *)q->host, q->guest, q->host, (const u32 *)(P->ram + q->at)) < 0)
+        return -1;
+    sceKernelDcacheWritebackRange((void *)q->host, q->len);
+    sceKernelIcacheInvalidateRange((void *)q->host, q->len);
+    return 0;
 }
 
 /* The guest runs RAM offset `p` (address `pc`) with no translation: a placement there whose words
@@ -363,9 +376,12 @@ static int fl_try(u32 pc, u32 p)
         return 0;
     }
     const FlPlace *q = &ar.p[i];
-    fl_place(&fl, q->unit, (u32 *)q->host, q->guest, q->host, (const u32 *)(P->ram + q->at));
-    sceKernelDcacheWritebackRange((void *)q->host, q->len);
-    sceKernelIcacheInvalidateRange((void *)q->host, q->len);
+    if (fl_load(q) < 0) {
+        say("native: cannot read floating unit %u: to the interpreter", (unsigned)q->unit);
+        memmove(ar.p + i, ar.p + i + 1, (ar.n - i - 1) * sizeof *ar.p);
+        ar.n--;
+        return 0;
+    }
     fl_install(q);
     if (native_stats.fl_places++ < 8)
         say("native: floating unit %u (%u words) placed at %08X for guest %08X, host %08X (%u B), from %08X", (unsigned)q->unit,
@@ -1968,6 +1984,7 @@ const char *native_init(Psx *psx, const DiscInfo *info)
         if (disc_blob(info->fl_offset, info->fl_stored, (void *)info->fl_host, info->fl_len) < 0 ||
             fl_open(&fl, (const u32 *)info->fl_host, info->fl_len / 4) < 0)
             return "DATA.PSAR floating code is damaged";
+        fl_bodies = info->fl_bodies;
         say("native: floating code: %u units, %u entries, %u KB arena at %08X", (unsigned)fl.units, (unsigned)fl.index,
             (unsigned)(info->fl_arena >> 10), (unsigned)ar.lo);
     }
@@ -2058,10 +2075,9 @@ int native_load(int fd)
         return ar.n = 0, -1;
     for (u32 i = 0; i < ar.n; i++) {
         const FlPlace *q = &ar.p[i];
-        if (q->unit >= fl.units || q->len < 4 * fl_unit(&fl, q->unit)->h_len || q->host < (i ? ar.p[i - 1].host + ar.p[i - 1].len : ar.lo) ||
-            q->host > ar.hi || ar.hi - q->host < q->len || q->at > RAM_SIZE - 4 * pl_words(q) || (q->at & 3))
+        if (q->unit >= fl.units || q->len < 4 * fl_body_words(fl_unit(&fl, q->unit)) || q->host < (i ? ar.p[i - 1].host + ar.p[i - 1].len : ar.lo) ||
+            q->host > ar.hi || ar.hi - q->host < q->len || q->at > RAM_SIZE - 4 * pl_words(q) || (q->at & 3) || fl_load(q) < 0)
             return ar.n = 0, -1;
-        fl_place(&fl, q->unit, (u32 *)q->host, q->guest, q->host, (const u32 *)(P->ram + q->at));
     }
     memset(gret_sp, 0xFF, sizeof gret_sp); /* not in the snapshot: no entry matches, pops take the top */
     sceKernelDcacheWritebackInvalidateAll();

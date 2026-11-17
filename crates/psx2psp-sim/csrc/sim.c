@@ -352,16 +352,16 @@ int sim_floating(Sim *s, const u32 *blob, u32 words, u32 arena)
     return 0;
 }
 
-/* For tests, on a blob of its own: fl_place of unit `u` at guest and host addresses into `dst`
- * of `cap` words (its host words, or -1), its sites from `ram` (the unit's words as RAM holds
- * them, or NULL), and fl_find in `ram` (RAM_SIZE bytes). */
-int sim_fl_place(const u32 *blob, u32 words, u32 u, u32 *dst, u32 cap, u32 guest, u32 host, const u32 *ram)
+/* For tests, on a head of its own: fl_place of unit `u`, its body `body` of `body_words` words,
+ * at guest and host addresses into `dst` of `cap` words (its host words, or -1), its sites from
+ * `ram` (the unit's words as RAM holds them, or NULL), and fl_find in `ram` (RAM_SIZE bytes). */
+int sim_fl_place(const u32 *blob, u32 words, u32 u, const u32 *body, u32 body_words, u32 *dst, u32 cap, u32 guest, u32 host, const u32 *ram)
 {
     Floating f;
-    if (fl_open(&f, blob, words) < 0 || u >= f.units || fl_unit(&f, u)->h_len > cap)
+    if (fl_open(&f, blob, words) < 0 || u >= f.units || fl_body_words(fl_unit(&f, u)) != body_words || body_words > cap)
         return -1;
-    fl_place(&f, u, dst, guest, host, ram);
-    return (int)fl_unit(&f, u)->h_len;
+    memcpy(dst, body, 4 * (size_t)body_words);
+    return fl_place(&f, u, dst, guest, host, ram) < 0 ? -1 : (int)fl_unit(&f, u)->h_len;
 }
 
 int sim_fl_find(const u32 *blob, u32 words, const u8 *ram, u32 p, u32 *at)

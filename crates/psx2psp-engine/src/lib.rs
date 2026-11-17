@@ -822,24 +822,25 @@ pub const NATIVE_RUNTIME: &[u8] = include_bytes!("../../../resources/psxrt.prx")
 ///   slice, each deflated or stored the same way, its patch table ([`native_code::patch_groups`]:
 ///   one (offset from the table, stored length, raw length) triple per group, then the groups,
 ///   each deflated or stored), then a directory of
-///   [`NATIVE_CODE_ENTRY_LEN`]-byte entries ([`native_code_entry`]), then the floating code
-///   ([`native_code::floating_blob`], deflated or stored). None without code. One directory
+///   [`NATIVE_CODE_ENTRY_LEN`]-byte entries ([`native_code_entry`]), then the floating code:
+///   its head ([`native_code::floating_blob`], deflated or stored) and its units' bodies
+///   ([`native_code::floating_bodies`]). None without code. One directory
 ///   serves every disc of the set: a disc change keeps the code that runs;
 /// - with more than one disc, each further disc's index and blocks, laid out as the first's, then
 ///   the disc table: [`NATIVE_DISC_ENTRY_LEN`] bytes per disc, the first included (disc ID 16,
 ///   raw sectors 4, index offset 4, blocks 4, zero 4). The header's first-disc fields stay, so a
 ///   one-disc set has no table.
 pub const NATIVE_PSAR_MAGIC: [u8; 8] = *b"PSXRTDAT";
-pub const NATIVE_PSAR_VERSION: u32 = 8;
+pub const NATIVE_PSAR_VERSION: u32 = 9;
 /// magic 8, version 4, header length 4, disc ID 16, title 128, disc sectors 4, sectors per block
 /// 4, index offset 4, block count 4, code directory offset 4, code images 4, host address of the
 /// code 4, code size 4 (these four written once the code is), flags 4 ([`NATIVE_FLAG_PAL60`]),
 /// CPU shift 4, disc table offset 4 and discs 4 (both 0 for one disc), then the floating code
 /// ([`NATIVE_PSAR_FLOATING`], all 0 without it).
-pub const NATIVE_PSAR_HEADER_LEN: usize = 0xE4;
-/// Offset of the floating code fields in the header: blob offset, stored length, raw length,
-/// host address the runtime reads it to ([`native_code::CodePack::blob_host`]), and arena bytes
-/// at the code's host address ([`native_code::CodePack::arena`]).
+pub const NATIVE_PSAR_HEADER_LEN: usize = 0xE8;
+/// Offset of the floating code fields in the header: head offset, stored length, raw length,
+/// host address the runtime reads it to ([`native_code::CodePack::blob_host`]), arena bytes at
+/// the code's host address ([`native_code::CodePack::arena`]), and the bodies' offset.
 pub const NATIVE_PSAR_FLOATING: u64 = 0xD0;
 /// Offset of the code fields in the header.
 const NATIVE_PSAR_CODE_FIELDS: u64 = 0xB0;
@@ -1223,7 +1224,7 @@ pub struct Coverage {
     /// not fit, or does not translate); in a packed unit whose words in the run differ from it
     /// off its sites (and per opcode of such a word, the words); in a packed unit whose words in
     /// the run it takes (RAM differs elsewhere in it, or the guest never entered it there).
-    pub unit_miss: (usize, usize, usize, std::collections::BTreeMap<u32, usize>),
+    pub unit_miss: (usize, usize, usize, std::collections::BTreeMap<u32, usize>, usize),
 }
 
 /// An overlay candidate that holds code the game runs at addresses it picks ([`Miss::Floating`]).
@@ -1284,7 +1285,7 @@ pub fn static_coverage(img: &DiscImage, patches: &[&dyn ImagePatch], cipher: Opt
         ids.push(id);
         cov.image_list.push((i.name.clone(), i.text_addr, i.text_size, words.iter().filter(|&&t| t != 0).count(), None));
     }
-    if !pack.floating.is_empty() && !m.floating(&native_code::floating_blob(&pack.floating), pack.arena) {
+    if !pack.floating.is_empty() && !m.floating(&native_code::floating_blob(&pack.floating, &vec![(0, 0); pack.floating.len()]), pack.arena) {
         return Err("the sim refuses the floating code".into());
     }
     let mut seen = std::collections::HashMap::new();
@@ -1459,7 +1460,9 @@ pub fn static_coverage(img: &DiscImage, patches: &[&dyn ImagePatch], cipher: Opt
                         .filter(|&(n, j)| j < u.words.len() && r[n].1 != u.words[j] && (!c.1.contains(&(j as u32)) || native_code::floating_form(r[n].1) != native_code::floating_form(u.words[j])))
                         .map(|(_, j)| u.words[j] >> 26)
                         .collect();
-                    if off.is_empty() {
+                    if off.is_empty() && c.0.table[(o - at) / 4] == u32::MAX {
+                        cov.unit_miss.4 += 1;
+                    } else if off.is_empty() {
                         cov.unit_miss.2 += 1;
                     } else {
                         cov.unit_miss.1 += 1;
@@ -1691,13 +1694,15 @@ fn write_native_psar<W: Write + Seek>(
         let fields = [offset(pos)?, code.images.len() as u32, code.base, code.size];
         w.write_all(&dir)?;
         pos += dir.len() as u64;
-        let mut floating = [0u32; 5];
+        let mut floating = [0u32; 6];
         if !code.floating.is_empty() {
-            let raw: Vec<u8> = native_code::floating_blob(&code.floating).iter().flat_map(|v| v.to_le_bytes()).collect();
+            let (bodies, at) = native_code::floating_bodies(&code.floating, pack);
+            let raw: Vec<u8> = native_code::floating_blob(&code.floating, &at).iter().flat_map(|v| v.to_le_bytes()).collect();
             let z = pack(&raw);
-            floating = [offset(pos)?, z.len() as u32, raw.len() as u32, code.blob_host, code.arena];
+            floating = [offset(pos)?, z.len() as u32, raw.len() as u32, code.blob_host, code.arena, offset(pos + z.len() as u64)?];
             w.write_all(&z)?;
-            pos += z.len() as u64;
+            w.write_all(&bodies)?;
+            pos += (z.len() + bodies.len()) as u64;
         }
         let end = w.stream_position()?;
         w.seek(SeekFrom::Start(psar + NATIVE_PSAR_CODE_FIELDS))?;
@@ -2383,7 +2388,7 @@ mod tests {
         assert_eq!(pbp.range(Section::DataPsar).start % 0x10, 0);
         let head = native_psar_header("SLES02895", "Sheep Dog 'n' Wolf", 40, 0);
         assert_eq!(psar[..NATIVE_PSAR_HEADER_LEN], head);
-        assert_eq!(psar[..16], *b"PSXRTDAT\x08\0\0\0\xE4\0\0\0");
+        assert_eq!(psar[..16], *b"PSXRTDAT\x09\0\0\0\xE8\0\0\0");
         assert_eq!(&psar[0x10..0x1A], b"SLES02895\0");
         assert_eq!(&psar[0x20..0x33], b"Sheep Dog 'n' Wolf\0");
         let word = |at: usize| u32::from_le_bytes(psar[at..at + 4].try_into().unwrap()) as usize;
@@ -2391,7 +2396,7 @@ mod tests {
         assert_eq!([word(0xB0), word(0xB4), word(0xB8), word(0xBC)], [0; 4], "no filesystem, no code");
         assert_eq!(word(0xC0), 0, "no flags");
         assert_eq!([word(0xC8), word(0xCC)], [0, 0], "one disc, no disc table");
-        assert_eq!((0xD0..0xE4).step_by(4).map(word).collect::<Vec<_>>(), [0; 5], "no floating code");
+        assert_eq!((0xD0..0xE8).step_by(4).map(word).collect::<Vec<_>>(), [0; 6], "no floating code");
 
         // The index bounds every block; each one gives back its sectors, the noise stored as is.
         let index: Vec<usize> = (0..4).map(|i| word(NATIVE_PSAR_HEADER_LEN + 4 * i)).collect();

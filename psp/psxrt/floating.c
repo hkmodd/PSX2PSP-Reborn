@@ -15,17 +15,10 @@ int fl_open(Floating *f, const u32 *w, u32 len)
     Floating g = {w, w[0], w[1]};
     for (u32 u = 0; u < g.units; u++) {
         const FlUnit *x = fl_unit(&g, u);
-        if (!x->g_len || !inside(x->g_off, x->g_len, len) || !inside(x->h_off, x->h_len, len) || !inside(x->t_off, x->g_len, len) ||
-            !inside(x->r_off, x->r_len, len) || x->s_len > len / 2 || !inside(x->s_off, 2 * x->s_len, len))
+        if (!x->g_len || x->g_len > RAM_SIZE / 4 || !inside(x->g_off, x->g_len, len) || x->s_len > len / 2 ||
+            !inside(x->s_off, 2 * x->s_len, len) || !inside(x->m_off, (x->g_len + 31) / 32, len) || x->h_len > RAM_SIZE ||
+            x->r_len > RAM_SIZE || x->b_len > 4 * fl_body_words(x))
             return -1;
-        for (u32 j = 0; j < x->g_len; j++)
-            if (w[x->t_off + j] != FL_NONE && w[x->t_off + j] >= x->h_len)
-                return -1;
-        for (u32 j = 0; j < x->r_len; j++) {
-            u32 r = w[x->r_off + j], i = r >> 2, k = r & 3;
-            if (i + (k == 1 || k == 3) >= x->h_len)
-                return -1;
-        }
         for (u32 j = 0; j < x->s_len; j++) {
             const u32 *s = w + x->s_off + 2 * j;
             if ((s[0] >> 1) >= x->g_len || s[1] + (s[0] & 1) >= x->h_len || (j && s[0] >> 1 < s[-2] >> 1))
@@ -67,6 +60,22 @@ u32 fl_key(const u8 *p)
     return h;
 }
 
+/* Whether `body`, unit x's, is whole: its table agrees with the map and points into the code, its
+ * relocations are in the code. */
+static int body_ok(const Floating *f, const FlUnit *x, const u32 *body)
+{
+    const u32 *t = body + x->h_len, *r = t + x->g_len;
+    for (u32 j = 0; j < x->g_len; j++)
+        if ((t[j] != FL_NONE) != fl_translates(f, x, j) || (t[j] != FL_NONE && t[j] >= x->h_len))
+            return 0;
+    for (u32 j = 0; j < x->r_len; j++) {
+        u32 i = r[j] >> 2, k = r[j] & 3;
+        if (i + (k == 1 || k == 3) >= x->h_len)
+            return 0;
+    }
+    return 1;
+}
+
 /* Whether the words `r` are unit x's: each the unit's, or of its form at a site. */
 static int match(const Floating *f, const FlUnit *x, const u32 *r)
 {
@@ -94,35 +103,42 @@ static u32 site_sum(const Floating *f, const FlUnit *x, const u32 *r)
 
 int fl_find(const Floating *f, const u8 *ram, u32 p, u32 *at)
 {
-    if (!f->w || (p & 3) || p > RAM_SIZE - 8)
+    if (!f->w || (p & 3) || p > RAM_SIZE - 4)
         return -1;
     const u32 *ix = f->w + 4 + UNIT_WORDS * f->units;
-    u32 key = fl_key(ram + p), lo = 0, hi = f->index;
-    while (lo < hi) {
-        u32 m = lo + (hi - lo) / 2;
-        if (ix[3 * m] < key)
-            lo = m + 1;
-        else
-            hi = m;
-    }
     int best = -1;
-    for (; lo < f->index && ix[3 * lo] == key; lo++) {
-        u32 u = ix[3 * lo + 1], off = 4 * ix[3 * lo + 2];
-        const FlUnit *x = fl_unit(f, u);
-        if (p < off || x->g_len > (RAM_SIZE - (p - off)) / 4 || (best >= 0 && fl_unit(f, (u32)best)->g_len >= x->g_len))
+    for (u32 k = 0; k < FL_WALK && 4 * k <= p; k++) { /* an entry at e = p - 4k, of a unit with p in it */
+        u32 e = p - 4 * k;
+        if (e > RAM_SIZE - 8)
             continue;
-        if (match(f, x, (const u32 *)(ram + p - off)))
-            best = (int)u, *at = p - off;
+        u32 key = fl_key(ram + e), lo = 0, hi = f->index;
+        while (lo < hi) {
+            u32 m = lo + (hi - lo) / 2;
+            if (ix[3 * m] < key)
+                lo = m + 1;
+            else
+                hi = m;
+        }
+        for (; lo < f->index && ix[3 * lo] == key; lo++) {
+            u32 u = ix[3 * lo + 1], off = 4 * ix[3 * lo + 2], j = ix[3 * lo + 2] + k;
+            const FlUnit *x = fl_unit(f, u);
+            if (e < off || j >= x->g_len || !fl_translates(f, x, j) || x->g_len > (RAM_SIZE - (e - off)) / 4 ||
+                (best >= 0 && fl_unit(f, (u32)best)->g_len >= x->g_len))
+                continue;
+            if (match(f, x, (const u32 *)(ram + e - off)))
+                best = (int)u, *at = e - off;
+        }
     }
     return best;
 }
 
-void fl_place(const Floating *f, u32 u, u32 *dst, u32 guest, u32 host, const u32 *ram)
+int fl_place(const Floating *f, u32 u, u32 *dst, u32 guest, u32 host, const u32 *ram)
 {
     const FlUnit *x = fl_unit(f, u);
-    const u32 *r = f->w + x->r_off, *s = f->w + x->s_off;
+    const u32 *r = dst + x->h_len + x->g_len, *s = f->w + x->s_off;
     u32 gd = guest - f->w[2], hd = host - f->w[3];
-    memcpy(dst, f->w + x->h_off, 4 * x->h_len);
+    if (!body_ok(f, x, dst))
+        return -1;
     for (u32 j = 0; j < x->r_len; j++) {
         u32 i = r[j] >> 2, k = r[j] & 3, v;
         switch (k) {
@@ -149,6 +165,7 @@ void fl_place(const Floating *f, u32 u, u32 *dst, u32 guest, u32 host, const u32
         } else
             dst[i] = w >> 26 == 8 ? w | 1u << 26 : w; /* addi as addiu, as the translation copies it */
     }
+    return 0;
 }
 
 int fl_holds(const Floating *f, const u8 *ram, const FlPlace *q)
@@ -165,7 +182,7 @@ int fl_placed(const Floating *f, const FlArena *a, const u8 *ram, u32 p, u32 bas
     for (u32 i = 0; i < a->n; i++) {
         const FlPlace *q = &a->p[i];
         const FlUnit *x = fl_unit(f, q->unit);
-        if (p - q->at < 4 * x->g_len && q->guest == q->at + base && f->w[x->t_off + (p - q->at) / 4] != FL_NONE && fl_holds(f, ram, q))
+        if (p - q->at < 4 * x->g_len && q->guest == q->at + base && fl_translates(f, x, (p - q->at) / 4) && fl_holds(f, ram, q))
             return (int)i;
     }
     return -1;
@@ -186,7 +203,7 @@ static u32 gap(const FlArena *a, u32 len, u32 *k)
 int fl_alloc(const Floating *f, FlArena *a, const u8 *ram, u32 u, u32 at, u32 guest, void (*gone)(const FlPlace *q))
 {
     const FlUnit *x = fl_unit(f, u);
-    u32 len = (4 * x->h_len + 63) & ~63u, k, host = gap(a, len, &k);
+    u32 len = (4 * fl_body_words(x) + 63) & ~63u, k, host = gap(a, len, &k);
     if (!host) {
         for (u32 i = a->n; i-- > 0;)
             if (!fl_holds(f, ram, &a->p[i])) {

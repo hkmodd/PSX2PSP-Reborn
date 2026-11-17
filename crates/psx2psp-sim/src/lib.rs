@@ -39,7 +39,7 @@ pub mod ffi {
         pub fn sim_watch_live(i: c_int) -> c_int;
         pub fn sim_watch_miss(i: c_int, checks: *mut u32, head: *mut c_int) -> *const u8;
         pub fn sim_floating(s: *mut Sim, blob: *const u32, words: u32, arena: u32) -> c_int;
-        pub fn sim_fl_place(blob: *const u32, words: u32, u: u32, dst: *mut u32, cap: u32, guest: u32, host: u32, ram: *const u32) -> c_int;
+        pub fn sim_fl_place(blob: *const u32, words: u32, u: u32, body: *const u32, body_words: u32, dst: *mut u32, cap: u32, guest: u32, host: u32, ram: *const u32) -> c_int;
         pub fn sim_fl_find(blob: *const u32, words: u32, ram: *const u8, p: u32, at: *mut u32) -> c_int;
         pub fn sim_fl_stats(out: *mut u32);
         pub fn cr_spread(ram: *const u32, lo: u32, bad: *mut u8, held: extern "C" fn(*mut c_void, u32) -> c_int, ctx: *mut c_void) -> u32;
@@ -62,21 +62,22 @@ pub fn code_runs_cut(ram: &[u32], lo: u32, bad: &mut [u8; 512], held: &[bool]) -
     unsafe { ffi::cr_spread(ram.as_ptr(), lo, bad.as_mut_ptr(), at, &mut h as *mut &[bool] as *mut c_void) }
 }
 
-/// The runtime's move of unit `u` of the floating code `blob` (`psp/psxrt/floating.c`
-/// `fl_place`) to guest address `guest` and host address `host`, its sites taken from `ram` (the
-/// unit's words as RAM holds them; None: as the unit's): its host words; None when the blob is
-/// damaged, has no such unit, or `ram` is shorter than the unit.
-pub fn floating_place(blob: &[u32], u: u32, guest: u32, host: u32, ram: Option<&[u32]>) -> Option<Vec<u32>> {
+/// The runtime's move of unit `u` of the floating code `blob` (its head, `psp/psxrt/floating.c`
+/// `fl_place`), whose body is `body`, to guest address `guest` and host address `host`, its sites
+/// taken from `ram` (the unit's words as RAM holds them; None: as the unit's): its host words;
+/// None when the head or body is damaged, the head has no such unit, or `ram` is shorter than the
+/// unit.
+pub fn floating_place(blob: &[u32], body: &[u32], u: u32, guest: u32, host: u32, ram: Option<&[u32]>) -> Option<Vec<u32>> {
     // the unit's g_len (floating.h FlUnit, 9 words from word 4); the core checks the rest
     let g_len = *blob.get(4 + 9 * u as usize + 1)?;
     if ram.is_some_and(|r| r.len() < g_len as usize) {
         return None;
     }
-    let mut out = vec![0u32; blob.len()];
+    let mut out = vec![0u32; body.len()];
     let r = ram.map_or(std::ptr::null(), |r| r.as_ptr());
-    // SAFETY: the core reads the blob's words, at most the unit's g_len words of `ram`, and
-    // writes at most `out.len()` words.
-    let n = unsafe { ffi::sim_fl_place(blob.as_ptr(), blob.len() as u32, u, out.as_mut_ptr(), out.len() as u32, guest, host, r) };
+    // SAFETY: the core reads the blob's and body's words, at most the unit's g_len words of
+    // `ram`, and writes at most `out.len()` words.
+    let n = unsafe { ffi::sim_fl_place(blob.as_ptr(), blob.len() as u32, u, body.as_ptr(), body.len() as u32, out.as_mut_ptr(), out.len() as u32, guest, host, r) };
     out.truncate(usize::try_from(n).ok()?);
     Some(out)
 }
@@ -205,8 +206,8 @@ impl<'a> Machine<'a> {
         (i >= 0).then_some(i)
     }
 
-    /// Takes floating code (`psp/psxrt/floating.h`, engine `native_code::floating_blob`) as the
-    /// native runtime places it, in an arena of `arena` bytes (0: no limit): a word the guest runs
+    /// Takes floating code (its head: `psp/psxrt/floating.h`, engine `native_code::floating_blob`;
+    /// the sim needs no bodies) as the native runtime places it, in an arena of `arena` bytes (0: no limit): a word the guest runs
     /// that no watched image holds takes the translation of the unit with an entry there whose
     /// words RAM holds, until a load over it. False when the blob is damaged.
     pub fn floating(&mut self, blob: &[u32], arena: u32) -> bool {

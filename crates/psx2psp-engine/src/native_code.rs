@@ -129,19 +129,38 @@ pub struct CodePack {
     /// The distinct [`floating_units`] of the overlays [`overlay::locate_all`] does not place,
     /// translated: the runtime moves one where the guest runs its words.
     pub floating: Vec<FloatingCode>,
-    /// Bytes at `base` where the runtime places [`CodePack::floating`] (0 without it).
+    /// Bytes at `base` where the runtime places [`CodePack::floating`] (0 without it): at least
+    /// [`floating_arena`] of their slots.
     pub arena: u32,
-    /// Host address where the runtime reads [`floating_blob`] of [`CodePack::floating`], below
+    /// Host address where the runtime reads the head ([`floating_blob`]) of [`CodePack::floating`], below
     /// `base` (0 without it).
     pub blob_host: u32,
 }
 
-/// Most bytes of host code the runtime keeps for floating code at once.
+/// Most bytes of slots [`floating_arena`] asks for floating code; the room left below the images
+/// may give it more.
 pub const FLOATING_ARENA_MAX: u32 = 4 << 20;
 
-/// [`CodePack::floating`] as the runtime reads it (`psp/psxrt/floating.h`): header, units, the
-/// index of their entries by [`floating_key`] of the two words there, and the data.
-pub fn floating_blob(codes: &[FloatingCode]) -> Vec<u32> {
+/// The bodies of `codes` ([`FloatingCode::body`]) as DATA.PSAR holds them, one after another,
+/// each packed by `pack` (deflate, or the bytes as they are): their bytes, and each one's byte
+/// offset there and length.
+pub fn floating_bodies(codes: &[FloatingCode], pack: impl Fn(&[u8]) -> Vec<u8>) -> (Vec<u8>, Vec<(u32, u32)>) {
+    let mut out = Vec::new();
+    let mut at = Vec::with_capacity(codes.len());
+    for c in codes {
+        let z = pack(&c.body().iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>());
+        at.push((out.len() as u32, z.len() as u32));
+        out.extend_from_slice(&z);
+    }
+    (out, at)
+}
+
+/// The head of [`CodePack::floating`] as the runtime keeps it in RAM (`psp/psxrt/floating.h`):
+/// header, units, the index of their entries by [`floating_key`] of the two words there, and the
+/// data (guest words, sites, map); `bodies` gives each unit's body in [`floating_bodies`] (the
+/// simulator, which does not read them, takes zeros).
+pub fn floating_blob(codes: &[FloatingCode], bodies: &[(u32, u32)]) -> Vec<u32> {
+    assert_eq!(codes.len(), bodies.len());
     let mut index: Vec<[u32; 3]> = Vec::new();
     for (u, c) in codes.iter().enumerate() {
         for e in c.indexed() {
@@ -152,15 +171,15 @@ pub fn floating_blob(codes: &[FloatingCode]) -> Vec<u32> {
     let head = 4 + FLOATING_UNIT_WORDS * codes.len() + 3 * index.len();
     let mut w = vec![codes.len() as u32, index.len() as u32, FLOATING_BASE, FLOATING_HOST];
     let mut data: Vec<u32> = Vec::new();
-    for c in codes {
+    for (c, &(b, bl)) in codes.iter().zip(bodies) {
         let mut put = |v: &[u32]| {
             let at = (head + data.len()) as u32;
             data.extend_from_slice(v);
             at
         };
-        let (g, h, t, r, s) = (put(&c.unit.words), put(&c.code), put(&c.table), put(&c.relocs), put(&c.sites));
-        let (gl, hl, rl, sl) = (c.unit.words.len(), c.code.len(), c.relocs.len(), c.sites.len() / 2);
-        w.extend([g, gl as u32, h, hl as u32, t, r, rl as u32, s, sl as u32]);
+        let (g, s, m) = (put(&c.unit.words), put(&c.sites), put(&c.map()));
+        let (gl, sl, hl, rl) = (c.unit.words.len(), c.sites.len() / 2, c.code.len(), c.relocs.len());
+        w.extend([g, gl as u32, s, sl as u32, m, hl as u32, rl as u32, b, bl]);
     }
     w.extend(index.iter().flatten());
     w.extend(data);
@@ -169,6 +188,10 @@ pub fn floating_blob(codes: &[FloatingCode]) -> Vec<u32> {
 
 /// Words of a unit's header in [`floating_blob`] (`psp/psxrt/floating.h` FlUnit).
 const FLOATING_UNIT_WORDS: usize = 9;
+
+/// How far back from a word the runtime looks for an index entry (`FL_WALK`): every word a unit
+/// translates has an entry at most `FLOATING_WALK - 1` words before it.
+const FLOATING_WALK: usize = 8;
 
 /// `w` without what a site of floating code takes from RAM (`psp/psxrt/floating.c` fl_form): a
 /// j/jal's target, an immediate (addi as addiu) or a shift amount.
@@ -249,15 +272,45 @@ impl FloatingCode {
         Ok(Self { unit, code: t.words, table, relocs, sites })
     }
 
-    /// The words [`floating_blob`] indexes: each translated one with a word after it.
-    fn indexed(&self) -> impl Iterator<Item = usize> + '_ {
-        (0..self.unit.words.len().saturating_sub(1)).filter(|&e| self.table[e] != u32::MAX)
+    /// The words [`floating_blob`] indexes, each with a word after it: for each translated word
+    /// with none of them [`FLOATING_WALK`] - 1 words back or less, it (the last but one when it is
+    /// the last).
+    fn indexed(&self) -> Vec<usize> {
+        let n = self.unit.words.len();
+        let mut out: Vec<usize> = Vec::new();
+        for j in (0..n).filter(|&j| self.table[j] != u32::MAX && n >= 2) {
+            if out.last().is_none_or(|&e| j - e >= FLOATING_WALK) {
+                out.push(j.min(n - 2));
+            }
+        }
+        out
     }
 
-    /// Its words in [`floating_blob`]: unit header, index entries, guest words, code, table and
-    /// relocations and sites.
+    /// A bit per guest word, from bit 0 of the first: the word has a translation.
+    fn map(&self) -> Vec<u32> {
+        let mut m = vec![0u32; self.unit.words.len().div_ceil(32)];
+        for (j, &t) in self.table.iter().enumerate() {
+            if t != u32::MAX {
+                m[j / 32] |= 1 << (j % 32);
+            }
+        }
+        m
+    }
+
+    /// What DATA.PSAR holds of it, read into its slot when the runtime places it: code, table,
+    /// relocations.
+    pub fn body(&self) -> Vec<u32> {
+        [&self.code[..], &self.table, &self.relocs].concat()
+    }
+
+    /// Its words in [`floating_blob`]: unit header, index entries, guest words, sites and map.
     pub fn blob_words(&self) -> usize {
-        FLOATING_UNIT_WORDS + 3 * self.indexed().count() + 2 * self.unit.words.len() + self.code.len() + self.relocs.len() + self.sites.len()
+        FLOATING_UNIT_WORDS + 3 * self.indexed().len() + self.unit.words.len() + self.sites.len() + self.unit.words.len().div_ceil(32)
+    }
+
+    /// Bytes of its slot in the arena: its body's, rounded up to 64 (`fl_alloc`).
+    pub fn slot_bytes(&self) -> u64 {
+        (4 * (self.code.len() + self.table.len() + self.relocs.len()) as u64).next_multiple_of(64)
     }
 }
 
@@ -604,16 +657,17 @@ pub fn build(exes: Vec<(String, Vec<u8>)>, overlays: Vec<Overlay>, captured: Vec
         g.0 = at;
         at += len;
     }
-    // Below the images, the floating code: the arena where the runtime places units, and below
-    // it the blob it reads them from. Units go in by blob size, smallest first, while both fit
-    // over CODE_FLOOR (the runtime's own memory is under it).
+    // Below the images, the floating code: the arena where the runtime reads units' bodies and
+    // places them, and below it the head it finds them with. Units go in by head size, smallest
+    // first, while both fit over CODE_FLOOR (the runtime's own memory is under it); the arena then
+    // takes the room left, up to twice the slots.
     let room = u64::from(base - CODE_FLOOR);
     let blob_room = |words: u64| (4 * words).next_multiple_of(0x1_0000);
     let mut order: Vec<(usize, usize)> = pack.floating.iter().map(FloatingCode::blob_words).enumerate().map(|(k, w)| (w, k)).collect();
     order.sort_unstable();
     let (mut keep, mut words, mut host) = (vec![false; pack.floating.len()], 4u64, 0u64);
     for (w, k) in order {
-        let code = 4 * pack.floating[k].code.len() as u64;
+        let code = pack.floating[k].slot_bytes();
         let (w2, h2) = (words + w as u64, host + code);
         if code <= floating_arena(h2) && blob_room(w2) + floating_arena(h2) <= room {
             (keep[k], words, host) = (true, w2, h2);
@@ -626,7 +680,7 @@ pub fn build(exes: Vec<(String, Vec<u8>)>, overlays: Vec<Overlay>, captured: Vec
     let mut keep = keep.into_iter();
     pack.floating.retain(|_| keep.next() == Some(true));
     if !pack.floating.is_empty() {
-        pack.arena = floating_arena(host) as u32;
+        pack.arena = (2 * host + 0x1_0000).min(room - blob_room(words)) as u32 & !0xFFFF;
         pack.blob_host = base - pack.arena - blob_room(words) as u32;
     }
     pack.base = base - pack.arena;
@@ -1045,16 +1099,25 @@ mod tests {
         let (exe, d) = unit.discover();
         let t = translate_floating(&exe, &d, &Hazards::check(&exe, &d), FLOATING_HOST).unwrap();
         assert_eq!(t.words, code.code);
-        let blob = floating_blob(std::slice::from_ref(&code));
+        let blob = head(std::slice::from_ref(&code));
+        let body = code.body();
         for (guest, host) in [(FLOATING_BASE, FLOATING_HOST), (0x8012_3450, 0x08B4_5670), (0x801F_F000, 0x0960_0000), (0x8000_1000, 0x0880_0400)] {
-            let c = psx2psp_sim::floating_place(&blob, 0, guest, host, None).unwrap();
+            let c = psx2psp_sim::floating_place(&blob, &body, 0, guest, host, None).unwrap();
             assert_eq!(c, t.moved(guest.wrapping_sub(FLOATING_BASE), host).words, "{guest:08X} {host:08X}");
-            let same = psx2psp_sim::floating_place(&blob, 0, guest, host, Some(&unit.words)).unwrap();
+            let same = psx2psp_sim::floating_place(&blob, &body, 0, guest, host, Some(&unit.words)).unwrap();
             assert_eq!(same, c, "RAM as the unit's");
         }
-        assert_eq!(psx2psp_sim::floating_place(&blob, 1, FLOATING_BASE, FLOATING_HOST, None), None, "no unit 1");
-        assert_eq!(psx2psp_sim::floating_place(&blob[..blob.len() - 1], 0, FLOATING_BASE, FLOATING_HOST, None), None, "a short blob");
-        assert_eq!(psx2psp_sim::floating_place(&blob, 0, FLOATING_BASE, FLOATING_HOST, Some(&unit.words[1..])), None, "short RAM");
+        assert_eq!(psx2psp_sim::floating_place(&blob, &body, 1, FLOATING_BASE, FLOATING_HOST, None), None, "no unit 1");
+        assert_eq!(psx2psp_sim::floating_place(&blob[..blob.len() - 1], &body, 0, FLOATING_BASE, FLOATING_HOST, None), None, "a short head");
+        assert_eq!(psx2psp_sim::floating_place(&blob, &body[1..], 0, FLOATING_BASE, FLOATING_HOST, None), None, "a short body");
+        assert_eq!(psx2psp_sim::floating_place(&blob, &body, 0, FLOATING_BASE, FLOATING_HOST, Some(&unit.words[1..])), None, "short RAM");
+        let n = code.code.len();
+        let gone = (0..unit.words.len()).find(|&j| code.table[j] != u32::MAX).unwrap();
+        let mut bad = body.clone();
+        bad[n + gone] = u32::MAX;
+        assert_eq!(psx2psp_sim::floating_place(&blob, &bad, 0, FLOATING_BASE, FLOATING_HOST, None), None, "a table that is not the map");
+        bad[n + gone] = n as u32;
+        assert_eq!(psx2psp_sim::floating_place(&blob, &bad, 0, FLOATING_BASE, FLOATING_HOST, None), None, "a table out of the code");
     }
 
     /// A game that links floating code where it loads it (Spider-Man's CD.WAD modules) rewrites
@@ -1067,7 +1130,8 @@ mod tests {
         let code = FloatingCode::translate(unit.clone()).unwrap();
         let kinds: BTreeSet<u32> = code.sites.chunks(2).map(|s| s[0] & 1).collect();
         assert_eq!(kinds, BTreeSet::from([0, 1]), "{:?}", code.sites);
-        let blob = floating_blob(std::slice::from_ref(&code));
+        let blob = head(std::slice::from_ref(&code));
+        let body = code.body();
         let mut linked = unit.words.clone();
         linked[5] = linked[5] & 0xFFFF_0000 | 7; // addiu t0, zero, 7
         let jump = |op: u32, t: u32| op << 26 | (t >> 2 & 0x03FF_FFFF);
@@ -1075,7 +1139,7 @@ mod tests {
         let (exe, d) = FloatingUnit { words: linked.clone(), entries: vec![0] }.discover();
         let t = translate_floating(&exe, &d, &Hazards::check(&exe, &d), FLOATING_HOST).unwrap();
         for (guest, host) in [(FLOATING_BASE, FLOATING_HOST), (0x8012_3450, 0x08B4_5670)] {
-            let c = psx2psp_sim::floating_place(&blob, 0, guest, host, Some(&linked)).unwrap();
+            let c = psx2psp_sim::floating_place(&blob, &body, 0, guest, host, Some(&linked)).unwrap();
             assert_eq!(c, t.moved(guest.wrapping_sub(FLOATING_BASE), host).words, "{guest:08X} {host:08X}");
         }
         let mut ram = vec![0u8; psx2psp_sim::RAM];
@@ -1094,21 +1158,50 @@ mod tests {
         assert_eq!(put(&linked), None, "another opcode");
     }
 
-    /// The blob holds what [`FloatingCode::blob_words`] counts, and a pack with floating code
+    /// The head ([`floating_blob`]) of floating code, with no bodies (the simulator's).
+    fn head(codes: &[FloatingCode]) -> Vec<u32> {
+        floating_blob(codes, &vec![(0, 0); codes.len()])
+    }
+
+    /// The head holds what [`FloatingCode::blob_words`] counts, and a pack with floating code
     /// lays out blob, arena and images upwards, over [`CODE_FLOOR`].
     #[test]
     fn floating_code_is_laid_out_below_the_images() {
         let code = FloatingCode::translate(FloatingUnit { words: floating_program(), entries: vec![0] }).unwrap();
         let mut two = code.clone();
         two.unit.words[0] ^= 1;
-        assert_eq!(floating_blob(&[code.clone(), two.clone()]).len(), 4 + code.blob_words() + two.blob_words());
+        assert_eq!(head(&[code.clone(), two.clone()]).len(), 4 + code.blob_words() + two.blob_words());
         let bytes: Vec<u8> = floating_program().iter().flat_map(|w| w.to_le_bytes()).collect();
         let pack = build(vec![("MAIN.EXE".into(), exe(0x8001_0000, &[ADDIU_V0_1, JR_RA, 0]))], vec![Overlay { name: "GOOL.BIN".into(), bytes, file: None }], vec![]).unwrap();
         assert_eq!(pack.floating.len(), 1, "{:?}", pack.skipped);
-        let blob = 4 * floating_blob(&pack.floating).len() as u32;
+        let blob = 4 * head(&pack.floating).len() as u32;
         assert!(pack.blob_host >= CODE_FLOOR && pack.blob_host + blob <= pack.base, "{:08X} {blob} {:08X}", pack.blob_host, pack.base);
-        assert!(pack.arena >= 4 * pack.floating[0].code.len() as u32);
+        assert!(u64::from(pack.arena) >= pack.floating[0].slot_bytes());
         assert_eq!(pack.images[0].host_base, pack.base + pack.arena);
+    }
+
+    /// DATA.PSAR holds each unit's body where its head says, deflated or as it is (when deflate
+    /// is not smaller): read back, it is the body the runtime places.
+    #[test]
+    fn the_head_says_where_each_body_is() {
+        let code = FloatingCode::translate(FloatingUnit { words: floating_program(), entries: vec![0] }).unwrap();
+        let mut two = code.clone();
+        two.unit.words[0] ^= 1;
+        let codes = [code, two];
+        let deflate = |r: &[u8]| {
+            let z = miniz_oxide::deflate::compress_to_vec(r, 6);
+            if z.len() < r.len() { z } else { r.to_vec() }
+        };
+        for (bytes, at) in [floating_bodies(&codes, |r| r.to_vec()), floating_bodies(&codes, deflate)] {
+            let blob = floating_blob(&codes, &at);
+            for (u, c) in codes.iter().enumerate() {
+                let x = &blob[4 + FLOATING_UNIT_WORDS * u..][..FLOATING_UNIT_WORDS];
+                let (off, len, raw) = (x[7] as usize, x[8] as usize, 4 * (x[5] + x[1] + x[6]) as usize);
+                let z = &bytes[off..off + len];
+                let body = if len == raw { z.to_vec() } else { miniz_oxide::inflate::decompress_to_vec(z).unwrap() };
+                assert_eq!(body, c.body().iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>(), "unit {u}");
+            }
+        }
     }
 
     /// The runtime finds a unit in RAM from any word it translates, at the place RAM holds it,
@@ -1117,13 +1210,13 @@ mod tests {
     fn the_runtime_finds_floating_code_by_its_words() {
         let unit = FloatingUnit { words: floating_program(), entries: vec![0] };
         let code = FloatingCode::translate(unit.clone()).unwrap();
-        let blob = floating_blob(std::slice::from_ref(&code));
+        let blob = head(std::slice::from_ref(&code));
         let mut ram = vec![0u8; psx2psp_sim::RAM];
         let at = 0x0001_2340;
         for (k, w) in unit.words.iter().enumerate() {
             ram[at + 4 * k..at + 4 * k + 4].copy_from_slice(&w.to_le_bytes());
         }
-        for e in 0..unit.words.len() - 1 {
+        for e in 0..unit.words.len() {
             let found = psx2psp_sim::floating_find(&blob, &ram, (at + 4 * e) as u32).unwrap();
             assert_eq!(found, (code.table[e] != u32::MAX).then_some((0, at as u32)), "word {e}");
         }

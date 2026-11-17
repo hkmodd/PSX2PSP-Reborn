@@ -10,17 +10,24 @@
  * target of a j/jal its translation holds in a lui/ori pair. A loader that links the code (jal
  * targets, lui/addiu halves of addresses) so rewrites only what the sites take.
  *
- * The blob, little-endian words:
+ * The head stays in RAM; each unit's body (host code, table, relocations) is in DATA.PSAR and is
+ * read into the slot of a placement when the unit is placed (native.c), so that the RAM floating
+ * code takes is its words, sites and index, and the arena.
+ *
+ * The head, little-endian words:
  *   [0] units, [1] index entries, [2] guest address and [3] host address of the translations
- *   units x FlUnit: offsets (words, from the blob's start) and lengths of the unit's guest words,
- *     host code, table (one word per guest word: offset in the host code, or FL_NONE),
- *     relocations (host word offset << 2 | kind: 0 guest address, 1 guest address in the
- *     lui/ori pair from that word, 2 j/jal to the host code, 3 host address in the pair) and
+ *   units x FlUnit: offsets (words, from the head's start) and lengths of the unit's guest words,
  *     sites (2 words each, by guest word: guest word << 1 | kind, host word offset; kind 0 the
  *     host word is a copy of the guest word, 1 the lui/ori pair from it holds the guest word's
- *     j/jal target)
- *   index x 3 words, sorted by key: fl_key of the two words at an entry, unit, entry (word)
- *   the data */
+ *     j/jal target) and map (a bit per guest word, from bit 0 of its first word: the word has a
+ *     translation); the host code's and relocations' lengths; the body's byte offset from the
+ *     first body and its bytes there (deflate, or as is when 4 * fl_body_words)
+ *   index x 3 words, sorted by key: fl_key of the two words at an entry, unit, entry (word). A
+ *     unit's entries are sparse: every word it translates has one at most FL_WALK - 1 words back
+ *   the data
+ * A body, words: host code (h_len), table (g_len: per guest word its offset in the host code, or
+ * FL_NONE), relocations (r_len: host word offset << 2 | kind: 0 guest address, 1 guest address in
+ * the lui/ori pair from that word, 2 j/jal to the host code, 3 host address in the pair). */
 #ifndef PSXRT_FLOATING_H
 #define PSXRT_FLOATING_H
 
@@ -29,18 +36,27 @@
 #define FL_NONE 0xFFFFFFFFu
 
 typedef struct FlUnit {
-    u32 g_off, g_len, h_off, h_len, t_off, r_off, r_len, s_off, s_len;
+    u32 g_off, g_len, s_off, s_len, m_off, h_len, r_len, b_off, b_len;
 } FlUnit;
+
+/* How far back from a word fl_find looks for an index entry (engine native_code FLOATING_WALK). */
+#define FL_WALK 8u
 
 typedef struct Floating {
     const u32 *w;
     u32 units, index;
 } Floating;
 
-/* Checks the blob of `words` words and opens it (kept, not copied): 0, or -1 when damaged. */
-int fl_open(Floating *f, const u32 *blob, u32 words);
+/* Checks the head of `words` words and opens it (kept, not copied): 0, or -1 when damaged. */
+int fl_open(Floating *f, const u32 *head, u32 words);
 
 static inline const FlUnit *fl_unit(const Floating *f, u32 u) { return (const FlUnit *)(f->w + 4) + u; }
+
+/* Words of a unit's body: host code, table, relocations. */
+static inline u32 fl_body_words(const FlUnit *x) { return x->h_len + x->g_len + x->r_len; }
+
+/* Whether word `j` of unit x has a translation. */
+static inline int fl_translates(const Floating *f, const FlUnit *x, u32 j) { return f->w[x->m_off + j / 32] >> (j & 31) & 1; }
 
 /* `w` without what a site takes from RAM: a j/jal's target, an immediate (addi as addiu) or a
  * shift amount. */
@@ -49,21 +65,22 @@ u32 fl_form(u32 w);
 /* The index key of the two words at `p`: FNV-1a 32 of their fl_form. */
 u32 fl_key(const u8 *p);
 
-/* The longest unit with an entry at RAM offset `p` that RAM holds there: its number, and *at the
- * RAM offset of its first word; -1 when none. */
+/* The longest unit that RAM holds over RAM offset `p` and that translates the word there: its
+ * number, and *at the RAM offset of its first word; -1 when none. */
 int fl_find(const Floating *f, const u8 *ram, u32 p, u32 *at);
 
-/* Unit `u`'s host code moved to guest address `guest` (of its first word) and host address
- * `host`, with its sites taken from `ram` (the unit's words as RAM holds them; NULL: as the
- * unit's): written to `dst` (h_len words). */
-void fl_place(const Floating *f, u32 u, u32 *dst, u32 guest, u32 host, const u32 *ram);
+/* Unit `u`'s body, read into `body` (fl_body_words), checked and its host code moved there to
+ * guest address `guest` (of its first word) and host address `host`, with its sites taken from
+ * `ram` (the unit's words as RAM holds them; NULL: as the unit's). The table stays after the
+ * code. 0, or -1 when the body is damaged. */
+int fl_place(const Floating *f, u32 u, u32 *body, u32 guest, u32 host, const u32 *ram);
 
 /* A unit placed for one RAM address: its code in a slot of the arena. */
 typedef struct FlPlace {
     u32 at;    /* RAM offset of the unit's first word */
     u32 unit;
     u32 host;  /* the slot */
-    u32 len;   /* bytes of the slot: the code's, rounded up to 64 */
+    u32 len;   /* bytes of the slot: the body's, rounded up to 64 */
     u32 guest; /* address of the unit's first word as the guest ran it */
     u32 sum;   /* FNV-1a 32 of RAM's words at the unit's sites when it was placed */
 } FlPlace;

@@ -43,10 +43,12 @@ dispatch table (one word per PS1 RAM word) with MISS.
   executable whose slice is installed is code the translator did not find: interpreted, no
   hashing.
 * Floating code (code the game runs wherever it loads it, as Crash 2's native GOOL pieces and
-  Spider-Man's CD.WAD modules) is a blob of units translated once (`floating.h`), read below the
-  code range. On a miss no executable serves, the runtime looks the two words there up in the
-  blob's index and, when RAM holds a whole unit around them, copies its code into an arena slot
-  (at the start of the code range), relocates it to that guest and host address, writes its
+  Spider-Man's CD.WAD modules) is units translated once (`floating.h`): their head (guest words,
+  sites, a map of the words they translate, a sparse index) is read below the code range, their
+  bodies (host code, table, relocations) stay in DATA.PSAR. On a miss no executable serves, the
+  runtime looks up the two words at the miss and up to 7 words back in the index and, when RAM
+  holds a whole unit around them that translates the missed word, reads its body into an arena
+  slot (at the start of the code range), relocates it to that guest and host address, writes its
   sites from RAM and installs its table entries. RAM may differ from the unit only at its sites:
   the immediates and shift amounts its translation copies, and the j/jal targets it holds in a
   lui/ori pair, which is what a game that links the code where it loads it rewrites. A placement
@@ -119,7 +121,7 @@ The log's `-- sas` line counts, per second:
 
 In `both` mode it also gives the RMS of both mixes.
 
-## DATA.PSAR (version 8)
+## DATA.PSAR (version 9)
 
 Little endian, written by `write_native_psar` in `crates/psx2psp-engine`; offsets are from the
 start of DATA.PSAR:
@@ -128,12 +130,12 @@ start of DATA.PSAR:
 |---|---|---|
 | 0x00 | 8 | `PSXRTDAT` |
 | 0x08 | 4 | version (6) |
-| 0x0C | 4 | header length (0xE4) |
+| 0x0C | 4 | header length (0xE8) |
 | 0x10 | 16 | disc ID, NUL padded (`SLES02895`) |
 | 0x20 | 128 | title, UTF-8, NUL padded |
 | 0xA0 | 4 | raw sectors of the disc image (2352 bytes each; sector 0 is LBA 150) |
 | 0xA4 | 4 | sectors per block (16) |
-| 0xA8 | 4 | offset of the block index of disc 1 (0xE4) |
+| 0xA8 | 4 | offset of the block index of disc 1 (0xE8) |
 | 0xAC | 4 | blocks = ceil(sectors / 16) |
 | 0xB0 | 4 | offset of the code directory (0: no translated code) |
 | 0xB4 | 4 | entries in the code directory |
@@ -143,11 +145,12 @@ start of DATA.PSAR:
 | 0xC4 | 4 | CPU shift: translated loops charge their PS1 cycles >> this (at most 8; 0 = R3000A cost). The converter writes 0; a `psxrt.cpu` file beside the EBOOT (decimal) overrides it for measurements |
 | 0xC8 | 4 | offset of the disc table (0: one disc) |
 | 0xCC | 4 | discs in the table (0: one disc; else 2..5) |
-| 0xD0 | 4 | offset of the floating code blob (0: none) |
+| 0xD0 | 4 | offset of the floating code head (0: none) |
 | 0xD4 | 4 | its stored length (equal to the raw length: stored as is) |
 | 0xD8 | 4 | its raw length (0: no floating code) |
-| 0xDC | 4 | host address the runtime loads the blob at |
-| 0xE0 | 4 | bytes from the code range's start where floating translations are placed |
+| 0xDC | 4 | host address the runtime loads the head at |
+| 0xE0 | 4 | bytes from the code range's start where floating units are read and placed |
+| 0xE4 | 4 | offset of the floating units' bodies (each deflated or stored, where the head says) |
 
 A game of more than one disc has a disc table of 0x20 bytes per disc (disc 1 first): disc ID
 (16, NUL padded), raw sectors, offset of its block index, blocks, zero. Each disc's blocks and
@@ -159,9 +162,9 @@ the last block may be shorter than 16 sectors).
 
 The blocks are followed by each translated executable's code, dispatch-table slice (one word
 per text word: a host address, or MISS) and patch table, stored the same way, then the
-directory, 0x40 bytes per executable (`CodeEntry` in `disc.h`), then the floating code blob
-(`floating.h`): code the game runs wherever it loads it, translated once and moved where RAM
-holds its words.
+directory, 0x40 bytes per executable (`CodeEntry` in `disc.h`), then the floating code head
+and its units' bodies (`floating.h`): code the game runs wherever it loads it, translated once
+and moved where RAM holds its words.
 
 | Offset | Size | Field |
 |---|---|---|
