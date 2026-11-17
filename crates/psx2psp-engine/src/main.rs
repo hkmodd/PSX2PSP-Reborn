@@ -56,8 +56,8 @@ CONVERT OPTIONS:
                      9 is ~0.1% smaller in about the same time). Games that hang on a real PSP below
                      some level are raised to it (patch database min_level, e.g. MediEvil)
   --native           experimental: a native EBOOT (category MG) that runs the psxrt runtime
-                     instead of POPS; one disc, same title/ID/artwork and disc patches (no
-                     POPS config)
+                     instead of POPS; 1-5 discs (L+R+SELECT changes disc), same
+                     title/ID/artwork and disc patches (no POPS config)
   --clip <src>       video/audio file or YouTube URL → ICON1.PMF + SND0.AT3 (see CLIP OPTIONS)
 
 CLIP OPTIONS:
