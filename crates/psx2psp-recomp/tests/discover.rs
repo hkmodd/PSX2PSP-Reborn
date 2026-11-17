@@ -228,6 +228,53 @@ fn a_pointer_after_a_long_zero_gap_is_a_handler() {
     assert!(!d.code.contains(&at(10)));
 }
 
+/// A function after data words, reached only through a table of text pointers that also holds a
+/// function already found, is a function too (Sheep Dog's constructor list at 8008C9AC: its
+/// first member 8008C868 follows data, the others follow returns); the data words are not code.
+#[test]
+fn a_pointer_in_a_table_beside_a_known_function_is_a_function() {
+    let x = exe(&[
+        r(8, RA, 0, 0, 0),  // 0 jr ra
+        NOP,                // 1
+        r(2, 1, A0, A0, 8), // 2 data (rotr, Allegrex: not code)
+        0x0001_0000,        // 3 data
+        i(9, ZERO, V0, 1),  // 4 f: addiu v0,zero,1 (after data: no return before it)
+        r(8, RA, 0, 0, 0),  // 5 jr ra
+        NOP,                // 6
+        i(9, ZERO, V0, 2),  // 7 g: addiu v0,zero,2 (after a return: found as a leaf)
+        r(8, RA, 0, 0, 0),  // 8 jr ra
+        NOP,                // 9
+        at(4),              // 10 table: f
+        at(7),              // 11 g
+        0,                  // 12 end
+    ]);
+    let d = Discovery::run(&x);
+    assert_eq!(d.entries.get(&at(7)), Some(&Origin::AfterReturn));
+    assert_eq!(d.entries.get(&at(4)), Some(&Origin::Pointer));
+    assert!(!d.code.contains(&at(2)) && !d.code.contains(&at(3)));
+    assert!(d.dead_ends.is_empty());
+}
+
+/// A lone pointer to code after data words is not followed: no return before it, no known
+/// function beside it in a table.
+#[test]
+fn a_lone_pointer_after_data_is_not_followed() {
+    let x = exe(&[
+        r(8, RA, 0, 0, 0),  // 0 jr ra
+        NOP,                // 1
+        r(2, 1, A0, A0, 8), // 2 data (rotr, Allegrex: not code)
+        0x0001_0000,        // 3 data
+        i(9, ZERO, V0, 1),  // 4 addiu v0,zero,1
+        r(8, RA, 0, 0, 0),  // 5 jr ra
+        NOP,                // 6
+        0x0001_0000,        // 7 data
+        at(4),              // 8 pointer to 4
+        0,                  // 9
+    ]);
+    let d = Discovery::run(&x);
+    assert!(!d.code.contains(&at(4)));
+}
+
 #[test]
 fn hazards_in_sequence_and_across_returns() {
     let x = program();

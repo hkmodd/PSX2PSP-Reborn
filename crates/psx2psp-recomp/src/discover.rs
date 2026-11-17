@@ -57,6 +57,24 @@ fn after_end(img: Image, a: u32) -> bool {
     false
 }
 
+/// The members of every table of text pointers in the text (two or more aligned words in a row,
+/// each pointing into it) that holds a function already found: a constructor list or a handler
+/// table, whose other members are functions too wherever they sit (Sheep Dog's constructor list
+/// 8008C9AC: its first member follows data, not a return).
+fn tabled(exe: &PsxExe, entries: &BTreeMap<u32, Origin>) -> HashSet<u32> {
+    let ptr = |a: u32| exe.word(a).filter(|&w| w & 3 == 0 && exe.contains(w));
+    let mut out = HashSet::new();
+    let mut a = exe.text_addr;
+    while a < exe.text_end() {
+        let run: Vec<u32> = (0..).map_while(|k| ptr(a.wrapping_add(4 * k))).collect();
+        if run.len() >= 2 && run.iter().any(|w| entries.contains_key(w)) {
+            out.extend(&run);
+        }
+        a = a.wrapping_add(4 * (run.len() as u32).max(1));
+    }
+    out
+}
+
 /// From `a`, every word decodes up to a `jr ra` (and its delay slot) within [`LEAF_MAX`].
 fn leaf_shape(img: Image, a: u32) -> bool {
     (0..LEAF_MAX).map(|n| a.wrapping_add(4 * n)).try_for_each(|p| match img.at(p) {
@@ -359,11 +377,12 @@ impl Discovery {
             .collect();
         loop {
             pointed.extend(d.built_pointers(img));
+            let tabled = tabled(exe, &d.entries);
             let mut changed = false;
             for a in (exe.text_addr..exe.text_end()).step_by(4) {
                 let w = exe.word(a).unwrap_or(0);
                 let prologue = matches!(w >> 16, 0x27BD | 0x23BD) && w & 0x8000 != 0;
-                let pointer = pointed.contains(&a) && after_end(img, a);
+                let pointer = pointed.contains(&a) && (after_end(img, a) || tabled.contains(&a));
                 // Tried again once it becomes a pointer: a leaf test may have failed before the code
                 // building it was found.
                 if d.code.contains(&a) || !(prologue || pointer || after_return(exe, a)) || !tried.insert((a, pointer)) {
