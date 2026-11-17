@@ -33,6 +33,7 @@ pub mod ffi {
         pub fn sim_poll_bound(s: *mut Sim, pc: u32, gpr: *const u32, raw: u32, room: u32) -> u32;
         pub fn sim_ran() -> *const u8;
         pub fn sim_ran_held() -> *const u8;
+        pub fn sim_ran_words() -> *const u32;
         pub fn sim_ran_clear();
         pub fn sim_watch(s: *mut Sim, at: u32, size: u32, head_len: u32, head_hash: u32, hash: u32, words: *const u8) -> c_int;
         pub fn sim_watch_live(i: c_int) -> c_int;
@@ -121,14 +122,17 @@ impl<'a> Machine<'a> {
     }
 
     /// Like [`Machine::take_ran`], with each word's second byte: nonzero where it ran while a
-    /// [`Machine::watch`]ed image held a translation of it. Returns (ran, ran_held).
-    pub fn take_ran_held(&mut self) -> (Vec<u8>, Vec<u8>) {
-        // SAFETY: as take_ran; both maps are RAM / 4 bytes.
+    /// [`Machine::watch`]ed image held a translation of it; and third, the instruction it last ran
+    /// as, read when it ran (the RAM may hold another file's words by now). Returns (ran,
+    /// ran_held, ran_words).
+    pub fn take_ran_held(&mut self) -> (Vec<u8>, Vec<u8>, Vec<u32>) {
+        // SAFETY: as take_ran; the three maps are RAM / 4 entries.
         unsafe {
             let r = std::slice::from_raw_parts(ffi::sim_ran(), RAM / 4).to_vec();
             let h = std::slice::from_raw_parts(ffi::sim_ran_held(), RAM / 4).to_vec();
+            let w = std::slice::from_raw_parts(ffi::sim_ran_words(), RAM / 4).to_vec();
             ffi::sim_ran_clear();
-            (r, h)
+            (r, h, w)
         }
     }
 

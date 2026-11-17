@@ -1256,16 +1256,16 @@ pub fn static_coverage(img: &DiscImage, patches: &[&dyn ImagePatch], cipher: Opt
         if f % every != 0 && f != frames && alive {
             continue;
         }
-        let (ran, held) = m.take_ran_held();
-        let ram = m.ram();
+        let (ran, held, insn) = m.take_ran_held();
         for w in (0..RAM / 4).filter(|&w| ran[w] != 0) {
             let a = (w * 4) as u32;
             if a < 0x1_0000 {
                 kernel.insert(a);
                 continue;
             }
-            // Per (address, instruction): the frame it first ran by, and whether it ever ran held.
-            let e = seen.entry((a, u32::from_le_bytes(ram[w * 4..w * 4 + 4].try_into().unwrap()))).or_insert((f, false));
+            // Per (address, instruction as it ran): the frame it first ran by, and whether it ever
+            // ran held.
+            let e = seen.entry((a, insn[w])).or_insert((f, false));
             e.1 |= held[w] != 0;
         }
         if !alive {

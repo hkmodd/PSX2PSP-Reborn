@@ -64,6 +64,9 @@ static void tty_fwd(void *user, const char *s, int n)
     rust_tty(rust_user, s, n);
 }
 
+/* The RAM psxrt_pc_trace reads the instructions that run in (ran_word). */
+static const u8 *ran_ram;
+
 Sim *sim_new(void *user, ReadFn rd, u32 disc_end, TextFn tty, TextFn log)
 {
     Sim *s = (Sim *)calloc(1, sizeof(Sim));
@@ -94,6 +97,7 @@ Sim *sim_new(void *user, ReadFn rd, u32 disc_end, TextFn tty, TextFn log)
         s->host.card[0] = s->card;
     }
     psx_init(&s->psx, &s->host, s->ram, s->scratch, s->vram, s->spu_ram, s->mdec_in, MDEC_CAP);
+    ran_ram = s->ram;
     /* PSX2PSP_SIM_GE=1: the PSP's GE translator (ge.c) runs beside the software rasterizer and
      * logs a hash of its display lists each frame (psp/psxrt/ge_host_pc.c); pictures unchanged. */
     if (getenv("PSX2PSP_SIM_GE")) {
@@ -135,8 +139,11 @@ static void trace_put(void)
 static u32 pc_count[RAM_SIZE / 4];
 
 /* Words of RAM the interpreter ran since sim_ran_clear, 1 byte per word: the converter's code
- * capture takes code that ran. */
+ * capture takes code that ran. ran_word: the instruction each last ran as, read when it ran (a
+ * load over it before the RAM is read would give the words of another file: Spider-Man loads
+ * a sound bank over the module it ran). */
 static u8 ran[RAM_SIZE / 4];
+static u32 ran_word[RAM_SIZE / 4];
 
 /* Static images watched as the native runtime takes them (native.c try_load, on_ram_loaded,
  * cache_flushed): a word holds a translation from when the guest first runs in an image's text
@@ -293,6 +300,7 @@ static void watch_reset(void)
 
 const u8 *sim_ran(void) { return ran; }
 const u8 *sim_ran_held(void) { return ran_held; }
+const u32 *sim_ran_words(void) { return ran_word; }
 void sim_ran_clear(void) { memset(ran, 0, sizeof ran), memset(ran_held, 0, sizeof ran_held); }
 
 void psxrt_pc_trace(u32 pc)
@@ -305,8 +313,12 @@ void psxrt_pc_trace(u32 pc)
             watch_isolated = 0, watch_flushed();
     }
     if ((pc & 0x1FFFFFFFu) < RAM_SIZE) {
-        u32 p = pc & (RAM_SIZE - 4);
-        ran[p >> 2] = 1;
+        u32 p = pc & (RAM_SIZE - 4), w;
+        memcpy(&w, ran_ram + p, 4);
+        /* Another instruction there: whether it ran held is its own. */
+        if (ran[p >> 2] && ran_word[p >> 2] != w)
+            ran_held[p >> 2] = 0;
+        ran[p >> 2] = 1, ran_word[p >> 2] = w;
         if (watch_page[p >> 12] && !held[p >> 2])
             watch_run(p);
         ran_held[p >> 2] |= held[p >> 2];
