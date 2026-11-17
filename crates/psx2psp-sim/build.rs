@@ -22,7 +22,7 @@ fn main() {
         build.file(psxrt.join(f));
     }
     build.include(&psxrt);
-    for f in ["ge.c", "ge.h", "ge_host.h", "ge_host_pc.c", "gel.h", "gel_hash.c", "gel_hash.h", "floating.c", "floating.h", "coderun.c", "coderun.h"] {
+    for f in ["ge.c", "ge.h", "ge_host.h", "ge_host_pc.c", "ge_dump.h", "gel.h", "gel_hash.c", "gel_hash.h", "floating.c", "floating.h", "coderun.c", "coderun.h"] {
         println!("cargo:rerun-if-changed={}", psxrt.join(f).display());
     }
     println!("cargo:rerun-if-changed=csrc/sim.c");
