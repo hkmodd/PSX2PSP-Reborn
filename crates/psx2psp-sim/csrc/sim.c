@@ -10,6 +10,7 @@
 
 typedef int (*ReadFn)(void *user, u32 lba, u8 *raw);
 typedef void (*TextFn)(void *user, const char *s, int n);
+typedef u32 (*SelectFn)(void *user, u32 n); /* sectors of disc n, now in the drive; 0: none */
 
 typedef struct Sim {
     Psx psx;
@@ -45,6 +46,7 @@ static void audio(void *user, const s16 *samples, int frames)
 static void *rust_user;
 static ReadFn rust_read;
 static TextFn rust_tty;
+static SelectFn rust_select;
 
 static int read_fwd(void *user, u32 lba, u8 *raw)
 {
@@ -240,12 +242,29 @@ void sim_pad(Sim *s, u16 buttons) { s->psx.sio.buttons[0] = buttons; }
 
 void sim_trace(Sim *s, int flags) { s->psx.trace = flags; }
 
-/* The shell opens, or closes on the disc whose lead-out is at LBA `disc_end` (the caller's
- * read_sector already reads it). */
-void sim_lid(Sim *s, int open, u32 disc_end)
+static int select_fwd(void *user, u32 n)
 {
-    if (!open)
-        s->host.disc_end = disc_end;
+    Sim *s = (Sim *)user;
+    u32 sectors = rust_select(rust_user, n);
+    if (sectors)
+        s->host.disc_end = 150 + sectors;
+    return sectors != 0;
+}
+
+/* The game has `n` discs, put in the drive by `sel` (manual changes and the core's automatic
+ * one). */
+void sim_discs(Sim *s, SelectFn sel, u32 n)
+{
+    rust_select = sel;
+    s->host.disc_select = select_fwd;
+    s->host.discs = n;
+}
+
+/* The shell opens, or closes after disc `disc` (0-based; < 0: the same) goes in. */
+void sim_lid(Sim *s, int open, int disc)
+{
+    if (!open && disc >= 0)
+        cd_insert(&s->psx, (u32)disc);
     cd_lid(&s->psx, open);
 }
 

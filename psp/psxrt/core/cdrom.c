@@ -16,6 +16,16 @@
 #define ACK_GAP 1500u        /* a queued response follows an acknowledge after this */
 #define SECTOR_1X (PSX_CLOCK / 75)
 #define SPINUP_TIME PSX_CLOCK /* shell closed to motor on: DuckStation's one second */
+/* The automatic disc change. A game that wants another disc tells the player so and polls
+ * Getstat until the shell opens: Exoddus' "insert disc 2" polls 13 times a frame and sends
+ * nothing else, against 0.4 a frame at its menu. Two one-second windows of Getstat alone at 4 a
+ * frame or more, with the drive idle, open the shell; the next disc goes in after SWAP_OPEN and
+ * the shell closes. A game still waiting gets the disc after it, up to every disc in turn; a
+ * change long after the last one starts the round again. */
+#define POLL_WINDOW PSX_CLOCK
+#define POLL_HOT 240u /* Getstat per window: 4 a frame at 60 Hz */
+#define SWAP_OPEN (2 * PSX_CLOCK)
+#define SWAP_ROUND (30ull * PSX_CLOCK)
 
 enum { ST_ERROR = 0x01, ST_MOTOR = 0x02, ST_SHELL = 0x10, ST_READ = 0x20, ST_SEEK = 0x40, ST_PLAY = 0x80 };
 
@@ -169,10 +179,42 @@ static void second(Psx *psx)
     resp_stat(psx, 2, psx->cycles);
 }
 
+/* Counts the waiting polls of the automatic disc change (see POLL_WINDOW). */
+static void swap_poll(Psx *psx, u8 c)
+{
+    Cdrom *cd = &psx->cd;
+    const PsxHost *h = psx->host;
+    if (!h->disc_select || h->discs < 2 || cd->lid != CD_LID_CLOSED || cd->swap_on)
+        return;
+    if (c != 0x01 || (cd->stat & (ST_READ | ST_SEEK | ST_PLAY))) {
+        cd->poll_n = 0, cd->poll_hot = 0, cd->poll_t0 = psx->cycles;
+        return;
+    }
+    cd->poll_n++;
+    u64 dt = psx->cycles - cd->poll_t0;
+    if (dt < POLL_WINDOW)
+        return;
+    cd->poll_hot = (u64)cd->poll_n * POLL_WINDOW >= (u64)POLL_HOT * dt ? cd->poll_hot + 1 : 0;
+    cd->poll_n = 0, cd->poll_t0 = psx->cycles;
+    if (cd->poll_hot < 2)
+        return;
+    cd->poll_hot = 0;
+    if (psx->cycles - cd->swap_due > SWAP_ROUND)
+        cd->swap_tries = 0;
+    if (cd->swap_tries >= h->discs)
+        return; /* no disc stopped the polling: the game waits for something else */
+    cd->swap_tries++;
+    cd->swap_on = 1, cd->swap_due = psx->cycles + SWAP_OPEN;
+    psx_log(psx, "cd: the game polls the drive, waiting for a disc: automatic change");
+    cd_lid(psx, 1);
+    psx_schedule(psx, cd->swap_due);
+}
+
 static void command(Psx *psx, u8 c)
 {
     Cdrom *cd = &psx->cd;
     const u8 *p = cd->params;
+    swap_poll(psx, c);
     u64 ack = psx->cycles + ACK_DELAY;
     u32 later = 0; /* delay of the second response after the first */
     if (psx->trace & 2)
@@ -346,6 +388,15 @@ void cd_lid(Psx *psx, int open)
     }
 }
 
+int cd_insert(Psx *psx, u32 n)
+{
+    const PsxHost *h = psx->host;
+    if (!h->disc_select || n >= h->discs || !h->disc_select(h->user, n))
+        return 0;
+    psx->cd.disc = (u8)n;
+    return 1;
+}
+
 u8 cd_read(Psx *psx, int reg)
 {
     Cdrom *cd = &psx->cd;
@@ -424,6 +475,15 @@ void cd_update(Psx *psx)
     Cdrom *cd = &psx->cd;
     if (cd->lid == CD_LID_SPINUP && psx->cycles >= cd->lid_due)
         cd->lid = CD_LID_CLOSED, cd->stat |= ST_MOTOR;
+    if (cd->swap_on && psx->cycles >= cd->swap_due) {
+        cd->swap_on = 0, cd->swap_due = psx->cycles;
+        if (cd->lid == CD_LID_OPEN) { /* still ours: the player did not close it meanwhile */
+            u32 n = (cd->disc + 1u) % psx->host->discs;
+            if (cd_insert(psx, n))
+                psx_log(psx, "cd: disc %u in the drive", (unsigned)n + 1);
+            cd_lid(psx, 0);
+        }
+    }
     if (cd->cmd2 && psx->cycles >= cd->cmd2_due)
         second(psx);
     if (cd->reading && psx->cycles >= cd->read_due)
@@ -438,6 +498,8 @@ void cd_update(Psx *psx)
         psx_schedule(psx, cd->q_due);
     if (cd->lid == CD_LID_SPINUP)
         psx_schedule(psx, cd->lid_due);
+    if (cd->swap_on)
+        psx_schedule(psx, cd->swap_due);
 }
 
 u32 cd_dma_word(Psx *psx)

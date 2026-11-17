@@ -22,7 +22,7 @@ use std::process::ExitCode;
 
 #[cfg(test)]
 use psx2psp_sim::ffi::sim_poll_bound;
-use psx2psp_sim::ffi::{sim_boot, sim_display, sim_frame, sim_free, sim_lid, sim_new, sim_pad, sim_ram, sim_status, sim_trace, sim_trace_to, sim_vram};
+use psx2psp_sim::ffi::{sim_boot, sim_discs, sim_display, sim_frame, sim_free, sim_lid, sim_new, sim_pad, sim_ram, sim_status, sim_trace, sim_trace_to, sim_vram};
 use psx2psp_sim::{PREGAP, RAM};
 
 struct Disc {
@@ -49,6 +49,18 @@ extern "C" fn read_sector(user: *mut c_void, lba: u32, raw: *mut u8) -> c_int {
     }
     let ok = disc.file.seek(SeekFrom::Start(u64::from(lba - PREGAP) * SECTOR)).is_ok() && disc.file.read_exact(buf).is_ok();
     if ok { 0 } else { -1 }
+}
+
+extern "C" fn select_disc(user: *mut c_void, n: u32) -> u32 {
+    // SAFETY: as in read_sector; the core calls this inside sim_frame or sim_lid only.
+    let drive = unsafe { &mut *(user as *mut Drive) };
+    match drive.discs.get(n as usize) {
+        Some(d) => {
+            drive.cur = n as usize;
+            d.sectors
+        }
+        None => 0,
+    }
 }
 
 fn text<'a>(s: *const c_char, n: c_int) -> &'a [u8] {
@@ -272,6 +284,7 @@ fn main() -> ExitCode {
         // PSXRT_TRACE: bit 0 BIOS calls, bit 1 CD commands, bit 2 DMA.
         let trace = std::env::var("PSXRT_TRACE").ok().and_then(|v| v.parse::<c_int>().ok()).unwrap_or(0);
         sim_trace(sim, trace);
+        sim_discs(sim, select_disc, drive.discs.len() as u32);
         if sim_boot(sim) != 0 {
             eprintln!("boot failed");
             sim_free(sim);
@@ -283,12 +296,10 @@ fn main() -> ExitCode {
         for frame in 1..=a.frames {
             for &(f, d, open) in &a.swaps {
                 if f == frame {
-                    sim_lid(sim, 1, 0);
+                    sim_lid(sim, 1, -1);
                     println!("[sim] frame {frame} shell open");
                 } else if f + open == frame {
-                    let drive = &mut *(user as *mut Drive); // the core reads through `user` only inside sim_frame
-                    drive.cur = d;
-                    sim_lid(sim, 0, drive.discs[d].sectors + PREGAP);
+                    sim_lid(sim, 0, d as c_int);
                     println!("[sim] frame {frame} shell closed on disc {}", d + 1);
                 }
             }

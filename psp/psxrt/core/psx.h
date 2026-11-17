@@ -67,6 +67,10 @@ typedef struct PsxHost {
     u32 (*usec)(void *user);
     /* Optional: called as a GPU DMA starts (end 0) and ends (end 1), to profile it apart. */
     void (*gpu_dma)(void *user, int end);
+    /* Optional, games of several discs: puts disc n (0-based, n < discs) in the drive, its
+     * read_sector source and disc_end; nonzero on success. Through cd_insert only. */
+    int (*disc_select)(void *user, u32 n);
+    u32 discs;
 } PsxHost;
 
 /* ---- CPU state, shared by the interpreter and the translated code's context ---- */
@@ -159,6 +163,13 @@ typedef struct Cdrom {
     /* the shell (cd_lid): CD_LID_CLOSED, CD_LID_OPEN, or CD_LID_SPINUP until lid_due */
     u8 lid;
     u64 lid_due;
+    /* the disc in the drive (0-based) and the automatic change (cd_update): a game waiting for
+     * another disc polls Getstat and nothing else; poll_n Getstat since poll_t0, poll_hot
+     * windows in a row at the waiting rate; swap_on while the drive is open for a change due at
+     * swap_due (after it, swap_due is when the last change closed), swap_tries in a row */
+    u8 disc, poll_hot, swap_on, swap_tries;
+    u32 poll_n;
+    u64 poll_t0, swap_due;
 } Cdrom;
 
 enum { CD_LID_CLOSED, CD_LID_OPEN, CD_LID_SPINUP };
@@ -536,6 +547,9 @@ u32 cd_dma_word(Psx *psx);
  * that need the disc fail with INT5 (11h, 80h) while it is open; after the close the motor spins
  * up for a second, and the next Getstat clears the shell bit (psx-spx "CDROM Drive"). */
 void cd_lid(Psx *psx, int open);
+/* Puts disc n in the drive through host->disc_select (the shell should be open): nonzero on
+ * success, and cd.disc is n. */
+int cd_insert(Psx *psx, u32 n);
 /* The next n 44100 Hz stereo samples of the CD audio (XA), through the CD volume matrix; 0 where
  * nothing is queued. */
 void cd_audio(Psx *psx, s32 *l, s32 *r, int n);

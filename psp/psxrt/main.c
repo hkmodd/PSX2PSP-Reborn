@@ -454,10 +454,11 @@ static int reserve_fixed(void)
 static void *draw_buf; /* relative to the start of the PSP's VRAM */
 static int show_text; /* the log lines over the picture: drawn by the CPU, so off at start */
 static DiscInfo disc_info;
-/* The disc change of a game of more than one disc: L+R+SELECT opens the shell, LEFT/RIGHT pick
- * the disc, CROSS closes it. read_pad sets the requests, frame() carries them out. */
+/* The disc change by hand, for a game the automatic one (core/cdrom.c) does not serve: L+R+SELECT
+ * opens the shell, LEFT/RIGHT pick the disc, CROSS closes it. read_pad sets the requests,
+ * frame() carries them out; the disc in the drive is psx.cd.disc. */
 static int lid_open, lid_req; /* lid_req: 1 open, 2 close on lid_pick */
-static u32 lid_pick, lid_disc; /* disc chosen, disc in the drive (0-based) */
+static u32 lid_pick; /* disc chosen (0-based) */
 
 typedef struct {
     u16 u, v;
@@ -899,7 +900,7 @@ static u16 read_pad(u32 frame_no)
     }
     if ((b & combo) == combo && (prev & combo) != combo) {
         if (disc_info.discs > 1)
-            lid_req = 1, lid_pick = lid_disc;
+            lid_req = 1;
         else
             show_text = !show_text;
     }
@@ -918,6 +919,16 @@ static u16 read_pad(u32 frame_no)
 /* ---- the machine ---- */
 static Psx psx;
 static PsxHost host;
+
+/* PsxHost.disc_select: disc n's blocks behind disc_read_sector, its lead-out in disc_end. */
+static int host_disc_select(void *user, u32 n)
+{
+    (void)user;
+    u32 s = disc_select(n);
+    if (s)
+        host.disc_end = 150 + s;
+    return s != 0;
+}
 static u32 frames;
 static int native;
 static u32 audio_drops, audio_gaps, audio_trims; /* per second; the audio ring below */
@@ -946,17 +957,17 @@ static void frame(void)
     static u32 draw0, mdec0, spu0, rgb0;
     static char status[64];
     psx.sio.buttons[0] = read_pad(frames);
+    if (lid_open && psx.cd.lid != CD_LID_OPEN)
+        lid_open = 0; /* the automatic change closed it first */
     if (lid_req == 1) {
-        lid_req = 0, lid_open = 1;
+        lid_req = 0, lid_open = 1, lid_pick = psx.cd.disc;
         cd_lid(&psx, 1);
-        say("disc: shell open, disc %u (%s) in the drive", (unsigned)lid_disc + 1, disc_name(lid_disc));
+        say("disc: shell open, disc %u (%s) in the drive", (unsigned)psx.cd.disc + 1, disc_name(psx.cd.disc));
     } else if (lid_req == 2) {
         lid_req = 0, lid_open = 0;
-        u32 s = disc_select(lid_pick);
-        if (s)
-            lid_disc = lid_pick, host.disc_end = 150 + s;
+        cd_insert(&psx, lid_pick);
         cd_lid(&psx, 0);
-        say("disc: shell closed on disc %u (%s)", (unsigned)lid_disc + 1, disc_name(lid_disc));
+        say("disc: shell closed on disc %u (%s)", (unsigned)psx.cd.disc + 1, disc_name(psx.cd.disc));
     }
     if (watch_n && psx.gpu.flips != watch_flips) {
         watch_flips = psx.gpu.flips;
@@ -1469,6 +1480,8 @@ int main(int argc, char **argv)
         halt("out of memory");
     host.read_sector = disc_read_sector;
     host.disc_end = 150 + disc_info.sectors;
+    host.disc_select = host_disc_select;
+    host.discs = disc_info.discs;
     host.tty = host_tty;
     host.log = host_log;
     host.vblank = host_vblank;
@@ -1523,6 +1536,8 @@ int main(int argc, char **argv)
         if (r == 0) {
             frames = f;
             say("resumed from %s at frame %u", path, (unsigned)f);
+            if (psx.cd.disc && !host_disc_select(NULL, psx.cd.disc))
+                halt("psxrt.snap has a disc in the drive that cannot be read: delete it to boot the disc");
             if (psx.gpu.renderer) /* the GE's copy of PS1 VRAM from RAM's */
                 psx.gpu.renderer->wrote(psx.gpu.renderer->self, 0, 0, VRAM_W, VRAM_H);
         }

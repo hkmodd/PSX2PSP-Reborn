@@ -14,6 +14,7 @@ pub mod ffi {
 
     pub type ReadFn = extern "C" fn(*mut c_void, u32, *mut u8) -> c_int;
     pub type TextFn = extern "C" fn(*mut c_void, *const c_char, c_int);
+    pub type SelectFn = extern "C" fn(*mut c_void, u32) -> u32;
 
     unsafe extern "C" {
         pub fn sim_new(user: *mut c_void, rd: ReadFn, disc_end: u32, tty: TextFn, log: TextFn) -> *mut Sim;
@@ -26,7 +27,8 @@ pub mod ffi {
         pub fn sim_display(s: *const Sim, out: *mut c_int);
         pub fn sim_status(s: *const Sim, out: *mut u32);
         pub fn sim_trace(s: *mut Sim, flags: c_int);
-        pub fn sim_lid(s: *mut Sim, open: c_int, disc_end: u32);
+        pub fn sim_lid(s: *mut Sim, open: c_int, disc: c_int);
+        pub fn sim_discs(s: *mut Sim, sel: SelectFn, n: u32);
         pub fn sim_trace_to(path: *const c_char, out: *mut u64) -> c_int;
         pub fn sim_poll_bound(s: *mut Sim, pc: u32, gpr: *const u32, raw: u32, room: u32) -> u32;
         pub fn sim_ran() -> *const u8;
