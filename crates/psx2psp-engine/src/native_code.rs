@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::{Arc, OnceLock};
 
-use psx2psp_recomp::emit::{Reloc, patchable, repatch, translate_floating};
+use psx2psp_recomp::emit::{Reloc, mem_op, patchable, repatch, takes_offset, translate_floating};
 use psx2psp_recomp::{Discovery, Hazards, Hit, PsxExe, Signatures, Translation, layout, overlay, translate};
 use rayon::prelude::*;
 
@@ -194,12 +194,13 @@ const FLOATING_UNIT_WORDS: usize = 9;
 const FLOATING_WALK: usize = 8;
 
 /// `w` without what a site of floating code takes from RAM (`psp/psxrt/floating.c` fl_form): a
-/// j/jal's target, an immediate (addi as addiu) or a shift amount.
+/// j/jal's target, an immediate (addi as addiu), a load's or store's offset or a shift amount.
 pub fn floating_form(w: u32) -> u32 {
     match (w >> 26, w & 0x3F) {
         (2 | 3, _) => w & 0xFC00_0000,
         (8, _) => (w | 1 << 26) & 0xFFFF_0000,
         (9..=0xF, _) => w & 0xFFFF_0000,
+        _ if mem_op(w) => w & 0xFFFF_0000,
         (0, 0 | 2 | 3) => w & !(0x1F << 6),
         _ => w,
     }
@@ -261,8 +262,10 @@ impl FloatingCode {
         for (&g, hs) in &t.patch {
             let Some(j) = word(g) else { continue };
             let w = unit.words[j as usize];
-            // every copy takes the word: one that does not (k0/k1, a fused pair) pins it
-            if patchable(w) && hs.iter().all(|&h| repatch(t.words[at(h) as usize], w).is_some()) {
+            // every copy takes the word: one that does not (k0/k1, a fused pair, a group's
+            // offset) pins it
+            let host = |h: u32| t.words[at(h) as usize];
+            if (patchable(w) && hs.iter().all(|&h| repatch(host(h), w).is_some())) || hs.iter().all(|&h| takes_offset(host(h), w)) {
                 sites.extend(hs.iter().map(|&h| (j << 1, at(h))));
             }
         }
@@ -337,7 +340,8 @@ impl FloatingUnit {
     pub fn discover(&self) -> (PsxExe, Discovery) {
         let exe = PsxExe { pc0: FLOATING_BASE, gp0: 0, text_addr: FLOATING_BASE, text: self.words.iter().flat_map(|w| w.to_le_bytes()).collect(), bss: (0, 0), stack: (0, 0) };
         let seeds: Vec<u32> = self.entries.iter().map(|&o| FLOATING_BASE + 4 * o).collect();
-        let d = Discovery::run_file(&exe, &[], &[], &seeds);
+        let mut d = Discovery::run_file(&exe, &[], &[], &seeds);
+        d.explore_known(&exe, &seeds);
         (exe, d)
     }
 }
@@ -352,13 +356,29 @@ pub fn floating_units(bytes: &[u8]) -> Vec<(usize, FloatingUnit)> {
     let d = Discovery::run_file(&exe, &[], &[], &[]);
     let word = |a: u32| exe.word(a).unwrap_or(0);
     let mut out: Vec<(usize, FloatingUnit)> = Vec::new();
+    // Zero words no instruction falls into (at a run's start, or after the delay slot of a jump
+    // that does not return), two or more, are padding (one is a `nop` code may be entered at:
+    // Crash 2's GOOL native code): RAM holds other data there (Spider-Man's CD.WAD modules
+    // follow each other with zeros the game loads its data over), so a unit around it never
+    // matches. Units leave it out and are cut there.
+    let ends = |w: u32| w >> 26 == 2 || (w >> 26 == 0 && w & 0x3F == 8) || w & 0xFFFF_0000 == 0x1000_0000;
+    let mut pad = None;
     let mut last = None;
     for &a in &d.code {
-        if last != Some(a.wrapping_sub(4)) {
+        let run = last == Some(a.wrapping_sub(4));
+        let zero = |a: u32| word(a) == 0 && d.code.contains(&a) && !d.delay_slots.contains_key(&a);
+        if zero(a) && (pad == Some(a - 4) || zero(a + 4) && (!run || d.delay_slots.get(&(a - 4)).is_some_and(|&j| ends(word(j))))) {
+            pad = Some(a);
+            last = None;
+            continue;
+        }
+        if !run {
             out.push(((a - FLOATING_BASE) as usize, FloatingUnit { words: Vec::new(), entries: Vec::new() }));
         }
         let u = &mut out.last_mut().unwrap().1;
-        if u.words.is_empty() || d.entries.contains_key(&a) || d.calls.contains_key(&a) {
+        // Every word the file's code reaches other than a delay slot seeds the unit's own
+        // discovery: a jump table or a pointer in the file's data outside the run is not in it.
+        if !d.delay_slots.contains_key(&a) {
             u.entries.push(u.words.len() as u32);
         }
         u.words.push(word(a));
@@ -1052,6 +1072,22 @@ mod tests {
         }
     }
 
+    /// Zeros no instruction falls into, two or more, are padding: the file's code reaches them
+    /// (Spider-Man's CD.WAD modules follow each other with zeros), RAM holds other data there, so
+    /// units leave them out and are cut there. A single `nop` and a delay slot stay.
+    #[test]
+    fn floating_units_leave_out_padding() {
+        const NOP: u32 = 0;
+        let addiu_v0 = |n: u32| 9 << 26 | 2 << 16 | n;
+        let w = [NOP, NOP, NOP, addiu_v0(1), JR_RA, NOP, NOP, NOP, addiu_v0(2), JR_RA, NOP, NOP, addiu_v0(3), JR_RA, NOP];
+        let bytes: Vec<u8> = w.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let exe = PsxExe { pc0: FLOATING_BASE, gp0: 0, text_addr: FLOATING_BASE, text: bytes.clone(), bss: (0, 0), stack: (0, 0) };
+        let d = Discovery::run_file(&exe, &[], &[], &[]);
+        assert!((0..3).all(|k| d.code.contains(&(FLOATING_BASE + 4 * k))), "the file's code reaches the zeros at its start");
+        let at: Vec<(usize, usize)> = floating_units(&bytes).iter().map(|(o, u)| (*o, u.words.len())).collect();
+        assert_eq!(at, [(12, 3), (32, 3), (48, 3)]);
+    }
+
     /// Position-independent code with every kind of relocation floating code has: relative
     /// branches and a `bal` inside it, `jal`/`j` to the game, a `jalr` and a `bal` past its end.
     fn floating_program() -> Vec<u32> {
@@ -1121,9 +1157,9 @@ mod tests {
     }
 
     /// A game that links floating code where it loads it (Spider-Man's CD.WAD modules) rewrites
-    /// its jal/j targets and immediates: the runtime finds the unit in RAM all the same and places
-    /// it with RAM's words, as the translation of the linked words would be; a load or store
-    /// offset is not a site, and RAM that differs there is not the unit.
+    /// its jal/j targets, immediates and load or store offsets: the runtime finds the unit in RAM
+    /// all the same and places it with RAM's words, as the translation of the linked words would
+    /// be; RAM that differs anywhere else (a register, an opcode) is not the unit.
     #[test]
     fn the_runtime_takes_linked_floating_code_from_ram() {
         let unit = FloatingUnit { words: floating_program(), entries: vec![0] };
@@ -1134,6 +1170,7 @@ mod tests {
         let body = code.body();
         let mut linked = unit.words.clone();
         linked[5] = linked[5] & 0xFFFF_0000 | 7; // addiu t0, zero, 7
+        linked[2] = linked[2] & 0xFFFF_0000 | 0x7FF0; // lw t2, %lo(0x7FF0)(a0)
         let jump = |op: u32, t: u32| op << 26 | (t >> 2 & 0x03FF_FFFF);
         linked[9] = jump(3, 0x8005_1230);
         let (exe, d) = FloatingUnit { words: linked.clone(), entries: vec![0] }.discover();
@@ -1151,9 +1188,9 @@ mod tests {
             psx2psp_sim::floating_find(&blob, &ram, at as u32).unwrap()
         };
         assert_eq!(put(&linked), Some((0, at as u32)), "linked");
-        linked[2] ^= 4; // lw t2, 4(a0)
-        assert_eq!(put(&linked), None, "a load offset differs");
-        linked[2] ^= 4;
+        linked[2] ^= 1 << 16; // lw t3
+        assert_eq!(put(&linked), None, "a load's register differs");
+        linked[2] ^= 1 << 16;
         linked[9] = jump(2, 0x8005_1230); // j for jal
         assert_eq!(put(&linked), None, "another opcode");
     }
@@ -1221,7 +1258,7 @@ mod tests {
             assert_eq!(found, (code.table[e] != u32::MAX).then_some((0, at as u32)), "word {e}");
         }
         assert_eq!(psx2psp_sim::floating_find(&blob, &ram, at as u32 + 2), Ok(None), "unaligned");
-        ram[at + 4 * 2] ^= 1;
+        ram[at + 4 * 2 + 2] ^= 1;
         assert_eq!(psx2psp_sim::floating_find(&blob, &ram, at as u32), Ok(None), "a word differs");
         assert_eq!(psx2psp_sim::floating_find(&blob, &ram[1..], at as u32), Err(()));
     }

@@ -597,6 +597,21 @@ impl Discovery {
         d
     }
 
+    /// Explores `seeds` as entries without the check [`Self::run_file`] makes on its own: code
+    /// a wider discovery already found, as a floating unit's words are its file's. A path that
+    /// leaves the image ends outside it, as one from its first word does.
+    pub fn explore_known(&mut self, exe: &PsxExe, seeds: &[u32]) {
+        let img = Image(exe, &[]);
+        self.visited = self.code.iter().filter(|a| !self.delay_slots.contains_key(a)).copied().collect();
+        for &s in seeds {
+            if exe.contains(s) && s & 3 == 0 && !self.code.contains(&s) {
+                self.entries.entry(s).or_insert(Origin::Call);
+                self.explore(img, vec![s]);
+            }
+        }
+        self.visited = HashSet::new();
+    }
+
     fn explore(&mut self, img: Image, mut work: Vec<u32>) {
         let exe = img.0;
         while let Some(mut pc) = work.pop() {

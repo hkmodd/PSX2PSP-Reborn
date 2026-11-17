@@ -35,6 +35,13 @@ int fl_open(Floating *f, const u32 *w, u32 len)
     return 0;
 }
 
+/* A load or store, lwc2/swc2 included (emit.rs mem_op). */
+static int fl_mem(u32 w)
+{
+    u32 op = w >> 26;
+    return (op >= 0x20 && op <= 0x2E) || op == 0x32 || op == 0x3A;
+}
+
 u32 fl_form(u32 w)
 {
     u32 op = w >> 26, fn = w & 0x3F;
@@ -42,6 +49,8 @@ u32 fl_form(u32 w)
         return w & 0xFC000000u;
     if (op >= 8 && op <= 0xF)
         return (op == 8 ? w | 1u << 26 : w) & 0xFFFF0000u;
+    if (fl_mem(w))
+        return w & 0xFFFF0000u;
     if (op == 0 && (fn == 0 || fn == 2 || fn == 3))
         return w & ~(0x1Fu << 6);
     return w;
@@ -162,7 +171,9 @@ int fl_place(const Floating *f, u32 u, u32 *dst, u32 guest, u32 host, const u32 
             t = ((guest + 4 * j + 4) & 0xF0000000u) | (w & 0x03FFFFFFu) << 2;
             dst[i] = (dst[i] & 0xFFFF0000u) | (t >> 16);
             dst[i + 1] = (dst[i + 1] & 0xFFFF0000u) | (t & 0xFFFFu);
-        } else
+        } else if (fl_mem(w)) /* an offset: the addiu k1 of the address, or the word itself */
+            dst[i] = (dst[i] & 0xFFFF0000u) | (w & 0xFFFFu);
+        else
             dst[i] = w >> 26 == 8 ? w | 1u << 26 : w; /* addi as addiu, as the translation copies it */
     }
     return 0;

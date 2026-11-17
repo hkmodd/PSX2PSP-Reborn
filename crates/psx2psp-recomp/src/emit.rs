@@ -114,6 +114,7 @@ pub struct Translation {
     /// Guest instruction -> host addresses of the words that copy it ([`simple`] ones only: one
     /// address, or two for a delay slot duplicated on both paths or also jumped to). When the
     /// game rewrites such an instruction, [`repatch`] gives the new host word for each address.
+    /// Also the words of a load or store's translation that hold its offset ([`takes_offset`]).
     pub patch: BTreeMap<u32, Vec<u32>>,
     /// Words of out-of-line code (slow paths, interrupt checks, host calls, long jumps), and the
     /// number of blocks they are written in between the main-pass code.
@@ -162,6 +163,21 @@ pub fn repatch(host: u32, guest: u32) -> Option<u32> {
         _ => !0,
     };
     (new & keep == host & keep).then_some(new)
+}
+
+/// A load or store, `lwc2`/`swc2` included.
+pub fn mem_op(w: u32) -> bool {
+    matches!(w >> 26, 0x20..=0x2E | 0x32 | 0x3A)
+}
+
+/// Whether the host word `host`, which [`Translation::patch`] lists for the load or store
+/// `guest`, holds its offset as it is: the `addiu k1, base, offset` of its address, or the word
+/// itself for the runtime. A rewrite of the offset alone is then the host word's low half
+/// (`psp/psxrt/floating.c` `fl_place`). A group's own word (an offset from the group's lowest)
+/// does not: a group's offsets stay as they are.
+pub fn takes_offset(host: u32, guest: u32) -> bool {
+    let addr = 9 << 26 | (guest >> 21 & 0x1F) << 21 | K1R << 16;
+    mem_op(guest) && host & 0xFFFF == guest & 0xFFFF && (host & 0xFFFF_0000 == addr || host == guest)
 }
 
 /// Whether [`repatch`] can take a rewrite of `w` at all: an I-type ALU immediate (`addi` to
@@ -384,6 +400,14 @@ impl Code {
         self.push(NOP);
         self.guest(pc);
         self.push(word);
+    }
+    /// [`Code::host_call`] for the load or store `word` at `pc`, the word listed as a copy of it.
+    fn host_call_mem(&mut self, pc: u32, word: u32) {
+        self.push(sw(RA, k0_off(layout::CTX + ctx::GPR + 4 * RA), K0R));
+        self.push(jal(RT_CALL));
+        self.push(NOP);
+        self.guest(pc);
+        self.simple(word, pc);
     }
 }
 
@@ -1017,7 +1041,7 @@ impl Em<'_> {
                     s.simple(w, p);
                 }
                 None => {
-                    c.push((i.0 & 0xFC1F_0000) | (K1R << 21) | (i.simm() as i32 - lo) as u16 as u32);
+                    c.simple((i.0 & 0xFC1F_0000) | (K1R << 21) | (i.simm() as i32 - lo) as u16 as u32, p);
                     s.append(self.mem(p, i));
                 }
             }
@@ -1037,7 +1061,7 @@ impl Em<'_> {
         let (rs, off) = (i.rs() as u32, i.imm() as u16);
         let (slow, io, back) = (self.label(), self.label(), self.label());
         let mut c = Code::default();
-        c.push(addiu(K1R, rs, off));
+        c.simple(addiu(K1R, rs, off), pc);
         c.push(sll(K1R, K1R, 8));
         c.branch(bltz(K1R), To::Label(slow), pc);
         c.push(srl(K1R, K1R, 8));
@@ -1051,7 +1075,7 @@ impl Em<'_> {
         s.push(srl(K1R, K1R, 10));
         s.push(xori(K1R, K1R, 0x2000));
         s.branch(bne(K1R, ZR), To::Label(io), pc);
-        s.push(addiu(K1R, rs, off));
+        s.simple(addiu(K1R, rs, off), pc);
         s.push(andi(K1R, K1R, 0x3FF));
         s.push(addu(K1R, K1R, K0R));
         s.push(op | k0_off(SCRATCH) as u32);
@@ -1067,9 +1091,9 @@ impl Em<'_> {
         if plain && then.is_empty() && undo.is_empty() && rt != 0 && rt != RA && rs != RA {
             s.push(sw(RA, k0_off(layout::CTX + ctx::GPR + 4 * RA), K0R));
             s.push(jal(layout::IO_READ));
-            s.push(addiu(K1R, rs, off));
+            s.simple(addiu(K1R, rs, off), pc);
             s.guest(pc);
-            s.push(i.0);
+            s.simple(i.0, pc);
             s.jump(2, To::Label(back), pc);
             s.push(lw(rt, k0_off(layout::CTX + ctx::GPR + 4 * rt), K0R));
             self.stub(s);
@@ -1084,16 +1108,16 @@ impl Em<'_> {
             }
             s.push(sw(RA, k0_off(layout::CTX + ctx::GPR + 4 * RA), K0R));
             s.push(jal(layout::IO_WRITE));
-            s.push(addiu(K1R, rs, off));
+            s.simple(addiu(K1R, rs, off), pc);
             s.guest(pc);
-            s.push(i.0);
+            s.simple(i.0, pc);
             s.jump(2, To::Label(back), pc);
             s.push(NOP);
             self.stub(s);
             return c;
         }
         undo.iter().for_each(|&w| s.push(w));
-        s.host_call(pc, i.0);
+        s.host_call_mem(pc, i.0);
         s.jump(2, To::Label(back), pc);
         s.push(NOP);
         self.stub(s);
@@ -1322,9 +1346,46 @@ impl Em<'_> {
                     return None;
                 }
                 if !self.d.code.contains(&t) {
-                    let c = self.resume(a, Reason::Outside);
-                    self.out.append(c);
-                    return None;
+                    // Out of the code (another floating unit, another image): through the table to
+                    // the guest address, the slot run on both paths as the guest runs it. The
+                    // branch is inverted to step over the exit.
+                    let inv = match k {
+                        Beq | Bne | Blez | Bgtz => Some(i.0 ^ 1 << 26),
+                        Bltz | Bgez => Some(i.0 ^ 1 << 16),
+                        _ => None,
+                    };
+                    if link != 0 || (clobbers && simple_slot.is_none()) || (!uncond && inv.is_none()) {
+                        let c = self.resume(a, Reason::Outside);
+                        self.out.append(c);
+                        return None;
+                    }
+                    if t <= a {
+                        let cost = self.loop_cost(t, a);
+                        self.poll(a, cost);
+                    }
+                    if simple_slot.is_none() {
+                        let c = slot(self);
+                        self.out.append(c);
+                    }
+                    let skip = (!uncond).then(|| self.label());
+                    if let (Some(skip), Some(inv)) = (skip, inv) {
+                        self.out.branch(inv, To::Label(skip), a);
+                        self.slot_word(simple_slot, s);
+                    }
+                    self.out.guest_pair(K1R, t, self.floating);
+                    self.dispatch(K1R, false, a);
+                    self.out.push(jr(K1R));
+                    match skip {
+                        Some(skip) => {
+                            self.out.push(NOP);
+                            self.out.def(skip);
+                            return Some(a + 8);
+                        }
+                        None => {
+                            self.slot_word(simple_slot, s);
+                            return None;
+                        }
+                    }
                 }
                 if t <= a && link == 0 {
                     let cost = self.loop_cost(t, a);

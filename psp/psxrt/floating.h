@@ -6,9 +6,10 @@
  * the converter measures is the runtime's.
  *
  * RAM holds a unit where each word is the unit's, or differs only where a site of it takes the
- * word from RAM (fl_form): an immediate or shift amount its translation copies as it is, or the
- * target of a j/jal its translation holds in a lui/ori pair. A loader that links the code (jal
- * targets, lui/addiu halves of addresses) so rewrites only what the sites take.
+ * word from RAM (fl_form): an immediate, a load's or store's offset or a shift amount its
+ * translation copies as it is, or the target of a j/jal its translation holds in a lui/ori pair.
+ * A loader that links the code (jal targets, lui/addiu halves of addresses, %lo offsets) so
+ * rewrites only what the sites take.
  *
  * The head stays in RAM; each unit's body (host code, table, relocations) is in DATA.PSAR and is
  * read into the slot of a placement when the unit is placed (native.c), so that the RAM floating
@@ -18,7 +19,8 @@
  *   [0] units, [1] index entries, [2] guest address and [3] host address of the translations
  *   units x FlUnit: offsets (words, from the head's start) and lengths of the unit's guest words,
  *     sites (2 words each, by guest word: guest word << 1 | kind, host word offset; kind 0 the
- *     host word is a copy of the guest word, 1 the lui/ori pair from it holds the guest word's
+ *     host word is a copy of the guest word (of its offset, in the low half, for a load or
+ *     store), 1 the lui/ori pair from it holds the guest word's
  *     j/jal target) and map (a bit per guest word, from bit 0 of its first word: the word has a
  *     translation); the host code's and relocations' lengths; the body's byte offset from the
  *     first body and its bytes there (deflate, or as is when 4 * fl_body_words)

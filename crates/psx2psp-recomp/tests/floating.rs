@@ -108,12 +108,15 @@ fn moved_code_is_the_code_translated_there() {
 
 #[test]
 fn each_kind_of_relocation_floating_code_has_is_recorded() {
-    // Host calls' pcs, the links of jalr s5 and of the bal past the end, the host jal of the bal
-    // inside. No host address in a lui/ori pair: those are ra constants, never in floating code.
+    // Host calls' pcs, the links of jalr s5 and of the bal past the end, the target of the beq
+    // past the end, the host jal of the bal inside. No host address in a lui/ori pair: those are
+    // ra constants, never in floating code.
     let t = floating(&program(), 0x8010_0000, 0x08A0_0000);
     let n = |k: Reloc| t.relocs.iter().filter(|&&(_, r)| r == k).count();
     assert!(n(Reloc::Guest) > 0 && n(Reloc::Jump) > 0, "{:?}", t.relocs);
-    assert_eq!((n(Reloc::GuestPair), n(Reloc::HostPair)), (2, 0), "{:?}", t.relocs);
+    assert_eq!((n(Reloc::GuestPair), n(Reloc::HostPair)), (3, 0), "{:?}", t.relocs);
+    // The beq past the end leaves through the table, not the runtime.
+    assert!(!t.runtime.contains_key(&(0x8010_0000 + 11 * 4)), "{:?}", t.runtime);
 }
 
 #[test]

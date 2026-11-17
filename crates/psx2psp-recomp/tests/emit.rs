@@ -961,6 +961,79 @@ fn delay_slot_that_is_also_a_target() {
     assert!(run.t.host(at(7)).is_some());
 }
 
+/// [`check`] with the words `out` taken out of the discovered code, as a floating unit's
+/// neighbours are: RAM still holds them and the interpreter runs them after a dispatch miss.
+fn check_cut(words: &[u32], out: std::ops::Range<u32>, end: u32, init: impl Fn(&mut Cpu)) -> Run {
+    let x = exe(words);
+    let mut d = Discovery::run(&x);
+    let gone = |a: &u32| (at(out.start)..at(out.end)).contains(a);
+    d.code.retain(|a| !gone(a));
+    d.delay_slots.retain(|a, _| !gone(a));
+    d.jumps.retain(|a, _| !gone(a));
+    let hz = Hazards::check(&x, &d);
+    let t = translate(&x, &d, &hz, CODE).unwrap();
+    let mut c = Cpu::new(Isa::R3000A, BASE);
+    init(&mut c);
+    let start = c.clone();
+    let mut m1 = Machine::new(&x);
+    let mut m2 = m1.clone();
+    m2.table(&t);
+    let end = End { guest: at(end), host: t.host(at(end)).unwrap(), code: CODE + 4 * t.words.len() as u32 };
+    run_ps1(&mut m1, &mut c, end, 100_000).unwrap();
+    let (g, log) = run_psp(&mut m2, &t, &start, end, 200_000).unwrap();
+    if let Some(d) = differs(&c, &m1, &g, &m2, true, 0..0, &|_, _| false) {
+        panic!("{d}");
+    }
+    Run { t, log }
+}
+
+/// A branch to code that is not the translation's leaves through the table, its slot run on the
+/// path it takes and on the one it does not; neither goes to the runtime.
+#[test]
+fn a_branch_out_of_the_code_goes_through_the_table() {
+    let prog = |branch: u32| {
+        [
+            branch,                // 0  to 8, out of the code
+            addiu(V0, ZERO, 5),    // 1  slot
+            addiu(V1, V0, 1),      // 2  not taken
+            j(2, 6),               // 3
+            NOP,                   // 4
+            NOP,                   // 5
+            j(2, 6),               // 6  end
+            NOP,                   // 7
+            addiu(A1, V0, 3),      // 8  out of the code
+            j(2, 6),               // 9
+            NOP,                   // 10
+        ]
+    };
+    let beq = b(4, A0, ZERO, 0, 8);
+    let bgez = b(1, A0, 1, 0, 8);
+    let always = b(4, ZERO, ZERO, 0, 8);
+    for (branch, a0, taken) in [(beq, 0, true), (beq, 1, false), (bgez, 1, true), (bgez, -1i32 as u32, false), (always, 1, true)] {
+        let run = check_cut(&prog(branch), 8..11, 6, |c| c.gpr[A0 as usize] = a0);
+        assert!(run.t.runtime.is_empty(), "{branch:08x}: {:?}", run.t.runtime);
+        assert_eq!(run.log.missed, if taken { vec![at(8)] } else { vec![] }, "{branch:08x} a0 {a0}");
+    }
+    // Backward, out of the code: the back edge still polls.
+    let w = [
+        j(2, 5),                   // 0
+        NOP,                       // 1
+        addiu(A1, V0, 3),          // 2  out of the code
+        j(2, 8),                   // 3
+        NOP,                       // 4
+        b(5, A0, ZERO, 5, 2),      // 5  bne a0,zero,2
+        addiu(V0, ZERO, 5),        // 6  slot
+        addiu(V1, V0, 1),          // 7
+        j(2, 8),                   // 8  end
+        NOP,                       // 9
+    ];
+    for a0 in [0, 1] {
+        let run = check_cut(&w, 2..5, 8, |c| c.gpr[A0 as usize] = a0);
+        assert!(run.t.runtime.is_empty(), "{:?}", run.t.runtime);
+        assert_eq!(run.log.missed, if a0 != 0 { vec![at(2)] } else { vec![] });
+    }
+}
+
 /// A code address built in `ra` (a hand-made return point, as Crash 2's) is the host address of
 /// its translation: the translated `jr ra` that takes it stays native.
 #[test]
