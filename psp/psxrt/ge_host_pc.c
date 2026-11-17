@@ -6,9 +6,12 @@
  * of ge.c against.
  *
  * The GE addresses 28 bits and the PC's pointers have 64: every block of memory a list addresses
- * is a region, and the GE address of a pointer in region i at offset o is i << 24 | o (offsets
- * from a 64-byte boundary, so alignments stay as they are). Pointers in no region and below 16 MB
- * pass as they are (VRAM offsets, which pspgu's draw buffer takes).
+ * is a region, and the GE address of a pointer in region i at offset o is i << 24 | o, o from the
+ * region's first byte. On the PSP every region starts on 64 bytes at least (A64 statics, partition
+ * blocks of 256), so o's low bits are the PSP's: ge.c's alignment choices (gel_addr(p) & 15) and
+ * the hashes are the PSP's, wherever the PC put the memory (the sim's VRAM moves with sizeof(Psx)).
+ * Pointers in no region and below 16 MB pass as they are (VRAM offsets, which pspgu's draw buffer
+ * takes).
  */
 #include <stdlib.h>
 #include <string.h>
@@ -28,11 +31,9 @@ static u32 unknown; /* pointers geh_addr found in no region */
 
 void geh_region(const void *p, u32 bytes)
 {
-    uintptr_t a = (uintptr_t)p & ~(uintptr_t)63;
-    bytes += (u32)((uintptr_t)p - a);
     if (nreg == REGIONS - 1 || bytes >= 1u << 24)
         abort();
-    reg[++nreg].p = a, reg[nreg].bytes = bytes;
+    reg[++nreg].p = (uintptr_t)p, reg[nreg].bytes = bytes;
 }
 
 uint32_t geh_addr(const void *p)
