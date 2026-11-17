@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::{Arc, OnceLock};
 
-use psx2psp_recomp::emit::{Reloc, patchable, translate_floating};
+use psx2psp_recomp::emit::{Reloc, patchable, repatch, translate_floating};
 use psx2psp_recomp::{Discovery, Hazards, Hit, PsxExe, Signatures, Translation, layout, overlay, translate};
 use rayon::prelude::*;
 
@@ -140,17 +140,16 @@ pub struct CodePack {
 pub const FLOATING_ARENA_MAX: u32 = 4 << 20;
 
 /// [`CodePack::floating`] as the runtime reads it (`psp/psxrt/floating.h`): header, units, the
-/// index of their entries by [`fnv1a32`] of the two words there, and the data.
+/// index of their entries by [`floating_key`] of the two words there, and the data.
 pub fn floating_blob(codes: &[FloatingCode]) -> Vec<u32> {
     let mut index: Vec<[u32; 3]> = Vec::new();
     for (u, c) in codes.iter().enumerate() {
         for e in c.indexed() {
-            let b: Vec<u8> = c.unit.words[e..e + 2].iter().flat_map(|w| w.to_le_bytes()).collect();
-            index.push([fnv1a32(&b), u as u32, e as u32]);
+            index.push([floating_key(&c.unit.words[e..e + 2]), u as u32, e as u32]);
         }
     }
     index.sort_unstable();
-    let head = 4 + 7 * codes.len() + 3 * index.len();
+    let head = 4 + FLOATING_UNIT_WORDS * codes.len() + 3 * index.len();
     let mut w = vec![codes.len() as u32, index.len() as u32, FLOATING_BASE, FLOATING_HOST];
     let mut data: Vec<u32> = Vec::new();
     for c in codes {
@@ -159,12 +158,34 @@ pub fn floating_blob(codes: &[FloatingCode]) -> Vec<u32> {
             data.extend_from_slice(v);
             at
         };
-        let (g, h, t, r) = (put(&c.unit.words), put(&c.code), put(&c.table), put(&c.relocs));
-        w.extend([g, c.unit.words.len() as u32, h, c.code.len() as u32, t, r, c.relocs.len() as u32]);
+        let (g, h, t, r, s) = (put(&c.unit.words), put(&c.code), put(&c.table), put(&c.relocs), put(&c.sites));
+        let (gl, hl, rl, sl) = (c.unit.words.len(), c.code.len(), c.relocs.len(), c.sites.len() / 2);
+        w.extend([g, gl as u32, h, hl as u32, t, r, rl as u32, s, sl as u32]);
     }
     w.extend(index.iter().flatten());
     w.extend(data);
     w
+}
+
+/// Words of a unit's header in [`floating_blob`] (`psp/psxrt/floating.h` FlUnit).
+const FLOATING_UNIT_WORDS: usize = 9;
+
+/// `w` without what a site of floating code takes from RAM (`psp/psxrt/floating.c` fl_form): a
+/// j/jal's target, an immediate (addi as addiu) or a shift amount.
+pub fn floating_form(w: u32) -> u32 {
+    match (w >> 26, w & 0x3F) {
+        (2 | 3, _) => w & 0xFC00_0000,
+        (8, _) => (w | 1 << 26) & 0xFFFF_0000,
+        (9..=0xF, _) => w & 0xFFFF_0000,
+        (0, 0 | 2 | 3) => w & !(0x1F << 6),
+        _ => w,
+    }
+}
+
+/// The index key of two words of floating code (`fl_key`): [`fnv1a32`] of their [`floating_form`].
+pub fn floating_key(w: &[u32]) -> u32 {
+    let b: Vec<u8> = w.iter().flat_map(|&x| floating_form(x).to_le_bytes()).collect();
+    fnv1a32(&b)
 }
 
 /// Host address a [`FloatingCode`] is translated at ([`translate_floating`]).
@@ -182,6 +203,11 @@ pub struct FloatingCode {
     /// Per word of `code` that depends on where it is: its offset (words) << 2 | the kind
     /// ([`reloc_kind`]).
     pub relocs: Vec<u32>,
+    /// Pairs by guest word (`psp/psxrt/floating.h`): `j << 1 | kind`, host word offset. Kind 0:
+    /// the host word is a copy of guest word `j` ([`Translation::patch`], [`patchable`]); kind 1:
+    /// the lui/ori pair from it holds the target of the j/jal at `j` ([`Translation::targets`]).
+    /// Where RAM may differ from the unit: a game that links the code where it loads it.
+    pub sites: Vec<u32>,
 }
 
 /// The two bits a [`FloatingCode`] relocation keeps of its kind.
@@ -207,7 +233,20 @@ impl FloatingCode {
             }
         }
         let relocs = t.relocs.iter().map(|&(h, r)| at(h) << 2 | reloc_kind(r)).collect();
-        Ok(Self { unit, code: t.words, table, relocs })
+        let word = |g: u32| g.checked_sub(FLOATING_BASE).map(|o| o / 4).filter(|&j| (j as usize) < unit.words.len());
+        let mut sites: Vec<(u32, u32)> = Vec::new();
+        for (&g, hs) in &t.patch {
+            let Some(j) = word(g) else { continue };
+            let w = unit.words[j as usize];
+            // every copy takes the word: one that does not (k0/k1, a fused pair) pins it
+            if patchable(w) && hs.iter().all(|&h| repatch(t.words[at(h) as usize], w).is_some()) {
+                sites.extend(hs.iter().map(|&h| (j << 1, at(h))));
+            }
+        }
+        sites.extend(t.targets.iter().filter_map(|&(h, g)| Some((word(g)? << 1 | 1, at(h)))));
+        sites.sort_unstable();
+        let sites = sites.into_iter().flat_map(|(a, b)| [a, b]).collect();
+        Ok(Self { unit, code: t.words, table, relocs, sites })
     }
 
     /// The words [`floating_blob`] indexes: each translated one with a word after it.
@@ -216,9 +255,9 @@ impl FloatingCode {
     }
 
     /// Its words in [`floating_blob`]: unit header, index entries, guest words, code, table and
-    /// relocations.
+    /// relocations and sites.
     pub fn blob_words(&self) -> usize {
-        7 + 3 * self.indexed().count() + 2 * self.unit.words.len() + self.code.len() + self.relocs.len()
+        FLOATING_UNIT_WORDS + 3 * self.indexed().count() + 2 * self.unit.words.len() + self.code.len() + self.relocs.len() + self.sites.len()
     }
 }
 
@@ -1008,11 +1047,51 @@ mod tests {
         assert_eq!(t.words, code.code);
         let blob = floating_blob(std::slice::from_ref(&code));
         for (guest, host) in [(FLOATING_BASE, FLOATING_HOST), (0x8012_3450, 0x08B4_5670), (0x801F_F000, 0x0960_0000), (0x8000_1000, 0x0880_0400)] {
-            let c = psx2psp_sim::floating_place(&blob, 0, guest, host).unwrap();
+            let c = psx2psp_sim::floating_place(&blob, 0, guest, host, None).unwrap();
+            assert_eq!(c, t.moved(guest.wrapping_sub(FLOATING_BASE), host).words, "{guest:08X} {host:08X}");
+            let same = psx2psp_sim::floating_place(&blob, 0, guest, host, Some(&unit.words)).unwrap();
+            assert_eq!(same, c, "RAM as the unit's");
+        }
+        assert_eq!(psx2psp_sim::floating_place(&blob, 1, FLOATING_BASE, FLOATING_HOST, None), None, "no unit 1");
+        assert_eq!(psx2psp_sim::floating_place(&blob[..blob.len() - 1], 0, FLOATING_BASE, FLOATING_HOST, None), None, "a short blob");
+        assert_eq!(psx2psp_sim::floating_place(&blob, 0, FLOATING_BASE, FLOATING_HOST, Some(&unit.words[1..])), None, "short RAM");
+    }
+
+    /// A game that links floating code where it loads it (Spider-Man's CD.WAD modules) rewrites
+    /// its jal/j targets and immediates: the runtime finds the unit in RAM all the same and places
+    /// it with RAM's words, as the translation of the linked words would be; a load or store
+    /// offset is not a site, and RAM that differs there is not the unit.
+    #[test]
+    fn the_runtime_takes_linked_floating_code_from_ram() {
+        let unit = FloatingUnit { words: floating_program(), entries: vec![0] };
+        let code = FloatingCode::translate(unit.clone()).unwrap();
+        let kinds: BTreeSet<u32> = code.sites.chunks(2).map(|s| s[0] & 1).collect();
+        assert_eq!(kinds, BTreeSet::from([0, 1]), "{:?}", code.sites);
+        let blob = floating_blob(std::slice::from_ref(&code));
+        let mut linked = unit.words.clone();
+        linked[5] = linked[5] & 0xFFFF_0000 | 7; // addiu t0, zero, 7
+        let jump = |op: u32, t: u32| op << 26 | (t >> 2 & 0x03FF_FFFF);
+        linked[9] = jump(3, 0x8005_1230);
+        let (exe, d) = FloatingUnit { words: linked.clone(), entries: vec![0] }.discover();
+        let t = translate_floating(&exe, &d, &Hazards::check(&exe, &d), FLOATING_HOST).unwrap();
+        for (guest, host) in [(FLOATING_BASE, FLOATING_HOST), (0x8012_3450, 0x08B4_5670)] {
+            let c = psx2psp_sim::floating_place(&blob, 0, guest, host, Some(&linked)).unwrap();
             assert_eq!(c, t.moved(guest.wrapping_sub(FLOATING_BASE), host).words, "{guest:08X} {host:08X}");
         }
-        assert_eq!(psx2psp_sim::floating_place(&blob, 1, FLOATING_BASE, FLOATING_HOST), None, "no unit 1");
-        assert_eq!(psx2psp_sim::floating_place(&blob[..blob.len() - 1], 0, FLOATING_BASE, FLOATING_HOST), None, "a short blob");
+        let mut ram = vec![0u8; psx2psp_sim::RAM];
+        let at = 0x0004_5670;
+        let mut put = |w: &[u32]| {
+            for (k, x) in w.iter().enumerate() {
+                ram[at + 4 * k..at + 4 * k + 4].copy_from_slice(&x.to_le_bytes());
+            }
+            psx2psp_sim::floating_find(&blob, &ram, at as u32).unwrap()
+        };
+        assert_eq!(put(&linked), Some((0, at as u32)), "linked");
+        linked[2] ^= 4; // lw t2, 4(a0)
+        assert_eq!(put(&linked), None, "a load offset differs");
+        linked[2] ^= 4;
+        linked[9] = jump(2, 0x8005_1230); // j for jal
+        assert_eq!(put(&linked), None, "another opcode");
     }
 
     /// The blob holds what [`FloatingCode::blob_words`] counts, and a pack with floating code
@@ -1049,7 +1128,7 @@ mod tests {
             assert_eq!(found, (code.table[e] != u32::MAX).then_some((0, at as u32)), "word {e}");
         }
         assert_eq!(psx2psp_sim::floating_find(&blob, &ram, at as u32 + 2), Ok(None), "unaligned");
-        ram[at + 4 * 5] ^= 1;
+        ram[at + 4 * 2] ^= 1;
         assert_eq!(psx2psp_sim::floating_find(&blob, &ram, at as u32), Ok(None), "a word differs");
         assert_eq!(psx2psp_sim::floating_find(&blob, &ram[1..], at as u32), Err(()));
     }

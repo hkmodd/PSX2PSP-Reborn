@@ -22,7 +22,7 @@
 #include <zlib.h>
 
 #define MAGIC "PSXRTDAT"
-#define VERSION 7
+#define VERSION 8
 #define HEADER_LEN 0xE4
 #define BLOCK_SECTORS 16
 #define RAW 2352

@@ -125,6 +125,10 @@ pub struct Translation {
     /// The words that depend on where the code is: host address of the word, and what it holds.
     /// [`Translation::moved`] applies them.
     pub relocs: Vec<(u32, Reloc)>,
+    /// [`translate_floating`]: host address of the `lui`/`ori` pair that holds the target of the
+    /// `j`/`jal` at a guest pc. A game that links code where it loads it rewrites those targets
+    /// (Spider-Man's CD.WAD modules); the runtime writes the pair from the word RAM holds.
+    pub targets: Vec<(u32, u32)>,
 }
 
 /// What a word of a [`Translation`] holds that changes with the guest or host address of the code.
@@ -315,6 +319,8 @@ struct Code {
     pat: Vec<(usize, u32)>,
     /// Word index -> the guest address it holds ([`Reloc::Guest`], [`Reloc::GuestPair`]).
     rel: Vec<(usize, Reloc)>,
+    /// Word index -> guest pc of the `j`/`jal` whose target the pair there holds.
+    tgt: Vec<(usize, u32)>,
 }
 
 impl Code {
@@ -357,6 +363,11 @@ impl Code {
         self.w.push(lui(reg, (a >> 16) as u16));
         self.w.push(ori(reg, reg, a as u16));
     }
+    /// `reg` = `t`, the target of the `j`/`jal` at `pc` ([`Translation::targets`]).
+    fn target_pair(&mut self, reg: u32, t: u32, pc: u32) {
+        self.tgt.push((self.w.len(), pc));
+        self.guest_pair(reg, t, false);
+    }
     fn append(&mut self, o: Code) {
         let b = self.w.len();
         self.w.extend(o.w);
@@ -364,6 +375,7 @@ impl Code {
         self.defs.extend(o.defs.into_iter().map(|(l, a)| (l, a + b)));
         self.pat.extend(o.pat.into_iter().map(|(a, p)| (a + b, p)));
         self.rel.extend(o.rel.into_iter().map(|(a, r)| (a + b, r)));
+        self.tgt.extend(o.tgt.into_iter().map(|(a, p)| (a + b, p)));
     }
     /// Host call for the guest instruction `word` at `pc` (`pc | RESUME` to hand over).
     fn host_call(&mut self, pc: u32, word: u32) {
@@ -1280,7 +1292,11 @@ impl Em<'_> {
                 if inside {
                     self.out.jump(3, To::Guest(t), a);
                 } else {
-                    self.out.guest_pair(K1R, t, k != Jal);
+                    if k == Jal {
+                        self.out.target_pair(K1R, t, a);
+                    } else {
+                        self.out.guest_pair(K1R, t, true);
+                    }
                     self.dispatch(K1R, false, a);
                     self.out.push(jalr(RA, K1R));
                 }
@@ -1289,7 +1305,23 @@ impl Em<'_> {
             }
             _ => {
                 let t = if k == J { i.jump_target(a) } else { i.branch_target(a) };
-                if (self.floating && k == J) || !self.d.code.contains(&t) {
+                if self.floating && k == J {
+                    // Through the table, to whatever the word RAM holds names.
+                    if t <= a && self.d.code.contains(&t) {
+                        let cost = self.loop_cost(t, a);
+                        self.poll(a, cost);
+                    }
+                    if simple_slot.is_none() {
+                        let c = slot(self);
+                        self.out.append(c);
+                    }
+                    self.out.target_pair(K1R, t, a);
+                    self.dispatch(K1R, false, a);
+                    self.out.push(jr(K1R));
+                    self.slot_word(simple_slot, s);
+                    return None;
+                }
+                if !self.d.code.contains(&t) {
                     let c = self.resume(a, Reason::Outside);
                     self.out.append(c);
                     return None;
@@ -1338,7 +1370,7 @@ impl Em<'_> {
 
     fn finish(self, base: u32) -> Result<Translation, Fail> {
         let Em { out, mut map, map_at, runtime, labels, cold, spans, .. } = self;
-        let Code { mut w, fix, defs, pat, rel } = out;
+        let Code { mut w, fix, defs, pat, rel, tgt } = out;
         let mut at = vec![usize::MAX; labels];
         for (l, i) in defs {
             at[l] = i;
@@ -1396,6 +1428,7 @@ impl Em<'_> {
                 relocs.sort_unstable_by_key(|r| r.0);
                 relocs
             },
+            targets: tgt.into_iter().map(|(i, pc)| (host(i), pc)).collect(),
         })
     }
 }
@@ -1441,6 +1474,7 @@ impl Translation {
             cold: self.cold,
             spans: self.spans.iter().map(|&(a, s, e)| (g(a), at(s), at(e))).collect(),
             relocs: self.relocs.iter().map(|&(h, r)| (at(h), r)).collect(),
+            targets: self.targets.iter().map(|&(h, pc)| (at(h), g(pc))).collect(),
         }
     }
 

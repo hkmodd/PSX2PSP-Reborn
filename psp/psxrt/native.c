@@ -363,7 +363,7 @@ static int fl_try(u32 pc, u32 p)
         return 0;
     }
     const FlPlace *q = &ar.p[i];
-    fl_place(&fl, q->unit, (u32 *)q->host, q->guest, q->host);
+    fl_place(&fl, q->unit, (u32 *)q->host, q->guest, q->host, (const u32 *)(P->ram + q->at));
     sceKernelDcacheWritebackRange((void *)q->host, q->len);
     sceKernelIcacheInvalidateRange((void *)q->host, q->len);
     fl_install(q);
@@ -2061,7 +2061,7 @@ int native_load(int fd)
         if (q->unit >= fl.units || q->len < 4 * fl_unit(&fl, q->unit)->h_len || q->host < (i ? ar.p[i - 1].host + ar.p[i - 1].len : ar.lo) ||
             q->host > ar.hi || ar.hi - q->host < q->len || q->at > RAM_SIZE - 4 * pl_words(q) || (q->at & 3))
             return ar.n = 0, -1;
-        fl_place(&fl, q->unit, (u32 *)q->host, q->guest, q->host);
+        fl_place(&fl, q->unit, (u32 *)q->host, q->guest, q->host, (const u32 *)(P->ram + q->at));
     }
     memset(gret_sp, 0xFF, sizeof gret_sp); /* not in the snapshot: no entry matches, pops take the top */
     sceKernelDcacheWritebackInvalidateAll();

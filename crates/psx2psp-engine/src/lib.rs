@@ -830,7 +830,7 @@ pub const NATIVE_RUNTIME: &[u8] = include_bytes!("../../../resources/psxrt.prx")
 ///   raw sectors 4, index offset 4, blocks 4, zero 4). The header's first-disc fields stay, so a
 ///   one-disc set has no table.
 pub const NATIVE_PSAR_MAGIC: [u8; 8] = *b"PSXRTDAT";
-pub const NATIVE_PSAR_VERSION: u32 = 7;
+pub const NATIVE_PSAR_VERSION: u32 = 8;
 /// magic 8, version 4, header length 4, disc ID 16, title 128, disc sectors 4, sectors per block
 /// 4, index offset 4, block count 4, code directory offset 4, code images 4, host address of the
 /// code 4, code size 4 (these four written once the code is), flags 4 ([`NATIVE_FLAG_PAL60`]),
@@ -1219,6 +1219,11 @@ pub struct Coverage {
     /// the words they gave a translation, and the placements the arena had no room for
     /// ([`psx2psp_sim::Machine::floating`]).
     pub floating_placed: (u32, u32, u32),
+    /// Why the Floating words in a unit got no placement: in a unit the pack left out (it does
+    /// not fit, or does not translate); in a packed unit whose words in the run differ from it
+    /// off its sites (and per opcode of such a word, the words); in a packed unit whose words in
+    /// the run it takes (RAM differs elsewhere in it, or the guest never entered it there).
+    pub unit_miss: (usize, usize, usize, std::collections::BTreeMap<u32, usize>),
 }
 
 /// An overlay candidate that holds code the game runs at addresses it picks ([`Miss::Floating`]).
@@ -1431,6 +1436,8 @@ pub fn static_coverage(img: &DiscImage, patches: &[&dyn ImagePatch], cipher: Opt
     // The distinct units of those files, and the Floating words a unit holds.
     let mut uniq: std::collections::HashMap<native_code::FloatingUnit, ()> = std::collections::HashMap::new();
     let mut in_unit = std::collections::HashSet::new();
+    let packed: std::collections::HashMap<&Vec<u32>, (&native_code::FloatingCode, std::collections::HashSet<u32>)> =
+        pack.floating.iter().map(|c| (&c.unit.words, (c, c.sites.chunks(2).map(|x| x[0] >> 1).collect()))).collect();
     for &f in fl.keys() {
         let units = native_code::floating_units(cands[f].1);
         cov.units.0 += units.len();
@@ -1438,8 +1445,27 @@ pub fn static_coverage(img: &DiscImage, patches: &[&dyn ImagePatch], cipher: Opt
             for &(g, q) in listed[k].iter().filter(|&&(g, _)| g == f) {
                 for i in floats(k, g, q) {
                     let o = 4 * (q + i);
-                    if units.iter().any(|(at, u)| (*at..at + 4 * u.words.len()).contains(&o)) {
-                        in_unit.insert(r[i].0);
+                    let Some((at, u)) = units.iter().find(|(at, u)| (*at..at + 4 * u.words.len()).contains(&o)) else { continue };
+                    if !in_unit.insert(r[i].0) {
+                        continue;
+                    }
+                    let Some(c) = packed.get(&u.words) else {
+                        cov.unit_miss.0 += 1;
+                        continue;
+                    };
+                    // the run's words over the unit, against it and its sites
+                    let off: Vec<u32> = (0..r.len())
+                        .filter_map(|n| Some((n, (4 * (q + n)).checked_sub(*at)? / 4)))
+                        .filter(|&(n, j)| j < u.words.len() && r[n].1 != u.words[j] && (!c.1.contains(&(j as u32)) || native_code::floating_form(r[n].1) != native_code::floating_form(u.words[j])))
+                        .map(|(_, j)| u.words[j] >> 26)
+                        .collect();
+                    if off.is_empty() {
+                        cov.unit_miss.2 += 1;
+                    } else {
+                        cov.unit_miss.1 += 1;
+                        for op in off {
+                            *cov.unit_miss.3.entry(op).or_default() += 1;
+                        }
                     }
                 }
             }
@@ -2357,7 +2383,7 @@ mod tests {
         assert_eq!(pbp.range(Section::DataPsar).start % 0x10, 0);
         let head = native_psar_header("SLES02895", "Sheep Dog 'n' Wolf", 40, 0);
         assert_eq!(psar[..NATIVE_PSAR_HEADER_LEN], head);
-        assert_eq!(psar[..16], *b"PSXRTDAT\x07\0\0\0\xE4\0\0\0");
+        assert_eq!(psar[..16], *b"PSXRTDAT\x08\0\0\0\xE4\0\0\0");
         assert_eq!(&psar[0x10..0x1A], b"SLES02895\0");
         assert_eq!(&psar[0x20..0x33], b"Sheep Dog 'n' Wolf\0");
         let word = |at: usize| u32::from_le_bytes(psar[at..at + 4].try_into().unwrap()) as usize;

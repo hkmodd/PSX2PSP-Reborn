@@ -42,11 +42,15 @@ dispatch table (one word per PS1 RAM word) with MISS.
   whichever shared its range). No match: the interpreter runs it. A MISS entry inside an
   executable whose slice is installed is code the translator did not find: interpreted, no
   hashing.
-* Floating code (code the game runs wherever it loads it, as Crash 2's native GOOL pieces) is a
-  blob of units translated once (`floating.h`), read below the code range. On a miss no
-  executable serves, the runtime looks the two words there up in the blob's index and, when RAM
-  holds a whole unit around them, copies its code into an arena slot (at the start of the code
-  range), relocates it to that guest and host address and installs its table entries. A
+* Floating code (code the game runs wherever it loads it, as Crash 2's native GOOL pieces and
+  Spider-Man's CD.WAD modules) is a blob of units translated once (`floating.h`), read below the
+  code range. On a miss no executable serves, the runtime looks the two words there up in the
+  blob's index and, when RAM holds a whole unit around them, copies its code into an arena slot
+  (at the start of the code range), relocates it to that guest and host address, writes its
+  sites from RAM and installs its table entries. RAM may differ from the unit only at its sites:
+  the immediates and shift amounts its translation copies, and the j/jal targets it holds in a
+  lui/ori pair, which is what a game that links the code where it loads it rewrites. A placement
+  is the unit with the site words it was placed with; a rewrite of one drops it. A
   placement whose words RAM still holds is reinstalled after a disc load; one whose words are
   gone gives its slot back when the arena is full. A live one is never moved: when the arena has
   no room the interpreter runs the code.
@@ -115,7 +119,7 @@ The log's `-- sas` line counts, per second:
 
 In `both` mode it also gives the RMS of both mixes.
 
-## DATA.PSAR (version 7)
+## DATA.PSAR (version 8)
 
 Little endian, written by `write_native_psar` in `crates/psx2psp-engine`; offsets are from the
 start of DATA.PSAR:

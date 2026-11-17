@@ -549,6 +549,9 @@ fn cmd_coverage(args: &[String]) -> R {
     if c.units.0 > 0 {
         let (n, u, w, h, held) = c.units;
         println!("  floating units: {n}, {u} distinct, {w} words, {h} host words; {held} Floating addresses in one");
+        let (out, off, other, ops) = &c.unit_miss;
+        let ops: Vec<String> = ops.iter().map(|(op, n)| format!("op {op:02X}: {n}")).collect();
+        println!("    of them in a unit not packed {out}, off its sites {off} ({}), else {other}", ops.join(", "));
     }
     let mut miss = c.missing.clone();
     miss.sort_by_key(|&(a, n, ..)| (std::cmp::Reverse(n), a));
