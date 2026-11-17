@@ -8,6 +8,10 @@
 
 #define MDEC_CAP 0x10000 /* words: a whole compressed frame */
 
+void ge_shadow_init(Psx *psx);             /* psp/psxrt/ge_host_pc.c */
+void ge_shadow_frame(Psx *psx, u32 frame); /* reads psx, writes only the log */
+static int sim_ge;                         /* PSX2PSP_SIM_GE, read once in sim_new */
+
 typedef int (*ReadFn)(void *user, u32 lba, u8 *raw);
 typedef void (*TextFn)(void *user, const char *s, int n);
 
@@ -88,6 +92,12 @@ Sim *sim_new(void *user, ReadFn rd, u32 disc_end, TextFn tty, TextFn log)
         s->host.card[0] = s->card;
     }
     psx_init(&s->psx, &s->host, s->ram, s->scratch, s->vram, s->spu_ram, s->mdec_in, MDEC_CAP);
+    /* PSX2PSP_SIM_GE=1: the PSP's GE translator (ge.c) runs beside the software rasterizer and
+     * logs a hash of its display lists each frame (psp/psxrt/ge_host_pc.c); pictures unchanged. */
+    if (getenv("PSX2PSP_SIM_GE")) {
+        sim_ge = 1;
+        ge_shadow_init(&s->psx);
+    }
     return s;
 }
 
@@ -227,6 +237,8 @@ int sim_frame(Sim *s)
     u32 f = s->frames;
     while (s->frames == f && !s->psx.exiting)
         cpu_run(&s->psx, s->psx.cycles + 4096);
+    if (sim_ge)
+        ge_shadow_frame(&s->psx, s->frames);
     return s->psx.exiting;
 }
 
