@@ -212,22 +212,30 @@ def main(argv):
     # hashing all of ge.c's memory (mem=1: the sim's check, not the translator's work).
     c2 = runs.get("C2")
 
-    def lean(name):
-        """(us, polys) over the frames after the first, every 60th left out; None if not timed in us"""
+    def lean_ns(name):
+        """the frames' n after the first, every 60th left out (a decode run's frames carry no number:
+        it takes the n of the run it is subtracted from)"""
+        return {f["n"] for f in frames.get(name, [])[1:] if f.get("mem") != "1" and num(f["frame"]) % 60}
+
+    def lean(name, ns):
+        """(us, polys) over the frames ns; None if not timed in us"""
         r = runs.get(name)
         if not r or r.get("unit") != "us":
             return None
-        fs = [f for f in frames.get(name, [])[1:] if f.get("mem") != "1" and num(f["frame"]) % 60]
+        fs = [f for f in frames.get(name, []) if f["n"] in ns]
         return sum(num(f["t"]) for f in fs), sum(num(f["polys"]) for f in fs)
 
     def us_poly_lean(name, less=None):
-        a = lean(name)
+        ns = lean_ns(name)
+        a = lean(name, ns)
         if not a or not a[1]:
             return None
         if less is None:
             return a[0] / a[1]
-        b = lean(less)
-        return (a[0] - b[0]) / a[1] if b else None
+        b = lean(less, ns)
+        if not b or b[1] != a[1]:
+            return None  # not the same frames
+        return (a[0] - b[0]) / a[1]
 
     c0_up, m0_up = us_poly_lean("C0"), us_poly_lean("M0")
     cpu_up, me_up = us_poly_lean("C0h"), us_poly_lean("M0h")
@@ -269,6 +277,11 @@ def main(argv):
             " over a CPU second %.0f ms lost against at least %.0f ms saved (C2 %.2f us/poly x %d = %.0f; psxrt"
             " measured %d-%d ms/s)" % (delta * 100, c4r["t"], c2["t"], lost, saved, us_poly(c2), POLYS_PER_S,
                                        us_poly(c2) * POLYS_PER_S / 1000, *MEASURED_GPU_POLY_MS))
+        if cpu_ge:
+            # only ge.c moving to the ME, in the lightest 3D scene measured (19.5k polys/s)
+            saved = min(saved, cpu_ge * 19500 / 1000)
+            say("   if only ge.c moves to the ME: %.2f us/poly (C0h less C0d) x 19500 = at least %.0f ms saved"
+                % (cpu_ge, saved))
         p2, p4 = profs.get("C2"), profs.get("C4")
         if p2 and p4:
             say("   memory stall C2 %s -> C4 %s cycles (%+d)" % (p2.get("r4"), p4.get("r4"), num(p4["r4"]) - num(p2["r4"])))
