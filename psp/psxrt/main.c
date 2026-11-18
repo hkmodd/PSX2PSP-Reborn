@@ -33,6 +33,7 @@
 
 #include "disc.h"
 #include "ge.h"
+#include "me.h"
 #include "native.h"
 #include "psx.h"
 #include "sas.h"
@@ -174,6 +175,9 @@ static s16 *rec_buf;
 static volatile u32 rec_w; /* stereo samples recorded */
 static void rec_save(void);
 static volatile int sas_on; /* spu_mode, once sceSasCore runs */
+/* psxrt.me beside the EBOOT: the Media Engine is psxrt's (me.h); sceSasCore runs on the ME, so the
+ * SPU then mixes every voice whatever psxrt.spu says */
+static int me_want;
 /* psxrt.watch beside the EBOOT: PS1 RAM words logged once a second, last value and the sum of
  * the values seen at each display flip (a per-frame variable summed over the game's frames) */
 #define WATCH_MAX 8
@@ -330,6 +334,12 @@ static void open_log(const char *eboot)
         sceIoRead(fd, word, sizeof word - 1);
         sceIoClose(fd);
         spu_mode = !strncmp(word, "cpu", 3) ? 0 : !strncmp(word, "both", 4) ? 2 : 1;
+    }
+    snprintf(slash + 1, sizeof path - (size_t)(slash + 1 - path), "psxrt.me");
+    fd = sceIoOpen(path, PSP_O_RDONLY, 0);
+    if (fd >= 0) {
+        sceIoClose(fd);
+        me_want = 1;
     }
     snprintf(slash + 1, sizeof path - (size_t)(slash + 1 - path), "psxrt.wav");
     fd = sceIoOpen(path, PSP_O_RDONLY, 0);
@@ -1120,6 +1130,7 @@ static void frame(void)
                 n += sites_log(line + n, (int)sizeof line - n);
             }
             n += ge_log(line + n, (int)sizeof line - n);
+            n += me_log(line + n, (int)sizeof line - n);
             u32 k = bench_n - BENCH_SKIP;
             if (bench_secs && bench_n > BENCH_SKIP && k >= bench_secs)
                 n += snprintf(line + n, sizeof line - (size_t)n,
@@ -1392,6 +1403,7 @@ static void rec_save(void)
 static int exit_callback(int a, int b, void *c)
 {
     (void)a, (void)b, (void)c;
+    me_stop();
     if (rec_buf)
         rec_save();
     if (card_changed)
@@ -1509,6 +1521,12 @@ int main(int argc, char **argv)
     host.card_dirty = host_card_dirty;
     psx_init(&psx, &host, (u8 *)FIXED_BASE, (u8 *)SCRATCH_BASE, vram, spu_ram, mdec_in, MDEC_WORDS);
     psx.trace = trace_bits;
+    if (me_want) {
+        char m[320];
+        spu_mode = 0;
+        me_start(m, sizeof m);
+        say("%s; the SPU mixes every voice (psxrt.me)", m);
+    }
     if (spu_mode) { /* before the SPU makes a sample: the stream's sample 0 is sceSasCore's */
         const char *why = sas_init(&psx, spu_mode, palloc);
         if (why) {

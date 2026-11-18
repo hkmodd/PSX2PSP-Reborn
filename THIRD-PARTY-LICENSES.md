@@ -8967,6 +8967,8 @@ Used by:
   ([psp-media-engine-custom-core](https://github.com/mcidclan/psp-media-engine-custom-core),
   [me-dmacplus-sc2me-then-me2sc](https://github.com/mcidclan/me-dmacplus-sc2me-then-me2sc),
   [me-simple-count](https://github.com/mcidclan/me-simple-count))
+- `psp/psxrt` (`me.c`): the Media Engine's boot handler and cache loops, the same as
+  me_probe's (psp-media-engine-custom-core, me-simple-count)
 
 ```
 MIT License
