@@ -561,7 +561,9 @@ static void vf_check(Psx *psx)
     memset(vf_mask, 15, sizeof vf_mask); /* the checks left coefficients everywhere */
 }
 
-#define VF_HALF(n) (n = in[hp >> 1] >> ((hp & 1) << 4) & 0xFFFF, hp++)
+/* The stream read a halfword at a time through a pointer: on the little-endian PSP the halfword
+ * hp of in[] is in[hp >> 1] >> ((hp & 1) << 4) & 0xFFFF, as halfword() reads it. */
+typedef u16 __attribute__((may_alias)) vf_u16;
 #define VF_CLAMP(v) (v < -0x400 ? -0x400 : v > 0x3FF ? 0x3FF : v)
 
 /* rle() for a zeroed block of ints, with the read position in a register and one multiply per
@@ -569,14 +571,14 @@ static void vf_check(Psx *psx)
  * changes. *mask gets the quadrants written to (vf_qbit). */
 static int vf_rle(Mdec *m, s32 *f, int t, u8 *mask)
 {
-    const u32 *in = m->in;
-    u32 hp = (u32)m->hpos, end = (u32)m->nin * 2, n, mk = 0;
+    const vf_u16 *in = (const vf_u16 *)m->in, *h = in + m->hpos, *end = in + m->nin * 2;
+    u32 n, mk = 0;
     do {
-        if (hp >= end) {
-            m->hpos = (int)hp;
+        if (h >= end) {
+            m->hpos = (int)(h - in);
             return 0;
         }
-        VF_HALF(n);
+        n = *h++;
     } while (n == 0xFE00);
     s32 q = (s32)(n >> 10), k = 0, val;
     if (!q)
@@ -584,9 +586,9 @@ static int vf_rle(Mdec *m, s32 *f, int t, u8 *mask)
             val = sext10(n) * 2;
             f[k] = VF_CLAMP(val);
             mk |= vf_qbit[k];
-            if (hp >= end)
+            if (h >= end)
                 break;
-            VF_HALF(n);
+            n = *h++;
             if ((k += (s32)(n >> 10) + 1) > 63)
                 break;
         }
@@ -603,15 +605,15 @@ static int vf_rle(Mdec *m, s32 *f, int t, u8 *mask)
             u32 p = zagzig[k];
             f[p] = VF_CLAMP(val);
             mk |= vf_qbit[p];
-            if (hp >= end)
+            if (h >= end)
                 break;
-            VF_HALF(n);
+            n = *h++;
             if ((k += (s32)(n >> 10) + 1) > 63)
                 break;
             val = (sext10(n) * qq[k] + 4) / 8;
         }
     }
-    m->hpos = (int)hp;
+    m->hpos = (int)(h - in);
     *mask = (u8)mk;
     return 1;
 }
