@@ -38,12 +38,19 @@ void geh_region(const void *p, u32 bytes)
     reg[++nreg].p = (uintptr_t)p, reg[nreg].bytes = bytes;
 }
 
+/* The region holding p; failing that, the one p ends (one past its last byte). Regions the linker
+ * or an arena lays end to end (me_probe.elf: list's end is clut_pool's start) would otherwise
+ * give clut_pool[0] as list + 512 KB, which the hash cannot read: the addresses, so the hashes,
+ * would follow the host's layout. */
 uint32_t geh_addr(const void *p)
 {
     uintptr_t a = (uintptr_t)p;
     for (int i = 1; i <= nreg; i++)
-        if (a >= reg[i].p && a - reg[i].p <= reg[i].bytes)
+        if (a >= reg[i].p && a - reg[i].p < reg[i].bytes)
             return (u32)i << 24 | (u32)(a - reg[i].p);
+    for (int i = 1; i <= nreg; i++)
+        if (a == reg[i].p + reg[i].bytes)
+            return (u32)i << 24 | reg[i].bytes;
     if (a < 1u << 24)
         return (u32)a;
     unknown++;

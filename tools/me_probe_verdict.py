@@ -89,9 +89,12 @@ def main(argv):
     alive = any(b.get("alive") == "1" for b in boots)
     cal = log.first("me calib")
     tpu = None
-    if cal and num(cal.get("us")):
+    if cal and num(cal.get("us")) and num(cal.get("count")):
         tpu = num(cal["count"]) / num(cal["us"])
         say("   ME clock: %s counts in %s us of the CPU's clock = %.2f counts/us" % (cal["count"], cal["us"], tpu))
+    elif cal:
+        say("   ME clock: Count read 0 over %s us (the ME's cp0 Count does not run): its times come from wall_us"
+            % cal.get("us"))
     end = log.first("me end")
     end_ok = bool(end) and end.get("alive") == "1" and end.get("beat_ok") == "1" and end.get("err") == "0"
     if end:
@@ -103,7 +106,7 @@ def main(argv):
         missing.append("me end")
     elif not end_ok:
         why_no.append("the ME did not stay ours to the end (me end)")
-    if tpu is None:
+    if cal is None:
         missing.append("me calib")
 
     # b: reading main RAM from the ME
@@ -198,29 +201,46 @@ def main(argv):
     if not hash_ok:
         why_no.append("the ME's lists are not the CPU's")
 
-    # 2. the ME's time
+    # 2. the ME's time. The frames after the first, less the one that also hashes all of ge.c's
+    # memory (mem=1: the sim's check, not the translator's work).
     c0, c2, m0 = runs.get("C0"), runs.get("C2"), runs.get("M0")
-    me_up = us_poly(m0) if m0 else None
-    cpu_up = us_poly(c0) if c0 else None
-    core = None
+
+    def us_poly_lean(name):
+        fs = [f for f in frames.get(name, [])[1:] if f.get("mem") != "1"]
+        polys = sum(num(f["polys"]) for f in fs)
+        return sum(num(f["t"]) for f in fs) / polys if polys else None
+
+    cpu_up = us_poly_lean("C0") if c0 else None
+    me_up, how = (us_poly_lean("M0"), "its clock") if m0 and tpu else (None, None)
+    if not me_up and m0 and c0 and cpu_up and num(m0.get("wall_us")) and num(c0.get("wall_us")):
+        # the ME has no clock of its own: the same work, so the CPU's time scaled by the walls
+        me_up, how = cpu_up * num(m0["wall_us"]) / num(c0["wall_us"]), "C0's x the walls M0/C0"
     if me_up and cpu_up:
+        ratio = me_up / cpu_up
         core = me_up * POLYS_PER_S / 1e6
-        say("2. ME %.2f us/poly against the CPU's %.2f (x%.2f): at %d polys/s the ME is busy %.0f ms of its second"
-            " (GO at most %.0f)" % (me_up, cpu_up, me_up / cpu_up, POLYS_PER_S, core * 1000, GO_CORE * 1000))
-        if core > GO_CORE:
-            why_no.append("the ME needs %.0f ms a second at %d polys/s" % (core * 1000, POLYS_PER_S))
+        lo, hi = (ms * ratio for ms in MEASURED_GPU_POLY_MS)
+        say("2. ME %.2f us/poly (%s) against the CPU's %.2f (x%.2f), the memory hash's frame left out" % (
+            me_up, how, cpu_up, ratio))
+        say("   replay as run: at %d polys/s the ME is busy %.0f ms of its second (the replay hashes each frame's"
+            " list: an upper bound)" % (POLYS_PER_S, core * 1000))
+        say("   psxrt's own %d-%d ms/s of gpu poly x%.2f: the ME busy %.0f-%.0f ms of its second (GO at most %.0f)"
+            % (MEASURED_GPU_POLY_MS[0], MEASURED_GPU_POLY_MS[1], ratio, lo, hi, GO_CORE * 1000))
+        if hi > GO_CORE * 1000:
+            why_no.append("the ME needs up to %.0f ms a second" % hi)
     else:
         missing.append("M0 or C0 with polys")
 
     # 3. the CPU's loss against its saving
     c4r = runs.get("C4")
     if c2 and c4r and us_poly(c2) and us_poly(c4r):
-        saved = us_poly(c2) * POLYS_PER_S / 1000
+        # saved: the least of the replay's own time and psxrt's measured gpu poly time
+        saved = min(us_poly(c2) * POLYS_PER_S / 1000, MEASURED_GPU_POLY_MS[0])
         delta = (num(c4r["t"]) - num(c2["t"])) / num(c2["t"])
         lost = max(delta, 0) * 1000
         say("3. the CPU translator with the ME translating beside it: %+.1f%% (C4 %s us against C2 %s us);"
-            " over a CPU second %.0f ms lost against %.0f ms saved (C2 %.2f us/poly x %d; psxrt measured %d-%d ms/s)"
-            % (delta * 100, c4r["t"], c2["t"], lost, saved, us_poly(c2), POLYS_PER_S, *MEASURED_GPU_POLY_MS))
+            " over a CPU second %.0f ms lost against at least %.0f ms saved (C2 %.2f us/poly x %d = %.0f; psxrt"
+            " measured %d-%d ms/s)" % (delta * 100, c4r["t"], c2["t"], lost, saved, us_poly(c2), POLYS_PER_S,
+                                       us_poly(c2) * POLYS_PER_S / 1000, *MEASURED_GPU_POLY_MS))
         p2, p4 = profs.get("C2"), profs.get("C4")
         if p2 and p4:
             say("   memory stall C2 %s -> C4 %s cycles (%+d)" % (p2.get("r4"), p4.get("r4"), num(p4["r4"]) - num(p2["r4"])))
