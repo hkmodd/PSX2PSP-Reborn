@@ -1003,6 +1003,33 @@ int native_entries_log(char *buf, int len)
     return n < len ? n + snprintf(buf + n, (size_t)(len - n), "\n") : len;
 }
 
+/* us_interp is the interpreter's own time: inside a timed run_guest, the work other counters time
+ * (device updates, sync_time's sleeps, guest calls run natively) is taken off. In a filmed second
+ * of Sheep Dog its update() calls were 30-50 ms of "interp" against ~2 ms of interpreting (the
+ * 473 ReturnFromException a second), and one long update in a sample counted 16 times made the
+ * 74-425 ms spikes. The outermost bracket open sets excl_us to its start value plus its length,
+ * whatever timed samples nested inside it took off. */
+static int timing;   /* timed run_guests in progress */
+static int excl_open; /* a bracket is open (inside the innermost timed run_guest) */
+static u32 excl_us;
+typedef struct {
+    u32 t, e;
+    int on;
+} Excl;
+
+static void excl_begin(Excl *x)
+{
+    x->on = timing && !excl_open;
+    if (x->on)
+        excl_open = 1, x->e = excl_us, x->t = sceKernelGetSystemTimeLow();
+}
+
+static void excl_end(const Excl *x)
+{
+    if (x->on)
+        excl_us = x->e + (sceKernelGetSystemTimeLow() - x->t), excl_open = 0;
+}
+
 static u32 run_guest(int mode)
 {
     static u32 n;
@@ -1010,9 +1037,12 @@ static u32 run_guest(int mode)
     if (n++ % PROF_EVERY) {
         h = interp(mode);
     } else {
-        u32 t = sceKernelGetSystemTimeLow();
+        int open = excl_open;
+        u32 e0 = excl_us, t = sceKernelGetSystemTimeLow();
+        excl_open = 0, timing++;
         h = interp(mode);
-        native_stats.us_interp += (sceKernelGetSystemTimeLow() - t) * PROF_EVERY - prof_bias;
+        timing--, excl_open = open;
+        native_stats.us_interp += (sceKernelGetSystemTimeLow() - t - (excl_us - e0)) * PROF_EVERY - prof_bias;
     }
     if (P->trace & 256)
         entry_note(pc, native_stats.steps - s0);
@@ -1059,8 +1089,10 @@ static u32 interp(int mode)
             } else {
                 if (isolated)
                     isolated = 0, cache_flushed();
-                u32 h = host_of(pc);
-                if (!h && try_load(pc, mode == 1))
+                /* the BIOS vectors are cpu_step's HLE whatever RAM holds there: no translation to
+                 * look for (try_load's floating-code search ran on every ReturnFromException) */
+                u32 h = host_of(pc), v = pc & 0x1FFFFFFFu;
+                if (!h && v != 0xA0 && v != 0xB0 && v != 0xC0 && try_load(pc, mode == 1))
                     h = host_of(pc);
                 if (h) {
                     finish_load(c);
@@ -1070,10 +1102,15 @@ static u32 interp(int mode)
             }
         }
         mode = 0;
-        if (!(n & 255))
-            sync_time();
-        if (P->cycles >= P->next_event)
-            update();
+        if (!(n & 255) || P->cycles >= P->next_event) {
+            Excl x;
+            excl_begin(&x);
+            if (!(n & 255))
+                sync_time();
+            if (P->cycles >= P->next_event)
+                update();
+            excl_end(&x);
+        }
         u32 at = c->pc, p = at & 0x1FFFFFFFu;
         if (cpu_step(P) < 0)
             P->exiting = 2;
@@ -1777,6 +1814,8 @@ static void native_call(Psx *psx, u32 addr)
     ra_link = 1;
     c->load_reg = 0;
     jump(c, addr);
+    Excl x;
+    excl_begin(&x);
     u32 h = run_guest(1);
     if (h != STUB_CALL_RET) {
         guest_calls++;
@@ -1785,6 +1824,7 @@ static void native_call(Psx *psx, u32 addr)
         from_ctx(c);
         charge();
     }
+    excl_end(&x);
     c->gpr[31] = ra, ra_link = link;
     c->pc = pc, c->next_pc = next, c->in_delay = delay;
 }
