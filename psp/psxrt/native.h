@@ -36,6 +36,11 @@ typedef struct NativeStats {
     u32 vsync_passes; /* v_wait passes counted down at once by hook_vsync_wait (not run as guest code) */
     u32 fl_places, fl_reused, fl_drops, fl_full; /* floating code: units placed, placements reinstalled, dropped, refused for room */
     u32 us_loaded; /* microseconds checking the translations of what DMAs and BIOS reads loaded (on_ram_loaded); main.c zeroes it */
+    /* owed-vblank stalls held by guest_owes: on an interrupt the CPU takes, a raised timer bit,
+     * a queued sector; the I_STAT bits and CD interrupt masks seen then (main.c zeroes them);
+     * PS1 kcycles of stall asked and run; CD sectors replaced while it ran; parts ended on 1024
+     * events, events found due and not run; PS1 cycles the CD drive waited in it for the guest */
+    u32 st_cut[3], st_bits, st_cdmask, st_ask_k, st_done, st_repl, st_jump[2], st_cdwait;
 } NativeStats;
 
 extern NativeStats native_stats;

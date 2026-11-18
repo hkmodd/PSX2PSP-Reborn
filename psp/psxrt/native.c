@@ -1055,8 +1055,10 @@ void native_vsync(void)
         t_base = t_lock + VS_US(vc - v_lock) - VS_MARGIN;
         /* the next slot has passed too: the CPU stalls to VS_SHORT before its vblank (psx_update
          * has moved next_vblank a frame on already; update() runs the stall, event by event) */
-        if ((s32)(v - vc) >= 0 && P->cycles + VS_SHORT < P->next_vblank)
+        if ((s32)(v - vc) >= 0 && P->cycles + VS_SHORT < P->next_vblank) {
             stall_to = P->next_vblank - VS_SHORT, native_stats.vs_short++;
+            native_stats.st_ask_k += (u32)((stall_to - P->cycles) / 1000);
+        }
     }
     c_base = P->cycles;
 }
@@ -1086,8 +1088,12 @@ static void update_once(void);
  * boot hung in CD_init). An interrupt the CPU takes ends the stall's part: the guest serves it,
  * and the next update goes on to stall_to. A device that waits on the guest (the CD's next
  * sector replaces one whose INT1 is not acknowledged: libcd's CdRead then sees "sector error")
- * never runs past an interrupt the guest has not had, taken or not (guest_owes: stopping only on
- * one the CPU takes let a stall inside the handler, SR.IEc 0, lose Spyro 2's sectors for good). */
+ * never runs past an interrupt the guest would lose (guest_owes: stopping only on one the CPU
+ * takes let a stall inside the handler, SR.IEc 0, lose Spyro 2's sectors for good; stopping on any
+ * raised bit held the stall through Sheep Dog's whole frame, run with a vblank or CD bit raised,
+ * so it ran only in the vblank wait and every flip stayed one vblank: 45% speed in the hub), and
+ * the CD reads nothing while the guest owes it (cd_waits). It never jumps past an event: one due
+ * and not run, or 1024 in a row, end its part there. */
 static void update_stall(void);
 /* Brackets one non-vblank update in PB_EVERY (a vblank's presents and sleeps: other threads run
  * inside it, on the same counters). */
@@ -1102,15 +1108,36 @@ static void update(void)
         prof_end(PB_UPDATE, native_stats.calls != calls);
 }
 
-/* The guest has an interrupt or a CD sector it has not served: a raised, unmasked I_STAT bit
- * (even while SR.IEc is 0: the guest is in its handler, or polls I_STAT), a CD interrupt not
- * acknowledged, or a data sector queued for delivery. */
+/* Running the devices on would lose the guest an interrupt: one the CPU takes now (it serves it
+ * at once); a raised, unmasked timer bit (even while SR.IEc is 0: the next raise would merge
+ * into it, a root-counter tick lost); a data sector queued behind an unacknowledged INT1 (the
+ * next one replaces it). A raised vblank, CD, DMA, SIO or SPU bit alone loses nothing: no
+ * vblank comes inside a stall, the CD queues its next sector and stops here, DICR and the SIO
+ * keep their own state. An unacknowledged CD interrupt alone does not stop it either: Sheep
+ * Dog's hub serves the CD once a frame, and stopping there held the stall to its vblank wait. */
 static int guest_owes(const Psx *p)
 {
-    if ((p->i_stat & p->i_mask) || (p->cd.irq_flags & 7))
-        return 1;
-    for (int i = 0; i < p->cd.nq; i++)
+    int why = psx_irq_pending(p) ? 0 : (p->i_stat & p->i_mask & 0x70) ? 1 : -1;
+    for (int i = 0; why < 0 && i < p->cd.nq; i++)
         if (p->cd.q[i].sector)
+            why = 2;
+    if (why < 0)
+        return 0;
+    native_stats.st_cut[why]++, native_stats.st_bits |= p->i_stat & p->i_mask, native_stats.st_cdmask |= p->cd.irq_mask;
+    return 1;
+}
+
+/* The CD has handed the guest something it has not acknowledged, or holds a sector for it: a
+ * sector read now would come behind it, and the guest, which runs no code in a stall, would meet
+ * two at once when it ends and stay one behind the drive from then on (Spyro 2: one replaced
+ * sector and "CdRead: sector error" a frame). The stall keeps the drive where it is instead: the
+ * guest sees its sectors come as far apart in its own running time as on the PS1. */
+static int cd_waits(const Cdrom *cd)
+{
+    if (cd->irq_flags & 7)
+        return 1;
+    for (int i = 0; i < cd->nq; i++)
+        if (cd->q[i].sector)
             return 1;
     return 0;
 }
@@ -1118,15 +1145,29 @@ static int guest_owes(const Psx *p)
 static void update_stall(void)
 {
     update_once();
+    u32 repl = P->cd.n_replaced;
     for (int k = 0; stall_to > P->cycles && !guest_owes(P); k++) {
-        u64 to = stall_to < P->next_event && k < 1024 ? stall_to : P->next_event;
-        if (k >= 1024 || to <= P->cycles)
-            to = stall_to;
+        u64 to = stall_to < P->next_event ? stall_to : P->next_event;
+        if (to <= P->cycles) { /* an event due and not run: run it, or end here if it stays due */
+            native_stats.st_jump[1]++;
+            psx_update(P);
+            if (P->next_event <= P->cycles)
+                break;
+            continue;
+        }
+        if (k >= 1024) { /* the guest runs a little, the next update goes on (no event skipped) */
+            native_stats.st_jump[0]++;
+            break;
+        }
         c_base += to - P->cycles; /* native_vsync's c_base is after the stall, as for a frame on time */
+        native_stats.st_done += (u32)(to - P->cycles);
+        if (P->cd.reading && cd_waits(&P->cd)) /* the drive waits on the guest: no sector under the head */
+            P->cd.read_due += to - P->cycles, native_stats.st_cdwait += (u32)(to - P->cycles);
         P->cycles = to;
         if (P->cycles >= P->next_event)
             psx_update(P);
     }
+    native_stats.st_repl += P->cd.n_replaced - repl;
     if (stall_to <= P->cycles)
         stall_to = 0;
 }
