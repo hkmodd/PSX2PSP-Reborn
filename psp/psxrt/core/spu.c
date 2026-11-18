@@ -591,10 +591,13 @@ typedef struct {
 static u32 rv_at(const Rv *w, s32 off)
 {
     s32 a = w->cur + off;
-    if ((u32)a >= (u32)w->size) {
-        a %= w->size;
-        if (a < 0)
-            a += w->size;
+    if ((u32)a >= (u32)w->size) { /* one area over or under, mostly: a division costs ~40 cycles */
+        a += a < 0 ? w->size : -w->size;
+        if ((u32)a >= (u32)w->size) {
+            a %= w->size;
+            if (a < 0)
+                a += w->size;
+        }
     }
     return (u32)(w->base + a) * 2;
 }
@@ -625,17 +628,31 @@ static s32 rv_apf(Spu *s, const Rv *w, s32 x, int m, int d, int vol)
 }
 
 /* Whether the reverb only reads zeros over a chunk: it writes nothing and its work area, clear of
- * the capture buffers the chunk writes, holds zeros (looked at when it is at most 1 KB, so the
- * look costs less than the steps it saves). */
+ * the capture buffers the chunk writes, holds zeros. What the area holds is looked at again only
+ * after something may have written it: a transfer into it (transfer), a chunk with the reverb's
+ * writes on (here), new RAM (spu_ram_changed). Sheep Dog's FMVs play with the writes off, the
+ * output volumes up and 18 KB of zeros: ~1000 cycles a step for nothing, 22050 steps a second. */
+static u32 rz_lo = ~0u; /* the area looked at (its first byte), ~0u: none */
+static const u8 *rz_ram;
+static int rz_zero;
+void spu_ram_changed(void) { rz_lo = ~0u; }
+
 static int rev_silent(const Spu *s)
 {
     u32 a = (u32)G(0x1F801DA2) * 8;
-    if ((s->ctrl & 0x80) || a < 0x1000 || a < 0x80000 - 0x400)
+    if (s->ctrl & 0x80) {
+        rz_lo = ~0u;
         return 0;
-    u32 w = 0;
-    for (; a < 0x80000 && !w; a += 4)
-        memcpy(&w, s->ram + a, 4);
-    return !w;
+    }
+    if (a < 0x1000)
+        return 0;
+    if (a != rz_lo || s->ram != rz_ram) {
+        u32 w = 0;
+        for (u32 p = a; p < 0x80000 && !w; p += 4)
+            memcpy(&w, s->ram + p, 4);
+        rz_lo = a, rz_ram = s->ram, rz_zero = !w;
+    }
+    return rz_zero;
 }
 
 static void reverb(Spu *s, s32 inl, s32 inr, int silent)
@@ -874,6 +891,8 @@ static void transfer(Psx *psx, u16 v)
             if ((hw >> i & 1) && a >= hw_v[i].start && a < hw_v[i].end)
                 hw_release(psx, i, 0, 1);
     hw_dirty[a >> 15] |= 1u << (a >> 10 & 31);
+    if (a >= rz_lo) /* into the reverb's area: what it holds is looked at again */
+        rz_lo = ~0u;
     wr16(s->ram, a, v);
     if ((s->ctrl & 0x40) && a == s->irq_addr)
         irq(psx);

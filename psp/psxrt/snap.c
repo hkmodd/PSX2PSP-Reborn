@@ -104,6 +104,7 @@ int snap_load(const char *path, Psx *psx, const DiscInfo *info, u32 *host_pc, u3
           get(fd, mdec_in, h.mdec_words * 4) || native_load(fd);
     sceIoClose(fd);
     sceKernelDcacheWritebackInvalidateAll();
+    spu_ram_changed();
     if (bad)
         return -3;
     *host_pc = h.host_pc, *frames = h.frames;

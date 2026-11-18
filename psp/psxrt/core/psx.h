@@ -607,6 +607,8 @@ void spu_write(Psx *psx, u32 addr, u16 v);
 void spu_dma_write(Psx *psx, u32 v);
 u32 spu_dma_read(Psx *psx);
 void spu_run(Psx *psx);
+/* SPU RAM was written other than through the SPU's ports (a snapshot loaded) */
+void spu_ram_changed(void);
 
 /* Voices played by a mixer of the host's (the PSP's sceSasCore on the Media Engine). Mode 0: the
  * SPU mixes every voice; 1: the host may take voices at key on; 2: the host takes them and the
