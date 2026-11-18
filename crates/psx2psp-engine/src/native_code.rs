@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::{Arc, OnceLock};
 
 use psx2psp_recomp::emit::{Reloc, mem_op, patchable, repatch, takes_offset, translate_floating};
-use psx2psp_recomp::{Discovery, Hazards, Hit, PsxExe, Signatures, Translation, layout, overlay, translate};
+use psx2psp_recomp::{Discovery, Hazards, Hit, PsxExe, Signatures, Translation, decipher, layout, overlay, translate};
 use rayon::prelude::*;
 
 /// Lowest host address translated code may take: below it are the runtime module, its heap and
@@ -511,7 +511,10 @@ pub fn build(exes: Vec<(String, Vec<u8>)>, overlays: Vec<Overlay>, captured: Vec
             parsed.push((name, exe, true, file.map(|(o, f)| Around::File(base.wrapping_sub(o), f))));
         }
     }
-    floating(&mut pack, &unplaced);
+    // Code an image deciphers in its own text before it runs it ([`decipher`]): what the disc
+    // holds there is noise; the deciphered code is floating, placed where RAM holds it.
+    let ciphered: Vec<(String, FloatingUnit)> = parsed.par_iter().flat_map_iter(|(name, exe, _, far)| deciphered_units(exe, far).into_iter().map(move |u| (format!("{name} deciphered"), u))).collect();
+    floating(&mut pack, &unplaced, &ciphered);
     // A captured run keeps only what lies outside the text of every disc image: one image across
     // an executable and the slot its overlays are loaded into would call the overlay resident at
     // capture directly, and run it after another overlay is loaded there.
@@ -762,10 +765,41 @@ pub fn build(exes: Vec<(String, Vec<u8>)>, overlays: Vec<Overlay>, captured: Vec
     Ok(pack)
 }
 
-/// [`CodePack::floating`] of the overlays `unplaced`: their units, the same words once (with the
-/// entries every file gives them), translated.
-fn floating(pack: &mut CodePack, unplaced: &[(String, Vec<u8>)]) {
+/// The floating units of the code `exe` deciphers in its text ([`decipher::deciphered`]): the
+/// deciphered text discovered from its entry and the entries of the jumps into what was
+/// deciphered, and each run of the code it finds in a deciphered span, entered at every word
+/// but a delay slot. `far`: the data around the text, as the image's own discovery reads it.
+fn deciphered_units(exe: &PsxExe, far: &Option<Around>) -> Vec<FloatingUnit> {
+    let Some(d) = decipher::deciphered(exe) else { return Vec::new() };
+    let x = PsxExe { text: d.text, ..exe.clone() };
+    let disc = match far {
+        Some(Around::Ram(seg, ram)) => Discovery::run_file(&x, &[(*seg, &ram[..])], &[], &d.entries),
+        Some(Around::File(at, file)) => Discovery::run_file(&x, &[], &[(*at, &file[..])], &d.entries),
+        None => Discovery::run_file(&x, &[], &[], &d.entries),
+    };
+    let mut out: Vec<FloatingUnit> = Vec::new();
+    for &(s, e) in &d.spans {
+        let mut last = None;
+        for &a in disc.code.range(s..e) {
+            if last != Some(a.wrapping_sub(4)) {
+                out.push(FloatingUnit { words: Vec::new(), entries: Vec::new() });
+            }
+            let u = out.last_mut().unwrap();
+            if !disc.delay_slots.contains_key(&a) {
+                u.entries.push(u.words.len() as u32);
+            }
+            u.words.push(x.word(a).unwrap_or(0));
+            last = Some(a);
+        }
+    }
+    out
+}
+
+/// [`CodePack::floating`] of the overlays `unplaced` and the units `more`: their units, the same
+/// words once (with the entries every file gives them), translated.
+fn floating(pack: &mut CodePack, unplaced: &[(String, Vec<u8>)], more: &[(String, FloatingUnit)]) {
     let mut units: Vec<(FloatingUnit, &str)> = unplaced.par_iter().flat_map_iter(|(n, b)| floating_units(b).into_iter().map(move |(_, u)| (u, n.as_str()))).collect();
+    units.extend(more.iter().map(|(n, u)| (u.clone(), n.as_str())));
     units.par_sort_unstable_by(|a, b| a.0.words.cmp(&b.0.words).then(a.1.cmp(b.1)));
     let mut uniq: Vec<(FloatingUnit, &str)> = Vec::new();
     for (u, n) in units {
@@ -827,6 +861,49 @@ mod tests {
 
     const JR_RA: u32 = 0x03E0_0008;
     const ADDIU_V0_1: u32 = 0x2402_0001;
+
+    /// Code an executable deciphers in its text before it jumps in (Spyro 2's LibCrypt check:
+    /// XOR with a key that steps `key = c - key`) is a floating unit of the deciphered words,
+    /// entered where the jump goes.
+    #[test]
+    fn code_deciphered_in_the_text_is_floating() {
+        const T: u32 = 0x8001_0000;
+        let i = |op: u32, rs: u32, rt: u32, imm: u32| op << 26 | rs << 21 | rt << 16 | (imm & 0xFFFF);
+        let r = |rs: u32, rt: u32, rd: u32, f: u32| rs << 21 | rt << 16 | rd << 11 | f;
+        let (v0, v1, t0, t2, t6, t7) = (2, 3, 8, 10, 14, 15);
+        let (key, c, at) = (0x6D24_339Bu32, 0x16D1_6348u32, T + 4 * 18);
+        let plain = [ADDIU_V0_1, 0x2442_0002, JR_RA, 0];
+        let mut w = vec![
+            i(0x0F, 0, t0, at >> 16),
+            i(0x09, t0, t0, at),
+            i(0x0F, 0, v0, key >> 16),
+            i(0x0D, v0, v0, key),
+            i(0x0F, 0, v1, c >> 16),
+            i(0x0D, v1, v1, c),
+            i(0x0F, 0, t6, at >> 16),
+            i(0x09, t6, t6, at),
+            i(0x08, 0, t7, plain.len() as u32),
+            i(0x23, t6, t2, 0),
+            i(0x08, t7, t7, 0xFFFF),
+            r(t2, v0, t2, 0x26),
+            i(0x2B, t6, t2, 0),
+            i(0x08, t6, t6, 4),
+            i(0x05, t7, 0, 0xFFFA),
+            r(v1, v0, v0, 0x22),
+            r(t0, 0, 0, 8),
+            0,
+        ];
+        let mut k = key;
+        for p in plain {
+            w.push(p ^ k);
+            k = c.wrapping_sub(k);
+        }
+        let pack = build(vec![("SCES_000.00".into(), exe(T, &w))], vec![], vec![]).unwrap();
+        let units: Vec<&FloatingUnit> = pack.floating.iter().map(|f| &f.unit).collect();
+        assert_eq!(units.len(), 1, "{units:?}");
+        assert_eq!(units[0].words, plain);
+        assert_eq!(units[0].entries[0], 0);
+    }
 
     #[test]
     fn fnv1a32_matches_the_reference() {

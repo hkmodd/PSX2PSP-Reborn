@@ -565,6 +565,9 @@ fn cmd_coverage(args: &[String]) -> R {
     for (_, (a, n, f, k)) in miss.iter().enumerate().filter(|(i, m)| *i < 40 || m.3 != Miss::Floating) {
         println!("  {:08X}-{:08X} {n:6} words, first run by frame {f}: {k:?}", a | 0x8000_0000, (a + 4 * n) | 0x8000_0000);
     }
+    for (a, name, ran, disc) in &c.replaced {
+        println!("  replaced {:08X} in {name}: ran {ran:08X}, disc {disc:08X}", a | 0x8000_0000);
+    }
     Ok(())
 }
 

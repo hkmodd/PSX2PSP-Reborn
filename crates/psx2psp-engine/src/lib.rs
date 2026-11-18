@@ -1234,6 +1234,9 @@ pub struct Coverage {
     /// off its sites (and per opcode of such a word, the words); in a packed unit whose words in
     /// the run it takes (RAM differs elsewhere in it, or the guest never entered it there).
     pub unit_miss: (usize, usize, usize, std::collections::BTreeMap<u32, usize>, usize),
+    /// Each [`Miss::Replaced`] word: address, the image whose text it is in, the instruction as
+    /// it ran, the word of the disc text there.
+    pub replaced: Vec<(u32, String, u32, u32)>,
 }
 
 /// An overlay candidate that holds code the game runs at addresses it picks ([`Miss::Floating`]).
@@ -1496,6 +1499,17 @@ pub fn static_coverage(img: &DiscImage, patches: &[&dyn ImagePatch], cipher: Opt
     cov.units.4 = in_unit.len();
     cov.floating = fl.into_values().collect();
     cov.kernel = kernel.len();
+    for &(a, insn) in seen.iter().filter(|(k, v)| !v.1 && missing[&k.0].1 == Miss::Replaced).map(|(k, _)| k) {
+        for i in &pack.images {
+            let Some(o) = a.checked_sub(i.text_addr & 0x1F_FFFF).filter(|&o| o < i.text_size) else { continue };
+            let o = o as usize;
+            let disc = texts.get(&i.name).and_then(|t| t.get(o..o + 4)).map_or(0, |w| u32::from_le_bytes(w.try_into().unwrap()));
+            if disc != insn {
+                cov.replaced.push((a, i.name.clone(), insn, disc));
+            }
+        }
+    }
+    cov.replaced.sort_unstable();
     for (&a, &(f, c)) in &missing {
         match cov.missing.last_mut() {
             Some((s, n, f0, c0)) if *s + 4 * *n == a && *c0 == c => {

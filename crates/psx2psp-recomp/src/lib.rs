@@ -6,6 +6,7 @@
 //! discovery, the load-delay hazard check, the Allegrex emitter with its host memory layout, and
 //! an interpreter that runs either side, used as the oracle of the differential tests.
 
+pub mod decipher;
 pub mod discover;
 pub mod emit;
 pub mod exe;
