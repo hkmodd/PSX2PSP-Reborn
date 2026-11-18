@@ -284,20 +284,27 @@ static int repatch(u32 host, u32 guest, u32 *out)
 
 /* `slot`: the block's first word is the delay slot of the word before, as when the sums were
  * taken (blk_slot0): a block sent to the interpreter must not change the next one's sums. */
-static u32 blk_code_sum(u32 b, u8 *code, u32 *fsum, int slot)
+static inline __attribute__((always_inline)) u32 code_sum(u32 b, u8 *code, u32 *fsum, int slot, const int forms)
 {
     const u32 *w = (const u32 *)(P->ram + (b << BLK_SHIFT)), *t = &table[b << (BLK_SHIFT - 2)];
     u32 h = 0x811C9DC5u, f = h;
     *code = 0;
     for (u32 i = 0; i < 1u << (BLK_SHIFT - 2); i++) {
         int in = is_code(t[i]);
-        if (in || slot)
-            h = (h ^ w[i]) * 0x01000193u, f = (f ^ form(w[i])) * 0x01000193u, *code = 1;
+        if (in || slot) {
+            h = (h ^ w[i]) * 0x01000193u, *code = 1;
+            if (forms)
+                f = (f ^ form(w[i])) * 0x01000193u;
+        }
         slot = in && has_slot(w[i]);
     }
-    *fsum = f;
+    if (forms)
+        *fsum = f;
     return h;
 }
+static u32 blk_code_sum(u32 b, u8 *code, u32 *fsum, int slot) { return code_sum(b, code, fsum, slot, 1); }
+/* The words' sum alone: recheck needs the forms' only for a block whose words changed. */
+static u32 blk_word_sum(u32 b, u8 *code, int slot) { return code_sum(b, code, NULL, slot, 0); }
 
 /* The table entries of [a, a + len) of RAM changed: their blocks are summed again. */
 static void blk_resum(u32 a, u32 len)
@@ -906,8 +913,11 @@ static void recheck(int all, u32 st[4])
         carried = 0;
         u32 f = 0, s = 0;
         if (blk_code[b])
-            st[0]++, s = blk_code_sum(b, &any, &f, blk_slot0[b]);
-        int diff = blk_code[b] && (all || s != blk_sum[b]), same = f == blk_form[b];
+            st[0]++, s = blk_word_sum(b, &any, blk_slot0[b]);
+        int diff = blk_code[b] && (all || s != blk_sum[b]);
+        if (diff)
+            blk_code_sum(b, &any, &f, blk_slot0[b]);
+        int same = f == blk_form[b];
         if (!diff && !has)
             continue;
         int whole = 0;
