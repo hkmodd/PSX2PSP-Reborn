@@ -1769,13 +1769,16 @@ fn write_native_psar<W: Write + Seek>(
 }
 
 /// PARAM.SFO of a native EBOOT: a PSP game (category `MG`, what the pspsdk's mksfo writes),
-/// with the title and ID of the PS1 disc.
+/// with the title and ID of the PS1 disc. `MEMSIZE` 1 is the pspsdk's `PSP_LARGE_MEMORY`: on a
+/// PSP-2000/3000 the user partition takes the extra 32 MB (the runtime's floating code and caches
+/// live there; PPSSPP grows the partition only with it, PSPLoaders.cpp); a PSP-1000 ignores it.
 pub fn native_sfo(title: &str, disc_id: &str) -> Sfo {
     let mut sfo = Sfo::new();
     sfo.set_int("BOOTABLE", 1);
     sfo.set_str("CATEGORY", "MG", 4);
     sfo.set_str("DISC_ID", disc_id, 16);
     sfo.set_str("DISC_VERSION", "1.00", 8);
+    sfo.set_int("MEMSIZE", 1);
     sfo.set_int("PARENTAL_LEVEL", 1);
     sfo.set_str("PSP_SYSTEM_VER", "1.00", 8);
     sfo.set_int("REGION", 0x8000);
@@ -2408,6 +2411,7 @@ mod tests {
         assert_eq!(sfo.get_str("DISC_ID"), Some("SLES02895"));
         assert_eq!(sfo.get_str("TITLE"), Some("Sheep Dog 'n' Wolf"));
         assert_eq!(sfo.get_int("BOOTABLE"), Some(1));
+        assert_eq!(sfo.get_int("MEMSIZE"), Some(1));
         assert_eq!(pbp.read(Section::Icon0).unwrap(), icon0);
         assert!(pbp.read(Section::Pic1).unwrap().is_empty());
 
