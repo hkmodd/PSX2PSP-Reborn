@@ -17,6 +17,7 @@ pub mod interp;
 pub mod layout;
 pub mod overlay;
 pub mod psyq;
+pub mod unpack;
 
 pub use discover::{Body, DeadEnd, Discovery, Flow, JumpReg, Origin};
 pub use emit::{EmitError, Reason, Translation, translate};

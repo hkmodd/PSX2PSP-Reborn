@@ -76,7 +76,7 @@ impl Bus for Text<'_> {
 }
 
 /// A run's registers: none zero but `zero`, different for each `seed`.
-fn cpu(pc: u32, seed: u64) -> Cpu {
+pub(crate) fn cpu(pc: u32, seed: u64) -> Cpu {
     let mut s = seed;
     let mut next = || {
         s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);

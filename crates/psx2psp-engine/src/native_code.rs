@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::{Arc, OnceLock};
 
 use psx2psp_recomp::emit::{Reloc, mem_op, patchable, repatch, takes_offset, translate_floating};
-use psx2psp_recomp::{Discovery, Hazards, Hit, PsxExe, Signatures, Translation, decipher, layout, overlay, translate};
+use psx2psp_recomp::{Discovery, Hazards, Hit, PsxExe, Signatures, Translation, decipher, layout, overlay, translate, unpack};
 use rayon::prelude::*;
 
 /// Lowest host address translated code may take: below it are the runtime module, its heap and
@@ -571,7 +571,9 @@ pub fn build(exes: Vec<(String, Vec<u8>)>, overlays: Vec<Overlay>, captured: Vec
     }
     // Code an image deciphers in its own text before it runs it ([`decipher`]): what the disc
     // holds there is noise; the deciphered code is floating, placed where RAM holds it.
-    let ciphered: Vec<(String, FloatingUnit)> = parsed.par_iter().flat_map_iter(|(name, exe, _, far)| deciphered_units(exe, far).into_iter().map(move |u| (format!("{name} deciphered"), u))).collect();
+    let mut ciphered: Vec<(String, FloatingUnit)> = parsed.par_iter().flat_map_iter(|(name, exe, _, far)| deciphered_units(exe, far).into_iter().map(move |u| (format!("{name} deciphered"), u))).collect();
+    // Code an executable unpacks into RAM before it runs it ([`unpack`]): floating as well.
+    ciphered.par_extend(parsed.par_iter().filter(|(_, _, overlay, _)| !overlay).flat_map_iter(|(name, exe, ..)| unpacked_units(exe).into_iter().map(move |u| (format!("{name} unpacked"), u))));
     floating(&mut pack, &unplaced, &ciphered);
     // A captured run keeps only what lies outside the text of every disc image: one image across
     // an executable and the slot its overlays are loaded into would call the overlay resident at
@@ -807,8 +809,28 @@ fn deciphered_units(exe: &PsxExe, far: &Option<Around>) -> Vec<FloatingUnit> {
         Some(Around::File(at, file)) => Discovery::run_file(&x, &[], &[(*at, &file[..])], &d.entries),
         None => Discovery::run_file(&x, &[], &[], &d.entries),
     };
+    units_in(&x, &disc, &d.spans)
+}
+
+/// The floating units of the code `exe` unpacks into RAM before it runs it
+/// ([`unpack::unpacked`]): the RAM as the unpacker leaves it, discovered from the entries it ran,
+/// and each run of the code found in what it wrote, entered at every word but a delay slot.
+fn unpacked_units(exe: &PsxExe) -> Vec<FloatingUnit> {
+    let Some(u) = unpack::unpacked(exe) else { return Vec::new() };
+    let seg = u.entries[0] & !0x1FFF_FFFF;
+    let entries: Vec<u32> = u.entries.iter().copied().filter(|&e| e & !0x1FFF_FFFF == seg).collect();
+    let (lo, hi) = (u.spans[0].0, u.spans[u.spans.len() - 1].1);
+    let x = PsxExe { pc0: entries[0], gp0: exe.gp0, text_addr: seg | lo, text: u.ram[lo as usize..hi as usize].to_vec(), bss: (0, 0), stack: (0, 0) };
+    let disc = Discovery::run_file(&x, &[(seg, &u.ram[..])], &[], &entries);
+    let spans: Vec<(u32, u32)> = u.spans.iter().map(|&(s, e)| (seg | s, seg | e)).collect();
+    units_in(&x, &disc, &spans)
+}
+
+/// The floating units of the code `disc` found in `spans` of `x`: one per run of consecutive
+/// words, entered at every word but a delay slot.
+fn units_in(x: &PsxExe, disc: &Discovery, spans: &[(u32, u32)]) -> Vec<FloatingUnit> {
     let mut out: Vec<FloatingUnit> = Vec::new();
-    for &(s, e) in &d.spans {
+    for &(s, e) in spans {
         let mut last = None;
         for &a in disc.code.range(s..e) {
             if last != Some(a.wrapping_sub(4)) {
@@ -929,6 +951,45 @@ mod tests {
             k = c.wrapping_sub(k);
         }
         let pack = build(vec![("SCES_000.00".into(), exe(T, &w))], vec![], vec![]).unwrap();
+        let units: Vec<&FloatingUnit> = pack.floating.iter().map(|f| &f.unit).collect();
+        assert_eq!(units.len(), 1, "{units:?}");
+        assert_eq!(units[0].words, plain);
+        assert_eq!(units[0].entries[0], 0);
+    }
+
+    /// Code an executable unpacks into RAM outside its text before it jumps in (each word
+    /// inverted: a packer's stream at its simplest) is a floating unit of the unpacked words,
+    /// entered where the jump goes.
+    #[test]
+    fn code_unpacked_into_ram_is_floating() {
+        const T: u32 = 0x8001_0000;
+        const DST: u32 = 0x8010_0000;
+        let i = |op: u32, rs: u32, rt: u32, imm: u32| op << 26 | rs << 21 | rt << 16 | (imm & 0xFFFF);
+        let r = |rs: u32, rt: u32, rd: u32, f: u32| rs << 21 | rt << 16 | rd << 11 | f;
+        let hi = |a: u32| (a >> 16) + (a >> 15 & 1);
+        let (t0, t1, t2, t3, t4) = (8, 9, 10, 11, 12);
+        let plain = [ADDIU_V0_1, 0x2442_0002, JR_RA, 0];
+        let src = T + 4 * 16;
+        let mut w = vec![
+            i(0x0F, 0, t0, hi(src)),
+            i(0x09, t0, t0, src),
+            i(0x0F, 0, t1, hi(DST)),
+            i(0x09, t1, t1, DST),
+            i(0x09, 0, t2, plain.len() as u32),
+            i(0x23, t0, t3, 0), // cl: lw t3,0(t0)
+            i(0x09, t0, t0, 4),
+            i(0x09, t2, t2, 0xFFFF),
+            r(t3, 0, t3, 0x27), // nor t3,t3,zero
+            i(0x2B, t1, t3, 0),
+            i(0x05, t2, 0, 0xFFFA), // bnez t2, cl
+            i(0x09, t1, t1, 4),
+            i(0x0F, 0, t4, hi(DST)),
+            i(0x09, t4, t4, DST),
+            r(t4, 0, 0, 8),
+            0,
+        ];
+        w.extend(plain.iter().map(|&p| !p));
+        let pack = build(vec![("SLES_000.00".into(), exe(T, &w))], vec![], vec![]).unwrap();
         let units: Vec<&FloatingUnit> = pack.floating.iter().map(|f| &f.unit).collect();
         assert_eq!(units.len(), 1, "{units:?}");
         assert_eq!(units[0].words, plain);
