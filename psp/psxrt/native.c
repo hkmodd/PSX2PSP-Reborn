@@ -1085,7 +1085,8 @@ static void update_once(void);
  * boot hung in CD_init). An interrupt the CPU takes ends the stall's part: the guest serves it,
  * and the next update goes on to stall_to. A device that waits on the guest (the CD's next
  * sector replaces one whose INT1 is not acknowledged: libcd's CdRead then sees "sector error")
- * never runs past an interrupt the guest has not had. */
+ * never runs past an interrupt the guest has not had, taken or not (guest_owes: stopping only on
+ * one the CPU takes let a stall inside the handler, SR.IEc 0, lose Spyro 2's sectors for good). */
 static void update_stall(void);
 /* Brackets one non-vblank update in PB_EVERY (a vblank's presents and sleeps: other threads run
  * inside it, on the same counters). */
@@ -1100,10 +1101,23 @@ static void update(void)
         prof_end(PB_UPDATE, native_stats.calls != calls);
 }
 
+/* The guest has an interrupt or a CD sector it has not served: a raised, unmasked I_STAT bit
+ * (even while SR.IEc is 0: the guest is in its handler, or polls I_STAT), a CD interrupt not
+ * acknowledged, or a data sector queued for delivery. */
+static int guest_owes(const Psx *p)
+{
+    if ((p->i_stat & p->i_mask) || (p->cd.irq_flags & 7))
+        return 1;
+    for (int i = 0; i < p->cd.nq; i++)
+        if (p->cd.q[i].sector)
+            return 1;
+    return 0;
+}
+
 static void update_stall(void)
 {
     update_once();
-    for (int k = 0; stall_to > P->cycles && !psx_irq_pending(P); k++) {
+    for (int k = 0; stall_to > P->cycles && !guest_owes(P); k++) {
         u64 to = stall_to < P->next_event && k < 1024 ? stall_to : P->next_event;
         if (k >= 1024 || to <= P->cycles)
             to = stall_to;
