@@ -1034,6 +1034,26 @@ fn a_branch_out_of_the_code_goes_through_the_table() {
     }
 }
 
+/// Code that runs on past the end of the discovered words leaves through the table, as a branch
+/// out does: the words after may be another unit's or image's translation (Crash 2's GOOL `nop`
+/// units run into the code after them), and the interpreter runs them only when not.
+#[test]
+fn running_off_the_code_goes_through_the_table() {
+    let w = [
+        addiu(V0, ZERO, 5),        // 0
+        addiu(V1, V0, 1),          // 1  runs on into 2
+        addiu(A1, V0, 3),          // 2  out of the code
+        j(2, 5),                   // 3
+        NOP,                       // 4
+        j(2, 5),                   // 5  end
+        NOP,                       // 6
+    ];
+    let run = check_cut(&w, 2..5, 5, |_| {});
+    assert!(run.t.runtime.is_empty(), "{:?}", run.t.runtime);
+    assert_eq!(run.log.missed, vec![at(2)]);
+    assert_eq!(run.log.resumed, None);
+}
+
 /// A code address built in `ra` (a hand-made return point, as Crash 2's) is the host address of
 /// its translation: the translated `jr ra` that takes it stays native.
 #[test]

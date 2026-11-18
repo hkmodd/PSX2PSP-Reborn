@@ -573,6 +573,30 @@ static int load_delayed(const Cpu *c, u32 pc)
     return reads;
 }
 
+static void finish_load(Cpu *c);
+
+/* The HLE kernel's own guest code: the pad driver's entries (bios.c K_PADDRV, which PsyQ's
+ * StartPAD finds through B0(5B) and calls) are `lui t0,0xBFC0; ori t0,t0,lo; jr t0; nop` to a
+ * magic BIOS address cpu_step serves. Their effect, t0 and the jump, at the interpreter's cost
+ * of 4 steps (8 cycles), without stepping them: the runtime's code is not the game's. The words
+ * are checked, so a game that writes its own code there runs it. */
+static int hle_trampoline(Cpu *c, u32 pc)
+{
+    u32 v = pc & 0x1FFFFFFFu;
+    if (v >= 0x10000u || (v & 3))
+        return 0;
+    const u32 *w = (const u32 *)(P->ram + v);
+    if (w[0] != 0x3C08BFC0u || (w[1] & 0xFFFFFF00u) != 0x3508FF00u || w[2] != 0x01000008u || w[3])
+        return 0;
+    u32 t = 0xBFC00000u | (w[1] & 0xFFFFu);
+    finish_load(c);
+    c->gpr[8] = t;
+    P->cycles += 8;
+    jump(c, t);
+    native_stats.bios++;
+    return 1;
+}
+
 static void finish_load(Cpu *c)
 {
     if (c->load_reg)
@@ -1127,6 +1151,8 @@ static u32 interp(int mode)
                     fix_ra(c);
                     return h;
                 }
+                if (!h && hle_trampoline(c, pc))
+                    continue;
             }
         }
         mode = 0;
@@ -1145,7 +1171,9 @@ static u32 interp(int mode)
         link_host(c, at);
         u32 *hs = hist[hist_n++ % HIST];
         hs[0] = at, hs[1] = c->gpr[31], hs[2] = c->gpr[1];
-        if (p == 0xA0 || p == 0xB0 || p == 0xC0)
+        /* the BIOS vectors and the magic addresses (0xBFC0FFxx: returns of host-made calls, the
+         * pad driver's entries) are cpu_step's HLE, not guest code */
+        if (p == 0xA0 || p == 0xB0 || p == 0xC0 || (at & 0xFFFFFF00u) == 0xBFC0FF00u)
             native_stats.bios++;
         else
             native_stats.steps++;

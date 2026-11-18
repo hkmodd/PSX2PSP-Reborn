@@ -77,8 +77,6 @@ pub enum Reason {
     GuestK,
     /// From here on the runtime's interpreter runs the guest.
     Invalid,
-    /// The path leaves the discovered code.
-    Unreached,
     /// A branch or jump to an address outside the executable.
     Outside,
     /// A transfer in a delay slot.
@@ -586,8 +584,7 @@ fn emit(
         em.map.insert(a, start);
         let next = em.insn(a);
         if let Some(n) = next.filter(|&n| !em.first(n)) {
-            let c = em.resume(n, Reason::Unreached);
-            em.out.append(c);
+            em.fall_out(n);
         }
         em.spans.push((a, start, em.out.w.len()));
         if !next.is_some_and(|n| em.first(n)) {
@@ -598,22 +595,19 @@ fn emit(
     for &s in d.delay_slots.keys().filter(|s| targets.contains(s) && d.code.contains(s)) {
         em.far_flush();
         em.map.insert(s, em.out.w.len());
-        let c = match em.at(s) {
-            Some((i, k)) if !k.has_delay_slot() && !em.hz.sites.contains_key(&s) => {
-                let (mut c, falls) = em.plain(s, i, k);
-                if falls {
-                    if em.first(s + 4) {
-                        c.jump(2, To::Guest(s + 4), s);
-                        c.push(NOP);
-                    } else {
-                        c.append(em.resume(s + 4, Reason::Unreached));
-                    }
-                }
-                c
-            }
-            _ => em.resume(s, Reason::Invalid),
+        let (c, falls) = match em.at(s) {
+            Some((i, k)) if !k.has_delay_slot() && !em.hz.sites.contains_key(&s) => em.plain(s, i, k),
+            _ => (em.resume(s, Reason::Invalid), false),
         };
         em.out.append(c);
+        if falls {
+            if em.first(s + 4) {
+                em.out.jump(2, To::Guest(s + 4), s);
+                em.out.push(NOP);
+            } else {
+                em.fall_out(s + 4);
+            }
+        }
         em.run_end();
     }
     em.flush();
@@ -726,6 +720,17 @@ impl Em<'_> {
         let mut c = Code::default();
         c.host_call(pc, word);
         c
+    }
+
+    /// Straight on to `n`, past the end of the discovered code: through the dispatch table, which
+    /// holds `n`'s translation when another image or floating unit has one (Crash 2's GOOL `nop`
+    /// units run into the code after them, 800D2F50 in its level), else sends the runtime there.
+    /// A hand-over would make the interpreter run `n` even then.
+    fn fall_out(&mut self, n: u32) {
+        self.out.guest_pair(K1R, n, self.floating);
+        self.dispatch(K1R, false, n);
+        self.out.push(jr(K1R));
+        self.out.push(NOP);
     }
 
     fn resume(&mut self, pc: u32, why: Reason) -> Code {
