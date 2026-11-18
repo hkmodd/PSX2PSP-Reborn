@@ -136,6 +136,8 @@ pub struct CodePack {
     /// `base`; 0 without it, or when the runtime takes head and arena from the user partition
     /// (they do not fit below the images: at most [`FLOATING_PARTITION_MAX`] bytes).
     pub blob_host: u32,
+    /// Executables not translated again: the same text at the same address as one in `images`.
+    pub duplicates: Vec<String>,
 }
 
 /// Most bytes of slots [`floating_arena`] asks for floating code; the room left below the images
@@ -547,6 +549,8 @@ pub fn build(exes: Vec<(String, Vec<u8>)>, overlays: Vec<Overlay>, captured: Vec
         let hash = fnv1a32(&exe.text);
         if seen.insert((exe.text_addr, exe.text.len(), hash)) {
             parsed.push((name, exe, false, None));
+        } else {
+            pack.duplicates.push(name);
         }
     }
     // An overlay runs in the segment of the executables that call it: kuseg when they are linked
@@ -1001,6 +1005,20 @@ mod tests {
         assert_eq!(fnv1a32(b""), 0x811C_9DC5);
         assert_eq!(fnv1a32(b"a"), 0xE40C_292C);
         assert_eq!(fnv1a32(b"foobar"), 0xBF9C_F968);
+    }
+
+    #[test]
+    fn an_executable_with_the_text_of_another_is_a_duplicate() {
+        let text = [ADDIU_V0_1, JR_RA, 0];
+        let other = [JR_RA, ADDIU_V0_1, 0];
+        let pack = build(
+            vec![("A.EXE".into(), exe(0x8001_0000, &text)), ("B.EXE".into(), exe(0x8001_0000, &text)), ("C.EXE".into(), exe(0x8001_0000, &other))],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        assert_eq!((pack.images.len(), pack.duplicates.clone()), (2, vec!["B.EXE".to_string()]));
+        assert!(pack.skipped.is_empty(), "{:?}", pack.skipped);
     }
 
     #[test]

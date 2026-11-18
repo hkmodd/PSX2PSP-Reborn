@@ -1827,6 +1827,7 @@ pub fn convert_native(req: &ConvertRequest, monitor: &dyn Monitor) -> Result<Con
     let mut overlays: Vec<native_code::Overlay> = Vec::new();
     let mut captured: Vec<native_code::Captured> = Vec::new();
     let mut found = 0;
+    let mut twins: Vec<String> = Vec::new(); // executables whose file, or text at its address, another one has
     for d in &discs {
         let patches = d.patches();
         let mine = disc_executables(&d.img, &patches);
@@ -1834,6 +1835,8 @@ pub fn convert_native(req: &ConvertRequest, monitor: &dyn Monitor) -> Result<Con
         for e in mine {
             if !exes.iter().any(|x| x.1 == e.1) {
                 exes.push(e);
+            } else {
+                twins.push(e.0);
             }
         }
         for o in disc_overlay_files(&d.img, &patches, cipher) {
@@ -1867,6 +1870,10 @@ pub fn convert_native(req: &ConvertRequest, monitor: &dyn Monitor) -> Result<Con
         let body: u64 = code.floating.iter().map(native_code::FloatingCode::slot_bytes).sum();
         let place = if code.blob_host != 0 { "below the images" } else { "from the PSP's user partition" };
         monitor.log(&format!("Native: floating code: {} units, {} KB of head and {} KB of arena {place} ({} KB of bodies on the disc)", code.floating.len(), 4 * head / 1024, code.arena / 1024, body / 1024));
+    }
+    twins.extend(code.duplicates.iter().cloned());
+    if !twins.is_empty() {
+        monitor.log(&format!("Native: {} executables are the code of another one, translated once: {}", twins.len(), twins.join(", ")));
     }
     let code_bytes: usize = code.images.iter().map(|i| i.code.len()).sum();
     let overlays = code.images.iter().filter(|i| i.overlay).count();
