@@ -360,7 +360,10 @@ pub fn floating_units(bytes: &[u8]) -> Vec<(usize, FloatingUnit)> {
     // that does not return), two or more, are padding (one is a `nop` code may be entered at:
     // Crash 2's GOOL native code): RAM holds other data there (Spider-Man's CD.WAD modules
     // follow each other with zeros the game loads its data over), so a unit around it never
-    // matches. Units leave it out and are cut there.
+    // matches. Units are cut there, and the padding is units of its own, `nop`s only, at most
+    // FLOATING_WALK words each (the same few in every pack): code may be entered at them (Crash 2
+    // enters GOOL native code at four `nop`s after an op word, 8014F7E4 in its first level, where
+    // the island it finds starts), and a `nop` placed where RAM holds a zero is exact anywhere.
     let ends = |w: u32| w >> 26 == 2 || (w >> 26 == 0 && w & 0x3F == 8) || w & 0xFFFF_0000 == 0x1000_0000;
     let mut pad = None;
     let mut last = None;
@@ -368,6 +371,12 @@ pub fn floating_units(bytes: &[u8]) -> Vec<(usize, FloatingUnit)> {
         let run = last == Some(a.wrapping_sub(4));
         let zero = |a: u32| word(a) == 0 && d.code.contains(&a) && !d.delay_slots.contains_key(&a);
         if zero(a) && (pad == Some(a - 4) || zero(a + 4) && (!run || d.delay_slots.get(&(a - 4)).is_some_and(|&j| ends(word(j))))) {
+            if pad != Some(a - 4) || out.last().is_none_or(|u| u.1.words.len() >= FLOATING_WALK) {
+                out.push(((a - FLOATING_BASE) as usize, FloatingUnit { words: Vec::new(), entries: Vec::new() }));
+            }
+            let u = &mut out.last_mut().unwrap().1;
+            u.entries.push(u.words.len() as u32);
+            u.words.push(0);
             pad = Some(a);
             last = None;
             continue;
@@ -1074,9 +1083,10 @@ mod tests {
 
     /// Zeros no instruction falls into, two or more, are padding: the file's code reaches them
     /// (Spider-Man's CD.WAD modules follow each other with zeros), RAM holds other data there, so
-    /// units leave them out and are cut there. A single `nop` and a delay slot stay.
+    /// units are cut there and the padding is units of its own. A single `nop` and a delay slot
+    /// stay.
     #[test]
-    fn floating_units_leave_out_padding() {
+    fn floating_units_cut_at_padding() {
         const NOP: u32 = 0;
         let addiu_v0 = |n: u32| 9 << 26 | 2 << 16 | n;
         let w = [NOP, NOP, NOP, addiu_v0(1), JR_RA, NOP, NOP, NOP, addiu_v0(2), JR_RA, NOP, NOP, addiu_v0(3), JR_RA, NOP];
@@ -1085,7 +1095,24 @@ mod tests {
         let d = Discovery::run_file(&exe, &[], &[], &[]);
         assert!((0..3).all(|k| d.code.contains(&(FLOATING_BASE + 4 * k))), "the file's code reaches the zeros at its start");
         let at: Vec<(usize, usize)> = floating_units(&bytes).iter().map(|(o, u)| (*o, u.words.len())).collect();
-        assert_eq!(at, [(12, 3), (32, 3), (48, 3)]);
+        assert_eq!(at, [(0, 3), (12, 3), (32, 3), (48, 3)]);
+    }
+
+    /// Padding an island starts at is units of `nop`s, FLOATING_WALK words at most each: Crash 2
+    /// enters GOOL native code at four `nop`s after an op word (8014F7E4 in its first level).
+    #[test]
+    fn floating_units_keep_the_nops_an_island_starts_at() {
+        const NOP: u32 = 0;
+        let addiu_v0 = |n: u32| 9 << 26 | 2 << 16 | n;
+        let op = 0x49BE_0BE0; // A GOOL op word: COP2 with no R3000 meaning.
+        let mut w = vec![op];
+        w.extend([NOP; 10]);
+        w.extend([addiu_v0(1), addiu_v0(2), addiu_v0(3), addiu_v0(4), JR_RA, NOP]);
+        let bytes: Vec<u8> = w.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let units = floating_units(&bytes);
+        let at: Vec<(usize, usize)> = units.iter().map(|(o, u)| (*o, u.words.len())).collect();
+        assert_eq!(at, [(4, 8), (36, 2), (44, 6)]);
+        assert!(units[..2].iter().all(|(_, u)| u.words.iter().all(|&w| w == NOP) && u.entries.len() == u.words.len()));
     }
 
     /// Position-independent code with every kind of relocation floating code has: relative
