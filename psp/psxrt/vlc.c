@@ -2,7 +2,6 @@
  * (Sheep Dog 'n' Wolf's SLES_028.95: 0x80111870), with its addresses in the comments, and counts
  * the instructions and the memory accesses the guest would make on the same path. */
 #include "vlc.h"
-#include <string.h>
 
 typedef uint16_t __attribute__((may_alias)) a16;
 typedef uint32_t __attribute__((may_alias)) a32;
@@ -20,121 +19,9 @@ typedef uint32_t __attribute__((may_alias)) a32;
         v1 &= 15;                                        \
     } while (0)
 
-/* tab1 as a function. The 64 KB table misses the 16 KB D-cache on almost every lookup (~80 cycles
- * of the ~120 a lookup costs); the codes it packs are ~100, and its rule is fixed: the 13 bits at
- * the head give up to three codes, each taken while it fits in the 13 bits, none after an escape
- * or an end of block; t1 is 0 when the 8 bits at the head are all zero (the long codes, in tab2).
- * The codes are learnt from the game's own table, the rule is checked on all of its 8192 entries
- * before it is used, and a sample of the table is checked again at each picture: where anything
- * differs, the lookups stay the table's. */
-#define VLC_ESC 0x7C1Fu
-#define VLC_EOB 0xFE00u
-#define VS_SLOTS 1024 /* code << 8 | length, by leading zeros and the bits after the leading one */
-#define VS_SAMPLE 64
-
-static uint32_t vs_tab1 = 1, vs_pos;
-static int vs_ok;
-static uint8_t vs_k[8];
-static uint16_t vs_off[8];
-static uint32_t vs_zo[8]; /* by leading zeros: the first slot << 8 | 31 - the bits after the leading one */
-static uint32_t vs_code[VS_SLOTS];
-
-static inline uint32_t vs_head(uint32_t w, uint32_t z) { return vs_code[(vs_zo[z] >> 8) + ((w << z << 1 >> 1) >> (vs_zo[z] & 31))]; }
-
-/* The entry for the 32 bits `v0` (its 13 at the head): t1, and t3 through `t3`. */
-static inline uint32_t vs_entry(uint32_t v0, uint32_t *t3)
-{
-    *t3 = 0;
-    if (!(v0 >> 24))
-        return 0;
-    uint32_t e = vs_head(v0, (uint32_t)__builtin_clz(v0)), c = e >> 8, used = e & 0xFF;
-    for (int n = 0; n < 32 && c != VLC_ESC && c != VLC_EOB; n += 16) {
-        uint32_t w = v0 << used;
-        if (!(w >> 24))
-            break;
-        uint32_t f = vs_head(w, (uint32_t)__builtin_clz(w));
-        if (used + (f & 0xFF) > 13)
-            break;
-        c = f >> 8, used += f & 0xFF, *t3 |= c << n;
-    }
-    return (e >> 8) << 16 | used;
-}
-
-/* Entry `p` of the table at `tab1` against the function, with junk in the bits past the 13. */
-static int vs_same(const uint8_t *ram, uint32_t tab1, uint32_t p)
-{
-    uint32_t t1 = R32(tab1 + 8 * p), t3, j;
-    for (j = 0; j < 2; j++) {
-        uint32_t f1 = vs_entry(p << 19 | (j ? 0x7FFFFu : 0), &t3);
-        if (f1 != t1 || (t1 && t3 != R32(tab1 + 8 * p + 4)))
-            return 0;
-    }
-    return 1;
-}
-
-static void vs_build(const uint8_t *ram, uint32_t tab1)
-{
-    uint32_t total = 0, p;
-    int z;
-    vs_tab1 = tab1, vs_ok = 0;
-    memset(vs_k, 0, sizeof vs_k);
-    /* the codes: the entries holding a single code with only zeros after it */
-    for (p = 0; p < 8192; p++) {
-        uint32_t t1 = R32(tab1 + 8 * p), len = t1 & 0xFF, code;
-        if (!t1 || R32(tab1 + 8 * p + 4) || len < 1 || len > 13 || p & ((1u << (13 - len)) - 1))
-            continue;
-        code = p >> (13 - len);
-        if (!code)
-            return;
-        z = (int)len - (32 - __builtin_clz(code));
-        if (z >= 8)
-            return;
-        if ((uint32_t)vs_k[z] < len - z - 1)
-            vs_k[z] = (uint8_t)(len - z - 1);
-    }
-    for (z = 0; z < 8; z++) {
-        vs_off[z] = (uint16_t)total;
-        vs_zo[z] = total << 8 | (31u - vs_k[z]);
-        total += 1u << vs_k[z];
-        if (total > VS_SLOTS)
-            return;
-    }
-    memset(vs_code, 0, total * 4);
-    for (p = 0; p < 8192; p++) {
-        uint32_t t1 = R32(tab1 + 8 * p), len = t1 & 0xFF, code, rest, n, i;
-        if (!t1 || R32(tab1 + 8 * p + 4) || len < 1 || len > 13 || p & ((1u << (13 - len)) - 1))
-            continue;
-        code = p >> (13 - len);
-        z = (int)len - (32 - __builtin_clz(code));
-        rest = len - z - 1;
-        n = 1u << (vs_k[z] - rest);
-        for (i = 0; i < n; i++) {
-            uint32_t *s = &vs_code[vs_off[z] + ((code & ((1u << rest) - 1)) << (vs_k[z] - rest)) + i];
-            if (*s && *s != ((t1 >> 16) << 8 | len))
-                return;
-            *s = (t1 >> 16) << 8 | len;
-        }
-    }
-    for (p = 0; p < total; p++)
-        if (!vs_code[p])
-            return;
-    for (p = 0; p < 8192; p++)
-        if (!vs_same(ram, tab1, p))
-            return;
-    vs_ok = 1;
-}
-
 void vlc_start(uint8_t *ram, const VlcVars *g, Vlc *r, uint32_t bs, uint32_t buf)
 {
     uint32_t t1 = R32(g->size);
-    if (g->tab1 != vs_tab1)
-        vs_build(ram, g->tab1);
-    else if (bs && vs_ok)
-        for (int i = 0; i < VS_SAMPLE; i++, vs_pos = (vs_pos + 127) & 8191)
-            if (!vs_same(ram, g->tab1, vs_pos)) {
-                vs_build(ram, g->tab1);
-                break;
-            }
     r->ins = 8, r->mem = 1; /* 0x870-0x88C */
     if (!bs) {              /* 0x890: on from the saved state, in its own buffer */
         uint32_t s = g->save;
@@ -169,7 +56,6 @@ int vlc_run(uint8_t *ram, const VlcVars *g, Vlc *rp, uint32_t budget)
     uint32_t a0 = r->a0, a1 = r->a1, v0 = r->v0, v1 = r->v1, t4 = r->t4, t5 = r->t5, t6 = r->t6;
     uint32_t t7 = r->t7, t8 = r->t8, t9 = r->t9, t0, t1, t2, t3, at;
     uint32_t stop = r->ins + 2 * r->mem + budget;
-    const int fast = vs_ok && vs_tab1 == g->tab1;
     if (!r->at_dc)
         goto ac;
 dc: /* 0x938: a block's DC code */
@@ -230,16 +116,11 @@ dc: /* 0x938: a block's DC code */
         goto save;
 ac:
     for (;;) { /* 0xA54: up to three codes from the next 13 bits, or one from the next 17 */
-        if (fast) {
-            t1 = vs_entry(v0, &t3);
-        } else {
-            t0 = (v0 >> 19 << 3) + g->tab1;
-            t1 = R32(t0);
-            if (t1)
-                t3 = R32(t0 + 4);
-        }
+        t0 = (v0 >> 19 << 3) + g->tab1;
+        t1 = R32(t0);
         r->ins += 7, r->mem++;
         if (t1) {
+            t3 = R32(t0 + 4);
             r->ins++, r->mem++;
         } else {
             v0 <<= 8, v1 += 8, r->ins += 2;
