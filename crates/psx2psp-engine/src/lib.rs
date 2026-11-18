@@ -839,8 +839,9 @@ pub const NATIVE_PSAR_VERSION: u32 = 9;
 /// ([`NATIVE_PSAR_FLOATING`], all 0 without it).
 pub const NATIVE_PSAR_HEADER_LEN: usize = 0xE8;
 /// Offset of the floating code fields in the header: head offset, stored length, raw length,
-/// host address the runtime reads it to ([`native_code::CodePack::blob_host`]), arena bytes at
-/// the code's host address ([`native_code::CodePack::arena`]), and the bodies' offset.
+/// host address the runtime reads it to ([`native_code::CodePack::blob_host`]; 0: the runtime
+/// takes head and arena from the user partition), arena bytes at the code's host address or
+/// after the head ([`native_code::CodePack::arena`]), and the bodies' offset.
 pub const NATIVE_PSAR_FLOATING: u64 = 0xD0;
 /// Offset of the code fields in the header.
 const NATIVE_PSAR_CODE_FIELDS: u64 = 0xB0;
@@ -1857,6 +1858,12 @@ pub fn convert_native(req: &ConvertRequest, monitor: &dyn Monitor) -> Result<Con
     let code = native_code::build(exes, overlays, captured).map_err(EngineError::Input)?;
     for (name, why) in &code.skipped {
         monitor.log(&format!("Native: {name} left to the interpreter: {why}"));
+    }
+    if !code.floating.is_empty() {
+        let head: usize = 4 + code.floating.iter().map(native_code::FloatingCode::blob_words).sum::<usize>();
+        let body: u64 = code.floating.iter().map(native_code::FloatingCode::slot_bytes).sum();
+        let place = if code.blob_host != 0 { "below the images" } else { "from the PSP's user partition" };
+        monitor.log(&format!("Native: floating code: {} units, {} KB of head and {} KB of arena {place} ({} KB of bodies on the disc)", code.floating.len(), 4 * head / 1024, code.arena / 1024, body / 1024));
     }
     let code_bytes: usize = code.images.iter().map(|i| i.code.len()).sum();
     let overlays = code.images.iter().filter(|i| i.overlay).count();

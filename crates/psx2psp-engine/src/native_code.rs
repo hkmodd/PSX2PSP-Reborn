@@ -129,17 +129,24 @@ pub struct CodePack {
     /// The distinct [`floating_units`] of the overlays [`overlay::locate_all`] does not place,
     /// translated: the runtime moves one where the guest runs its words.
     pub floating: Vec<FloatingCode>,
-    /// Bytes at `base` where the runtime places [`CodePack::floating`] (0 without it): at least
-    /// [`floating_arena`] of their slots.
+    /// Bytes where the runtime places [`CodePack::floating`] (0 without it): at least
+    /// [`floating_arena`] of their slots; at `base`, or after the head when `blob_host` is 0.
     pub arena: u32,
     /// Host address where the runtime reads the head ([`floating_blob`]) of [`CodePack::floating`], below
-    /// `base` (0 without it).
+    /// `base`; 0 without it, or when the runtime takes head and arena from the user partition
+    /// (they do not fit below the images: at most [`FLOATING_PARTITION_MAX`] bytes).
     pub blob_host: u32,
 }
 
 /// Most bytes of slots [`floating_arena`] asks for floating code; the room left below the images
 /// may give it more.
 pub const FLOATING_ARENA_MAX: u32 = 4 << 20;
+
+/// Most bytes of head and arena the runtime takes from the user partition for floating code
+/// that does not fit below the images ([`CodePack::blob_host`] 0). A PSP-3000 has 26 MB of it
+/// free after psxrt's own memory (PSP log, 2026-11-18): this leaves 10 MB; a PSP-1000 that has
+/// not the room runs the floating code in the interpreter.
+pub const FLOATING_PARTITION_MAX: u32 = 16 << 20;
 
 /// The bodies of `codes` ([`FloatingCode::body`]) as DATA.PSAR holds them, one after another,
 /// each packed by `pack` (deflate, or the bytes as they are): their bytes, and each one's byte
@@ -315,6 +322,47 @@ impl FloatingCode {
     pub fn slot_bytes(&self) -> u64 {
         (4 * (self.code.len() + self.table.len() + self.relocs.len()) as u64).next_multiple_of(64)
     }
+}
+
+/// Lays out `pack.floating` for images from host address `base` down, the runtime's own memory
+/// under `floor`, and sets `pack.base` to the lowest region. Below the images: the arena where the
+/// runtime reads units' bodies and places them, and below it the head it finds them with. Units go
+/// in by head size, smallest first, while both fit over `floor`; the arena then takes the room
+/// left, up to twice the slots. When not all of them fit there, the runtime takes head and arena
+/// from the user partition instead (`blob_host` 0, the arena [`floating_arena`] of the slots), up
+/// to [`FLOATING_PARTITION_MAX`] bytes of it. Units left out go to `pack.skipped`.
+fn place_floating(pack: &mut CodePack, base: u32, floor: u32) {
+    let blob_room = |words: u64| (4 * words).next_multiple_of(0x1_0000);
+    let all_words = 4 + pack.floating.iter().map(|c| c.blob_words() as u64).sum::<u64>();
+    let all_host: u64 = pack.floating.iter().map(FloatingCode::slot_bytes).sum();
+    let largest = pack.floating.iter().map(FloatingCode::slot_bytes).max().unwrap_or(0);
+    let below = largest <= floating_arena(all_host) && blob_room(all_words) + floating_arena(all_host) <= u64::from(base - floor);
+    let room = if below { u64::from(base - floor) } else { u64::from(FLOATING_PARTITION_MAX) };
+    let mut order: Vec<(usize, usize)> = pack.floating.iter().map(FloatingCode::blob_words).enumerate().map(|(k, w)| (w, k)).collect();
+    order.sort_unstable();
+    let (mut keep, mut words, mut host) = (vec![false; pack.floating.len()], 4u64, 0u64);
+    for (w, k) in order {
+        let code = pack.floating[k].slot_bytes();
+        let (w2, h2) = (words + w as u64, host + code);
+        if code <= floating_arena(h2) && blob_room(w2) + floating_arena(h2) <= room {
+            (keep[k], words, host) = (true, w2, h2);
+        }
+    }
+    let left = keep.iter().filter(|&&k| !k).count();
+    if left > 0 {
+        let place = if below { "below the images" } else { "of the user partition" };
+        pack.skipped.push(("floating code".into(), format!("{left} of {} units do not fit in the {room} B {place}", keep.len())));
+    }
+    let mut keep = keep.into_iter();
+    pack.floating.retain(|_| keep.next() == Some(true));
+    (pack.arena, pack.blob_host) = (0, 0);
+    if !pack.floating.is_empty() && below {
+        pack.arena = (2 * host + 0x1_0000).min(room - blob_room(words)) as u32 & !0xFFFF;
+        pack.blob_host = base - pack.arena - blob_room(words) as u32;
+    } else if !pack.floating.is_empty() {
+        pack.arena = floating_arena(host) as u32;
+    }
+    pack.base = if below { base - pack.arena } else { base };
 }
 
 /// The arena for floating code of `host` bytes: room for each unit twice, at most
@@ -689,33 +737,7 @@ pub fn build(exes: Vec<(String, Vec<u8>)>, overlays: Vec<Overlay>, captured: Vec
         g.0 = at;
         at += len;
     }
-    // Below the images, the floating code: the arena where the runtime reads units' bodies and
-    // places them, and below it the head it finds them with. Units go in by head size, smallest
-    // first, while both fit over CODE_FLOOR (the runtime's own memory is under it); the arena then
-    // takes the room left, up to twice the slots.
-    let room = u64::from(base - CODE_FLOOR);
-    let blob_room = |words: u64| (4 * words).next_multiple_of(0x1_0000);
-    let mut order: Vec<(usize, usize)> = pack.floating.iter().map(FloatingCode::blob_words).enumerate().map(|(k, w)| (w, k)).collect();
-    order.sort_unstable();
-    let (mut keep, mut words, mut host) = (vec![false; pack.floating.len()], 4u64, 0u64);
-    for (w, k) in order {
-        let code = pack.floating[k].slot_bytes();
-        let (w2, h2) = (words + w as u64, host + code);
-        if code <= floating_arena(h2) && blob_room(w2) + floating_arena(h2) <= room {
-            (keep[k], words, host) = (true, w2, h2);
-        }
-    }
-    let left = keep.iter().filter(|&&k| !k).count();
-    if left > 0 {
-        pack.skipped.push(("floating code".into(), format!("{left} of {} units do not fit in the {room} B below the images", keep.len())));
-    }
-    let mut keep = keep.into_iter();
-    pack.floating.retain(|_| keep.next() == Some(true));
-    if !pack.floating.is_empty() {
-        pack.arena = (2 * host + 0x1_0000).min(room - blob_room(words)) as u32 & !0xFFFF;
-        pack.blob_host = base - pack.arena - blob_room(words) as u32;
-    }
-    pack.base = base - pack.arena;
+    place_floating(&mut pack, base, CODE_FLOOR);
     pack.size = at - pack.base;
 
     let images: Vec<Result<CodeImage, String>> = ok
@@ -1319,6 +1341,25 @@ mod tests {
         assert!(pack.blob_host >= CODE_FLOOR && pack.blob_host + blob <= pack.base, "{:08X} {blob} {:08X}", pack.blob_host, pack.base);
         assert!(u64::from(pack.arena) >= pack.floating[0].slot_bytes());
         assert_eq!(pack.images[0].host_base, pack.base + pack.arena);
+    }
+
+    /// Floating code that does not fit below the images goes to the user partition: head and
+    /// arena out of the code's range (`blob_host` 0), every unit kept, the images where they
+    /// were; with the room, below them again.
+    #[test]
+    fn floating_code_that_does_not_fit_below_goes_to_the_partition() {
+        let code = FloatingCode::translate(FloatingUnit { words: floating_program(), entries: vec![0] }).unwrap();
+        let mut two = code.clone();
+        two.unit.words[0] ^= 1;
+        let base = 0x0900_0000;
+        let mut pack = CodePack { floating: vec![code.clone(), two], ..CodePack::default() };
+        place_floating(&mut pack, base, base - 0x1_0000);
+        assert_eq!((pack.floating.len(), pack.blob_host, pack.base), (2, 0, base), "{:?}", pack.skipped);
+        assert!(pack.skipped.is_empty(), "{:?}", pack.skipped);
+        assert!(u64::from(pack.arena) >= 2 * code.slot_bytes() && pack.arena % 0x1_0000 == 0, "{}", pack.arena);
+        place_floating(&mut pack, base, base - 0x4_0000);
+        assert_eq!(pack.floating.len(), 2);
+        assert!(pack.blob_host >= base - 0x4_0000 && pack.base == base - pack.arena && pack.blob_host < pack.base, "{:08X} {:08X}", pack.blob_host, pack.base);
     }
 
     /// DATA.PSAR holds each unit's body where its head says, deflated or as it is (when deflate

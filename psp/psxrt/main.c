@@ -1491,15 +1491,19 @@ int main(int argc, char **argv)
     say("disc %s \"%s\": %u sectors, %u blocks", disc_info.disc_id, disc_info.title, (unsigned)disc_info.sectors, (unsigned)disc_info.blocks);
     native = disc_info.images > 0;
     if (native) {
-        /* the floating code's blob (disc.h) is read just below the code */
-        u32 lo = disc_info.fl_len ? disc_info.fl_host : disc_info.code_base, size = FIXED_BASE - lo;
-        if (disc_info.fl_len && (lo > disc_info.code_base || disc_info.code_base - lo < disc_info.fl_len))
+        /* the floating code's head (disc.h) is read just below the code, or with its arena into a
+         * block of the user partition (fl_host 0: they do not fit below the images), taken last,
+         * before native_init: a PSP that has not the room leaves the floating code to the
+         * interpreter */
+        int below = disc_info.fl_len && disc_info.fl_host;
+        u32 lo = below ? disc_info.fl_host : disc_info.code_base, size = FIXED_BASE - lo;
+        if (below && (lo > disc_info.code_base || disc_info.code_base - lo < disc_info.fl_len))
             halt("DATA.PSAR floating code is out of range");
         SceUID uid = lo < FIXED_BASE ? sceKernelAllocPartitionMemory(USER_PARTITION, "psxrt code", PSP_SMEM_Addr, size, (void *)lo) : -1;
         if (uid < 0 || (u32)sceKernelGetBlockHeadAddr(uid) != lo)
             halt("the translated code's region is not free");
         say("native: %u executables, code at %08X-%08X", (unsigned)disc_info.images, (unsigned)disc_info.code_base, (unsigned)(disc_info.code_base + disc_info.code_size));
-        if (disc_info.fl_len)
+        if (below)
             say("native: floating code: %u B at %08X, %u B arena", (unsigned)disc_info.fl_len, (unsigned)lo, (unsigned)disc_info.fl_arena);
     }
 
@@ -1558,6 +1562,19 @@ int main(int argc, char **argv)
         disc_info.cpu_shift = (u32)cpu_override;
     if (native && disc_info.cpu_shift)
         say("CPU: loops charge PS1 cycles >> %u", (unsigned)disc_info.cpu_shift);
+    if (native && disc_info.fl_len && !disc_info.fl_host) {
+        u32 head = (disc_info.fl_len + 63) & ~63u;
+        u8 *b = palloc("psxrt floating", head + disc_info.fl_arena + 64);
+        if (b) {
+            disc_info.fl_host = ((u32)b + 63) & ~63u;
+            disc_info.fl_arena_at = disc_info.fl_host + head;
+            say("native: floating code: %u KB head and %u KB arena at %08X, from the user partition", (unsigned)(head >> 10),
+                (unsigned)(disc_info.fl_arena >> 10), (unsigned)disc_info.fl_host);
+        } else {
+            say("native: no %u KB for the floating code: the interpreter runs it", (unsigned)((head + disc_info.fl_arena) >> 10));
+            disc_info.fl_len = 0;
+        }
+    }
     if (native && (err = native_init(&psx, &disc_info)) != NULL)
         halt(err);
     u32 resume = 0; /* psxrt.snap beside the EBOOT: the run goes on from there */

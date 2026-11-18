@@ -33,6 +33,9 @@ typedef struct DiscInfo {
      * fl_arena bytes from code_base where they are placed. fl_len 0 for none. */
     u32 fl_offset, fl_stored, fl_len, fl_host, fl_arena;
     u32 fl_bodies;
+    /* where the arena is when the runtime took head and arena from the user partition (fl_host 0
+     * in DATA.PSAR; main.c sets both), 0 when it is at code_base */
+    u32 fl_arena_at;
 } DiscInfo;
 
 #define DISC_MAX 5

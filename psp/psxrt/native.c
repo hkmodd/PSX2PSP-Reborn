@@ -150,6 +150,12 @@ typedef struct Image {
 static Image img[MAX_IMAGES];
 static int nimg;
 static u32 code_lo, code_hi;
+/* The floating code's arena (floating.h): from code_lo with the executables' code above it from
+ * img_lo, or a block of the user partition (img_lo = code_lo). */
+static FlArena ar;
+static u32 img_lo;
+/* Host address `h` is translated code: an executable's or a placed unit's. */
+static inline int is_code(u32 h) { return h - code_lo < code_hi - code_lo || h - ar.lo < ar.hi - ar.lo; }
 static u32 cpu_shift; /* DiscInfo.cpu_shift, at most 8 */
 static Psx *P;
 static u64 t_base, c_base;
@@ -280,10 +286,10 @@ static int repatch(u32 host, u32 guest, u32 *out)
 static u32 blk_code_sum(u32 b, u8 *code, u32 *fsum, int slot)
 {
     const u32 *w = (const u32 *)(P->ram + (b << BLK_SHIFT)), *t = &table[b << (BLK_SHIFT - 2)];
-    u32 h = 0x811C9DC5u, f = h, len = code_hi - code_lo;
+    u32 h = 0x811C9DC5u, f = h;
     *code = 0;
     for (u32 i = 0; i < 1u << (BLK_SHIFT - 2); i++) {
-        int in = t[i] - code_lo < len;
+        int in = is_code(t[i]);
         if (in || slot)
             h = (h ^ w[i]) * 0x01000193u, f = (f ^ form(w[i])) * 0x01000193u, *code = 1;
         slot = in && has_slot(w[i]);
@@ -297,7 +303,7 @@ static void blk_resum(u32 a, u32 len)
 {
     for (u32 b = a >> BLK_SHIFT, e = (a + len + (1u << BLK_SHIFT) - 1) >> BLK_SHIFT; b < e && b < BLKS; b++) {
         const u32 *w = (const u32 *)(P->ram + (b << BLK_SHIFT));
-        blk_slot0[b] = b && table[(b << (BLK_SHIFT - 2)) - 1] - code_lo < code_hi - code_lo && has_slot(w[-1]);
+        blk_slot0[b] = b && is_code(table[(b << (BLK_SHIFT - 2)) - 1]) && has_slot(w[-1]);
         blk_sum[b] = blk_code_sum(b, &blk_code[b], &blk_form[b], blk_slot0[b]);
     }
 }
@@ -305,7 +311,6 @@ static void blk_resum(u32 a, u32 len)
 /* ---- floating code (floating.h): units translated once, placed where RAM holds their words ----
  * The table entries of a placement's translated words point into its slot. */
 static Floating fl;
-static FlArena ar; /* from code_lo; the executables' code is above it */
 static u32 fl_bodies; /* DATA.PSAR offset of the units' bodies */
 
 static u32 pl_words(const FlPlace *q) { return fl_unit(&fl, q->unit)->g_len; }
@@ -318,7 +323,7 @@ static void fl_install(const FlPlace *q)
     const u32 *t = (const u32 *)q->host + x->h_len; /* the body's table, after the code */
     u32 *e = &table[q->at >> 2];
     for (u32 j = 0; j < x->g_len; j++) {
-        if (e[j] - ar.hi < code_hi - ar.hi)
+        if (e[j] - img_lo < code_hi - img_lo)
             continue;
         if (t[j] != FL_NONE)
             e[j] = q->host + 4 * t[j];
@@ -422,7 +427,7 @@ static int runs(const Image *m, u32 o)
     u32 lo = m->e->host_base, len = m->e->code_len, t = table[o >> 2];
     if (t - lo < len)
         return 1;
-    return o >= 4 && t - code_lo >= code_hi - code_lo && table[(o >> 2) - 1] - lo < len && has_slot(*(const u32 *)(P->ram + o - 4));
+    return o >= 4 && !is_code(t) && table[(o >> 2) - 1] - lo < len && has_slot(*(const u32 *)(P->ram + o - 4));
 }
 
 /* Block `b` of RAM in `m`'s translation, from its patch table, which has an entry for each word
@@ -502,8 +507,7 @@ static int block_patch(u32 b, u8 *bad, int write, int same)
 static int held_word(void *ctx, u32 j)
 {
     (void)ctx;
-    u32 len = code_hi - code_lo;
-    return table[j] - code_lo < len || (j && table[j - 1] - code_lo < len && has_slot(((const u32 *)P->ram)[j - 1]));
+    return is_code(table[j]) || (j && is_code(table[j - 1]) && has_slot(((const u32 *)P->ram)[j - 1]));
 }
 
 static void flush_code(void)
@@ -558,7 +562,7 @@ static void finish_load(Cpu *c)
 /* The host address for guest or host `pc`: itself when it is host code, its translation, or 0. */
 static u32 host_of(u32 pc)
 {
-    if ((pc >= code_lo && pc < code_hi) || pc == STUB_CALL_RET || pc == STUB_GRET)
+    if (is_code(pc) || pc == STUB_CALL_RET || pc == STUB_GRET)
         return pc;
     u32 p = pc & 0x1FFFFFFFu;
     if (p >= 0x800000 || (pc & 3))
@@ -1226,7 +1230,7 @@ static u32 guest_ra(u32 ra, u32 sp)
     static u32 seen_h[RA_SEEN], seen_g[RA_SEEN], next;
     if (ra == STUB_GRET)
         return gret_top ? gret[(gret_at(sp) - 1) % GRET_DEPTH] : 1;
-    if (ra - code_lo >= code_hi - code_lo)
+    if (!is_code(ra))
         return ra;
     int k = -1;
     for (int i = 0; i < RA_SEEN && k < 0; i++)
@@ -2008,14 +2012,17 @@ const char *native_init(Psx *psx, const DiscInfo *info)
     code_hi = info->code_base + info->code_size;
     ar.lo = ar.hi = code_lo, ar.n = 0;
     if (info->fl_len) {
-        if (info->fl_arena > info->code_size || (info->fl_arena & 63))
+        if ((!info->fl_arena_at && info->fl_arena > info->code_size) || (info->fl_arena & 63) || !info->fl_host)
             return "DATA.PSAR floating code is out of range";
-        ar.hi = code_lo + info->fl_arena;
+        if (info->fl_arena_at)
+            ar.lo = info->fl_arena_at;
+        ar.hi = ar.lo + info->fl_arena;
     }
+    img_lo = info->fl_arena_at ? code_lo : ar.hi;
     for (u32 i = 0; i < info->images; i++) {
         const CodeEntry *e = &info->dir[i];
         u32 text = e->text_addr & 0x1FFFFFFFu;
-        if (text >= RAM_SIZE * 4 || (text & 3) || (text & (RAM_SIZE - 1)) + e->text_size > RAM_SIZE || e->host_base < ar.hi ||
+        if (text >= RAM_SIZE * 4 || (text & 3) || (text & (RAM_SIZE - 1)) + e->text_size > RAM_SIZE || e->host_base < img_lo ||
             e->host_base + e->code_len > code_hi || (e->host_base & 3))
             return "DATA.PSAR code directory is out of range";
         img[i] = (Image){e, text & (RAM_SIZE - 4), 0, 0, 0, 0, ~0u};

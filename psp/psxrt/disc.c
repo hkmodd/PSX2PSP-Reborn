@@ -180,7 +180,7 @@ const char *disc_open(const char *path, DiscInfo *info)
     info->cpu_shift = h.cpu_shift;
     info->discs = ndiscs;
     info->fl_offset = h.fl_offset, info->fl_stored = h.fl_stored, info->fl_len = h.fl_len;
-    info->fl_host = h.fl_host, info->fl_arena = h.fl_arena, info->fl_bodies = h.fl_bodies;
+    info->fl_host = h.fl_host, info->fl_arena = h.fl_arena, info->fl_bodies = h.fl_bodies, info->fl_arena_at = 0;
     if (h.fl_len && (h.fl_len & 3 || h.fl_stored > h.fl_len || h.fl_host & 3))
         return "DATA.PSAR floating code is damaged";
     if (h.images) {
