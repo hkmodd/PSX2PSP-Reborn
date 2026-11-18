@@ -634,12 +634,37 @@ static void draw(Psx *psx, const u32 *c, int n)
         }
 }
 
+#ifdef __psp__
+/* Image rows reach RAM's VRAM with uncached stores. An MDEC column is 32-48 B every 2 KB: a
+ * cached store write-allocates a line per row (fetch ~80 cycles, writeback later) that nobody
+ * reads before it is evicted. First every line of the rows this call will write is written back
+ * and dropped (Allegrex cache 0x1B, hit writeback invalidate), then one sync: no clean copy can
+ * be read stale and no dirty copy can land on the new pixels afterwards. */
+static u32 rows_uncached(Gpu *g, u32 left)
+{
+    u32 rows = (u32)(g->xi + (int)left + g->xw - 1) / (u32)g->xw, room = (u32)(g->xh - g->xr);
+    if (rows > room)
+        rows = room;
+    for (u32 r = 0; r < rows; r++) {
+        u16 *row = &g->vram[((g->xy + g->xr + (int)r) & 511) * VRAM_W + g->xx];
+        for (u32 a = (u32)row & ~63u, e = (u32)(row + g->xw - 1); a <= e; a += 64)
+            __asm__ volatile("cache 0x1B, 0(%0)" : : "r"(a) : "memory");
+    }
+    __asm__ volatile("sync" : : : "memory");
+    return 0x40000000u;
+}
+#endif
+
 u32 gpu_gp0_pixels(Psx *psx, const u32 *w, u32 n)
 {
     Gpu *g = &psx->gpu;
     const u16 *p = (const u16 *)w;
-    u32 left = 2 * n, used = 0;
+    u32 left = 2 * n, used = 0, un = 0;
     u16 set = g->mask_set ? 0x8000 : 0;
+#ifdef __psp__
+    if (g->xfer == 1 && !g->mask_check && !set && g->xx + g->xw <= VRAM_W)
+        un = rows_uncached(g, left);
+#endif
     while (g->xfer == 1 && used < left) {
         u32 run = (u32)(g->xw - g->xi), x = (u32)(g->xx + g->xi) & 1023;
         if (run > left - used)
@@ -647,7 +672,7 @@ u32 gpu_gp0_pixels(Psx *psx, const u32 *w, u32 n)
         u16 *row = &g->vram[((g->xy + g->xr) & 511) * VRAM_W];
         const u16 *src = p + used;
         if (!g->mask_check && !set && x + run <= VRAM_W)
-            memcpy(row + x, src, run * 2);
+            memcpy((u16 *)((uintptr_t)(row + x) | un), src, run * 2);
         else
             for (u32 i = 0; i < run; i++) {
                 u16 *d = &row[(x + i) & 1023];
