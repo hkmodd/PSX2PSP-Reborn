@@ -1002,10 +1002,19 @@ pub fn disc_overlay_files(img: &DiscImage, patches: &[&dyn ImagePatch], cipher: 
             let hi = runs.get(k + 1).map_or(code.len(), |r| r.0).min(z + 1 + AROUND);
             let Some(b) = read(2048 * lo as u32, 2048 * (hi - lo) as u32) else { continue };
             let (b, at) = (Arc::new(b), 2048 * (a - lo));
-            out.extend(overlay::code_runs(&b[at..at + n as usize]).into_iter().map(|(s, e)| {
+            // A zero-based module is a piece whole, to the next one: its code is found only from
+            // its start, its switch tables follow its code. A run of code is cut where one starts.
+            let end = at + n as usize;
+            let mods: Vec<usize> = overlay::zero_based(&b[at..end], 2048 * a as u32).into_iter().map(|m| at + m as usize).collect();
+            let mut pieces: Vec<(usize, usize)> = mods.iter().enumerate().map(|(k, &m)| (m, mods.get(k + 1).map_or(b.len(), |&x| x).min(m + native_code::OVERLAY_MAX as usize))).collect();
+            for (s, e) in overlay::code_runs(&b[at..end]) {
                 let (s, e) = (at + s as usize, at + e as usize);
-                Overlay { name: format!("{name}+{:X}", 2048 * lo + s), bytes: b[s..e].to_vec(), file: Some((s as u32, b.clone())) }
-            }));
+                let mut cuts = vec![s];
+                cuts.extend(mods.iter().filter(|&&m| s < m && m < e));
+                cuts.push(e);
+                pieces.extend(cuts.windows(2).map(|c| (c[0], c[1])).filter(|c| !mods.contains(&c.0)));
+            }
+            out.extend(pieces.into_iter().map(|(s, e)| Overlay { name: format!("{name}+{:X}", 2048 * lo + s), bytes: b[s..e].to_vec(), file: Some((s as u32, b.clone())) }));
         }
         // Islands of code without prologues ([`discover::islands`]), joined across ISLE_GAP:
         // code a file holds between data, as Crash 2's GOOL entries hold their native code.

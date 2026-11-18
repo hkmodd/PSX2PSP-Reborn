@@ -528,3 +528,81 @@ fn an_island_of_code_after_data_is_found() {
     let bytes: Vec<u8> = w.iter().flat_map(|w| w.to_le_bytes()).collect();
     assert_eq!(psx2psp_recomp::discover::islands(&bytes), vec![(16, 44), (68, 84)]);
 }
+
+/// A module of 256 words whose code is linked at `link` (0: zero-based): `main` calls eleven
+/// functions and switches on `a1` through a two-entry table at word 240, whose address it builds
+/// with `lui`/`lw` and whose entries are its cases' addresses (words 32 and 34) from `link`.
+fn module(link: u32) -> Vec<u8> {
+    let mut w = vec![NOP; 256];
+    let jal = |n: u32| (3 << 26) | (((link + 4 * n) >> 2) & 0x03FF_FFFF);
+    let jmp = |n: u32| (2 << 26) | (((link + 4 * n) >> 2) & 0x03FF_FFFF);
+    w[0] = i(9, SP, SP, (-8i16) as u16); //       main: addiu sp,sp,-8
+    for k in 0..11 {
+        w[1 + 2 * k] = jal(48 + 16 * k as u32); //  jal f_k; nop
+    }
+    let code = [
+        i(0xB, A1, AT, 2),                        // 23 sltiu at,a1,2
+        i(4, AT, ZERO, 11),                       // 24 beq at,zero,36
+        r(0, 0, A1, T0, 2),                       // 25 sll t0,a1,2
+        i(0xF, 0, T1, (link >> 16) as u16),       // 26 lui t1,hi(link)
+        r(0x21, T1, T0, T1, 0),                   // 27 addu t1,t1,t0
+        i(0x23, T1, T0, 4 * 240),                 // 28 lw t0,960(t1)
+        NOP,                                      // 29
+        r(8, T0, 0, 0, 0),                        // 30 jr t0
+        NOP,                                      // 31
+        jmp(36),                                  // 32 case 0: j 36
+        NOP,                                      // 33
+        jmp(36),                                  // 34 case 1: j 36
+        NOP,                                      // 35
+        r(8, RA, 0, 0, 0),                        // 36 jr ra
+        i(9, SP, SP, 8),                          // 37 addiu sp,sp,8
+    ];
+    w[23..23 + code.len()].copy_from_slice(&code);
+    for k in 0..11 {
+        let f = 48 + 16 * k;
+        w[f] = i(9, SP, SP, (-16i16) as u16); //    f_k: addiu sp,sp,-16
+        w[f + 1] = r(8, RA, 0, 0, 0); //            jr ra
+        w[f + 2] = i(9, SP, SP, 16); //             addiu sp,sp,16
+    }
+    w[240] = link + 4 * 32;
+    w[241] = link + 4 * 34;
+    w.iter().flat_map(|w| w.to_le_bytes()).collect()
+}
+
+/// A zero-based module is found by its calls naming its prologues as offsets from 0, at a 2 KB
+/// sector of its file; code linked at its address is not one.
+#[test]
+fn zero_based_modules_are_found_at_their_sector() {
+    use psx2psp_recomp::overlay;
+    let (zero, linked) = (module(0), module(0x8001_0000));
+    assert!(overlay::zero_based_start(&zero));
+    assert!(!overlay::zero_based_start(&linked));
+    // A file: the linked code four words in (its prologues are not where the module's calls
+    // land), padding, the module at its second sector.
+    let mut file = vec![0; 16];
+    file.extend(&linked);
+    file.resize(0x800, 0);
+    file.extend(&zero);
+    assert_eq!(overlay::zero_based(&file, 0), [0x800]);
+    // The same bytes from 0x400 of the file: the module is at 0x400 of them.
+    assert_eq!(overlay::zero_based(&file[0x400..], 0x400), [0x400]);
+    assert_eq!(overlay::zero_based(&linked, 0), Vec::<u32>::new());
+}
+
+/// Discovered at 80000000, a zero-based module's switch table and cases are its offsets there;
+/// in a text that is not a module the table at offset 960 is not read (only the jumps after the
+/// `jr` are taken as its cases).
+#[test]
+fn zero_based_switch_tables_are_offsets_in_the_module() {
+    let base = 0x8000_0000;
+    let x = PsxExe { pc0: base, gp0: 0, text_addr: base, text: module(0), bss: (0, 0), stack: (0, 0) };
+    let d = Discovery::run_file(&x, &[], &[], &[]);
+    let o = |n: u32| base + 4 * n;
+    assert_eq!(d.jumps[&o(30)], JumpReg::Table { table: o(240), targets: vec![o(32), o(34)], bounded: true });
+    assert!(d.code.contains(&o(32)) && d.code.contains(&o(34)));
+    // Four calls: under 8 votes, not a module.
+    let mut few = module(0);
+    few[4 * 9..4 * 23].fill(0);
+    let x = PsxExe { text: few, ..x };
+    assert_eq!(Discovery::run_file(&x, &[], &[], &[]).jumps[&o(30)], JumpReg::Table { table: o(32), targets: vec![o(32), o(34)], bounded: false });
+}

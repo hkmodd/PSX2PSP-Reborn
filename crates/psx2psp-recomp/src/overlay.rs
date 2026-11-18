@@ -140,6 +140,56 @@ fn at_slot_by_span(bytes: &[u8], slots: &BTreeSet<u32>) -> Option<(u32, u32)> {
     (n >= STRONG && 16 * n as usize >= 15 * refs.len() && n >= len / 0x400).then_some((b, n))
 }
 
+/// The starts (byte offsets in `bytes`) of the zero-based modules in `bytes`, whose first
+/// byte is at offset `at` of its file: code whose addresses are its own offsets, which the game's
+/// loader adds the module's address to wherever it puts it (Spider-Man's CD.WAD: every `j`,
+/// `jal` into the module, `lui`/`addiu` pair and pointer). Its calls into itself name, as
+/// offsets from 0, the prologues it holds: at its start `s`, each distinct `jal` target `t`
+/// with a prologue at `s + t` votes. A file is read by sectors, so a module starts at a 2 KB
+/// sector of its file. Code linked at an absolute address votes nowhere (its targets lie past
+/// its prologues by its address); a start takes [`STRONG`] votes and three times the votes
+/// prologues and targets give there by chance (targets × prologues / words). Spider-Man's
+/// CD.WAD from 013B4824: 31 to 98 votes at its ten modules, 16 at most at its other 270 sectors,
+/// 6.3 expected.
+pub fn zero_based(bytes: &[u8], at: u32) -> Vec<u32> {
+    let m = Modules::of(bytes);
+    (at.wrapping_neg() % 0x800..m.len()).step_by(0x800).filter(|&s| m.starts_at(s)).collect()
+}
+
+/// `bytes` start with a zero-based module ([`zero_based`]): their addresses are their offsets.
+pub fn zero_based_start(bytes: &[u8]) -> bool {
+    Modules::of(bytes).starts_at(0)
+}
+
+/// The votes of [`zero_based`]: the words, and the distinct `jal` targets below their end.
+struct Modules {
+    words: Vec<u32>,
+    targets: Vec<u32>,
+    prologues: u64,
+}
+
+impl Modules {
+    fn of(bytes: &[u8]) -> Self {
+        let words: Vec<u32> = bytes.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+        let len = 4 * words.len() as u32;
+        let prologues = words.iter().filter(|&&w| is_prologue(w)).count() as u64;
+        let mut targets: Vec<u32> = words.iter().filter(|&&w| w >> 26 == 3).map(|&w| (w & 0x03FF_FFFF) << 2).filter(|&t| t < len).collect();
+        targets.sort_unstable();
+        targets.dedup();
+        Modules { words, targets, prologues }
+    }
+
+    fn len(&self) -> u32 {
+        4 * self.words.len() as u32
+    }
+
+    fn starts_at(&self, s: u32) -> bool {
+        let near = &self.targets[..self.targets.partition_point(|&t| t < self.len() - s)];
+        let votes = near.iter().filter(|&&t| self.words.get((s + t) as usize / 4).is_some_and(|&w| is_prologue(w))).count() as u64;
+        votes >= STRONG as u64 && votes * self.words.len() as u64 >= 3 * near.len() as u64 * self.prologues
+    }
+}
+
 /// The entries (offset, size) of an archive of `len` bytes whose `head` is a table of contents:
 /// little-endian (offset, size) pairs up to the first offset, each entry starting where the one
 /// before ends or at the next 2 KB sector; an empty entry there is skipped (Spyro 2's 72nd).

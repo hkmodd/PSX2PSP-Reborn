@@ -175,7 +175,7 @@ fn island_walk(img: Image, a: u32) -> Option<Walk> {
 pub fn islands(bytes: &[u8]) -> Vec<(u32, u32)> {
     const BASE: u32 = 0x8000_0000;
     let exe = PsxExe { pc0: BASE, gp0: 0, text_addr: BASE, text: bytes[..bytes.len() & !3].to_vec(), bss: (0, 0), stack: (0, 0) };
-    let img = Image(&exe, &[]);
+    let img = Image(&exe, &[], false);
     let exits = island_exits(img);
     let (mut out, mut a, end) = (Vec::new(), BASE, BASE + exe.text.len() as u32);
     while a < end {
@@ -310,11 +310,21 @@ pub struct Body {
 /// Data outside the text that switch tables may be read from: (address of the first byte, bytes).
 pub type Far<'a> = &'a [(u32, &'a [u8])];
 
-/// Instruction access over the text, and the far data switch tables are read from.
+/// Instruction access over the text, the far data switch tables are read from, and whether the
+/// text is a zero-based module ([`crate::overlay::zero_based_start`]).
 #[derive(Clone, Copy)]
-pub(crate) struct Image<'a>(pub &'a PsxExe, pub Far<'a>);
+pub(crate) struct Image<'a>(pub &'a PsxExe, pub Far<'a>, pub bool);
 
 impl Image<'_> {
+    /// The address code builds as `a`. A zero-based module builds its offsets, which its loader
+    /// relocates to where it puts it: its switch tables, their entries and the constants it jumps
+    /// to are its text's there (Spider-Man's CD.WAD module at 01421000: `lui 1; addiu -19676` is
+    /// its table at B324, whose entries such as 9C38 are its cases). Not a table without a bound:
+    /// its scan would walk the module's relocation table, offsets too, as cases.
+    fn rel(self, a: u32) -> u32 {
+        if self.2 && (a as usize) < self.0.text.len() { self.0.text_addr.wrapping_add(a) } else { a }
+    }
+
     /// The data word at `a`: the text's, else the far data's.
     fn data(self, a: u32) -> Option<u32> {
         if a & 3 != 0 {
@@ -391,7 +401,7 @@ impl Image<'_> {
         match self.switch_table(rs, pc) {
             Ok(t) => t,
             Err(why) => match (self.const_of(rs, pc), self.jump_list(pc)) {
-                (Some(c), _) => JumpReg::Const(c),
+                (Some(c), _) => JumpReg::Const(self.rel(c)),
                 (None, Some(targets)) => JumpReg::Table { table: pc.wrapping_add(8), targets, bounded: false },
                 (None, None) => JumpReg::Unresolved(why),
             },
@@ -460,7 +470,7 @@ impl Image<'_> {
         let (Some(base), Some((idx, sll_at))) = (base, index) else {
             return Err("addu operands are not table + index*4");
         };
-        let table = base.wrapping_add(lw.simm());
+        let table = self.rel(base.wrapping_add(lw.simm()));
         if self.data(table).is_none() {
             return Err("table outside the text and the far data");
         }
@@ -482,7 +492,7 @@ impl Image<'_> {
             Some(n) => {
                 for e in 0..n {
                     match self.data(table.wrapping_add(4 * e)) {
-                        Some(t) => targets.push(t),
+                        Some(t) => targets.push(self.rel(t)),
                         None => break,
                     }
                 }
@@ -526,7 +536,8 @@ impl Discovery {
     /// in the 34 KB of data before its code, 621 words of code run in the first minute).
     pub fn run_file(exe: &PsxExe, far: Far, file: Far, seeds: &[u32]) -> Self {
         let around: Vec<(u32, &[u8])> = far.iter().chain(file).copied().collect();
-        let img = Image(exe, &around);
+        // Only a text at a 256 MB boundary: a `j` names its offsets there.
+        let img = Image(exe, &around, exe.text_addr & 0x0FFF_FFFF == 0 && crate::overlay::zero_based_start(&exe.text));
         let mut d = Discovery::default();
         d.entries.insert(exe.pc0, Origin::Entry);
         d.explore(img, vec![exe.pc0]);
@@ -601,7 +612,7 @@ impl Discovery {
     /// a wider discovery already found, as a floating unit's words are its file's. A path that
     /// leaves the image ends outside it, as one from its first word does.
     pub fn explore_known(&mut self, exe: &PsxExe, seeds: &[u32]) {
-        let img = Image(exe, &[]);
+        let img = Image(exe, &[], false);
         self.visited = self.code.iter().filter(|a| !self.delay_slots.contains_key(a)).copied().collect();
         for &s in seeds {
             if exe.contains(s) && s & 3 == 0 && !self.code.contains(&s) {
@@ -704,7 +715,7 @@ impl Discovery {
 
     /// The body of the function at `entry`.
     pub fn body(&self, exe: &PsxExe, entry: u32) -> Body {
-        let img = Image(exe, &[]);
+        let img = Image(exe, &[], false);
         let other = |t: u32| t != entry && self.entries.contains_key(&t);
         let mut body = Body::default();
         let mut seen = HashSet::new();

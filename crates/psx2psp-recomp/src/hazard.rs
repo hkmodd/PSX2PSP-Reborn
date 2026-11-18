@@ -48,7 +48,7 @@ pub struct Hazards {
 
 impl Hazards {
     pub fn check(exe: &PsxExe, d: &Discovery) -> Self {
-        let img = Image(exe, &[]);
+        let img = Image(exe, &[], false);
         let mut returns: HashMap<u32, Vec<u32>> = HashMap::new();
         for &f in d.entries.keys() {
             for r in d.body(exe, f).returns {
