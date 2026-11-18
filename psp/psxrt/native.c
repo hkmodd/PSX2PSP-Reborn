@@ -82,6 +82,7 @@
 #define STUB_GTE_GPF 0x09A00FF8u
 #define STUB_GTE_DPCS 0x09A00FA8u
 #define STUB_GTE_SQR 0x09A00FB0u
+#define STUB_GTE_DPCT 0x09A00FB8u
 #define TABLE_ADDR 0x09A01000u
 #define TABLE_WORDS (RAM_SIZE / 4)
 /* CTX words */
@@ -121,7 +122,7 @@ void psxrt_gte_avsz3(void), psxrt_gte_avsz3_door(void);
 void psxrt_gte_avsz4(void), psxrt_gte_avsz4_door(void);
 void psxrt_gte_rtps(void), psxrt_gte_rtps_door(void);
 void psxrt_gte_rtpt(void), psxrt_gte_rtpt_door(void);
-void psxrt_gte_mvmva(void), psxrt_gte_gpf(void), psxrt_gte_dpcs(void), psxrt_gte_sqr(void);
+void psxrt_gte_mvmva(void), psxrt_gte_gpf(void), psxrt_gte_dpcs(void), psxrt_gte_sqr(void), psxrt_gte_dpct(void);
 u32 psxrt_zero3[3]; /* MVMVA's translation when it has none */
 void native_enter(u32 host_pc);
 /* gte_fast.c */
@@ -2117,13 +2118,16 @@ static const struct {
     {STUB_GTE_GPF, 0x0190003Du, psxrt_gte_gpf, psxrt_gte_cmd},
     {STUB_GTE_GPF, 0x0198003Du, psxrt_gte_gpf, psxrt_gte_cmd},
     {STUB_GTE_GPF, 0x0008043Du, psxrt_gte_gpf, psxrt_gte_cmd},
-    /* DPCS and SQR with sf and lm both ways */
+    /* DPCS, SQR and DPCT with sf and lm both ways */
     {STUB_GTE_DPCS, 0x00780010u, psxrt_gte_dpcs, psxrt_gte_cmd},
     {STUB_GTE_DPCS, 0x00700010u, psxrt_gte_dpcs, psxrt_gte_cmd},
     {STUB_GTE_DPCS, 0x00780410u, psxrt_gte_dpcs, psxrt_gte_cmd},
     {STUB_GTE_SQR, 0x00A00428u, psxrt_gte_sqr, psxrt_gte_cmd},
     {STUB_GTE_SQR, 0x00A80428u, psxrt_gte_sqr, psxrt_gte_cmd},
     {STUB_GTE_SQR, 0x00A80028u, psxrt_gte_sqr, psxrt_gte_cmd},
+    {STUB_GTE_DPCT, 0x00F8002Au, psxrt_gte_dpct, psxrt_gte_cmd},
+    {STUB_GTE_DPCT, 0x00F0002Au, psxrt_gte_dpct, psxrt_gte_cmd},
+    {STUB_GTE_DPCT, 0x00F8042Au, psxrt_gte_dpct, psxrt_gte_cmd},
 };
 #define GTE_OPS (int)(sizeof gte_ops / sizeof gte_ops[0])
 
@@ -2330,7 +2334,7 @@ const char *native_init(Psx *psx, const DiscInfo *info)
     }
     int bad = gte_asm_check(psx, GTE_OPS * 4096);
     gte_stubs(!bad);
-    say("native: GTE NCLIP/AVSZ/RTPS/RTPT/MVMVA/GPF/DPCS/SQR in asm, %d of %d checks differ%s", bad, GTE_OPS * 4096,
+    say("native: GTE NCLIP/AVSZ/RTPS/RTPT/MVMVA/GPF/DPCS/SQR/DPCT in asm, %d of %d checks differ%s", bad, GTE_OPS * 4096,
         bad ? ": through the runtime" : "");
     io_fast_psx = psx, io_fast_shift = cpu_shift;
     int served;

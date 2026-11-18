@@ -13,7 +13,7 @@
 //! | [`MISS`] | | Runtime entry for a dispatch-table miss (written by the runtime) |
 //! | [`GTE_CMD`] | | Runtime entry for a GTE command (written by the runtime) |
 //! | [`GTE_NCLIP`] .. [`GTE_RTPT`] | | Runtime entries for the commands of [`GTE_OWN`] |
-//! | [`GTE_MVMVA`], [`GTE_GPF`], [`GTE_DPCS`], [`GTE_SQR`] | | Runtime entries for the commands of [`GTE_WORD`] |
+//! | [`GTE_MVMVA`], [`GTE_GPF`], [`GTE_DPCS`], [`GTE_SQR`], [`GTE_DPCT`] | | Runtime entries for the commands of [`GTE_WORD`] |
 //! | [`TABLE`] | 2 MB | Dispatch table: host address of the code for guest `addr & 0x1FFFFF` |
 //!
 //! Allegrex `k0` holds [`K0`] at all times: it is the base for [`CTX`] and [`TABLE`], and its
@@ -80,13 +80,16 @@ pub const GTE_GPF: u32 = 0x09A0_0FF8;
 pub const GTE_DPCS: u32 = 0x09A0_0FA8;
 /// SQR entry, as [`GTE_MVMVA`].
 pub const GTE_SQR: u32 = 0x09A0_0FB0;
+/// DPCT entry, as [`GTE_MVMVA`].
+pub const GTE_DPCT: u32 = 0x09A0_0FB8;
 /// The GTE commands with an entry that reads their word, `(entry, mask, value)`: a command word
 /// `w` with `w & mask == value` goes to `entry` the way other words go to [`GTE_CMD`].
-pub const GTE_WORD: [(u32, u32, u32); 4] = [
+pub const GTE_WORD: [(u32, u32, u32); 5] = [
     (GTE_MVMVA, 0x3F, 0x12),
     (GTE_GPF, 0x3F, 0x3D),
     (GTE_DPCS, 0x3F, 0x10),
     (GTE_SQR, 0x3F, 0x28),
+    (GTE_DPCT, 0x3F, 0x2A),
 ];
 /// Dispatch table, one word per guest word address of RAM.
 pub const TABLE: u32 = 0x09A0_1000;

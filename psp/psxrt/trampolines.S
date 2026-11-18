@@ -864,6 +864,53 @@ psxrt_gte_dpcs:
     sw $13, GD(22)($k0)
     .end psxrt_gte_dpcs
 
+/* DPCT: DPCS on RGB0 three times (core/gte.c), each pass pushing its colour with RGBC's code
+ * byte; FLAG gathers the three. The passes left are counted in bits 25-26 of the word in k1,
+ * above every field the macros read. */
+    .globl psxrt_gte_dpct
+    .ent psxrt_gte_dpct
+psxrt_gte_dpct:
+    WORD_ENTER
+    lw $8, GC(21)($k0)
+    sll $9, $8, 1
+    xor $8, $8, $9
+    lw $9, GC(22)($k0)
+    sll $13, $9, 1
+    xor $9, $9, $13
+    or $8, $8, $9
+    lw $9, GC(23)($k0)
+    sll $13, $9, 1
+    xor $9, $9, $13
+    or $8, $8, $9
+    bltz $8, word_far
+    lw $10, GD(8)($k0)
+    li $ra, 2
+    ins $k1, $ra, 25, 2
+    li $15, 1
+dpct_pass:
+    lw $11, GD(20)($k0)
+    DP_ROW 0
+    DP_ROW 1
+    DP_ROW 2
+    lw $8, GD(21)($k0)
+    sw $8, GD(20)($k0)
+    lw $8, GD(22)($k0)
+    sw $8, GD(21)($k0)
+    lw $13, GD(6)($k0)
+    srl $13, $13, 24
+    sll $13, $13, 24
+    WORD_RGB 0
+    WORD_RGB 1
+    WORD_RGB 2
+    sw $13, GD(22)($k0)
+    ext $ra, $k1, 25, 2
+    addiu $ra, $ra, -1
+    bgez $ra, dpct_pass
+    ins $k1, $ra, 25, 2
+    b word_charge
+    nop
+    .end psxrt_gte_dpct
+
 /* SQR: MAC = IR * IR, by the word's sf and lm. */
 .macro SQR_ROW n
     lw $9, GD(9 + \n)($k0)
