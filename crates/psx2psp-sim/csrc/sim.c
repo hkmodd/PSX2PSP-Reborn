@@ -572,4 +572,5 @@ void sim_status(const Sim *s, u32 *out)
     out[1] = (u32)(s->psx.cycles >> 20);
     out[2] = s->frames;
     out[3] = s->psx.i_mask;
+    out[4] = (u32)s->psx.gpu.flips; /* display-area changes: the game's own frames */
 }

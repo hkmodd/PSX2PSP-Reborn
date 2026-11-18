@@ -334,17 +334,18 @@ fn main() -> ExitCode {
             if (a.every != 0 && frame % a.every == 0) || last {
                 let mut d = [0 as c_int; 6];
                 sim_display(sim, d.as_mut_ptr());
-                let mut st = [0u32; 4];
+                let mut st = [0u32; 5];
                 sim_status(sim, st.as_mut_ptr());
                 let path = a.out.join(format!("frame{frame:05}.png"));
                 if let Err(e) = screen(vram, &d).save(&path) {
                     eprintln!("{}: {e}", path.display());
                 }
                 println!(
-                    "[sim] frame {frame} pc {:08X} {} Mcycles imask {:03X} display {}x{} at {},{}{}{}",
+                    "[sim] frame {frame} pc {:08X} {} Mcycles imask {:03X} flips {} display {}x{} at {},{}{}{}",
                     st[0],
                     st[1],
                     st[3],
+                    st[4],
                     d[2],
                     d[3],
                     d[0],
