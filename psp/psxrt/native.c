@@ -992,7 +992,10 @@ void native_vsync_early(void)
 static void update_once(void);
 /* psx_update, then the stall native_vsync asked for: the guest runs no code while the devices
  * go through their events in order up to stall_to (one jump made the CD lose interrupts: the
- * boot hung in CD_init). */
+ * boot hung in CD_init). An interrupt the CPU takes ends the stall's part: the guest serves it,
+ * and the next update goes on to stall_to. A device that waits on the guest (the CD's next
+ * sector replaces one whose INT1 is not acknowledged: libcd's CdRead then sees "sector error")
+ * never runs past an interrupt the guest has not had. */
 static void update_stall(void);
 /* Brackets one non-vblank update in PB_EVERY (a vblank's presents and sleeps: other threads run
  * inside it, on the same counters). */
@@ -1010,17 +1013,17 @@ static void update(void)
 static void update_stall(void)
 {
     update_once();
-    if (stall_to > P->cycles) /* native_vsync's c_base is after the stall, as for a frame on time */
-        c_base += stall_to - P->cycles;
-    for (int k = 0; stall_to > P->cycles; k++) {
+    for (int k = 0; stall_to > P->cycles && !psx_irq_pending(P); k++) {
         u64 to = stall_to < P->next_event && k < 1024 ? stall_to : P->next_event;
         if (k >= 1024 || to <= P->cycles)
             to = stall_to;
+        c_base += to - P->cycles; /* native_vsync's c_base is after the stall, as for a frame on time */
         P->cycles = to;
         if (P->cycles >= P->next_event)
             psx_update(P);
     }
-    stall_to = 0;
+    if (stall_to <= P->cycles)
+        stall_to = 0;
 }
 
 static void update_once(void)
