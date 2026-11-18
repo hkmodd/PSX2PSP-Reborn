@@ -68,6 +68,8 @@ int disc_read_sector(void *user, u32 lba, u8 *raw);
 /* Reads `raw_len` bytes stored at `off` (`stored` bytes, raw deflate unless equal) into `dst`:
  * 0, or -1. */
 int disc_blob(u32 off, u32 stored, void *dst, u32 raw_len);
+/* As disc_blob, from `stored` bytes already in memory at `src`. CPU thread only. */
+int disc_inflate(const void *src, u32 stored, void *dst, u32 raw_len);
 /* One disc_blob for disc_ahead. */
 typedef struct DiscBlob {
     u32 off, stored;

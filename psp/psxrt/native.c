@@ -405,14 +405,92 @@ static u32 pbuf[PATCH_MAX / 4];
 static const CodeEntry *pbuf_e;
 static u32 pbuf_g;
 
+/* Whole stored patch tables, kept in memory: a group is then inflated from there instead of read
+ * with two Memory Stick IOs (Sheep Dog, PSP: the flush after WHEEL's Exec took 220 ms for ~34
+ * groups, ~3 ms an IO). A table is data of the EBOOT, never stale: it is read in one IO the first
+ * time a group of it is needed, and the least recently used go when PTAB_BUDGET or the slots are
+ * full. One that does not fit, or finds no memory, stays on the IO path. */
+#define PTAB_SLOTS 4
+#define PTAB_BUDGET (2u << 20)
+#define PTAB_NO 8
+typedef struct Ptab {
+    const CodeEntry *e;
+    SceUID uid;
+    const u8 *mem;
+    u32 len, used;
+} Ptab;
+static Ptab ptab[PTAB_SLOTS];
+static const CodeEntry *ptab_no[PTAB_NO]; /* tables on the IO path */
+static u32 ptab_tick, ptab_total, ptab_nn;
+
+static const Ptab *ptab_get(const CodeEntry *e)
+{
+    int f = -1;
+    for (int i = 0; i < PTAB_SLOTS; i++)
+        if (ptab[i].e == e)
+            return ptab[i].used = ++ptab_tick, &ptab[i];
+    for (u32 i = 0; i < PTAB_NO; i++)
+        if (ptab_no[i] == e)
+            return NULL;
+    u32 t = sceKernelGetSystemTimeLow(), n = e->patch_groups, len = 12 * n, d[3];
+    ptab_no[ptab_nn++ % PTAB_NO] = e; /* until the table is in */
+    if (!n || len > sizeof pbuf || disc_blob(e->patch_off, len, pbuf, len) < 0)
+        return NULL;
+    pbuf_e = NULL; /* pbuf held the index */
+    for (u32 g = 0; g < n; g++) {
+        memcpy(d, (const u8 *)pbuf + 12 * g, 12);
+        if (d[0] < 12 * n || d[1] > PTAB_BUDGET || d[0] > PTAB_BUDGET - d[1])
+            return NULL;
+        if (d[0] + d[1] > len)
+            len = d[0] + d[1];
+    }
+    for (;;) {
+        int lru = -1;
+        f = -1;
+        for (int i = 0; i < PTAB_SLOTS; i++)
+            if (!ptab[i].e)
+                f = i;
+            else if (lru < 0 || ptab[i].used < ptab[lru].used)
+                lru = i;
+        if (f >= 0 && ptab_total + len <= PTAB_BUDGET)
+            break;
+        if (lru < 0)
+            return NULL;
+        sceKernelFreePartitionMemory(ptab[lru].uid);
+        ptab_total -= ptab[lru].len;
+        ptab[lru].e = NULL;
+    }
+    SceUID uid = sceKernelAllocPartitionMemory(2, "psxrt patches", PSP_SMEM_High, len, NULL);
+    if (uid < 0)
+        return NULL;
+    u8 *mem = sceKernelGetBlockHeadAddr(uid);
+    if (disc_blob(e->patch_off, len, mem, len) < 0) {
+        sceKernelFreePartitionMemory(uid);
+        return NULL;
+    }
+    ptab_no[(ptab_nn - 1) % PTAB_NO] = NULL;
+    ptab[f] = (Ptab){e, uid, mem, len, ++ptab_tick};
+    ptab_total += len;
+    say("native: patch table of %.16s kept (%u KB, %u us)", e->name, (unsigned)(len >> 10), (unsigned)(sceKernelGetSystemTimeLow() - t));
+    return &ptab[f];
+}
+
 static const u32 *patch_group(const CodeEntry *e, u32 g)
 {
     if (pbuf_e == e && pbuf_g == g)
         return pbuf;
     u32 d[3]; /* offset from patch_off, stored length, raw length */
     pbuf_e = NULL;
-    if (!e->patch_off || g >= e->patch_groups || disc_blob(e->patch_off + 12 * g, 12, d, 12) < 0 || d[2] > PATCH_MAX ||
-        d[2] < 4 * (PATCH_BLKS + 1) || (d[2] & 3) || disc_blob(e->patch_off + d[0], d[1], pbuf, d[2]) < 0)
+    if (!e->patch_off || g >= e->patch_groups)
+        return NULL;
+    const Ptab *pt = ptab_get(e);
+    if (pt) {
+        memcpy(d, pt->mem + 12 * g, 12);
+        if (d[2] > PATCH_MAX || d[2] < 4 * (PATCH_BLKS + 1) || (d[2] & 3) || d[0] + d[1] > pt->len ||
+            disc_inflate(pt->mem + d[0], d[1], pbuf, d[2]) < 0)
+            return NULL;
+    } else if (disc_blob(e->patch_off + 12 * g, 12, d, 12) < 0 || d[2] > PATCH_MAX || d[2] < 4 * (PATCH_BLKS + 1) || (d[2] & 3) ||
+               disc_blob(e->patch_off + d[0], d[1], pbuf, d[2]) < 0)
         return NULL;
     for (u32 k = 0; k < PATCH_BLKS; k++)
         if (pbuf[k] < PATCH_BLKS + 1 || pbuf[k] > pbuf[k + 1] || pbuf[k + 1] > d[2] / 4)

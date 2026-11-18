@@ -17,6 +17,7 @@
 #include <pspiofilemgr.h>
 #include <pspsysmem.h>
 #include <pspthreadman.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <zlib.h>
@@ -329,6 +330,17 @@ static int blob(Reader *r, u32 off, u32 stored, void *dst, u32 raw_len)
 }
 
 int disc_blob(u32 off, u32 stored, void *dst, u32 raw_len) { return blob(&rd, off, stored, dst, raw_len); }
+
+int disc_inflate(const void *src, u32 stored, void *dst, u32 raw_len)
+{
+    if (stored == raw_len)
+        return memcpy(dst, src, raw_len), 0;
+    if (stored > raw_len || inflateReset(&rd.zs) != Z_OK)
+        return -1;
+    rd.zs.next_in = (Bytef *)(uintptr_t)src, rd.zs.avail_in = stored;
+    rd.zs.next_out = dst, rd.zs.avail_out = raw_len;
+    return inflate(&rd.zs, Z_FINISH) == Z_STREAM_END && !rd.zs.avail_out ? 0 : -1;
+}
 
 static void fail(Reader *r, u32 b, const char *what, int code)
 {
