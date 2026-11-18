@@ -3,7 +3,8 @@
  * design note): the clock, the data cache, memory, the uncached mirror, VRAM and the GE's queue.
  * ge.c calls nothing else, so the same translator builds its lists on the PSP, on the ME or in the
  * sim, each with its own host. The PSP's host is here, inline: the same calls ge.c made itself.
- * Another host defines the same names (the declarations below are the contract).
+ * Another host defines the same names (the declarations below are the contract). GEH_PC takes
+ * the contract on the PSP too: me_probe runs ge.c there with ge_host_pc.c, on the CPU and the ME.
  */
 #ifndef PSXRT_GE_HOST_H
 #define PSXRT_GE_HOST_H
@@ -11,7 +12,7 @@
 #include "gel.h"
 #include "psx.h"
 
-#ifdef __psp__
+#if defined(__psp__) && !defined(GEH_PC)
 
 #include <pspge.h>
 #include <pspgu.h>
