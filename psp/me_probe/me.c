@@ -184,7 +184,7 @@ static void job(volatile MeCtl *c)
         __asm__ volatile("ctc1 %0, $31" : : "r"(fcr));
         PrRun *run = (PrRun *)c->arg[4];
         run->now = me_now, run->ctl = c, run->t_last = count();
-        ReplayHooks h = {NULL, pr_frame, run, (int)run->no_hash};
+        ReplayHooks h = {NULL, pr_frame, run, (int)run->no_hash, (int)run->decode};
         TrRun fn = c->arg[0] == 8 ? tr8_run : c->arg[0] == 6 ? tr6_run : tr5_run;
         run->ok = fn((Psx *)c->arg[1], (const u32 *)c->arg[2], c->arg[3], GE_NORMAL, &h, &run->r);
         c->res[0] = (u32)run->ok;

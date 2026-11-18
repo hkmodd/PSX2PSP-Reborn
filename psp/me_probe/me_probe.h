@@ -55,7 +55,7 @@ typedef struct {
     u32 (*now)(void);
     volatile MeCtl *ctl; /* the ME's progress, or NULL */
     u32 t_last, nf, polys, t, matched;
-    u32 no_hash;  /* ReplayHooks' */
+    u32 no_hash, decode; /* ReplayHooks' */
     u32 sc_timed; /* an ME run's t by the CPU's clock (me_run), not the ME's Count */
     int ok;
     ReplayResult r;

@@ -8,11 +8,13 @@
  *   wb             the cost of writing back 16 KB of dirty data cache, the GE idle and drawing
  *   C0, C1         the translator on the CPU, the ME in reset; the GE idle, then drawing
  *   C0h            C0 with no list or memory hashed (geh_hash): the translator's own time
+ *   C0d            the dump only read, ge.c never called: C0h less C0d is ge.c's time (copy 7 again)
  *   me boot        the ME out of reset into me.c; its clock against the CPU's (me calib)
  *   b              the ME reading 1 MB of main RAM: uncached, cached, copied to its eDRAM, and the
  *                  same copy by the DMACplus
  *   M0, M0h        the translator on the ME alone, hashing and not; each frame's time by the CPU's
  *                  clock at the ME's progress (me_run), as the ME's Count does not run
+ *   M0d            M0h's dump only read (copy 8 again): M0h less M0d is ge.c's time on the ME
  *   C2, C3, C4     the CPU's translator, the GE drawing, the ME idle, copying at full rate, and
  *                  running the translator itself (M1) beside it
  *   me prof, me edram, me end  what the ME sees at the profiler and past 2 MB of eDRAM; whether it
@@ -273,7 +275,7 @@ static void prof_stop(const char *name)
 
 static PrRun cpu_pr;
 /* the translator copy `copy` over the dump on the CPU, memory from a, hashing or not; its wall time */
-static u32 sc_run(const char *name, int copy, Arena *a, int no_hash)
+static u32 sc_run(const char *name, int copy, Arena *a, int no_hash, int decode)
 {
     Psx *psx = psx_new(a);
     memset(&cpu_pr, 0, sizeof cpu_pr);
@@ -282,7 +284,7 @@ static u32 sc_run(const char *name, int copy, Arena *a, int no_hash)
         return 0;
     }
     cpu_pr.now = sc_now;
-    ReplayHooks h = {NULL, pr_frame, &cpu_pr, no_hash};
+    ReplayHooks h = {NULL, pr_frame, &cpu_pr, no_hash, decode};
     tr_arena[copy] = a;
     prof_start();
     u32 t = sc_now();
@@ -297,12 +299,12 @@ static u32 sc_run(const char *name, int copy, Arena *a, int no_hash)
  * not. The CPU naps 100 us between looks at the ME's progress: each frame's t is the CPU's clock
  * between the looks that saw it end (the ME's Count does not run, me calib), out by at most a look
  * in ~30 ms frames. 1 when the job ended; wall, the CPU's time from the kick to the end. */
-static int me_run(const char *name, PrRun *mr, int copy, Psx *mp, int no_hash, u32 *wall)
+static int me_run(const char *name, PrRun *mr, int copy, Psx *mp, int no_hash, int decode, u32 *wall)
 {
     u32 ts[PR_FRAMES + 1], seen = 0, looks = 0;
     if (me_dead)
         return 0;
-    mr->no_hash = (u32)no_hash;
+    mr->no_hash = (u32)no_hash, mr->decode = (u32)decode;
     me_kick(JOB_REPLAY, (u32)copy, (u32)mp, (u32)dump, dump_words, (u32)mr);
     u32 t0 = sc_now(), now;
     ts[0] = t0;
@@ -548,14 +550,16 @@ int main(int argc, char **argv)
     wb_measure(1);
 
     /* C0, C1: the ME in reset */
-    u32 w0 = sc_run("C0", 0, A, 0);
+    u32 w0 = sc_run("C0", 0, A, 0, 0);
     log_run("C0", "cpu", 0, "off", &cpu_pr, w0, 0, A->peak);
     u32 busy_us = 4 * (w0 ? w0 : 1000000);
     ge_busy(ge_draws_for(busy_us));
-    u32 w = sc_run("C1", 1, A, 0);
+    u32 w = sc_run("C1", 1, A, 0, 0);
     log_run("C1", "cpu", 1, "off", &cpu_pr, w, ge_tail(), A->peak);
-    w = sc_run("C0h", 7, A, 1);
+    w = sc_run("C0h", 7, A, 1, 0);
     log_run("C0h", "cpu", 0, "off", &cpu_pr, w, 0, A->peak);
+    w = sc_run("C0d", 7, A, 1, 1);
+    log_run("C0d", "cpu", 0, "off", &cpu_pr, w, 0, A->peak);
 
     /* a: the ME up, and its clock */
     if (me_boot(0) || me_boot(1)) {
@@ -596,31 +600,31 @@ int main(int argc, char **argv)
             (unsigned)us, ok && me_ctl->res[0] == bsum);
     }
 
-    /* M0, M0h: the translator on the ME alone, hashing and not */
+    /* M0, M0h: the translator on the ME alone, hashing and not; M0d, M0h's dump only read */
     PrRun *mr = NULL;
     Arena *MA = B ? B : A;
-    for (int k = 0; k < 2; k++) {
-        const char *name = k ? "M0h" : "M0";
+    for (int k = 0; k < 3; k++) {
+        const char *name = k == 2 ? "M0d" : k ? "M0h" : "M0";
         int copy = k ? 8 : 5;
         Psx *mp = me_dead ? NULL : psx_new(MA);
         if (mp && (mr = (PrRun *)arena_calloc(MA, 1, sizeof(PrRun))) != NULL) {
             tr_arena[copy] = MA;
             u32 wall;
-            if (me_run(name, mr, copy, mp, k, &wall))
+            if (me_run(name, mr, copy, mp, k > 0, k == 2, &wall))
                 log_run(name, "me", 0, "replay", mr, wall, 0, MA->peak);
         }
     }
 
     /* C2: the ME idle */
     ge_busy(ge_draws_for(busy_us));
-    w = sc_run("C2", 2, A, 0);
+    w = sc_run("C2", 2, A, 0, 0);
     log_run("C2", "cpu", 1, me_dead ? "dead" : "idle", &cpu_pr, w, ge_tail(), A->peak);
 
     /* C3: the ME copying 1 MB to its eDRAM, again and again */
     if (!me_dead) {
         ge_busy(ge_draws_for(busy_us));
         me_kick(JOB_STREAM, (u32)bsrc, BSRC_BYTES, 0, 0, 0);
-        w = sc_run("C3", 3, A, 0);
+        w = sc_run("C3", 3, A, 0, 0);
         u32 tail = ge_tail();
         me_ctl->stop = 1;
         if (me_wait(5000000)) {
@@ -638,7 +642,7 @@ int main(int argc, char **argv)
             ge_busy(ge_draws_for(busy_us));
             me_kick(JOB_REPLAY, 6, (u32)mp, (u32)dump, dump_words, (u32)mr);
             u32 tm = sc_now();
-            w = sc_run("C4", 4, A, 0);
+            w = sc_run("C4", 4, A, 0, 0);
             u32 tail = ge_tail();
             int busy = me_busy();
             u32 prog = me_ctl->progress;

@@ -6,6 +6,14 @@
 
 static u32 no_clock(void) { return 0; }
 
+/* decode runs: the loaded prim and vertices kept, as a call would take them */
+#ifdef _MSC_VER
+static const void *volatile kept;
+#define KEEP(p, v) (kept = (p), kept = (v))
+#else
+#define KEEP(p, v) __asm__ volatile("" : : "r"(p), "r"(v) : "memory")
+#endif
+
 /* the polygon commands rd_packet ran: its whole commands within the words it took */
 static u32 packet_polys(const u32 *w, u32 took)
 {
@@ -22,6 +30,7 @@ int replay_run(Psx *psx, const u32 *d, u32 n, int mode, const ReplayHooks *h, Re
     static const ReplayHooks none;
     h = h ? h : &none;
     u32 (*clock)(void) = h->clock ? h->clock : no_clock;
+    int dec = h->decode, inited = 0;
     memset(r, 0, sizeof *r);
     if (n < GEDP_HEAD || d[0] != GEDP_MAGIC || d[1] != GEDP_VERSION || d[4] != VRAM_W || d[5] != VRAM_H ||
         d[6] != GEDP_GPU_WORDS || d[7] != GEDP_PRIM_WORDS)
@@ -63,14 +72,16 @@ int replay_run(Psx *psx, const u32 *d, u32 n, int mode, const ReplayHooks *h, Re
             continue;
         }
         if (type == GEDP_INIT) {
-            if (rd)
+            if (inited++)
                 return r->err = "a second INIT", 0;
+            if (dec)
+                continue;
             geh_hash(!h->no_hash);
             geh_start(psx, mode);
             rd = g->renderer;
             continue;
         }
-        if (!rd)
+        if (!inited)
             return r->err = "a call before INIT", 0;
         if (!len)
             return r->err = "an event without its return word", 0;
@@ -80,44 +91,74 @@ int replay_run(Psx *psx, const u32 *d, u32 n, int mode, const ReplayHooks *h, Re
         switch (type) {
         case GEDP_TRI:
             gedp_vtx_load(gedp_prim_load(a, &p), v, 3);
-            got = (u32)rd->triangle(rd->self, &p, &v[0], &v[1], &v[2]);
+            if (dec)
+                KEEP(&p, v);
+            else
+                got = (u32)rd->triangle(rd->self, &p, &v[0], &v[1], &v[2]);
             f.polys++;
             break;
         case GEDP_QUAD:
             gedp_vtx_load(gedp_prim_load(a, &p), v, 4);
-            got = (u32)rd->quad(rd->self, &p, v);
+            if (dec)
+                KEEP(&p, v);
+            else
+                got = (u32)rd->quad(rd->self, &p, v);
             f.polys++;
             break;
         case GEDP_RECT: {
             const u32 *w = gedp_prim_load(a, &p);
             gedp_vtx_load(w + 4, v, 1);
+            if (dec) {
+                KEEP(&p, v);
+                break;
+            }
             got = (u32)rd->rect(rd->self, &p, (s32)w[0], (s32)w[1], (s32)w[2], (s32)w[3], v, (int)w[4 + GEDP_VTX_WORDS],
                                 (int)w[5 + GEDP_VTX_WORDS]);
             break;
         }
         case GEDP_LINE:
             gedp_vtx_load(gedp_prim_load(a, &p), v, 2);
-            got = (u32)rd->line(rd->self, &p, &v[0], &v[1]);
+            if (dec)
+                KEEP(&p, v);
+            else
+                got = (u32)rd->line(rd->self, &p, &v[0], &v[1]);
             break;
         case GEDP_FILL:
+            if (dec)
+                break;
             got = (u32)rd->fill(rd->self, (s32)a[0], (s32)a[1], (s32)a[2], (s32)a[3], (u16)a[4]);
             break;
         case GEDP_COPY:
+            if (dec)
+                break;
             got = (u32)rd->copy(rd->self, (s32)a[0], (s32)a[1], (s32)a[2], (s32)a[3], (s32)a[4], (s32)a[5], (int)a[6], (u16)a[7]);
             break;
         case GEDP_READ:
+            if (dec)
+                break;
             rd->read(rd->self, (s32)a[0], (s32)a[1], (s32)a[2], (s32)a[3]);
             break;
         case GEDP_WROTE:
+            if (dec)
+                break;
             rd->wrote(rd->self, (s32)a[0], (s32)a[1], (s32)a[2], (s32)a[3]);
             break;
         case GEDP_POLY:
+            if (dec) {
+                KEEP(a, a);
+                f.polys++;
+                break;
+            }
             if (!rd->poly)
                 return r->err = "POLY with no rd_poly", 0;
             got = (u32)rd->poly(rd->self, a);
             f.polys++;
             break;
         case GEDP_PACKET:
+            if (dec) {
+                f.polys += packet_polys(a, want); /* the words rd_packet took, as the sim had it */
+                break;
+            }
             if (!rd->packet)
                 return r->err = "PACKET with no rd_packet", 0;
             got = rd->packet(rd->self, a, len - 1);
@@ -126,7 +167,8 @@ int replay_run(Psx *psx, const u32 *d, u32 n, int mode, const ReplayHooks *h, Re
         case GEDP_FRAME: {
             if (len != GEDP_FRAME_WORDS + 1)
                 return r->err = "FRAME of another size", 0;
-            geh_frame(a[0], &f.got);
+            if (!dec)
+                geh_frame(a[0], &f.got);
             u32 te = clock() - t;
             const GehFrame *o = &f.got;
             f.want = a;

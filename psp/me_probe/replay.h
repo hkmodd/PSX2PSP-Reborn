@@ -22,6 +22,8 @@ typedef struct {
     void (*frame)(void *user, const ReplayFrame *f); /* optional: after each frame */
     void *user;
     int no_hash; /* timing: geh_hash(0), so no frame is the sim's */
+    int decode;  /* timing: the dump read and its prims loaded, ge.c never called (no INIT, no frame end):
+                  * a run's time less this is ge.c's. Needs no copy of its own. */
 } ReplayHooks;
 
 typedef struct {

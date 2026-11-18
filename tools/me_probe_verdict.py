@@ -5,9 +5,10 @@
 GO needs all of:
   1. the ME runs the translator with the CPU's hashes, frame by frame (M0 and M1 against C0);
   2. its cost at 45k polys/s, ME us/poly x 45000, is at most half the ME's second (GO_CORE: the other
-     half for the queue, the waits and what the dump leaves out). The ME's us/poly is M0h's: no list
-     or memory hashed, each frame timed by the CPU's clock at the ME's progress (the ME's Count does
-     not run). It still decodes the dump and finds each address's region, so it is an upper bound;
+     half for the queue, the waits and what the dump leaves out). The ME's us/poly is ge.c's alone:
+     M0h (no list or memory hashed) less M0d (the dump only read, ge.c never called), each frame
+     timed by the CPU's clock at the ME's progress (the ME's Count does not run). Without M0d (probe
+     0b's log) it is M0h's, an upper bound that counts the replay's dump reading;
   3. the CPU loses less to the ME's memory traffic than it saves: the CPU translator's slowdown
      with the ME translating beside it (C4 against C2, both with the GE drawing), over a whole
      second of CPU, below the CPU's own translator time at 45k polys/s (C2 us/poly x 45000).
@@ -19,6 +20,7 @@ import sys
 POLYS_PER_S = 45000
 GO_CORE = 0.5
 MEASURED_GPU_POLY_MS = (167, 349)  # psxrt's gpu poly time per second in the 3D scenes (design note)
+MEASURED_GPU_US_POLY = (349 * 1000 / 44000, 167 * 1000 / 19500)  # the same at 44k and 19.5k polys/s
 
 
 def parse(path):
@@ -155,7 +157,7 @@ def main(argv):
             return t / tpu / polys if tpu else None
         return t / polys
 
-    for name in ("C0", "C1", "C0h", "M0", "M0h", "C2", "C3", "C4", "M1"):
+    for name in ("C0", "C1", "C0h", "C0d", "M0", "M0h", "M0d", "C2", "C3", "C4", "M1"):
         r = runs.get(name)
         if not r:
             continue
@@ -210,27 +212,47 @@ def main(argv):
     # hashing all of ge.c's memory (mem=1: the sim's check, not the translator's work).
     c2 = runs.get("C2")
 
-    def us_poly_lean(name):
+    def lean(name):
+        """(us, polys) over the frames after the first, every 60th left out; None if not timed in us"""
         r = runs.get(name)
         if not r or r.get("unit") != "us":
             return None
         fs = [f for f in frames.get(name, [])[1:] if f.get("mem") != "1" and num(f["frame"]) % 60]
-        polys = sum(num(f["polys"]) for f in fs)
-        return sum(num(f["t"]) for f in fs) / polys if polys else None
+        return sum(num(f["t"]) for f in fs), sum(num(f["polys"]) for f in fs)
+
+    def us_poly_lean(name, less=None):
+        a = lean(name)
+        if not a or not a[1]:
+            return None
+        if less is None:
+            return a[0] / a[1]
+        b = lean(less)
+        return (a[0] - b[0]) / a[1] if b else None
 
     c0_up, m0_up = us_poly_lean("C0"), us_poly_lean("M0")
     cpu_up, me_up = us_poly_lean("C0h"), us_poly_lean("M0h")
+    cpu_ge, me_ge = us_poly_lean("C0h", "C0d"), us_poly_lean("M0h", "M0d")
     if c0_up and m0_up:
         say("2. hashing: ME %.2f us/poly (M0) against the CPU's %.2f (C0), x%.2f" % (m0_up, c0_up, m0_up / c0_up))
     if me_up and cpu_up:
+        say("2. not hashing: ME %.2f us/poly (M0h) against the CPU's %.2f (C0h), x%.2f; at %d polys/s %.0f ms"
+            " of the ME's second with the dump's reading in (an upper bound)"
+            % (me_up, cpu_up, me_up / cpu_up, POLYS_PER_S, me_up * POLYS_PER_S / 1000))
+    if me_ge and cpu_ge:
+        say("2. the dump only read: ME %.2f us/poly (M0d), CPU %.2f (C0d)" % (me_up - me_ge, cpu_up - cpu_ge))
+        me_up, cpu_up, what = me_ge, cpu_ge, "ge.c alone (M0h less M0d, C0h less C0d)"
+    else:
+        what = "M0h, the dump's reading in: an upper bound"
+    if me_up and cpu_up:
         ratio = me_up / cpu_up
         core = me_up * POLYS_PER_S / 1000
-        lo, hi = (ms * ratio for ms in MEASURED_GPU_POLY_MS)
-        say("2. not hashing: ME %.2f us/poly (M0h) against the CPU's %.2f (C0h), x%.2f" % (me_up, cpu_up, ratio))
-        say("   measured: at %d polys/s the ME is busy %.0f ms of its second (GO at most %.0f; the replay's dump"
-            " decoding and region lookups counted in: an upper bound)" % (POLYS_PER_S, core, GO_CORE * 1000))
-        say("   beside it, psxrt's own %d-%d ms/s of gpu poly x%.2f: %.0f-%.0f ms" % (
-            MEASURED_GPU_POLY_MS[0], MEASURED_GPU_POLY_MS[1], ratio, lo, hi))
+        lo, hi = (us * POLYS_PER_S / 1000 * ratio for us in MEASURED_GPU_US_POLY)
+        say("2. ME %.2f us/poly against the CPU's %.2f (x%.2f), %s" % (me_up, cpu_up, ratio, what))
+        say("   measured: at %d polys/s the ME is busy %.0f ms of its second (GO at most %.0f)"
+            % (POLYS_PER_S, core, GO_CORE * 1000))
+        say("   beside it, psxrt's own gpu poly time in the game, %.2f-%.2f us/poly on the CPU (349 ms/s at 44k,"
+            " 167 at 19.5k) x%.2f: %.0f-%.0f ms at %d polys/s"
+            % (MEASURED_GPU_US_POLY[0], MEASURED_GPU_US_POLY[1], ratio, lo, hi, POLYS_PER_S))
         if core > GO_CORE * 1000:
             why_no.append("the ME measured busy %.0f ms a second at %d polys/s" % (core, POLYS_PER_S))
     else:
