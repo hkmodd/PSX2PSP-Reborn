@@ -1354,6 +1354,12 @@ fn real_executables_translate() {
             t.cold.1,
             (t.words.len() - t.cold.0) as f64 / t.cold.1.max(1) as f64,
         );
+        // the static hand-overs (a Guard goes to the interpreter only when its target needs it)
+        let sites: Vec<String> =
+            t.runtime.iter().filter(|(_, r)| r.resumes() && **r != Reason::Guard).map(|(a, r)| format!("{a:08X} {r:?}")).collect();
+        if !sites.is_empty() {
+            println!("  hand-overs: {}", sites.join(", "));
+        }
         guest += g;
         host += 4 * t.words.len();
     }
