@@ -105,6 +105,9 @@ GelScissor geh_scissor;
 
 static GelHash fh = {GEL_HASH_SEED, 0, 0, 0, 0};
 static u32 lists;
+static int hash_off;
+
+void geh_hash(int on) { hash_off = !on; }
 
 int geh_list_start(void *buf)
 {
@@ -117,7 +120,8 @@ u32 geh_list_finish(void)
 {
     gel_cmd(&pc_list, 0x0F, 0);
     gel_cmd(&pc_list, 0x0C, 0);
-    gel_hash(&fh, pc_list.start, resolve);
+    if (!hash_off)
+        gel_hash(&fh, pc_list.start, resolve);
     lists++;
     return (u32)((u8 *)pc_list.current - (u8 *)pc_list.start);
 }
@@ -140,7 +144,7 @@ void geh_frame(u32 frame, GehFrame *o)
 {
     ge_sync();
     o->frame = frame, o->lists = lists, o->words = fh.words, o->prims = fh.prims, o->calls = fh.calls;
-    o->misses = fh.misses, o->unknown = unknown, o->h = fh.h, o->mem = frame % 60 == 0, o->mh = GEL_HASH_SEED;
+    o->misses = fh.misses, o->unknown = unknown, o->h = fh.h, o->mem = !hash_off && frame % 60 == 0, o->mh = GEL_HASH_SEED;
     fh = (GelHash){GEL_HASH_SEED, 0, 0, 0, 0}, lists = 0;
     for (int i = 1; o->mem && i <= nreg; i++)
         o->mh = gel_hash_bytes(o->mh, (const void *)reg[i].p, reg[i].bytes);

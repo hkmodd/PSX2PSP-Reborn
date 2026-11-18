@@ -3,7 +3,9 @@
  * sim logs it, and whether it is the sim's. Exit 0 when the dump read through, and, in
  * GE_SHADOW mode, every frame and every call's return were the sim's.
  *
- *   replay_pc <dump> [shadow|normal] [-v]
+ *   replay_pc <dump> [shadow|normal] [-v] [-nohash]
+ *
+ * -nohash: as me_probe's timing runs, no list or memory hashed (no frame is then the sim's).
  */
 #include <stdarg.h>
 #include <stdio.h>
@@ -49,7 +51,7 @@ static void on_frame(void *user, const ReplayFrame *f)
 
 int main(int argc, char **argv)
 {
-    int mode = GE_SHADOW;
+    int mode = GE_SHADOW, no_hash = 0;
     const char *path = NULL;
     for (int i = 1; i < argc; i++)
         if (!strcmp(argv[i], "shadow"))
@@ -58,10 +60,12 @@ int main(int argc, char **argv)
             mode = GE_NORMAL;
         else if (!strcmp(argv[i], "-v"))
             verbose = 1;
+        else if (!strcmp(argv[i], "-nohash"))
+            no_hash = 1;
         else
             path = argv[i];
     if (!path) {
-        fprintf(stderr, "replay_pc <dump> [shadow|normal] [-v]\n");
+        fprintf(stderr, "replay_pc <dump> [shadow|normal] [-v] [-nohash]\n");
         return 2;
     }
     FILE *fp = fopen(path, "rb");
@@ -79,7 +83,7 @@ int main(int argc, char **argv)
     psx->host = &host;
     psx->gpu.vram = (u16 *)calloc(VRAM_W * VRAM_H, 2);
     psx->ram = (u8 *)calloc(2 * 1024 * 1024, 1);
-    ReplayHooks h = {NULL, on_frame, &mode};
+    ReplayHooks h = {NULL, on_frame, &mode, no_hash};
     ReplayResult r;
     int ok = replay_run(psx, d, (u32)(bytes / 4), mode, &h, &r);
     printf("replay %s: %u events, %u frames (%u not the sim's), %u returns not the sim's, %u polys after the first frame%s%s\n",

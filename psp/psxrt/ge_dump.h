@@ -128,6 +128,9 @@ typedef struct {
 void geh_start(Psx *psx, int mode);
 void geh_frame(u32 frame, GehFrame *o);
 void geh_frame_log(Psx *psx, const GehFrame *o);
+/* Timing runs (me_probe): 0 hashes neither the lists nor the memory, their GehFrame hashes then
+ * the seed's; 1, as ever. */
+void geh_hash(int on);
 
 /* The words of a polygon command (GP0 20-3F), as rd_packet counts them. */
 static inline u32 gedp_poly_words(u32 c0)

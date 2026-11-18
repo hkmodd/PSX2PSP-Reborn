@@ -21,6 +21,7 @@ typedef struct {
     u32 (*clock)(void); /* optional */
     void (*frame)(void *user, const ReplayFrame *f); /* optional: after each frame */
     void *user;
+    int no_hash; /* timing: geh_hash(0), so no frame is the sim's */
 } ReplayHooks;
 
 typedef struct {

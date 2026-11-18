@@ -65,6 +65,7 @@ int replay_run(Psx *psx, const u32 *d, u32 n, int mode, const ReplayHooks *h, Re
         if (type == GEDP_INIT) {
             if (rd)
                 return r->err = "a second INIT", 0;
+            geh_hash(!h->no_hash);
             geh_start(psx, mode);
             rd = g->renderer;
             continue;

@@ -7,10 +7,12 @@
  *   ge cal         the GE's time for a draw of the busy list (100 textured, blended full-screen sprites)
  *   wb             the cost of writing back 16 KB of dirty data cache, the GE idle and drawing
  *   C0, C1         the translator on the CPU, the ME in reset; the GE idle, then drawing
+ *   C0h            C0 with no list or memory hashed (geh_hash): the translator's own time
  *   me boot        the ME out of reset into me.c; its clock against the CPU's (me calib)
  *   b              the ME reading 1 MB of main RAM: uncached, cached, copied to its eDRAM, and the
  *                  same copy by the DMACplus
- *   M0             the translator on the ME alone
+ *   M0, M0h        the translator on the ME alone, hashing and not; each frame's time by the CPU's
+ *                  clock at the ME's progress (me_run), as the ME's Count does not run
  *   C2, C3, C4     the CPU's translator, the GE drawing, the ME idle, copying at full rate, and
  *                  running the translator itself (M1) beside it
  *   me prof, me edram, me end  what the ME sees at the profiler and past 2 MB of eDRAM; whether it
@@ -72,7 +74,7 @@ void kuKernelPokew(void *addr, unsigned int value);
 #define DMA_CH 0xBC800180u /* src, dst, next, ctrl, status */
 
 #define BSRC_BYTES (1024 * 1024)
-#define ARENA_BYTES (11 * 1024 * 1024)
+#define ARENA_BYTES (9 * 1024 * 1024) /* probe 0: peak 7950336 */
 
 static u32 sc_now(void) { return sceKernelGetSystemTimeLow(); }
 
@@ -194,7 +196,7 @@ static int me_boot(int unlock)
 
 /* ---- the translator's runs ---- */
 
-static const TrRun tr_run[TR_COPIES] = {tr0_run, tr1_run, tr2_run, tr3_run, tr4_run, tr5_run, tr6_run};
+static const TrRun tr_run[TR_COPIES] = {tr0_run, tr1_run, tr2_run, tr3_run, tr4_run, tr5_run, tr6_run, tr7_run, tr8_run};
 static const u32 *dump;
 static u32 dump_words;
 
@@ -241,7 +243,7 @@ static void log_run(const char *name, const char *on, int ge, const char *me, co
     say("run name=%s on=%s ge=%d me=%s ok=%d frames=%u polys=%u t=%u matched=%u unit=%s wall_us=%u ge_tail_us=%u "
         "peak=%u events=%u err=%s",
         name, on, ge, me, r->ok, (unsigned)r->nf, (unsigned)r->polys, (unsigned)r->t, (unsigned)r->matched,
-        strcmp(on, "me") ? "us" : "count", (unsigned)wall, (unsigned)tail, (unsigned)peak, (unsigned)r->r.events, err);
+        strcmp(on, "me") || r->sc_timed ? "us" : "count", (unsigned)wall, (unsigned)tail, (unsigned)peak, (unsigned)r->r.events, err);
     for (u32 i = 0; i < r->nf && i < PR_FRAMES; i++) {
         const PrFrame *f = &r->f[i];
         note("frame name=%s n=%u frame=%u polys=%u t=%u match=%u h=%08X%08X mem=%u mh=%08X%08X", name, (unsigned)i,
@@ -270,8 +272,8 @@ static void prof_stop(const char *name)
 }
 
 static PrRun cpu_pr;
-/* the translator copy `copy` over the dump on the CPU, memory from a; its wall time */
-static u32 sc_run(const char *name, int copy, Arena *a)
+/* the translator copy `copy` over the dump on the CPU, memory from a, hashing or not; its wall time */
+static u32 sc_run(const char *name, int copy, Arena *a, int no_hash)
 {
     Psx *psx = psx_new(a);
     memset(&cpu_pr, 0, sizeof cpu_pr);
@@ -280,7 +282,7 @@ static u32 sc_run(const char *name, int copy, Arena *a)
         return 0;
     }
     cpu_pr.now = sc_now;
-    ReplayHooks h = {NULL, pr_frame, &cpu_pr};
+    ReplayHooks h = {NULL, pr_frame, &cpu_pr, no_hash};
     tr_arena[copy] = a;
     prof_start();
     u32 t = sc_now();
@@ -289,6 +291,44 @@ static u32 sc_run(const char *name, int copy, Arena *a)
     u32 wall = sc_now() - t;
     prof_stop(name);
     return wall;
+}
+
+/* The translator copy `copy` (5, 8: the ME's) on the ME alone over the dump, memory mp, hashing or
+ * not. The CPU naps 100 us between looks at the ME's progress: each frame's t is the CPU's clock
+ * between the looks that saw it end (the ME's Count does not run, me calib), out by at most a look
+ * in ~30 ms frames. 1 when the job ended; wall, the CPU's time from the kick to the end. */
+static int me_run(const char *name, PrRun *mr, int copy, Psx *mp, int no_hash, u32 *wall)
+{
+    u32 ts[PR_FRAMES + 1], seen = 0, looks = 0;
+    if (me_dead)
+        return 0;
+    mr->no_hash = (u32)no_hash;
+    me_kick(JOB_REPLAY, (u32)copy, (u32)mp, (u32)dump, dump_words, (u32)mr);
+    u32 t0 = sc_now(), now;
+    ts[0] = t0;
+    for (;;) {
+        int busy = me_busy(); /* before progress: when done, the progress read after it is the last */
+        now = sc_now();
+        u32 p = me_ctl->ack == me_seq ? me_ctl->progress : 0;
+        looks++;
+        while (seen < p && seen < PR_FRAMES)
+            ts[++seen] = now;
+        if (!busy || now - t0 > 30000000)
+            break;
+        sceKernelDelayThread(100);
+    }
+    *wall = now - t0;
+    if (!me_wait(1000))
+        return 0;
+    mr->t = 0, mr->sc_timed = 1;
+    for (u32 i = 0; i < mr->nf && i < PR_FRAMES; i++) {
+        mr->f[i].t = i < seen ? ts[i + 1] - ts[i] : 0;
+        if (i)
+            mr->t += mr->f[i].t;
+    }
+    say("me_run name=%s looks=%u seen=%u us_per_look=%u", name, (unsigned)looks, (unsigned)seen,
+        (unsigned)(*wall / (looks ? looks : 1)));
+    return 1;
 }
 
 /* ---- the GE, kept busy ---- */
@@ -508,12 +548,14 @@ int main(int argc, char **argv)
     wb_measure(1);
 
     /* C0, C1: the ME in reset */
-    u32 w0 = sc_run("C0", 0, A);
+    u32 w0 = sc_run("C0", 0, A, 0);
     log_run("C0", "cpu", 0, "off", &cpu_pr, w0, 0, A->peak);
     u32 busy_us = 4 * (w0 ? w0 : 1000000);
     ge_busy(ge_draws_for(busy_us));
-    u32 w = sc_run("C1", 1, A);
+    u32 w = sc_run("C1", 1, A, 0);
     log_run("C1", "cpu", 1, "off", &cpu_pr, w, ge_tail(), A->peak);
+    w = sc_run("C0h", 7, A, 1);
+    log_run("C0h", "cpu", 0, "off", &cpu_pr, w, 0, A->peak);
 
     /* a: the ME up, and its clock */
     if (me_boot(0) || me_boot(1)) {
@@ -554,29 +596,31 @@ int main(int argc, char **argv)
             (unsigned)us, ok && me_ctl->res[0] == bsum);
     }
 
-    /* M0: the translator on the ME alone */
+    /* M0, M0h: the translator on the ME alone, hashing and not */
     PrRun *mr = NULL;
-    Psx *mp = me_dead ? NULL : psx_new(B ? B : A);
     Arena *MA = B ? B : A;
-    if (mp && (mr = (PrRun *)arena_calloc(MA, 1, sizeof(PrRun))) != NULL) {
-        tr_arena[5] = MA;
-        t = sc_now();
-        int ok = me_job(JOB_REPLAY, 5, (u32)mp, (u32)dump, dump_words, (u32)mr, 30000000);
-        u32 wall = sc_now() - t;
-        if (ok)
-            log_run("M0", "me", 0, "replay", mr, wall, 0, MA->peak);
+    for (int k = 0; k < 2; k++) {
+        const char *name = k ? "M0h" : "M0";
+        int copy = k ? 8 : 5;
+        Psx *mp = me_dead ? NULL : psx_new(MA);
+        if (mp && (mr = (PrRun *)arena_calloc(MA, 1, sizeof(PrRun))) != NULL) {
+            tr_arena[copy] = MA;
+            u32 wall;
+            if (me_run(name, mr, copy, mp, k, &wall))
+                log_run(name, "me", 0, "replay", mr, wall, 0, MA->peak);
+        }
     }
 
     /* C2: the ME idle */
     ge_busy(ge_draws_for(busy_us));
-    w = sc_run("C2", 2, A);
+    w = sc_run("C2", 2, A, 0);
     log_run("C2", "cpu", 1, me_dead ? "dead" : "idle", &cpu_pr, w, ge_tail(), A->peak);
 
     /* C3: the ME copying 1 MB to its eDRAM, again and again */
     if (!me_dead) {
         ge_busy(ge_draws_for(busy_us));
         me_kick(JOB_STREAM, (u32)bsrc, BSRC_BYTES, 0, 0, 0);
-        w = sc_run("C3", 3, A);
+        w = sc_run("C3", 3, A, 0);
         u32 tail = ge_tail();
         me_ctl->stop = 1;
         if (me_wait(5000000)) {
@@ -587,14 +631,14 @@ int main(int argc, char **argv)
 
     /* C4: the ME running the translator (M1) beside the CPU's */
     if (!me_dead && B) {
-        mp = psx_new(B);
+        Psx *mp = psx_new(B);
         mr = mp ? (PrRun *)arena_calloc(B, 1, sizeof(PrRun)) : NULL;
         if (mr) {
             tr_arena[6] = B;
             ge_busy(ge_draws_for(busy_us));
             me_kick(JOB_REPLAY, 6, (u32)mp, (u32)dump, dump_words, (u32)mr);
             u32 tm = sc_now();
-            w = sc_run("C4", 4, A);
+            w = sc_run("C4", 4, A, 0);
             u32 tail = ge_tail();
             int busy = me_busy();
             u32 prog = me_ctl->progress;

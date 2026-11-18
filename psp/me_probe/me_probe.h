@@ -14,7 +14,7 @@
 #include "ge.h"
 #include "replay.h"
 
-#define TR_COPIES 7
+#define TR_COPIES 9
 #define ME_ALIVE 0x4D454F4Bu /* "MEOK", the ME's first write */
 
 enum {
@@ -55,6 +55,8 @@ typedef struct {
     u32 (*now)(void);
     volatile MeCtl *ctl; /* the ME's progress, or NULL */
     u32 t_last, nf, polys, t, matched;
+    u32 no_hash;  /* ReplayHooks' */
+    u32 sc_timed; /* an ME run's t by the CPU's clock (me_run), not the ME's Count */
     int ok;
     ReplayResult r;
     PrFrame f[PR_FRAMES];
@@ -69,6 +71,8 @@ int tr3_run(Psx *, const u32 *, u32, int, const ReplayHooks *, ReplayResult *);
 int tr4_run(Psx *, const u32 *, u32, int, const ReplayHooks *, ReplayResult *);
 int tr5_run(Psx *, const u32 *, u32, int, const ReplayHooks *, ReplayResult *);
 int tr6_run(Psx *, const u32 *, u32, int, const ReplayHooks *, ReplayResult *);
+int tr7_run(Psx *, const u32 *, u32, int, const ReplayHooks *, ReplayResult *);
+int tr8_run(Psx *, const u32 *, u32, int, const ReplayHooks *, ReplayResult *);
 
 /* me.c */
 extern volatile MeCtl *me_ctl; /* the uncached alias, set before the ME starts */

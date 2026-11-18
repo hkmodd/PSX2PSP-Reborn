@@ -184,8 +184,8 @@ static void job(volatile MeCtl *c)
         __asm__ volatile("ctc1 %0, $31" : : "r"(fcr));
         PrRun *run = (PrRun *)c->arg[4];
         run->now = me_now, run->ctl = c, run->t_last = count();
-        ReplayHooks h = {NULL, pr_frame, run};
-        TrRun fn = c->arg[0] == 6 ? tr6_run : tr5_run;
+        ReplayHooks h = {NULL, pr_frame, run, (int)run->no_hash};
+        TrRun fn = c->arg[0] == 8 ? tr8_run : c->arg[0] == 6 ? tr6_run : tr5_run;
         run->ok = fn((Psx *)c->arg[1], (const u32 *)c->arg[2], c->arg[3], GE_NORMAL, &h, &run->r);
         c->res[0] = (u32)run->ok;
         break;
@@ -226,6 +226,8 @@ void me_main(void)
                 __asm__ volatile("nop");
             continue;
         }
+        c->progress = 0; /* before ack: the CPU reads progress only once ack is its job's */
+        __asm__ volatile("sync");
         c->ack = seq;
         dcache_wbinv_all();
         job(c);
@@ -263,6 +265,8 @@ TR_ALLOC(3)
 TR_ALLOC(4)
 TR_ALLOC(5)
 TR_ALLOC(6)
+TR_ALLOC(7)
+TR_ALLOC(8)
 
 void me_abort(void) __attribute__((noreturn));
 void me_abort(void)

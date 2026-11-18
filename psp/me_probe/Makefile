@@ -10,7 +10,7 @@
 # on the ME's copies, so that a call shows in the log instead of corrupting the CPU's.
 ME_TRAPS = fopen fwrite fclose getenv snprintf strtoul
 TARGET = me_probe
-OBJS = main.o me.o $(foreach n,0 1 2 3 4 5 6,copy$(n).o)
+OBJS = main.o me.o $(foreach n,0 1 2 3 4 5 6 7 8,copy$(n).o)
 
 PSXRT = ../psxrt
 INCDIR = $(PSXRT) $(PSXRT)/core
@@ -43,8 +43,8 @@ tr/all.o: $(TR_OBJS)
 copy%.o: tr/all.o Makefile
 	psp-objcopy -G replay_run $< tr/local$*.o
 	psp-objcopy --redefine-sym replay_run=tr$*_run --redefine-sym calloc=tr$*_calloc --redefine-sym free=tr$*_free \
-		--redefine-sym abort=$(if $(filter 5 6,$*),me_abort,cpu_abort) --redefine-sym psx_log=pr_log \
-		--redefine-sym psx_raise=pr_raise --redefine-sym psx_video_mode=pr_video 		$(if $(filter 5 6,$*),$(foreach f,$(ME_TRAPS),--redefine-sym $(f)=me_trap_$(f))) tr/local$*.o $@
+		--redefine-sym abort=$(if $(filter 5 6 8,$*),me_abort,cpu_abort) --redefine-sym psx_log=pr_log \
+		--redefine-sym psx_raise=pr_raise --redefine-sym psx_video_mode=pr_video 		$(if $(filter 5 6 8,$*),$(foreach f,$(ME_TRAPS),--redefine-sym $(f)=me_trap_$(f))) tr/local$*.o $@
 
 clean: clean-tr
 clean-tr:
