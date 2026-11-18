@@ -1265,8 +1265,16 @@ pub struct FloatingFile {
 /// runtime takes images ([`psx2psp_sim::Machine::watch`]: checked at the first run in the text
 /// after a load, held until a load over the word). Words rewritten inside a held image count as
 /// covered (the runtime patches them or sends their block to the interpreter): a measure of
-/// discovery, not of self-modifying code. `every` sets how often the maps are read.
-pub fn static_coverage(img: &DiscImage, patches: &[&dyn ImagePatch], cipher: Option<psx2psp_recomp::overlay::XorLcg>, frames: u32, every: u32) -> std::result::Result<Coverage, String> {
+/// discovery, not of self-modifying code. `every` sets how often the maps are read. `pad`, when
+/// given, is the input instead: (first frame, frames, PS1 buttons) presses, as [`pad_script`] reads.
+pub fn static_coverage(
+    img: &DiscImage,
+    patches: &[&dyn ImagePatch],
+    cipher: Option<psx2psp_recomp::overlay::XorLcg>,
+    frames: u32,
+    every: u32,
+    pad: Option<&[(u32, u32, u16)]>,
+) -> std::result::Result<Coverage, String> {
     use psx2psp_sim::{Machine, RAM};
     let (exes, overlays) = (disc_executables(img, patches), disc_overlay_files(img, patches, cipher));
     // Each file's text as on the disc, by name: what an image holds where its words ran.
@@ -1305,7 +1313,8 @@ pub fn static_coverage(img: &DiscImage, patches: &[&dyn ImagePatch], cipher: Opt
     let mut kernel = std::collections::BTreeSet::new();
     let every = every.max(1);
     for f in 1..=frames {
-        let alive = m.frame(capture_pad(f));
+        let held = pad.map_or_else(|| capture_pad(f), |p| p.iter().filter(|&&(at, n, _)| f >= at && f - at < n).fold(0, |m, &(.., b)| m | b));
+        let alive = m.frame(held);
         cov.frames = f;
         for (k, &id) in ids.iter().enumerate() {
             if cov.image_list[k].4.is_none() && m.watch_live(id) {
@@ -1521,6 +1530,27 @@ pub fn static_coverage(img: &DiscImage, patches: &[&dyn ImagePatch], cipher: Opt
         }
     }
     Ok(cov)
+}
+
+/// The presses of a runtime `psxrt.pad` script: "frame buttons frames" triples, the buttons in
+/// hex PSP bits (L and R become the PS1's L1 and R1, as the runtime maps them); L+R+START,
+/// the runtime's snapshot request, is left out. (first frame, frames, PS1 buttons active high).
+pub fn pad_script(text: &str) -> std::result::Result<Vec<(u32, u32, u16)>, String> {
+    let v: Vec<&str> = text.split_whitespace().collect();
+    if v.len() % 3 != 0 {
+        return Err(format!("{} words: not frame/buttons/frames triples", v.len()));
+    }
+    let mut out = Vec::new();
+    for t in v.chunks_exact(3) {
+        let bad = || format!("bad press {} {} {}", t[0], t[1], t[2]);
+        let f = t[0].parse::<u32>().map_err(|_| bad())?;
+        let b = u32::from_str_radix(t[1], 16).map_err(|_| bad())?;
+        let n = t[2].parse::<u32>().map_err(|_| bad())?;
+        if b & 0x308 != 0x308 {
+            out.push((f, n, ((b & 0xF0F9) | ((b >> 8) & 3) << 10) as u16));
+        }
+    }
+    Ok(out)
 }
 
 /// The input of [`captured_code`] and [`static_coverage`] at frame `f`: Start and Cross pressed
@@ -2513,6 +2543,19 @@ mod tests {
 
         let six = ConvertRequest { discs: vec![req.discs[0].clone(); NATIVE_MAX_DISCS + 1], ..req };
         assert!(convert_native(&six, &()).is_err(), "at most NATIVE_MAX_DISCS");
+    }
+
+    #[test]
+    fn pad_scripts_read_as_the_runtime_maps_the_psp_buttons() {
+        use psx2psp_sim::{CROSS, START};
+        let p = pad_script("800 8 75
+1900 4000 40
+2000 308 6
+2100 300 6
+2200 90 3").unwrap();
+        assert_eq!(p, vec![(800, 75, START), (1900, 40, CROSS), (2100, 6, 0xC00), (2200, 3, 0x90)]);
+        assert!(pad_script("800 8").is_err());
+        assert!(pad_script("800 zz 3").is_err());
     }
 
     #[test]

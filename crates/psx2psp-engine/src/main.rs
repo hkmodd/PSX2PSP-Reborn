@@ -23,7 +23,7 @@ USAGE:
   psx2psp patches <disc.cue|disc.bin> [--id <code>] [--ppf <file>]
                                      the patch database's entries for the game, with hits
   psx2psp libs    <disc.cue|disc.bin>  the PsyQ library functions in each executable
-  psx2psp coverage <disc.cue|disc.bin> [--frames N] [--every N]
+  psx2psp coverage <disc.cue|disc.bin> [--frames N] [--every N] [--pad psxrt.pad]
                                      the code the game runs in the sim that the static
                                      translation finds (no capture), and where it misses
   psx2psp clip    <video|audio|URL> [clip options] [-o <dir>]   → ICON1.PMF / SND0.AT3
@@ -489,13 +489,18 @@ fn cmd_libs(disc: &Path) -> R {
 }
 
 fn cmd_coverage(args: &[String]) -> R {
-    let (mut disc, mut frames, mut every) = (None, psx2psp_engine::CAPTURE_FRAMES, 60);
+    let (mut disc, mut frames, mut every, mut pad) = (None, psx2psp_engine::CAPTURE_FRAMES, 60, None);
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut val = || it.next().ok_or_else(|| format!("{a} needs a value"));
         match a.as_str() {
             "--frames" => frames = val()?.parse()?,
             "--every" => every = val()?.parse()?,
+            "--pad" => {
+                let path = val()?;
+                let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+                pad = Some(psx2psp_engine::pad_script(&text).map_err(|e| format!("{path}: {e}"))?);
+            }
             s if s.starts_with('-') => return Err(format!("unknown flag {s}").into()),
             s => disc = Some(PathBuf::from(s)),
         }
@@ -505,7 +510,7 @@ fn cmd_coverage(args: &[String]) -> R {
     let t = std::time::Instant::now();
     let db = load_patches();
     let cipher = img.probe().disc_id.and_then(|id| db.cipher(&db.pops_id(&id)));
-    let c = psx2psp_engine::static_coverage(&img, &[], cipher, frames, every)?;
+    let c = psx2psp_engine::static_coverage(&img, &[], cipher, frames, every, pad.as_deref())?;
     let pct = if c.ran == 0 { 100.0 } else { 100.0 * c.covered as f64 / c.ran as f64 };
     println!(
         "coverage {pct:.2}%: {} of {} instructions run are in the static translation ({} images, {} frames, {:.1} s); kernel area {} words, not counted",
