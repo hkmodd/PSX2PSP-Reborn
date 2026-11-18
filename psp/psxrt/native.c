@@ -78,8 +78,10 @@
 #define STUB_GTE_AVSZ4 0x09A00FE0u
 #define STUB_GTE_RTPS 0x09A00FE8u
 #define STUB_GTE_RTPT 0x09A00FF0u
-#define STUB_GTE_MVMVA 0x09A00FC8u /* these two take their word in k1 */
+#define STUB_GTE_MVMVA 0x09A00FC8u /* these four take their word in k1 */
 #define STUB_GTE_GPF 0x09A00FF8u
+#define STUB_GTE_DPCS 0x09A00FA8u
+#define STUB_GTE_SQR 0x09A00FB0u
 #define TABLE_ADDR 0x09A01000u
 #define TABLE_WORDS (RAM_SIZE / 4)
 /* CTX words */
@@ -119,7 +121,7 @@ void psxrt_gte_avsz3(void), psxrt_gte_avsz3_door(void);
 void psxrt_gte_avsz4(void), psxrt_gte_avsz4_door(void);
 void psxrt_gte_rtps(void), psxrt_gte_rtps_door(void);
 void psxrt_gte_rtpt(void), psxrt_gte_rtpt_door(void);
-void psxrt_gte_mvmva(void), psxrt_gte_gpf(void);
+void psxrt_gte_mvmva(void), psxrt_gte_gpf(void), psxrt_gte_dpcs(void), psxrt_gte_sqr(void);
 u32 psxrt_zero3[3]; /* MVMVA's translation when it has none */
 void native_enter(u32 host_pc);
 /* gte_fast.c */
@@ -2101,15 +2103,26 @@ static const struct {
     {STUB_GTE_GPF, 0x0190003Du, psxrt_gte_gpf, psxrt_gte_cmd},
     {STUB_GTE_GPF, 0x0198003Du, psxrt_gte_gpf, psxrt_gte_cmd},
     {STUB_GTE_GPF, 0x0008043Du, psxrt_gte_gpf, psxrt_gte_cmd},
+    /* DPCS and SQR with sf and lm both ways */
+    {STUB_GTE_DPCS, 0x00780010u, psxrt_gte_dpcs, psxrt_gte_cmd},
+    {STUB_GTE_DPCS, 0x00700010u, psxrt_gte_dpcs, psxrt_gte_cmd},
+    {STUB_GTE_DPCS, 0x00780410u, psxrt_gte_dpcs, psxrt_gte_cmd},
+    {STUB_GTE_SQR, 0x00A00428u, psxrt_gte_sqr, psxrt_gte_cmd},
+    {STUB_GTE_SQR, 0x00A80428u, psxrt_gte_sqr, psxrt_gte_cmd},
+    {STUB_GTE_SQR, 0x00A80028u, psxrt_gte_sqr, psxrt_gte_cmd},
 };
 #define GTE_OPS (int)(sizeof gte_ops / sizeof gte_ops[0])
 
 /* The divide's reciprocal table for psxrt_gte_rtps/rtpt, as core/gte.c builds its own. */
 u8 psxrt_unr[0x104];
 
+/* A routine called as translated code calls it. Its way on to GTE_CMD runs C on native_host_sp/gp
+ * (trampolines.S TO_HOST), which nothing has set yet at init: 4 KB below this frame, and this gp. */
 static void gte_call_asm(void (*fn)(void), u32 cmd)
 {
-    __asm__ volatile("lui $26, 0x09A0\n\tori $26, $26, 0x004C\n\tmove $27, %1\n\tjalr %0\n\tnop" : : "r"(fn), "r"(cmd) : "$26", "$27", "$31", "memory");
+    __asm__ volatile("addiu $8, $sp, -0x1000\n\tins $8, $0, 0, 4\n\tsw $8, %2\n\tsw $gp, %3\n\t"
+                     "lui $26, 0x09A0\n\tori $26, $26, 0x004C\n\tmove $27, %1\n\tjalr %0\n\tnop"
+                     : : "r"(fn), "r"(cmd), "m"(native_host_sp), "m"(native_host_gp) : "$8", "$26", "$27", "$31", "memory");
 }
 
 static u32 rnd_state = 0x2545F491u;
@@ -2124,16 +2137,17 @@ static s32 rnd_mag(int bits) { return (s32)rnd() >> (32 - bits + (rnd() % bits))
 static u32 rnd16(void) { return (u32)rnd_mag(16) & 0xFFFF; }
 static s32 rnd_pair(void) { return (s32)(rnd16() | rnd16() << 16); }
 
-/* Each routine against gte_command on random registers (TR within 31 bits, as the routines take
- * them): the number of differing results. The GTE and the CTX words the routines park guest
- * state in are kept. */
+/* Each routine against gte_command on random registers (TR and BK within 31 bits, as the routines
+ * take them; FC within 31 bits 7 times in 8, beyond for DPCS's way to GTE_CMD): the number of
+ * differing results. The GTE, CTX (where the routines park guest state and charge cycles), the
+ * cycle count and the GTE counts GTE_CMD keeps are kept. */
 static int gte_asm_check(Psx *psx, int n)
 {
     Gte *g = psx->gte, keep = *g, in, want;
-    u32 park[10];
-    for (int r = 0; r < 8; r++)
-        park[r] = ctx[8 + r];
-    park[8] = ctx[C_HI], park[9] = ctx[C_LO];
+    u32 park[0x40], n_gtec = native_stats.n_io[IO_GTEC], n_gte[64];
+    u64 cycles = psx->cycles;
+    memcpy(park, (const void *)ctx, sizeof park);
+    memcpy(n_gte, native_stats.n_gte, sizeof n_gte);
     int bad = 0, per[GTE_OPS] = {0};
     for (int i = 0; i < n; i++) {
         for (int r = 0; r < 32; r++)
@@ -2147,7 +2161,8 @@ static int gte_asm_check(Psx *psx, int n)
         for (int r = 8; r < 12; r++) /* IR0-IR3: 16-bit values, as every write leaves them */
             in.d[r] = rnd_mag(16);
         for (int r = 5; r < 8; r++)
-            in.c[r] = rnd_mag(31), in.c[r + 8] = rnd_mag(31); /* TR, BK */
+            in.c[r] = rnd_mag(31), in.c[r + 8] = rnd_mag(31), /* TR, BK, FC */
+            in.c[r + 16] = (i & 7) ? rnd_mag(31) : rnd_pair();
         in.c[24] = rnd_mag(32), in.c[25] = rnd_mag(32), in.c[28] = rnd_mag(32);
         int k = i % GTE_OPS;
         *g = in;
@@ -2164,9 +2179,10 @@ static int gte_asm_check(Psx *psx, int n)
     for (int k = 0; k < GTE_OPS; k++)
         bad += per[k];
     *g = keep;
-    for (int r = 0; r < 8; r++)
-        ctx[8 + r] = park[r];
-    ctx[C_HI] = park[8], ctx[C_LO] = park[9];
+    memcpy((void *)ctx, park, sizeof park);
+    psx->cycles = cycles;
+    native_stats.n_io[IO_GTEC] = n_gtec;
+    memcpy(native_stats.n_gte, n_gte, sizeof n_gte);
     return bad;
 }
 
@@ -2300,7 +2316,7 @@ const char *native_init(Psx *psx, const DiscInfo *info)
     }
     int bad = gte_asm_check(psx, GTE_OPS * 4096);
     gte_stubs(!bad);
-    say("native: GTE NCLIP/AVSZ/RTPS/RTPT/MVMVA/GPF in asm, %d of %d checks differ%s", bad, GTE_OPS * 4096,
+    say("native: GTE NCLIP/AVSZ/RTPS/RTPT/MVMVA/GPF/DPCS/SQR in asm, %d of %d checks differ%s", bad, GTE_OPS * 4096,
         bad ? ": through the runtime" : "");
     io_fast_psx = psx, io_fast_shift = cpu_shift;
     int served;

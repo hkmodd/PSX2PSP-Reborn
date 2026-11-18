@@ -19,6 +19,7 @@
 #define G(r) (0x3B4 + 4 * (r)) /* CTX GPR r from k0 */
 #define HI 0x434
 #define LO 0x438
+#define BUDGET 0x444 /* CTX.BUDGET (native.c C_BUDGET) */
 /* CTX.GTE_RET: one slot for every lean entry (psxrt_gte_*, psxrt_io_read/write): each parks its
  * return site here and the C behind it (C_SITE in io_fast.c, native.c) reads it once on entry.
  * That holds only while no lean entry runs translated code (run_guest) before reading C_SITE: a
@@ -792,6 +793,98 @@ word_far:
     j psxrt_gte_cmd
     lw $ra, GTE_RET($k0)
     .end psxrt_gte_gpf
+
+/* DPCS, colour component n (core/gte.c interpolate): in = RGBC byte n << 16 (t6, t7 = 1);
+ * MAC = FC * 0x1000 - in, shifted by sf, to IR saturated with lm 0 (FLAG bit 24-n) in t1; then
+ * MAC = IR * IR0 (t2) + in, MAC and IR by the word's sf and lm. An FC within 31 bits keeps the
+ * first sum within 43 bits, so it never overflows; the second fits 31 bits. */
+.macro DP_ROW n
+    ext $14, $11, 8 * \n, 8
+    sll $14, $14, 16
+    lw $13, GC(21 + \n)($k0)
+    sll $9, $13, 12
+    mtlo $9
+    sra $9, $13, 20
+    mthi $9
+    msub $14, $15
+    mflo $8
+    ext $ra, $k1, 19, 1
+    beqz $ra, .Lsf\@
+    mfhi $9
+    srl $8, $8, 12
+    ins $8, $9, 20, 12
+.Lsf\@:
+    seh $9, $8
+    beq $9, $8, .Lok\@
+    sra $ra, $8, 31
+    xori $9, $ra, 0x7FFF
+    lui $ra, 1 << (8 - \n)
+    or $12, $12, $ra
+.Lok\@:
+    mtlo $14
+    mthi $zero
+    madd $9, $10
+    WORD_MAC \n
+.endm
+
+/* DPCS: the depth cue of RGBC towards FC by IR0, then the colour pushed. An FC beyond 31 bits
+ * goes to GTE_CMD. */
+    .globl psxrt_gte_dpcs
+    .ent psxrt_gte_dpcs
+psxrt_gte_dpcs:
+    WORD_ENTER
+    lw $8, GC(21)($k0)
+    sll $9, $8, 1
+    xor $8, $8, $9
+    lw $9, GC(22)($k0)
+    sll $13, $9, 1
+    xor $9, $9, $13
+    or $8, $8, $9
+    lw $9, GC(23)($k0)
+    sll $13, $9, 1
+    xor $9, $9, $13
+    or $8, $8, $9
+    bltz $8, word_far
+    lw $11, GD(6)($k0)
+    lw $10, GD(8)($k0)
+    li $15, 1
+    DP_ROW 0
+    DP_ROW 1
+    DP_ROW 2
+    lw $8, GD(21)($k0)
+    sw $8, GD(20)($k0)
+    lw $8, GD(22)($k0)
+    sw $8, GD(21)($k0)
+    srl $13, $11, 24
+    sll $13, $13, 24
+    WORD_RGB 0
+    WORD_RGB 1
+    WORD_RGB 2
+    b word_charge
+    sw $13, GD(22)($k0)
+    .end psxrt_gte_dpcs
+
+/* SQR: MAC = IR * IR, by the word's sf and lm. */
+.macro SQR_ROW n
+    lw $9, GD(9 + \n)($k0)
+    mult $9, $9
+    WORD_MAC \n
+.endm
+
+    .globl psxrt_gte_sqr
+    .ent psxrt_gte_sqr
+psxrt_gte_sqr:
+    WORD_ENTER
+    SQR_ROW 0
+    SQR_ROW 1
+    SQR_ROW 2
+/* The 10 cycles GTE_CMD adds (gte_fast.c), taken from the budget: PS1 time as through GTE_CMD. */
+word_charge:
+    lw $8, BUDGET($k0)
+    addiu $8, $8, -10
+    b word_leave
+    sw $8, BUDGET($k0)
+    .end psxrt_gte_sqr
 /* The same entries through GTE_CMD, for when native_init's check finds a difference. */
 .macro GTE_DOOR name, cmd
     .globl psxrt_gte_\name\()_door
