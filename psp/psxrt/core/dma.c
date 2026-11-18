@@ -139,6 +139,13 @@ static void transfer(Psx *psx, int ch)
                     i += n, addr = (addr + 4 * n) & 0x1FFFFC;
                     continue;
                 }
+                if (ch == 3 && step == 4) { /* a sector's data: whole words at a time */
+                    u32 n = words - i, room = (RAM_SIZE - addr) / 4;
+                    if ((n = cd_dma_block(psx, (u32 *)(psx->ram + addr), n < room ? n : room))) {
+                        i += n, addr = (addr + 4 * n) & 0x1FFFFC;
+                        continue;
+                    }
+                }
                 wr(psx, addr, dev_read(psx, ch));
                 i++, addr = (addr + step) & 0x1FFFFC;
             }

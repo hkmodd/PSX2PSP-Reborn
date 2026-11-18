@@ -1070,7 +1070,8 @@ static void frame(void)
                     if (d->n_run[ch])
                         n += snprintf(line + n, sizeof line - (size_t)n, " ch%d %u/%u/%u", ch, (unsigned)d->n_run[ch],
                                       ms_of(d->us_run[ch]), ms_of(d->words[ch]));
-                n += snprintf(line + n, sizeof line - (size_t)n, "\n");
+                n += snprintf(line + n, sizeof line - (size_t)n, "; ram_loaded %u ms\n", ms_of(native_stats.us_loaded));
+                native_stats.us_loaded = 0;
                 memset(d->n_run, 0, sizeof d->n_run), memset(d->us_run, 0, sizeof d->us_run), memset(d->words, 0, sizeof d->words);
                 if (sas_on) {
                     u32 us;

@@ -543,6 +543,7 @@ u8 cd_read(Psx *psx, int reg);
 void cd_write(Psx *psx, int reg, u8 v);
 void cd_update(Psx *psx);
 u32 cd_dma_word(Psx *psx);
+u32 cd_dma_block(Psx *psx, u32 *dst, u32 n);
 /* The shell opens (1) or closes (0). The host changes the disc while it is open: read_sector's
  * source and disc_end, before the close. Opening stops the drive with INT5 (11h, 08h); commands
  * that need the disc fail with INT5 (11h, 80h) while it is open; after the close the motor spins

@@ -502,6 +502,19 @@ void cd_update(Psx *psx)
         psx_schedule(psx, cd->swap_due);
 }
 
+/* A DMA's whole words of the sector's data, straight into `dst`: up to `n`, while the data lasts
+ * (cd_dma_word's bytes, in the same order); 0 when less than a word is left, for cd_dma_word. */
+u32 cd_dma_block(Psx *psx, u32 *dst, u32 n)
+{
+    Cdrom *cd = &psx->cd;
+    u32 left = cd->data_pos < cd->data_len ? (u32)(cd->data_len - cd->data_pos) / 4 : 0;
+    if (n > left)
+        n = left;
+    memcpy(dst, cd->data + cd->data_pos, 4 * n);
+    cd->data_pos += (int)(4 * n);
+    return n;
+}
+
 u32 cd_dma_word(Psx *psx)
 {
     u32 v = 0;

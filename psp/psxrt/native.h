@@ -35,6 +35,7 @@ typedef struct NativeStats {
     u32 io_host; /* timer/IRQ/pad instructions run as host calls (recipes' own reads not counted) */
     u32 vsync_passes; /* v_wait passes counted down at once by hook_vsync_wait (not run as guest code) */
     u32 fl_places, fl_reused, fl_drops, fl_full; /* floating code: units placed, placements reinstalled, dropped, refused for room */
+    u32 us_loaded; /* microseconds checking the translations of what DMAs and BIOS reads loaded (on_ram_loaded); main.c zeroes it */
 } NativeStats;
 
 extern NativeStats native_stats;

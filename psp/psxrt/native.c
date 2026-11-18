@@ -738,7 +738,7 @@ static void on_ram_loaded(Psx *psx, u32 addr, u32 len)
         cache_flushed();
         return;
     }
-    u32 a = addr & (RAM_SIZE - 4), end = a + ((len + 3) & ~3u);
+    u32 t = sceKernelGetSystemTimeLow(), a = addr & (RAM_SIZE - 4), end = a + ((len + 3) & ~3u);
     if (end > RAM_SIZE)
         end = RAM_SIZE;
     for (u32 x = a; x < end; x += 4)
@@ -747,6 +747,7 @@ static void on_ram_loaded(Psx *psx, u32 addr, u32 len)
     for (int i = 0; i < nimg; i++)
         if (a < img[i].text + img[i].e->text_size && img[i].text < end)
             img[i].gen++;
+    native_stats.us_loaded += sceKernelGetSystemTimeLow() - t;
 }
 
 /* ---- time ---- */
