@@ -43,7 +43,7 @@ use thiserror::Error;
 
 use crate::discover::{Discovery, Image, JumpReg};
 use crate::exe::PsxExe;
-use crate::hazard::Hazards;
+use crate::hazard::{HazardKind, Hazards};
 use crate::hooks::{self, HOOK, Hook};
 use crate::insn::{Insn, Isa, Kind, Uses, decode};
 use crate::layout::{self, RT_CALL, SCRATCH, ctx, gte, k0_off};
@@ -89,6 +89,9 @@ pub enum Reason {
     SlotClobbers,
     /// A load whose delay slot the code depends on (see [`crate::hazard`]).
     Hazard,
+    /// A register jump with a load in its slot and unknown targets: native, unless at run time
+    /// the target's first word names the loaded register ([`Em::guard`]).
+    Guard,
     /// A recipe the runtime runs itself ([`crate::hooks`]).
     Hook,
 }
@@ -1199,6 +1202,68 @@ impl Em<'_> {
         }
     }
 
+    /// An unconditional branch at `a` to a `jr` of the register the load in the branch's slot
+    /// writes: the `jr` runs in the load's delay, so it jumps where the register pointed before,
+    /// and the load lands before the `jr`'s own slot (R3000A load delay, psx-spx "CPU Load
+    /// Delay"). Crash 2's GOOL code ends its pieces so: `b` to `jr ra` with `lw ra` in the slot,
+    /// the old `ra` running the piece once more. One host sequence: the old target, the load, the
+    /// `jr`'s slot, the jump. False (nothing written) for any other shape, and in floating code,
+    /// where RAM at the target may not be the unit's words.
+    fn stale_jump(&mut self, a: u32, i: Insn, k: Kind, si: Insn, sk: Kind) -> bool {
+        use Kind::*;
+        let uncond = matches!(k, J) || (k == Beq && i.rs() == i.rt()) || (k == Bgez && i.rs() == 0);
+        if self.floating || !uncond || !matches!(sk, Lb | Lbu | Lh | Lhu | Lw | Lwl | Lwr) {
+            return false;
+        }
+        let t = if k == J { i.jump_target(a) } else { i.branch_target(a) };
+        let (Some((ti, tk)), Some((ui, uk))) = (self.at(t), self.at(t + 4)) else { return false };
+        let r = si.rt();
+        // The `jr`'s slot one plain word (a `nop` in GOOL): nothing in it can leave the sequence.
+        let Some(w) = simple(ui, uk) else { return false };
+        if tk != Jr || ti.rs() != r || (Uses::of(si, sk).read | Uses::of(si, sk).write) & GUEST_K != 0 || !self.d.code.contains(&t) {
+            return false;
+        }
+        let host = !matches!(self.d.jumps.get(&t), Some(JumpReg::Table { .. }));
+        self.dispatch(r as u32, host, a);
+        self.out.push(sw(K1R, k0_off(layout::CTX + ctx::JUMP), K0R));
+        let c = self.plain(a + 4, si, sk).0;
+        self.out.append(c);
+        self.out.push(lw(K1R, k0_off(layout::CTX + ctx::JUMP), K0R));
+        self.out.push(jr(K1R));
+        self.out.simple(w, t + 4);
+        true
+    }
+
+    /// `jr`/`jalr` at `a` with a load into `r` in its slot and targets discovery does not know
+    /// (hazard [`crate::hazard::HazardKind::UnknownSlot`]). The target's first instruction runs
+    /// in the load's delay and would read the old `r` (psx-spx "CPU Load Delay"); the native path
+    /// lands the load first. So the guest word at the target is read here, before the slot: if
+    /// its `rs` or `rt` field names `r` (a superset of the instructions that read it), or the
+    /// target is a host address, the interpreter runs the jump, exact to the cycle (psxrt's
+    /// `load_delayed`). Anything else goes native. 16 words, 2 RAM reads; Crash 2's GOOL calls
+    /// `jalr t8` with `lw s3,36(sp)` in the slot.
+    fn guard(&mut self, a: u32, rs: u32, r: u32) {
+        let slow = self.label();
+        let o = &mut self.out;
+        o.push(srl(K1R, rs, 27));
+        o.push(addiu(K1R, K1R, 0xFFFF));
+        o.branch(beq(K1R, ZR), To::Label(slow), a);
+        o.push(addu(K1R, rs, 0));
+        for (n, pos) in [21, 16].into_iter().enumerate() {
+            o.push(ins(K1R, K0R, 21, 11));
+            o.push(lw(K1R, 0, K1R));
+            o.push(ext(K1R, K1R, pos, 5));
+            o.push(xori(K1R, K1R, r as u16));
+            o.branch(beq(K1R, ZR), To::Label(slow), a);
+            o.push(if n == 0 { addu(K1R, rs, 0) } else { NOP });
+        }
+        let mut s = Code::default();
+        s.def(slow);
+        let c = self.resume(a, Reason::Guard);
+        s.append(c);
+        self.stub(s);
+    }
+
     /// The host delay slot after a transfer: the guest slot's simple word, or a `nop` when its
     /// code went before the transfer.
     fn slot_word(&mut self, simple_slot: Option<u32>, s: u32) {
@@ -1225,9 +1290,15 @@ impl Em<'_> {
         };
         let simple_slot = self.simple_at(s, si, sk);
         let clobbers = su.write & bu.read != 0;
+        if self.hz.sites.contains_key(&s) && self.stale_jump(a, i, k, si, sk) {
+            return None;
+        }
+        let guard = matches!(k, Jr | Jalr)
+            && matches!(sk, Lb | Lbu | Lh | Lhu | Lw | Lwl | Lwr)
+            && self.hz.sites.get(&s) == Some(&HazardKind::UnknownSlot);
         let why = if sk.has_delay_slot() {
             Some(Reason::BranchInSlot)
-        } else if self.hz.sites.contains_key(&s) {
+        } else if self.hz.sites.contains_key(&s) && !guard {
             Some(Reason::Hazard)
         } else if (bu.read | bu.write) & GUEST_K != 0 {
             Some(Reason::GuestK)
@@ -1280,6 +1351,9 @@ impl Em<'_> {
                     }
                 };
                 let rs = i.rs() as u32;
+                if guard {
+                    self.guard(a, rs, si.rt() as u32);
+                }
                 // A switch table holds guest addresses only.
                 let host = !matches!(self.d.jumps.get(&a), Some(JumpReg::Table { .. }));
                 if let Some(w) = simple_slot {

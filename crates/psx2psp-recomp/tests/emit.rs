@@ -1061,6 +1061,84 @@ fn a_code_address_built_in_ra_is_a_host_return_point() {
     assert!(run.t.runtime.is_empty(), "{:?}", run.t.runtime);
 }
 
+/// Crash 2's GOOL pieces end with `b` to `jr ra` and `lw ra` in the slot: the `jr` reads `ra`
+/// in the load's delay and returns to the old one, so the piece runs twice before the loaded
+/// address takes over. Translated natively, as the console runs it.
+/// Crash 2's GOOL calls `jalr t8` with `lw s3` in the slot, targets unknown to discovery: the
+/// callee's first instruction runs in the load's delay. A callee that does not name `s3` there
+/// is called natively; one that reads it is left to the interpreter, which sees the old `s3`.
+#[test]
+fn a_register_call_with_a_load_in_its_slot_checks_the_target_word() {
+    let w = [
+        lui(A1, 0x8002),             // 0
+        lui(T0, 0x8001),             // 1
+        addiu(T0, T0, 4 * 28),       // 2  t0 = c1
+        mem(SW, T0, 0, A1),          // 3
+        addiu(T0, T0, 4 * 3),        // 4  t0 = c2
+        mem(SW, T0, 4, A1),          // 5
+        addiu(T1, ZERO, 9),          // 6
+        mem(SW, T1, 8, A1),          // 7
+        addiu(S3, ZERO, 5),          // 8  old s3
+        mem(LW, T8, 0, A1),          // 9  t8 = c1, not a constant
+        NOP,                         // 10
+        r(9, T8, 0, RA, 0),          // 11 jalr t8
+        mem(LW, S3, 8, A1),          // 12 lw s3 (new s3 9)
+        addiu(S3, ZERO, 5),          // 13
+        mem(LW, T8, 4, A1),          // 14 t8 = c2
+        NOP,                         // 15
+        r(9, T8, 0, RA, 0),          // 16 jalr t8
+        mem(LW, S3, 8, A1),          // 17 lw s3
+        b(5, T9, ZERO, 18, 22),      // 18 bne t9,zero,calls (never: makes c1 and c2 code)
+        NOP,                         // 19
+        j(2, 34),                    // 20 j end
+        NOP,                         // 21
+        j(3, 28),                    // 22 calls: jal c1
+        NOP,                         // 23
+        j(3, 31),                    // 24 jal c2
+        NOP,                         // 25
+        j(2, 34),                    // 26 j end
+        NOP,                         // 27
+        addu(T2, T1, ZERO),          // 28 c1: no s3
+        r(8, RA, 0, 0, 0),           // 29 jr ra
+        NOP,                         // 30
+        addu(T3, S3, ZERO),          // 31 c2: reads the old s3 (5)
+        r(8, RA, 0, 0, 0),           // 32 jr ra
+        NOP,                         // 33
+        j(2, 34),                    // 34 end
+        NOP,                         // 35
+    ];
+    let run = check(&w, 34, |_| {}, false);
+    assert_eq!(run.t.runtime.get(&at(11)), Some(&Reason::Guard), "{:?}", run.t.runtime);
+    assert_eq!(run.t.runtime.get(&at(16)), Some(&Reason::Guard), "{:?}", run.t.runtime);
+    assert_eq!(run.log.resumed, Some(at(16)));
+}
+
+#[test]
+fn a_jr_in_the_delay_of_its_load_jumps_where_the_register_was() {
+    let w = [
+        lui(A1, 0x8002),             // 0
+        lui(T0, 0x8001),             // 1
+        addiu(T0, T0, 4 * 12),       // 2  t0 = word 12, the exit
+        mem(SW, T0, 0, A1),          // 3
+        j(3, 10),                    // 4  jal 10: ra = word 6
+        NOP,                         // 5
+        addiu(T1, T1, 1),            // 6  the piece: twice
+        i(1, ZERO, 1, 14 - 7 - 1),   // 7  b 14 (bgez zero)
+        mem(LW, RA, 0, A1),          // 8  slot: ra = word 12, after the jr reads it
+        NOP,                         // 9
+        r(8, RA, 0, 0, 0),           // 10 jr ra
+        NOP,                         // 11
+        j(2, 16),                    // 12 the exit
+        NOP,                         // 13
+        r(8, RA, 0, 0, 0),           // 14 jr ra (the old ra)
+        addiu(T2, RA, 0),            // 15 slot: the new ra
+        j(2, 16),                    // 16 end
+        NOP,                         // 17
+    ];
+    let run = check(&w, 16, |_| {}, false);
+    assert!(run.t.runtime.is_empty(), "{:?}", run.t.runtime);
+}
+
 /// A return point built in `ra` in the middle of a straight line (no branch goes there, as Sheep
 /// Dog's WHEEL.EXE 8001C108 -> 80036330) starts a block of its own.
 #[test]

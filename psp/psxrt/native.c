@@ -549,6 +549,30 @@ static void jump(Cpu *c, u32 pc)
     c->in_delay = 0;
 }
 
+/* The interpreter stops at translated code `pc` with a load in flight: 1 when the instruction
+ * there must run in the load's delay, the old value in the register (R3000A: the instruction
+ * after a load reads the old value). Its rs or rt field naming the register (J and JAL name
+ * none): a write to it the interpreter's step also gets right. A host `pc` (a translated return
+ * point) has no guest word to read: the load lands, as the translation's own loads do. The
+ * first 8 cases are logged. */
+static int load_delayed(const Cpu *c, u32 pc)
+{
+    static u32 logged;
+    u32 r = (u32)c->load_reg;
+    if (!r)
+        return 0;
+    if (is_code(pc)) {
+        if (logged++ < 8)
+            say("native: load delay: r%u lands before host %08X", (unsigned)r, (unsigned)pc);
+        return 0;
+    }
+    u32 w = *(const u32 *)(P->ram + (pc & (RAM_SIZE - 4))), op = w >> 26;
+    int reads = op != 2 && op != 3 && (((w >> 21) & 31) == r || ((w >> 16) & 31) == r);
+    if (logged++ < 8)
+        say("native: load delay: r%u into %08X (%08X)%s", (unsigned)r, (unsigned)pc, (unsigned)w, reads ? ": runs in the delay" : "");
+    return reads;
+}
+
 static void finish_load(Cpu *c)
 {
     if (c->load_reg)
@@ -1098,7 +1122,7 @@ static u32 interp(int mode)
                 u32 h = host_of(pc), v = pc & 0x1FFFFFFFu;
                 if (!h && v != 0xA0 && v != 0xB0 && v != 0xC0 && try_load(pc, mode == 1))
                     h = host_of(pc);
-                if (h) {
+                if (h && !load_delayed(c, pc)) {
                     finish_load(c);
                     fix_ra(c);
                     return h;
