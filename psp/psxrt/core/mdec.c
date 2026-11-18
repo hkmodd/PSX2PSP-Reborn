@@ -358,11 +358,19 @@ static void vf_zero(int b)
     "vmin.q C000, C000, C700\n vmin.q C010, C010, C700\n vmin.q C020, C020, C700\n vmin.q C030, C030, C700\n" \
     "vmax.q C000, C000, C710\n vmax.q C010, C010, C710\n vmax.q C020, C020, C710\n vmax.q C030, C030, C710\n"
 
-/* The six blocks in vf_coef (Cr, Cb, Y0-Y3) to vf_rgba. Two chroma quads and two luma rows a step:
- * the rows of a pair are one chroma row (oy even), so its terms load once, and the two rows'
- * operations interleave, each waiting out the other's latency. Each value takes the same
- * operations as one row at a time. */
-static void vf_colour(void)
+/* The 24-bit words of four pixels, R0 G0 B0 R1 | G1 B1 R2 G2 | B2 R3 G3 B3, are rows of three
+ * matrices of the even (e: x 0 2 4 6) and odd (o: 1 3 5 7) channel columns: rows 0 and 2 of
+ * [Re Ge Be Ro], of [Go Bo Re' Ge'] (Re' = Re[y,x,w,z]: element 0 is pixel 2's) and rows 1 and 3
+ * of [Be Ro Go Bo]. A row of 8 pixels is six words. Row oy: M2, M3, M4; row oy + 1: M5, M1, M6. */
+#define VF_CP24(A, B, C, Re, Ge, Be, Ro, Go, Bo) \
+    "vmov.q C" A "30, C" Ro "\n vmov.q C" C "00, C" Be "\n vmov.q C" B "00, C" Go "\n vmov.q C" B "10, C" Bo "\n" \
+    "vpfxs y, x, w, z\n vmov.q C" B "20, C" Re "\n vpfxs y, x, w, z\n vmov.q C" B "30, C" Ge "\n"
+
+/* The six blocks in vf_coef (Cr, Cb, Y0-Y3) to vf_rgba, or as 24-bit pixels to rgb24. Two chroma
+ * quads and two luma rows a step: the rows of a pair are one chroma row (oy even), so its terms
+ * load once, and the two rows' operations interleave, each waiting out the other's latency. Each
+ * value takes the same operations as one row at a time. */
+static void vf_colour(u32 *rgb24)
 {
     for (int b = 0; b < 6; b++)
         vf_idct_any(b);
@@ -377,6 +385,34 @@ static void vf_colour(void)
                          :
                          : "r"(vf_pix[0] + q), "r"(vf_pix[1] + q), "r"(vf_term[0] + q), "r"(vf_term[1] + q), "r"(vf_term[2] + q)
                          : "memory");
+    if (rgb24) {
+        for (int i = 0; i < 4; i++)
+            for (int y = 0; y < 8; y += 2) {
+                int oy = (i >> 1) * 8 + y, c = (oy >> 1) * 8 + (i & 1) * 4;
+                __asm__ volatile("lv.q C000, 0(%0)\n lv.q C010, 16(%0)\n lv.q C020, 32(%0)\n lv.q C030, 48(%0)\n" VROUND4
+                                 "lv.q C100, 0(%1)\n lv.q C110, 0(%2)\n lv.q C120, 0(%3)\n"
+                                 /* row oy: even x in C200-C220, odd in C410-C430; row oy + 1: C500-C520, C610-C630 */
+                                 "vadd.q C200, C000, C100\n vadd.q C410, C010, C100\n vadd.q C500, C020, C100\n vadd.q C610, C030, C100\n"
+                                 "vadd.q C210, C000, C110\n vadd.q C420, C010, C110\n vadd.q C510, C020, C110\n vadd.q C620, C030, C110\n"
+                                 "vadd.q C220, C000, C120\n vadd.q C430, C010, C120\n vadd.q C520, C020, C120\n vadd.q C630, C030, C120\n"
+                                 "vf2iz.q C200, C200, 23\n vf2iz.q C410, C410, 23\n vf2iz.q C500, C500, 23\n vf2iz.q C610, C610, 23\n"
+                                 "vf2iz.q C210, C210, 23\n vf2iz.q C420, C420, 23\n vf2iz.q C510, C510, 23\n vf2iz.q C620, C620, 23\n"
+                                 "vf2iz.q C220, C220, 23\n vf2iz.q C430, C430, 23\n vf2iz.q C520, C520, 23\n vf2iz.q C630, C630, 23\n"
+                                 VF_CP24("2", "3", "4", "200", "210", "220", "410", "420", "430")
+                                 VF_CP24("5", "1", "6", "500", "510", "520", "610", "620", "630")
+                                 "vi2uc.q S000, R200\n vi2uc.q S001, R300\n vi2uc.q S002, R401\n"
+                                 "vi2uc.q S003, R202\n vi2uc.q S010, R302\n vi2uc.q S011, R403\n"
+                                 "vi2uc.q S012, R500\n vi2uc.q S013, R100\n vi2uc.q S020, R601\n"
+                                 "vi2uc.q S021, R502\n vi2uc.q S022, R102\n vi2uc.q S023, R603\n"
+                                 "sv.s S000, 0(%4)\n sv.s S001, 4(%4)\n sv.s S002, 8(%4)\n sv.s S003, 12(%4)\n sv.s S010, 16(%4)\n sv.s S011, 20(%4)\n"
+                                 "sv.s S012, 48(%4)\n sv.s S013, 52(%4)\n sv.s S020, 56(%4)\n sv.s S021, 60(%4)\n sv.s S022, 64(%4)\n sv.s S023, 68(%4)\n"
+                                 :
+                                 : "r"(vf_pix[2 + i] + y * 8), "r"(vf_term[0] + c), "r"(vf_term[1] + c), "r"(vf_term[2] + c),
+                                   "r"(rgb24 + oy * 12 + (i & 1) * 6)
+                                 : "memory");
+            }
+        return;
+    }
     __asm__ volatile("vzero.q C230\n vzero.q C430\n vzero.q C530\n vzero.q C630\n");
     for (int i = 0; i < 4; i++)
         for (int y = 0; y < 8; y += 2) {
@@ -402,23 +438,23 @@ static void vf_colour(void)
         }
 }
 
-/* vf_rgba to the output format: 24-bit (depth 2) or 15-bit (depth 3). */
-static void vf_pack(u32 *out, int depth, int sign, int bit15)
+/* A colour macroblock to `out`: 24-bit (depth 2) straight from the VFPU, 15-bit (depth 3) from
+ * vf_rgba. Signed output is the unsigned bytes with their top bit flipped. */
+static void vf_output(u32 *out, int depth, int sign, int bit15)
 {
-    const u32 *p = vf_rgba;
     u32 x = sign ? 0x80808080u : 0;
-    if (depth == 2)
-        for (int n = 0; n < 64; n++, p += 4, out += 3) {
-            out[0] = (p[0] | p[1] << 24) ^ x;
-            out[1] = (p[1] >> 8 | p[2] << 16) ^ x;
-            out[2] = (p[2] >> 16 | p[3] << 8) ^ x;
-        }
-    else {
-        u16 *o = (u16 *)out, hi = bit15 ? 0x8000 : 0;
-        for (int n = 0; n < 256; n++) {
-            u32 w = p[n] ^ x;
-            o[n] = (u16)((w >> 3 & 0x1F) | (w >> 6 & 0x3E0) | (w >> 9 & 0x7C00) | hi);
-        }
+    if (depth == 2) {
+        vf_colour(out);
+        for (int n = 0; x && n < 192; n++)
+            out[n] ^= x;
+        return;
+    }
+    vf_colour(NULL);
+    const u32 *p = vf_rgba;
+    u16 *o = (u16 *)out, hi = bit15 ? 0x8000 : 0;
+    for (int n = 0; n < 256; n++) {
+        u32 w = p[n] ^ x;
+        o[n] = (u16)((w >> 3 & 0x1F) | (w >> 6 & 0x3E0) | (w >> 9 & 0x7C00) | hi);
     }
 }
 
@@ -474,8 +510,7 @@ static void vf_check(Psx *psx)
         for (int i = 0; i < 4; i++)
             yuv_c(&t, blk[0], blk[1], blk[2 + i], (i & 1) * 8, (i >> 1) * 8);
         static u32 out[192];
-        vf_colour();
-        vf_pack(out, depth, sign, t.bit15);
+        vf_output(out, depth, sign, t.bit15);
         if (depth == 2) {
             const u8 *a = (const u8 *)t.out, *b = (const u8 *)out;
             for (int k = 0; k < 768; k++) {
@@ -511,16 +546,16 @@ static void vf_check(Psx *psx)
                 vf_idct(vf_coef[b], vf_left[b >= 2], vf_pix[b]);
         u32 t1 = h->usec(h->user);
         for (int i = 0; i < 64; i++)
-            vf_colour();
+            vf_output(out, 2, 0, 0);
         u32 t2 = h->usec(h->user);
         for (int i = 0; i < 64; i++)
-            vf_pack(out, 2, 0, 0);
+            vf_output(out, 3, 0, 0);
         u32 t3 = h->usec(h->user);
         for (int i = 0; i < 64; i++)
             for (int b = 0; b < 6; b++)
                 vf_idct_tl(vf_coef[b], vf_left[b >= 2], vf_pix[b]);
         u32 t4 = h->usec(h->user);
-        psx_log(psx, "mdec: a macroblock costs %u ns of IDCT (%u ns with top-left blocks), %u ns of IDCT and colour, %u ns of 24-bit packing",
+        psx_log(psx, "mdec: a macroblock costs %u ns of IDCT (%u ns with top-left blocks), %u ns of IDCT and 24-bit colour, %u ns of IDCT and 15-bit colour",
                 (t1 - t0) * 1000 / 64, (t4 - t3) * 1000 / 64, (t2 - t1) * 1000 / 64, (t3 - t2) * 1000 / 64);
     }
     memset(vf_mask, 15, sizeof vf_mask); /* the checks left coefficients everywhere */
@@ -638,8 +673,7 @@ static int vf_decode(Mdec *m)
     if (vf_stale && memcmp(vf_from, m->scale, sizeof vf_from))
         vf_build(m->scale);
     vf_stale = 0;
-    vf_colour();
-    vf_pack(m->out, m->depth, m->sign, m->bit15);
+    vf_output(m->out, m->depth, m->sign, m->bit15);
     return 1;
 }
 #endif
