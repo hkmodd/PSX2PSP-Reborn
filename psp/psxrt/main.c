@@ -493,7 +493,9 @@ static u32 us_rgb24; /* time spent converting, for the log */
  * list (the PS1 picture to the screen), then the text */
 static u32 us_pwait, us_pdraw, us_ptext;
 
-static void convert24_to(const Gpu *g, int w, int h, u32 *dst)
+/* quad: the four words of 4 pixels go out as one 16-byte VFPU store (mtv, sv.q), one uncached bus
+ * write instead of four; dst must be 16-byte aligned */
+static void convert24_to(const Gpu *g, int w, int h, u32 *dst, int quad)
 {
     const u32 wrap = VRAM_W * 2 - 1, b0 = (u32)g->disp_x * 2;
     /* whole words when the line starts on one and does not wrap: 4 pixels in 3 words */
@@ -502,23 +504,60 @@ static void convert24_to(const Gpu *g, int w, int h, u32 *dst)
         const u8 *row = (const u8 *)g->vram + (u32)((g->disp_y + y) & (VRAM_H - 1)) * VRAM_W * 2;
         u32 *o = dst + y * 512;
         const u32 *s = (const u32 *)(row + b0);
-        for (u32 x = 0; x < fast; x += 4, s += 3) {
-            u32 a = s[0], b = s[1], c = s[2];
-            o[x] = 0xFF000000u | a;
-            o[x + 1] = 0xFF000000u | a >> 24 | b << 8;
-            o[x + 2] = 0xFF000000u | b >> 16 | c << 16;
-            o[x + 3] = 0xFF000000u | c >> 8;
-        }
+        if (quad)
+            for (u32 x = 0; x < fast; x += 4, s += 3) {
+                u32 a = s[0], b = s[1], c = s[2];
+                __asm__ volatile("mtv %0, S000\n mtv %1, S001\n mtv %2, S002\n mtv %3, S003\n sv.q C000, 0(%4)\n"
+                                 :
+                                 : "r"(0xFF000000u | a), "r"(0xFF000000u | a >> 24 | b << 8), "r"(0xFF000000u | b >> 16 | c << 16),
+                                   "r"(0xFF000000u | c >> 8), "r"(o + x)
+                                 : "memory");
+            }
+        else
+            for (u32 x = 0; x < fast; x += 4, s += 3) {
+                u32 a = s[0], b = s[1], c = s[2];
+                o[x] = 0xFF000000u | a;
+                o[x + 1] = 0xFF000000u | a >> 24 | b << 8;
+                o[x + 2] = 0xFF000000u | b >> 16 | c << 16;
+                o[x + 3] = 0xFF000000u | c >> 8;
+            }
         for (u32 x = fast, b = b0 + 3 * fast; x < (u32)w; x++, b += 3)
             o[x] = 0xFF000000u | (u32)row[(b + 2) & wrap] << 16 | (u32)row[(b + 1) & wrap] << 8 | row[b & wrap];
     }
 }
 
-/* The display area converted into the texture; returns the GE's address of it. */
+/* The converted area's words, hashed through the uncached alias: the two store paths must agree. */
+static u32 rgb24_hash(int w, int h)
+{
+    u32 k = 2166136261u;
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++)
+            k = (k ^ rgb24_un[y * 512 + x]) * 16777619u;
+    return k;
+}
+
+/* The display area converted into the texture; returns the GE's address of it. The first call
+ * times both store paths on the PSP (word, quad, word again: the faster word run counts) and keeps
+ * the quad one if it is faster and writes the same words. */
 static const void *convert24(const Gpu *g, int w, int h)
 {
+    static int quad = -1;
+    if ((u32)rgb24_un & 15)
+        quad = 0;
+    if (quad < 0) {
+        u32 t0 = sceKernelGetSystemTimeLow();
+        convert24_to(g, w, h, rgb24_un, 0);
+        u32 t1 = sceKernelGetSystemTimeLow(), k0 = rgb24_hash(w, h), t2 = sceKernelGetSystemTimeLow();
+        convert24_to(g, w, h, rgb24_un, 1);
+        u32 t3 = sceKernelGetSystemTimeLow(), k1 = rgb24_hash(w, h), t4 = sceKernelGetSystemTimeLow();
+        convert24_to(g, w, h, rgb24_un, 0);
+        u32 t5 = sceKernelGetSystemTimeLow(), us_w = t1 - t0 < t5 - t4 ? t1 - t0 : t5 - t4;
+        quad = k0 == k1 && t3 - t2 < us_w;
+        say("rgb24 %dx%d: word stores %u us, quad stores %u us, %s: %s stores from now on", w, h, (unsigned)us_w,
+            (unsigned)(t3 - t2), k0 == k1 ? "same words" : "words differ", quad ? "quad" : "word");
+    }
     u32 t = sceKernelGetSystemTimeLow();
-    convert24_to(g, w, h, rgb24_un);
+    convert24_to(g, w, h, rgb24_un, quad);
     us_rgb24 += sceKernelGetSystemTimeLow() - t;
     return rgb24_tex;
 }
