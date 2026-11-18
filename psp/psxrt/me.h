@@ -5,8 +5,9 @@
  * dma.c's dma_list_hook). sceSasCore runs on the ME, so main.c has the SPU mix every voice when
  * psxrt.me is there.
  *
- * Kernel words through KUBridge (kubridge.S, ARK-4). The ME goes back in reset when psxrt exits;
- * the firmware does not take it back, so the PSP is best restarted after a run.
+ * Kernel words through KUBridge (kubridge.S, ARK-4). The ME goes back in reset when psxrt exits.
+ * No restart is needed after a run: every run that took the ME found it out of reset at boot
+ * (RESETEN 0x40 in me_probe's 3 logs and in 2b-1/2b-2's, with no restart in between).
  */
 #ifndef PSXRT_ME_H
 #define PSXRT_ME_H
