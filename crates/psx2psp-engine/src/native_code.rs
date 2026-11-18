@@ -509,6 +509,16 @@ const MIN_CAPTURED: u32 = 0x400;
 /// Largest disc file looked at as an overlay: the PS1 RAM above the kernel area.
 pub const OVERLAY_MAX: u32 = 0x1F_0000;
 
+/// The bytes of `exe`'s text up to its last translated word and that word's delay slot: what the
+/// runtime installs, hashes and checks. The data after it (an overlay's variables, which the game
+/// sets before it calls in) stays out of the hashes, or the runtime would never find the text it
+/// translated.
+fn code_size(exe: &PsxExe, t: &Translation) -> u32 {
+    let len = exe.text.len() as u32;
+    let last = t.map.keys().map(|&g| g.wrapping_sub(exe.text_addr)).filter(|&o| o < len).max();
+    last.map_or(len, |o| (o + 8).min(len))
+}
+
 /// Translates `exes` (file name, file bytes) and the files of `overlays` that
 /// [`overlay::locate_all`] places (S24): executables the guest loads by name, overlays it reads
 /// to an address of its own. Files of `exes` that are not a PS-X EXE are reported as skipped,
@@ -671,34 +681,38 @@ pub fn build(exes: Vec<(String, Vec<u8>)>, overlays: Vec<Overlay>, captured: Vec
         })
         .collect();
 
-    // Sizes first: a group of executables at one address takes the largest of them.
-    let sizes: Vec<Result<u32, String>> = parsed
+    // Sizes first: a group of executables at one address takes the largest of them. With each
+    // size, how much of the text is code (`code_size`).
+    let sizes: Vec<Result<(u32, u32), String>> = parsed
         .par_iter()
-        .map(|p| translate(&p.exe, &p.disc, &p.hz, PROVISIONAL).map(|t| t.words.len() as u32 * 4).map_err(|e| e.to_string()))
+        .map(|p| translate(&p.exe, &p.disc, &p.hz, PROVISIONAL).map(|t| (t.words.len() as u32 * 4, code_size(&p.exe, &t))).map_err(|e| e.to_string()))
         .collect();
     let mut ok = Vec::new();
     for (p, size) in parsed.into_iter().zip(sizes) {
         match size {
-            Ok(n) => ok.push((p, n, 0)),
+            Ok((n, code)) => ok.push((p, n, 0, code)),
             Err(e) => pack.skipped.push((p.name, e)),
         }
     }
-    // Texts that share an address are never in RAM together: the levels of a game at one
+    // Code that shares an address is never in RAM together: the levels of a game at one
     // address, the rooms of an overlay slot that each start at their own first function (Silent
     // Hill: 246 runs of SILENT from 800CB370 on). They share a host region, as large as the
-    // largest. A group is every text left that holds one address, the last byte of the text
-    // that ends first among them (the fewest groups), and is keyed by it. Texts that share no
-    // address get disjoint regions, so they can be resident together.
-    let span = |x: &PsxExe| (x.text_addr & 0x1FFF_FFFF, (x.text_addr & 0x1FFF_FFFF) + x.text.len().max(1) as u32);
+    // largest. A group is every code span left that holds one address, the last byte of the span
+    // that ends first among them (the fewest groups), and is keyed by it. Spans that share no
+    // address get disjoint regions, so they can be resident together. The span is the text the
+    // runtime installs and hashes, not the file: data past the code may be loaded over while the
+    // code runs (Dragon Ball GT's SLUS_004.93 ends 0x60 bytes into the STEP*.BIN slot, whose
+    // translation took its region and was written over its code).
+    let span = |x: &PsxExe, code: u32| (x.text_addr & 0x1FFF_FFFF, (x.text_addr & 0x1FFF_FFFF) + code.max(1));
     let mut order: Vec<usize> = (0..ok.len()).collect();
-    order.sort_by_key(|&i| span(&ok[i].0.exe).1);
+    order.sort_by_key(|&i| span(&ok[i].0.exe, ok[i].3).1);
     for &i in &order {
         if ok[i].2 != 0 {
             continue;
         }
-        let at = span(&ok[i].0.exe).1 - 1;
+        let at = span(&ok[i].0.exe, ok[i].3).1 - 1;
         for o in ok.iter_mut().filter(|o| o.2 == 0) {
-            let (a, b) = span(&o.0.exe);
+            let (a, b) = span(&o.0.exe, o.3);
             if a <= at && at < b {
                 o.2 = at | 0x8000_0000;
             }
@@ -706,7 +720,7 @@ pub fn build(exes: Vec<(String, Vec<u8>)>, overlays: Vec<Overlay>, captured: Vec
     }
     // Group: region size, and whether an executable is in it.
     let mut groups: BTreeMap<u32, (u32, bool)> = BTreeMap::new();
-    for (p, n, at) in &ok {
+    for (p, n, at, _) in &ok {
         let g = groups.entry(*at).or_default();
         g.0 = g.0.max(n.next_multiple_of(ALIGN));
         g.1 |= !p.overlay;
@@ -742,18 +756,12 @@ pub fn build(exes: Vec<(String, Vec<u8>)>, overlays: Vec<Overlay>, captured: Vec
 
     let images: Vec<Result<CodeImage, String>> = ok
         .into_par_iter()
-        .map(|(p, len, at)| {
+        .map(|(p, len, at, text_size)| {
             let host_base = groups[&at].0;
             let t = translate(&p.exe, &p.disc, &p.hz, host_base).map_err(|e| e.to_string())?;
             if t.words.len() as u32 * 4 != len {
                 return Err(format!("translation at {host_base:#010x} is {} words, {} at first", t.words.len(), len / 4));
             }
-            // The text up to its last translated word and that word's delay slot: the data after
-            // it (an overlay's variables, which the game sets before it calls in) stays out of
-            // the hashes, or the runtime would never find the text it translated.
-            let len = p.exe.text.len() as u32;
-            let last = t.map.keys().map(|&g| g.wrapping_sub(p.exe.text_addr)).filter(|&o| o < len).max();
-            let text_size = last.map_or(len, |o| (o + 8).min(len));
             let text = &p.exe.text[..text_size as usize];
             let mut table = vec![layout::MISS; text_size.div_ceil(4) as usize];
             for (&g, &h) in &t.map {
@@ -1048,6 +1056,22 @@ mod tests {
         assert!(o.host_base >= m.host_base + m.code.len() as u32, "disjoint regions");
         let word = |i: usize| u32::from_le_bytes(o.table[4 * i..4 * i + 4].try_into().unwrap());
         assert_ne!(word(36), layout::MISS, "each function is translated");
+    }
+
+    /// An executable whose file runs on past its code into the slot of the overlays loaded after
+    /// it (Dragon Ball GT: SLUS_004.93's text ends 0x60 bytes into STEP*.BIN at 8003DFA0) is
+    /// resident with them: the overlay loads over its data, never its code. A shared host region
+    /// had the overlay's translation written over the executable's.
+    #[test]
+    fn an_executable_whose_data_overlays_load_over_keeps_its_own_region() {
+        let mut main = vec![ADDIU_V0_1, JR_RA, 0];
+        main.resize(0x80, 0x5A5A_5A5A);
+        let pack = build(vec![("MAIN.EXE".into(), exe(0x8001_0000, &main))], vec![Overlay::whole("LEVEL.OVL", overlay(0x8001_0100))], vec![]).unwrap();
+        assert!(pack.skipped.is_empty(), "{:?}", pack.skipped);
+        let [m, o] = &pack.images[..] else { panic!("{:?}", pack.images.iter().map(|i| &i.name).collect::<Vec<_>>()) };
+        assert_eq!((m.name.as_str(), m.text_size, o.name.as_str(), o.text_addr), ("MAIN.EXE", 12, "LEVEL.OVL", 0x8001_0100));
+        let (rm, ro) = (m.host_base..m.host_base + m.code.len() as u32, o.host_base..o.host_base + o.code.len() as u32);
+        assert!(rm.end <= ro.start || ro.end <= rm.start, "disjoint regions: {rm:x?} {ro:x?}");
     }
 
     /// Code captured at `at`, with a RAM of zeros around it.
