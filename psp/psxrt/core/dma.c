@@ -68,6 +68,8 @@ static void run(Psx *psx, int ch)
 {
     const PsxHost *h = psx->host;
     u32 t = h->usec ? h->usec(h->user) : 0;
+    if (ch == 2 || ch == 6) /* the ME's last walk done: the GPU's state, and the list in RAM OTC may clear */
+        gpu_sync(psx, GPU_SYNC_DMA);
     if (ch == 2 && h->gpu_dma)
         h->gpu_dma(h->user, 0);
     transfer(psx, ch);

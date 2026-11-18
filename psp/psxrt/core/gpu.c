@@ -24,7 +24,7 @@ static void sw_read(Psx *psx, s32 x0, s32 y0, s32 x1, s32 y1)
 static void sw_wrote(Psx *psx, s32 x0, s32 y0, s32 x1, s32 y1)
 {
     const GpuRenderer *r = psx->gpu.renderer;
-    gpu_writes++;
+    gpu_count_writes(psx, 1);
     if (r)
         r->wrote(r->self, x0, y0, x1 - x0 + 1, y1 - y0 + 1);
 }
@@ -340,7 +340,10 @@ static void vtx_col(Vtx *v, u32 w)
 u32 gpu_slow_us; /* polygons past the renderer's fast lane, timed as execute() times them */
 u32 prof_bias;
 u32 gpu_writes;
-static int poly_slow;
+void (*gpu_sync_hook)(int why);
+Psx *gpu_me_psx;
+u32 *gpu_me_writes;
+static int poly_slow; /* read only with a clock (never on the ME), so never written there */
 
 static void draw_polygon(Psx *psx, const u32 *c)
 {
@@ -350,7 +353,8 @@ static void draw_polygon(Psx *psx, const u32 *c)
     if (tex) /* the second vertex's texpage, as gpu_poly_soft sets it */
         set_texpage(psx, (psx->gpu.texpage & ~0x1FFu) | (c[gour ? 5 : 4] >> 16 & 0x1FF));
     int fast = rd && rd->poly ? rd->poly(rd->self, c) : -1;
-    poly_slow = fast != GPU_DRAWN;
+    if (psx != gpu_me_psx)
+        poly_slow = fast != GPU_DRAWN;
     if (fast != GPU_DRAWN)
         gpu_poly_soft(psx, c, fast);
 }
@@ -581,7 +585,7 @@ static void execute(Psx *psx, const u32 *c, int n)
     int k = cmd >= 0x20 && cmd < 0x40 ? 0 : cmd >= 0x40 && cmd < 0x60 ? 1 : cmd >= 0x60 && cmd < 0x80 ? 2
           : cmd >= 0x80 && cmd < 0xA0 ? 3 : cmd == 0x02 ? 4 : 5;
     psx->gpu.n_kind[k]++;
-    gpu_writes += k < 5; /* draws, copies and fills; transfers count in sw_wrote */
+    gpu_count_writes(psx, k < 5); /* draws, copies and fills; transfers count in sw_wrote */
     if (!h->usec || t16++ % 16) {
         draw(psx, c, n);
         return;
@@ -636,6 +640,7 @@ static void draw(Psx *psx, const u32 *c, int n)
 
 u32 gpu_gp0_pixels(Psx *psx, const u32 *w, u32 n)
 {
+    gpu_sync(psx, GPU_SYNC_GP0);
     Gpu *g = &psx->gpu;
     const u16 *p = (const u16 *)w;
     u32 left = 2 * n, used = 0;
@@ -668,6 +673,7 @@ u32 gpu_gp0_pixels(Psx *psx, const u32 *w, u32 n)
 
 void gpu_gp0(Psx *psx, u32 v)
 {
+    gpu_sync(psx, GPU_SYNC_GP0);
     Gpu *g = &psx->gpu;
     if (g->xfer == 1) {
         u16 lo = (u16)v, hi = (u16)(v >> 16);
@@ -700,6 +706,7 @@ void gpu_gp0(Psx *psx, u32 v)
  * word (from the first such word to the end of the packet). */
 void gpu_gp0_packet(Psx *psx, const u32 *w, u32 n)
 {
+    gpu_sync(psx, GPU_SYNC_GP0);
     Gpu *g = &psx->gpu;
     while (n && !g->ncmd && g->xfer != 1) {
         int line, need = cmd_words(w[0] >> 24, &line);
@@ -733,6 +740,7 @@ static void reset(Psx *psx)
  * spacing says nothing about it (Sheep Dog draws 240-line NTSC frames 256 lines apart). */
 int gpu_display_height(const Psx *psx)
 {
+    gpu_sync(psx, GPU_SYNC_OTHER);
     const Gpu *g = &psx->gpu;
     u32 st = g->stat;
     int h = g->vrange2 - g->vrange1;
@@ -751,6 +759,7 @@ int gpu_display_height(const Psx *psx)
  * kept instead of stretched. */
 void gpu_picture(const Psx *psx, int w, int h, int *x0, int *y0, int *x1, int *y1)
 {
+    gpu_sync(psx, GPU_SYNC_OTHER);
     const Gpu *g = &psx->gpu;
     *x0 = *y0 = 0, *x1 = w, *y1 = h;
     if (!(g->stat & 0x200000) || g->load_x1 <= g->load_x0)
@@ -775,6 +784,7 @@ void gpu_picture(const Psx *psx, int w, int h, int *x0, int *y0, int *x1, int *y
 
 void gpu_gp1(Psx *psx, u32 v)
 {
+    gpu_sync(psx, GPU_SYNC_GP1);
     Gpu *g = &psx->gpu;
     switch (v >> 24) {
     case 0x00: xfer_abort(psx), reset(psx), psx_video_mode(psx); break;
@@ -832,6 +842,7 @@ void gpu_gp1(Psx *psx, u32 v)
 
 u32 gpu_read(Psx *psx, int reg)
 {
+    gpu_sync(psx, GPU_SYNC_READ);
     Gpu *g = &psx->gpu;
     if (reg) {
         u32 s = g->stat | 0x1C000000u; /* ready for commands, VRAM reads and DMA blocks */
@@ -854,6 +865,7 @@ u32 gpu_read(Psx *psx, int reg)
 
 void gpu_vblank(Psx *psx)
 {
+    gpu_sync(psx, GPU_SYNC_VBLANK);
     Gpu *g = &psx->gpu;
     g->frame++;
     if (g->stat & (1u << 22))

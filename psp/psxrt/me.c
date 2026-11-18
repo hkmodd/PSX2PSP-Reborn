@@ -5,11 +5,14 @@
  * its stack at the top of its eDRAM and jumps to me_main, which runs the SC's jobs one by one from
  * MeCtl. Nothing on the ME's side calls the firmware.
  *
- * Slice 2b-2: the GPU's linked lists (dma.c's dma_list_walk, through gpu.c into ge.c) are a job,
- * through dma_list_hook. The SC waits on the job and serves it: the clock it publishes in MeCtl,
- * the list calls ge_host.h sends here, the GE's stall from the word the ME moves. Both data caches
- * go to RAM and are dropped at the job's edges and around every list call, so each side reads what
- * the other wrote; between those points no line the ME writes is written by the SC.
+ * Slices 2b-2 and 2b-3: the GPU's linked lists (dma.c's dma_list_walk, through gpu.c into ge.c) are
+ * a job, through dma_list_hook, on a copy of the Psx with its own GPU state. The CPU goes on with
+ * the game; a serve thread looks at the job every POLL_US (the clock it publishes in MeCtl, the
+ * list calls ge_host.h sends here, the GE's stall from the word the ME moves), and every entry
+ * that reads or writes the GPU's state (core/psx.h, gpu_sync) waits for the job's end and serves it
+ * meanwhile. Both data caches go to RAM at the job's edges and around every list call, so each side
+ * reads what the other wrote; between those points no line the ME writes is written by the SC
+ * (the link map's check, fshare.py beside the build).
  *
  * The same boot as me_probe (psp/me_probe, probes 0-0c on a PSP-3000). The handler holds no
  * address of its own, so it needs no relocation in the prx: what it jumps to is in its words.
@@ -42,6 +45,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "ge.h"
 #include "ge_host.h"
 #include "me.h"
 #include "psx.h"
@@ -213,11 +217,40 @@ static void me_main(volatile MeCtl *c)
 
 /* ---- the SC's side ---- */
 
+#define POLL_US 200 /* the serve thread's look at a walk in flight */
+
+/* The walk's Psx: the game's GPU state and RAM, and a host with no log and no clock (the ME has
+ * neither). During a walk only the ME writes it, and its lines hold nothing else (the type's
+ * alignment pads it to whole lines). */
+typedef struct {
+    Psx psx;
+    PsxHost host;
+    u32 writes; /* gpu_writes' count of the walk (core/psx.h, gpu_count_writes) */
+} __attribute__((aligned(64))) MeJob;
+
+static MeJob mj;
 static u8 ctl_mem[128] __attribute__((aligned(64)));
-static int on, dead;
+static int on, dead, mj_init;
 static u32 seq, kicked_job, beat0, pings, pings_ok, late, n_dead;
-static u32 walks, walk_us, rpcs, stalls, st_seen, rpc_seen;
-static PsxHost me_host; /* the game's host for a walk on the ME: no log, the published clock */
+static u32 st_seen, rpc_seen;
+
+/* The walk in flight: the game's Psx, its list, the words the CPU counted, when it was kicked and
+ * first seen done (0: not yet). */
+static volatile int busy;
+static Psx *walk_psx;
+static u32 walk_addr, walk_words, t_kick, t_done;
+
+/* The serve thread and the CPU's own thread take turns at serve_once: the serve thread, at a
+ * higher priority, never runs inside the other's turn (it sees in_main and waits for its next
+ * look); the CPU's thread runs inside the serve thread's turn only while that thread blocks in a
+ * list call, and then sees in_serve and looks again. */
+static volatile int in_main, in_serve, quit;
+static SceUID kick_sema = -1, serve_thread = -1;
+
+static struct {
+    u32 walks, cpu_walks, walk_us, head_us, words_bad, rpcs, stalls, polls, lost;
+    u32 waits[GPU_SYNC_N], wait_us[GPU_SYNC_N];
+} st;
 
 static u32 now(void) { return sceKernelGetSystemTimeLow(); }
 
@@ -236,6 +269,7 @@ static void me_dead(void)
 {
     me_reset();
     dma_list_hook = NULL;
+    gpu_sync_hook = NULL;
     dead = 1, n_dead++;
 }
 
@@ -247,7 +281,8 @@ static void ping_check(void)
     kicked_job = JOB_NONE;
 }
 
-/* The last job done within ME_TIMEOUT; 0, and the ME off, when it was not. */
+/* The last job (a ping: walks end in me_sync) done within ME_TIMEOUT; 0, and the ME off, when it
+ * was not. */
 static int me_idle(void)
 {
     u32 t = now();
@@ -260,67 +295,176 @@ static int me_idle(void)
     return 1;
 }
 
-static u32 me_usec(void *user)
+/* One look at the walk: the clock published, the newest stall applied, a list call served. done
+ * is read first, so what the ME wrote before it is in by the next two reads. 1 when the walk is
+ * done; *moved is the time of the last stall or list call. */
+static int serve_once(u32 *moved)
 {
-    (void)user;
-    return ctl->sc_us;
+    u32 t = now();
+    ctl->sc_us = t;
+    u32 done = ctl->done, r = ctl->rpc_seq, s = ctl->st_seq;
+    if (s != st_seen) {
+        st_seen = s, st.stalls++, *moved = t;
+        sceGeListUpdateStallAddr((int)ctl->st_id, (void *)ctl->st_addr);
+    }
+    if (r != rpc_seen) {
+        u32 a = ctl->rpc_arg, res = 0;
+        sceKernelDcacheWritebackInvalidateAll();
+        switch (ctl->rpc_op) {
+        case RPC_START: res = (u32)geh_list_start((void *)a); break;
+        case RPC_FINISH: res = geh_list_finish(); break;
+        case RPC_WAIT: geh_list_wait(); break;
+        }
+        sceKernelDcacheWritebackInvalidateAll();
+        ctl->rpc_res = res;
+        __asm__ volatile("sync");
+        ctl->rpc_ack = r;
+        rpc_seen = r, st.rpcs++, *moved = now();
+        return 0;
+    }
+    if (done != seq)
+        return 0;
+    if (!t_done)
+        t_done = t;
+    return 1;
 }
 
-/* dma_list_hook: the walk runs on the ME while the SC serves it. Before the kick the SC's cache
- * goes to RAM and is dropped, so the ME reads the SC's latest; after done it is dropped again (the
- * ME's writes are in RAM). While it waits the SC writes its stack, this file's counters and MeCtl;
- * the list calls it makes for the ME are written back before the ack. With a trace on the walk stays
- * on the SC: the ME has no log, and the traces' statics (gpu.c's last image) share lines with the
- * disc thread's. */
-static u32 me_walk(Psx *psx, u32 addr)
+/* The walk done: the ME's writes are in RAM (it wrote its cache back before done) and no line of
+ * them stays in the SC's cache; its GPU state, VRAM writes and GPU interrupt go to the game's Psx. */
+static void walk_end(void)
 {
-    if (psx->trace || !me_idle())
-        return dma_list_walk(psx, addr);
-    const PsxHost *h0 = psx->host;
-    me_host = *h0;
-    me_host.log = NULL;
-    me_host.usec = h0->usec ? me_usec : NULL;
-    psx->host = &me_host;
-    u32 t0 = now(), tp = t0, words = 0;
-    ctl->sc_us = t0;
     sceKernelDcacheWritebackInvalidateAll();
-    kick(JOB_WALK, (u32)psx, addr);
+    Psx *psx = walk_psx;
+    psx->gpu = mj.psx.gpu;
+    gpu_writes += mj.writes;
+    if (mj.psx.i_stat & (1u << IRQ_GPU))
+        psx_raise(psx, IRQ_GPU);
+    ge_bind(psx);
+    st.words_bad += ctl->res[0] != walk_words;
+    st.walk_us += (t_done ? t_done : now()) - t_kick;
+    kicked_job = JOB_NONE;
+    busy = 0;
+}
+
+/* The ME stopped in a walk: back in reset, and the walk again on the SC from the GPU state before
+ * the kick (the game's Psx was not written since). What the ME had put in the GE's list stays. */
+static void walk_lost(void)
+{
+    me_dead();
+    sceKernelDcacheWritebackInvalidateAll();
+    Psx *psx = walk_psx;
+    ge_bind(psx);
+    kicked_job = JOB_NONE;
+    busy = 0;
+    st.lost++;
+    dma_list_walk(psx, walk_addr);
+}
+
+/* gpu_sync_hook: the CPU waits for the walk in flight and serves it meanwhile. Nothing on the ME
+ * (ge.c's entries call it there too). */
+static void me_sync(int why)
+{
+    if (geh_me() || !busy)
+        return;
+    u32 t0 = now(), tp = t0;
     for (;;) {
-        u32 t = now();
-        ctl->sc_us = t;
-        u32 done = ctl->done, r = ctl->rpc_seq, s = ctl->st_seq; /* in this order: what the ME wrote before is in */
-        if (s != st_seen) {
-            st_seen = s, stalls++, tp = t;
-            sceGeListUpdateStallAddr((int)ctl->st_id, (void *)ctl->st_addr);
-        }
-        if (r != rpc_seen) {
-            u32 a = ctl->rpc_arg, res = 0;
-            sceKernelDcacheWritebackInvalidateAll();
-            switch (ctl->rpc_op) {
-            case RPC_START: res = (u32)geh_list_start((void *)a); break;
-            case RPC_FINISH: res = geh_list_finish(); break;
-            case RPC_WAIT: geh_list_wait(); break;
-            }
-            sceKernelDcacheWritebackInvalidateAll();
-            ctl->rpc_res = res;
-            __asm__ volatile("sync");
-            ctl->rpc_ack = r;
-            rpc_seen = r, rpcs++, tp = now();
+        in_main = 1;
+        __asm__ volatile("" : : : "memory");
+        if (in_serve) {
+            in_main = 0;
             continue;
         }
-        if (done == seq) {
-            words = ctl->res[0];
-            kicked_job = JOB_NONE;
+        int done = serve_once(&tp);
+        in_main = 0;
+        if (done) {
+            walk_end();
             break;
         }
-        if (t - tp > ME_TIMEOUT) {
-            me_dead();
+        if (now() - tp > ME_TIMEOUT) {
+            walk_lost();
             break;
         }
     }
-    sceKernelDcacheWritebackInvalidateAll();
-    psx->host = h0;
-    walks++, walk_us += now() - t0;
+    if ((unsigned)why < GPU_SYNC_N)
+        st.waits[why]++, st.wait_us[why] += now() - t0;
+}
+
+/* The serve thread: from a kick to the walk's done, a look every POLL_US, so the GE gets its
+ * stalls and the ME its list calls while the CPU runs the game. */
+static int serve_main(SceSize n, void *arg)
+{
+    (void)n, (void)arg;
+    while (!quit) {
+        sceKernelWaitSema(kick_sema, 1, NULL);
+        while (!quit && busy) {
+            u32 tp = 0;
+            int done = 0;
+            if (!in_main) {
+                in_serve = 1;
+                __asm__ volatile("" : : : "memory");
+                done = serve_once(&tp);
+                in_serve = 0;
+                st.polls++;
+            }
+            if (done)
+                break;
+            sceKernelDelayThread(POLL_US);
+        }
+    }
+    return 0;
+}
+
+/* The GPU list's words, from its headers: what dma_list_walk returns for it, so the DMA's time is
+ * the same as with the walk on the SC. */
+static u32 list_words(const Psx *psx, u32 addr)
+{
+    u32 words = 0;
+    for (int guard = 0; guard < 0x40000; guard++) {
+        u32 h;
+        memcpy(&h, psx->ram + (addr & (RAM_SIZE - 4)), 4);
+        words += (h >> 24) + 1;
+        addr = h & 0xFFFFFF;
+        if (addr & 0x800000)
+            break;
+        addr &= 0x1FFFFC;
+    }
+    return words;
+}
+
+/* dma_list_hook: the walk goes to the ME on a copy of the GPU state and the CPU goes on; the GPU's
+ * entries (gpu_sync) wait for it. Before the kick the SC's cache goes to RAM, so the ME reads the
+ * list and the state as they are now. With a trace on the walk stays on the SC (the ME has no
+ * log, and the traces' statics share lines with the disc thread's). */
+static u32 me_walk(Psx *psx, u32 addr)
+{
+    me_sync(GPU_SYNC_DMA);
+    if (psx->trace || dead || !me_idle()) {
+        st.cpu_walks++;
+        return dma_list_walk(psx, addr);
+    }
+    u32 t0 = now();
+    u32 words = list_words(psx, addr);
+    if (!mj_init)
+        mj.psx = *psx, mj_init = 1;
+    mj.psx.gpu = psx->gpu;
+    mj.psx.ram = psx->ram;
+    mj.psx.trace = 0;
+    mj.psx.i_stat = 0;
+    mj.host = *psx->host;
+    mj.host.log = NULL;
+    mj.host.usec = NULL;
+    mj.psx.host = &mj.host;
+    mj.writes = 0;
+    ge_bind(&mj.psx);
+    walk_psx = psx, walk_addr = addr, walk_words = words, t_done = 0;
+    ctl->sc_us = now();
+    sceKernelDcacheWritebackAll();
+    kick(JOB_WALK, (u32)&mj.psx, addr);
+    busy = 1;
+    t_kick = now();
+    st.walks++, st.head_us += t_kick - t0;
+    if (kick_sema >= 0)
+        sceKernelSignalSema(kick_sema, 1);
     return words;
 }
 
@@ -363,14 +507,24 @@ int me_start(char *msg, int cap)
         return 0;
     }
     beat0 = ctl->beat;
+    /* the serve thread: above the game's thread (0x20) and the disc's (0x1F), below audio (0x12) */
+    kick_sema = sceKernelCreateSema("psxrt_me_kick", 0, 0, 0x7FFFFFFF, NULL);
+    serve_thread = kick_sema < 0 ? -1 : sceKernelCreateThread("psxrt_me", serve_main, 0x16, 0x2000, 0, NULL);
+    if (serve_thread >= 0 && sceKernelStartThread(serve_thread, 0, NULL) < 0)
+        serve_thread = -1;
+    gpu_me_psx = &mj.psx;
+    gpu_me_writes = &mj.writes;
+    gpu_sync_hook = me_sync;
     dma_list_hook = me_walk;
     snprintf(msg, (size_t)cap,
              "ME: psxrt's loop runs (unlock %u, %u us, %u handler words, readback bad %u); RESETEN %08X before, %08X now;"
-             " the GPU's lists walk there",
+             " the GPU's lists walk there while the CPU goes on (serve thread %s, a look every %u us)",
              (unsigned)unlock, (unsigned)us, (unsigned)(me_handler_end - (const u32 *)(void *)me_handler), (unsigned)bad,
-             (unsigned)r0, kuKernelPeekw(KW(RESETEN)));
+             (unsigned)r0, kuKernelPeekw(KW(RESETEN)), serve_thread >= 0 ? "on" : "OFF: stalls at the waits only", (unsigned)POLL_US);
     return 1;
 }
+
+static const char *const why_name[GPU_SYNC_N] = {"read", "gp0", "gp1", "vblank", "dma", "ge", "other"};
 
 int me_log(char *line, int cap)
 {
@@ -378,23 +532,39 @@ int me_log(char *line, int cap)
         return 0;
     int n;
     if (dead) {
-        n = snprintf(line, (size_t)cap, "-- me: off, no answer in %u ms (%u times; job %u, err %X): the lists walk on the CPU\n",
-                     (unsigned)(ME_TIMEOUT / 1000), (unsigned)n_dead, (unsigned)kicked_job, (unsigned)ctl->err);
+        n = snprintf(line, (size_t)cap, "-- me: off, no answer in %u ms (%u times, %u in a walk; job %u, err %X): the lists walk on the CPU\n",
+                     (unsigned)(ME_TIMEOUT / 1000), (unsigned)n_dead, (unsigned)st.lost, (unsigned)kicked_job, (unsigned)ctl->err);
     } else {
         u32 b = ctl->beat;
-        if (ctl->done == seq) { /* the next ping only when the last job is done */
-            ping_check();
-            kick(JOB_PING, seq + 1, 0);
-            pings++;
-        } else {
-            late++;
+        if (!busy) { /* the next ping only when no walk is in flight and the last job is done */
+            if (ctl->done == seq) {
+                ping_check();
+                kick(JOB_PING, seq + 1, 0);
+                pings++;
+            } else {
+                late++;
+            }
         }
-        n = snprintf(line, (size_t)cap, "-- me: beat %u, pings %u/%u, late %u, err %X; walks %u in %u ms, list calls %u, stalls %u\n",
-                     (unsigned)(b - beat0), (unsigned)pings_ok, (unsigned)pings, (unsigned)late, (unsigned)ctl->err,
-                     (unsigned)walks, (unsigned)(walk_us / 1000), (unsigned)rpcs, (unsigned)stalls);
+        u32 wn = 0, wus = 0;
+        for (int k = 0; k < GPU_SYNC_N; k++)
+            wn += st.waits[k], wus += st.wait_us[k];
+        n = snprintf(line, (size_t)cap,
+                     "-- me: beat %u, pings %u/%u, late %u, err %X; walks %u (%u on the CPU), kick to done %u ms, headers %u ms, words bad %u;"
+                     " waits %u in %u ms (",
+                     (unsigned)(b - beat0), (unsigned)pings_ok, (unsigned)pings, (unsigned)late, (unsigned)ctl->err, (unsigned)st.walks,
+                     (unsigned)st.cpu_walks, (unsigned)(st.walk_us / 1000), (unsigned)(st.head_us / 1000), (unsigned)st.words_bad,
+                     (unsigned)wn, (unsigned)(wus / 1000));
+        for (int k = 0; k < GPU_SYNC_N && n < cap; k++)
+            n += snprintf(line + n, (size_t)(cap - n), "%s%s %u/%u", k ? ", " : "", why_name[k], (unsigned)st.waits[k],
+                          (unsigned)(st.wait_us[k] / 1000));
+        if (n < cap)
+            n += snprintf(line + n, (size_t)(cap - n), " n/ms); list calls %u, stalls %u, polls %u\n", (unsigned)st.rpcs,
+                          (unsigned)st.stalls, (unsigned)st.polls);
         beat0 = b;
     }
-    walks = walk_us = rpcs = stalls = 0;
+    u32 lost = st.lost;
+    memset(&st, 0, sizeof st);
+    st.lost = lost;
     return n < cap ? n : cap - 1;
 }
 
@@ -403,5 +573,9 @@ void me_stop(void)
     if (on && !dead)
         me_reset();
     dma_list_hook = NULL;
+    gpu_sync_hook = NULL;
+    quit = 1;
+    if (kick_sema >= 0)
+        sceKernelSignalSema(kick_sema, 1);
     on = 0;
 }
