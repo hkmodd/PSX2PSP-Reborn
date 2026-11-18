@@ -482,8 +482,12 @@ static void screen_init(void)
     draw_buf = (void *)GE_DISP_B;
 }
 
-/* 24-bit display modes (MDEC movies) are converted to this 8888 texture, 512x512. */
-static u32 *rgb24_tex;
+/* 24-bit display modes (MDEC movies) are converted to this 8888 texture, 512x512. The GE reads it
+ * at rgb24_tex; the CPU writes and reads it only through rgb24_un, the uncached alias: a store
+ * into a cached line first reads the line (write-allocate), so the conversion's 512 KB of stores
+ * cost a line fill each, and the writeback after. Measured on the PSP (efd972f), 320x256:
+ * cached 4065 us + writeback 15 us, uncached 3103 us. */
+static u32 *rgb24_tex, *rgb24_un;
 static u32 us_rgb24; /* time spent converting, for the log */
 /* present's parts, for the log: waiting for the GE to finish the frame's drawing, then its own
  * list (the PS1 picture to the screen), then the text */
@@ -510,30 +514,11 @@ static void convert24_to(const Gpu *g, int w, int h, u32 *dst)
     }
 }
 
+/* The display area converted into the texture; returns the GE's address of it. */
 static const void *convert24(const Gpu *g, int w, int h)
 {
-    /* Once, where the conversion's time goes: the stores into cached lines (each missing line read
-     * from RAM first), the writeback, or the reads; the same stores uncached for comparison */
-    static int measured;
-    if (!measured) {
-        u32 t0 = sceKernelGetSystemTimeLow();
-        convert24_to(g, w, h, rgb24_tex);
-        u32 t1 = sceKernelGetSystemTimeLow();
-        sceKernelDcacheWritebackRange(rgb24_tex, (u32)h * 512 * 4);
-        u32 t2 = sceKernelGetSystemTimeLow();
-        sceKernelDcacheWritebackInvalidateRange(rgb24_tex, (u32)h * 512 * 4);
-        u32 t3 = sceKernelGetSystemTimeLow();
-        convert24_to(g, w, h, (u32 *)((u32)rgb24_tex | 0x40000000u));
-        u32 t4 = sceKernelGetSystemTimeLow();
-        convert24_to(g, w, h, rgb24_tex); /* again, the source now cached */
-        u32 t5 = sceKernelGetSystemTimeLow();
-        say("rgb24 %dx%d on the CPU: cached %u us + writeback %u us; uncached %u us; cached again %u us", w, h,
-            (unsigned)(t1 - t0), (unsigned)(t2 - t1), (unsigned)(t4 - t3), (unsigned)(t5 - t4));
-        measured = 1;
-    }
     u32 t = sceKernelGetSystemTimeLow();
-    convert24_to(g, w, h, rgb24_tex);
-    sceKernelDcacheWritebackRange(rgb24_tex, (u32)h * 512 * 4);
+    convert24_to(g, w, h, rgb24_un);
     us_rgb24 += sceKernelGetSystemTimeLow() - t;
     return rgb24_tex;
 }
@@ -745,7 +730,7 @@ static void shot_write(const u16 *vram, int x0, int y0, int w, int h, int deep, 
         for (int x = 0; x < w; x++) {
             u8 *o = row + x * 3;
             if (deep) {
-                u32 c = rgb24_tex[y * 512 + x];
+                u32 c = rgb24_un[y * 512 + x];
                 o[0] = (u8)(c >> 16), o[1] = (u8)(c >> 8), o[2] = (u8)c;
             } else {
                 u16 c = vram[((y0 + y) & (VRAM_H - 1)) * VRAM_W + ((x0 + x) & (VRAM_W - 1))];
@@ -762,11 +747,11 @@ static void shot_write(const u16 *vram, int x0, int y0, int w, int h, int deep, 
  * to the bit, or the CPU path takes over for good. */
 static void g24_check(const Gpu *g, int w, int h)
 {
-    const u32 *ref = convert24(g, w, h);
-    u16 *got = (u16 *)(rgb24_tex + 512 * 256); /* the GE copies its buffer here, past ref */
-    sceKernelDcacheWritebackInvalidateRange(got, 512u * (u32)h * 2);
+    convert24(g, w, h);
+    const u32 *ref = rgb24_un;
+    u16 *got = (u16 *)(rgb24_un + 512 * 256); /* the GE copies its buffer here, past ref */
     ge_open();
-    sceGuCopyImage(GU_PSM_5650, 0, 0, w, h, 512, (void *)(0x04000000u + GE_RGB24), 0, 0, 512, got);
+    sceGuCopyImage(GU_PSM_5650, 0, 0, w, h, 512, (void *)(0x04000000u + GE_RGB24), 0, 0, 512, rgb24_tex + 512 * 256);
     ge_sync();
     u32 bad = 0, lit = 0;
     for (int y = 0; y < h; y++)
@@ -1484,6 +1469,9 @@ int main(int argc, char **argv)
     rgb24_tex = palloc("psxrt rgb24", 512 * 512 * 4);
     if (!vram || !spu_ram || !mdec_in || !rgb24_tex)
         halt("out of memory");
+    /* no line of the texture in the D-cache from here on: none can be written back over rgb24_un's stores */
+    sceKernelDcacheWritebackInvalidateRange(rgb24_tex, 512 * 512 * 4);
+    rgb24_un = (u32 *)((u32)rgb24_tex | 0x40000000u);
     host.read_sector = disc_read_sector;
     host.disc_end = 150 + disc_info.sectors;
     host.disc_select = host_disc_select;
