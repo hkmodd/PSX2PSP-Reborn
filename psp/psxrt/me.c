@@ -3,7 +3,13 @@
  * copy the unlock flag, me_main's cached address and the shared block's uncached address, and
  * lets the ME out of reset. The handler turns on the ME's buses and FPU, clears its caches, puts
  * its stack at the top of its eDRAM and jumps to me_main, which runs the SC's jobs one by one from
- * MeCtl. Nothing on the ME's side calls the firmware, and the ME writes no cached memory.
+ * MeCtl. Nothing on the ME's side calls the firmware.
+ *
+ * Slice 2b-2: the GPU's linked lists (dma.c's dma_list_walk, through gpu.c into ge.c) are a job,
+ * through dma_list_hook. The SC waits on the job and serves it: the clock it publishes in MeCtl,
+ * the list calls ge_host.h sends here, the GE's stall from the word the ME moves. Both data caches
+ * go to RAM and are dropped at the job's edges and around every list call, so each side reads what
+ * the other wrote; between those points no line the ME writes is written by the SC.
  *
  * The same boot as me_probe (psp/me_probe, probes 0-0c on a PSP-3000). The handler holds no
  * address of its own, so it needs no relocation in the prx: what it jumps to is in its words.
@@ -30,12 +36,15 @@
  *   DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
  *   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
+#include <pspge.h>
 #include <pspkernel.h>
 #include <psputils.h>
 #include <stdio.h>
 #include <string.h>
 
+#include "ge_host.h"
 #include "me.h"
+#include "psx.h"
 
 /* KUBridge (kubridge.S) */
 unsigned int kuKernelPeekw(void *addr);
@@ -45,21 +54,23 @@ void kuKernelPokew(void *addr, unsigned int value);
 #define RESETEN 0xBC10004Cu /* bit 0x04: the ME held in reset */
 #define ME_RESET_BIT 0x04u
 #define ME_VECTOR 0xBFC00000u /* where the ME starts out of reset */
-#define SYSTIME 0xBC600000u   /* the 1 MHz system timer [?]: me_start checks it against the kernel's */
 #define ME_ALIVE 0x4D454F4Bu  /* "MEOK", the ME's first write */
-#define ME_CLOCK_AT 10        /* the second whose job is JOB_CLOCK instead of a ping */
+#define ME_TIMEOUT 1000000u   /* us without an answer or a list call: the ME is off */
 
 enum {
     JOB_NONE,
-    JOB_PING,  /* res0 = arg0 + 1 */
-    JOB_CLOCK, /* SYSTIME as the ME reads it, before and after ~300 us of nops: res0, res1 */
+    JOB_PING, /* res0 = arg0 + 1 */
+    JOB_WALK, /* res0 = dma_list_walk(arg0, arg1) */
 };
+enum { RPC_START = 1, RPC_FINISH, RPC_WAIT }; /* geh_list_start(arg), geh_list_finish(), geh_list_wait() */
 
 /* 128 bytes, 64-byte aligned, only ever read and written uncached: a line each side writes */
 typedef struct {
-    u32 seq, job, arg[2], sc_pad[12];
-    u32 alive, beat, ack, done, err, res[3], me_pad[8];
+    u32 seq, job, arg[2], sc_us, rpc_ack, rpc_res, sc_pad[9];
+    u32 alive, beat, ack, done, err, res[3], st_seq, st_id, st_addr, rpc_seq, rpc_op, rpc_arg, me_pad[2];
 } MeCtl;
+
+static volatile MeCtl *ctl; /* written by the SC before the boot, only read after */
 
 /* ---- the ME's side ---- */
 
@@ -130,18 +141,48 @@ static void me_dcache_wbinv_all(void)
     __asm__ volatile("sync");
 }
 
+/* ge_host.h's calls on the ME. The clock is the one the SC publishes while it waits. */
+u32 me_geh_us(void) { return ctl->sc_us; }
+void me_geh_wbinv_all(void) { me_dcache_wbinv_all(); }
+
+/* The GE may run the list up to buf + n: the SC applies the newest stall it finds. ge.c wrote the
+ * list back first, so any address the SC reads here has its bytes in RAM. */
+void me_geh_list_stall(int id, void *buf, u32 n)
+{
+    volatile MeCtl *c = ctl;
+    __asm__ volatile("sync");
+    c->st_id = (u32)id, c->st_addr = (u32)GEH_UNCACHED(buf) + n;
+    __asm__ volatile("sync");
+    c->st_seq = c->st_seq + 1;
+}
+
+/* A call the SC makes for the ME: everything the ME wrote is in RAM first and nothing of RAM stays
+ * in its cache, so the ME reads what the SC's call wrote (the SC writes it back before the ack). */
+static u32 me_rpc(u32 op, u32 arg)
+{
+    volatile MeCtl *c = ctl;
+    me_dcache_wbinv_all();
+    c->rpc_op = op, c->rpc_arg = arg;
+    __asm__ volatile("sync");
+    u32 s = c->rpc_seq + 1;
+    c->rpc_seq = s;
+    while (c->rpc_ack != s)
+        ;
+    return c->rpc_res;
+}
+
+int me_geh_list_start(void *buf) { return (int)me_rpc(RPC_START, (u32)buf); }
+u32 me_geh_list_finish(void) { return me_rpc(RPC_FINISH, 0); }
+void me_geh_list_wait(void) { me_rpc(RPC_WAIT, 0); }
+
 static void me_job(volatile MeCtl *c)
 {
-    volatile const u32 *st = (volatile const u32 *)SYSTIME;
     switch (c->job) {
     case JOB_PING:
         c->res[0] = c->arg[0] + 1;
         break;
-    case JOB_CLOCK:
-        c->res[0] = *st;
-        for (u32 i = 0; i < 100000; i++)
-            __asm__ volatile("nop");
-        c->res[1] = *st;
+    case JOB_WALK:
+        c->res[0] = dma_list_walk((Psx *)c->arg[0], c->arg[1]);
         break;
     default:
         c->err = 0xBAD70B;
@@ -162,7 +203,7 @@ static void me_main(volatile MeCtl *c)
             continue;
         }
         c->ack = seq;
-        me_dcache_wbinv_all();
+        me_dcache_wbinv_all(); /* no line of the SC's memory older than RAM */
         me_job(c);
         me_dcache_wbinv_all(); /* everything the job wrote is in RAM before done */
         __asm__ volatile("sync");
@@ -173,20 +214,114 @@ static void me_main(volatile MeCtl *c)
 /* ---- the SC's side ---- */
 
 static u8 ctl_mem[128] __attribute__((aligned(64)));
-static volatile MeCtl *ctl;
-static int on;
-static u32 seq, kicked_job, beat0, pings, pings_ok, late, secs, clock_kick;
+static int on, dead;
+static u32 seq, kicked_job, beat0, pings, pings_ok, late, n_dead;
+static u32 walks, walk_us, rpcs, stalls, st_seen, rpc_seen;
+static PsxHost me_host; /* the game's host for a walk on the ME: no log, the published clock */
 
 static u32 now(void) { return sceKernelGetSystemTimeLow(); }
 
 static void me_reset(void) { kuKernelPokew(KW(RESETEN), kuKernelPeekw(KW(RESETEN)) | ME_RESET_BIT); }
 
-static void kick(u32 job, u32 a0)
+static void kick(u32 job, u32 a0, u32 a1)
 {
-    ctl->job = job, ctl->arg[0] = a0;
+    ctl->job = job, ctl->arg[0] = a0, ctl->arg[1] = a1;
     __asm__ volatile("sync");
     ctl->seq = ++seq;
     kicked_job = job;
+}
+
+/* The ME stopped answering: back in reset, and the lists walk on the SC from now on. */
+static void me_dead(void)
+{
+    me_reset();
+    dma_list_hook = NULL;
+    dead = 1, n_dead++;
+}
+
+/* A ping's answer, counted once */
+static void ping_check(void)
+{
+    if (kicked_job == JOB_PING)
+        pings_ok += ctl->res[0] == seq + 1;
+    kicked_job = JOB_NONE;
+}
+
+/* The last job done within ME_TIMEOUT; 0, and the ME off, when it was not. */
+static int me_idle(void)
+{
+    u32 t = now();
+    while (ctl->done != seq)
+        if (now() - t > ME_TIMEOUT) {
+            me_dead();
+            return 0;
+        }
+    ping_check();
+    return 1;
+}
+
+static u32 me_usec(void *user)
+{
+    (void)user;
+    return ctl->sc_us;
+}
+
+/* dma_list_hook: the walk runs on the ME while the SC serves it. Before the kick the SC's cache
+ * goes to RAM and is dropped, so the ME reads the SC's latest; after done it is dropped again (the
+ * ME's writes are in RAM). While it waits the SC writes its stack, this file's counters and MeCtl;
+ * the list calls it makes for the ME are written back before the ack. With a trace on the walk stays
+ * on the SC: the ME has no log, and the traces' statics (gpu.c's last image) share lines with the
+ * disc thread's. */
+static u32 me_walk(Psx *psx, u32 addr)
+{
+    if (psx->trace || !me_idle())
+        return dma_list_walk(psx, addr);
+    const PsxHost *h0 = psx->host;
+    me_host = *h0;
+    me_host.log = NULL;
+    me_host.usec = h0->usec ? me_usec : NULL;
+    psx->host = &me_host;
+    u32 t0 = now(), tp = t0, words = 0;
+    ctl->sc_us = t0;
+    sceKernelDcacheWritebackInvalidateAll();
+    kick(JOB_WALK, (u32)psx, addr);
+    for (;;) {
+        u32 t = now();
+        ctl->sc_us = t;
+        u32 done = ctl->done, r = ctl->rpc_seq, s = ctl->st_seq; /* in this order: what the ME wrote before is in */
+        if (s != st_seen) {
+            st_seen = s, stalls++, tp = t;
+            sceGeListUpdateStallAddr((int)ctl->st_id, (void *)ctl->st_addr);
+        }
+        if (r != rpc_seen) {
+            u32 a = ctl->rpc_arg, res = 0;
+            sceKernelDcacheWritebackInvalidateAll();
+            switch (ctl->rpc_op) {
+            case RPC_START: res = (u32)geh_list_start((void *)a); break;
+            case RPC_FINISH: res = geh_list_finish(); break;
+            case RPC_WAIT: geh_list_wait(); break;
+            }
+            sceKernelDcacheWritebackInvalidateAll();
+            ctl->rpc_res = res;
+            __asm__ volatile("sync");
+            ctl->rpc_ack = r;
+            rpc_seen = r, rpcs++, tp = now();
+            continue;
+        }
+        if (done == seq) {
+            words = ctl->res[0];
+            kicked_job = JOB_NONE;
+            break;
+        }
+        if (t - tp > ME_TIMEOUT) {
+            me_dead();
+            break;
+        }
+    }
+    sceKernelDcacheWritebackInvalidateAll();
+    psx->host = h0;
+    walks++, walk_us += now() - t0;
+    return words;
 }
 
 static int boot(u32 unlock, u32 *us, u32 *bad)
@@ -195,7 +330,7 @@ static int boot(u32 unlock, u32 *us, u32 *bad)
     u32 words = (u32)(me_handler_end - h);
     memset(ctl_mem, 0, sizeof ctl_mem);
     ctl = (volatile MeCtl *)(0x40000000u | (u32)ctl_mem);
-    sceKernelDcacheWritebackInvalidateAll(); /* no cached line of ctl_mem left to write back over the ME's */
+    sceKernelDcacheWritebackInvalidateAll(); /* ctl in RAM for the ME; no cached line of ctl_mem left */
     *bad = 0;
     for (u32 pass = 0; pass < 2; pass++)
         for (u32 i = 0; i < words; i++) {
@@ -220,20 +355,20 @@ static int boot(u32 unlock, u32 *us, u32 *bad)
 int me_start(char *msg, int cap)
 {
     u32 r0 = kuKernelPeekw(KW(RESETEN));
-    u32 st_hw = kuKernelPeekw(KW(SYSTIME)), st_k = now();
     u32 us = 0, bad = 0, unlock = 0;
     on = boot(0, &us, &bad) || boot(unlock = 1, &us, &bad);
     if (!on) {
-        snprintf(msg, (size_t)cap, "ME: no answer in 500 ms with or without the unlock (RESETEN %08X, readback bad %u): the GE path stays on the CPU",
+        snprintf(msg, (size_t)cap, "ME: no answer in 500 ms with or without the unlock (RESETEN %08X, readback bad %u): the GPU's lists walk on the CPU",
                  (unsigned)r0, (unsigned)bad);
         return 0;
     }
     beat0 = ctl->beat;
+    dma_list_hook = me_walk;
     snprintf(msg, (size_t)cap,
              "ME: psxrt's loop runs (unlock %u, %u us, %u handler words, readback bad %u); RESETEN %08X before, %08X now;"
-             " SYSTIME word %u, sceKernelGetSystemTimeLow %u",
+             " the GPU's lists walk there",
              (unsigned)unlock, (unsigned)us, (unsigned)(me_handler_end - (const u32 *)(void *)me_handler), (unsigned)bad,
-             (unsigned)r0, kuKernelPeekw(KW(RESETEN)), (unsigned)st_hw, (unsigned)st_k);
+             (unsigned)r0, kuKernelPeekw(KW(RESETEN)));
     return 1;
 }
 
@@ -241,42 +376,32 @@ int me_log(char *line, int cap)
 {
     if (!on || cap <= 0)
         return 0;
-    int n = 0;
-    secs++;
-    u32 b = ctl->beat, t = now();
-    if (seq) {
-        if (ctl->done != seq) {
-            late++;
-        } else if (kicked_job == JOB_PING) {
-            pings_ok += ctl->res[0] == seq + 1;
-        } else if (kicked_job == JOB_CLOCK) {
-            u32 m0 = ctl->res[0], m1 = ctl->res[1];
-            n += snprintf(line + n, (size_t)(cap - n),
-                          "-- me clock: the SC kicked at %u, the ME read SYSTIME %u then %u (+%d), the SC saw it done at %u: %s\n",
-                          (unsigned)clock_kick, (unsigned)m0, (unsigned)m1, (int)(m1 - m0), (unsigned)t,
-                          m0 - clock_kick <= t - clock_kick && m1 - m0 <= t - m0 && m1 != m0 ? "the SC's clock" : "not the SC's clock");
-            kicked_job = JOB_NONE;
-        }
-    }
-    if (!seq || ctl->done == seq) { /* the next job only when the last one is done */
-        if (secs == ME_CLOCK_AT) {
-            clock_kick = now();
-            kick(JOB_CLOCK, 0);
-        } else {
-            kick(JOB_PING, seq + 1);
+    int n;
+    if (dead) {
+        n = snprintf(line, (size_t)cap, "-- me: off, no answer in %u ms (%u times; job %u, err %X): the lists walk on the CPU\n",
+                     (unsigned)(ME_TIMEOUT / 1000), (unsigned)n_dead, (unsigned)kicked_job, (unsigned)ctl->err);
+    } else {
+        u32 b = ctl->beat;
+        if (ctl->done == seq) { /* the next ping only when the last job is done */
+            ping_check();
+            kick(JOB_PING, seq + 1, 0);
             pings++;
+        } else {
+            late++;
         }
+        n = snprintf(line, (size_t)cap, "-- me: beat %u, pings %u/%u, late %u, err %X; walks %u in %u ms, list calls %u, stalls %u\n",
+                     (unsigned)(b - beat0), (unsigned)pings_ok, (unsigned)pings, (unsigned)late, (unsigned)ctl->err,
+                     (unsigned)walks, (unsigned)(walk_us / 1000), (unsigned)rpcs, (unsigned)stalls);
+        beat0 = b;
     }
-    if (n < cap)
-        n += snprintf(line + n, (size_t)(cap - n), "-- me: beat %u, pings %u/%u, late %u, err %X\n", (unsigned)(b - beat0),
-                      (unsigned)pings_ok, (unsigned)pings, (unsigned)late, (unsigned)ctl->err);
-    beat0 = b;
+    walks = walk_us = rpcs = stalls = 0;
     return n < cap ? n : cap - 1;
 }
 
 void me_stop(void)
 {
-    if (on)
+    if (on && !dead)
         me_reset();
+    dma_list_hook = NULL;
     on = 0;
 }

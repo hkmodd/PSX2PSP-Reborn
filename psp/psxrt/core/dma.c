@@ -78,6 +78,36 @@ static void run(Psx *psx, int ch)
     psx->dma.n_run[ch]++;
 }
 
+/* The GPU's linked list (channel 2, sync mode 2) from addr, every packet to the GPU: its words.
+ * dma_list_hook, when set, walks it instead (psxrt's Media Engine runs dma_list_walk there);
+ * NULL everywhere else, and the walk is this one. */
+u32 (*dma_list_hook)(Psx *psx, u32 addr);
+
+u32 dma_list_walk(Psx *psx, u32 addr)
+{
+    u32 words = 0;
+    const GpuRenderer *r = psx->gpu.renderer;
+    u32 (*packet)(void *, const u32 *, u32) = r ? r->packet : NULL;
+    for (int guard = 0; guard < 0x40000; guard++) {
+        u32 h = rd(psx, addr), n = h >> 24;
+        if (!n) { /* an empty ordering table entry */
+        } else if (addr + 4 * (n + 1) <= RAM_SIZE) {
+            const u32 *w = (const u32 *)(psx->ram + addr + 4);
+            u32 k = packet && !psx->gpu.ncmd && psx->gpu.xfer != 1 ? packet(r->self, w, n) : 0;
+            if (k < n)
+                gpu_gp0_packet(psx, w + k, n - k);
+        } else
+            for (u32 i = 1; i <= n; i++)
+                gpu_gp0(psx, rd(psx, addr + 4 * i));
+        words += n + 1;
+        addr = h & 0xFFFFFF;
+        if (addr & 0x800000)
+            break;
+        addr &= 0x1FFFFC;
+    }
+    return words;
+}
+
 static void transfer(Psx *psx, int ch)
 {
     DmaChan *c = &psx->dma.ch[ch];
@@ -85,25 +115,7 @@ static void transfer(Psx *psx, int ch)
     int from_ram = c->chcr & 1;
     u32 step = (c->chcr & 2) ? (u32)-4 : 4u;
     if (sync == 2) { /* linked list (GPU) */
-        const GpuRenderer *r = psx->gpu.renderer;
-        u32 (*packet)(void *, const u32 *, u32) = r ? r->packet : NULL;
-        for (int guard = 0; guard < 0x40000; guard++) {
-            u32 h = rd(psx, addr), n = h >> 24;
-            if (!n) { /* an empty ordering table entry */
-            } else if (addr + 4 * (n + 1) <= RAM_SIZE) {
-                const u32 *w = (const u32 *)(psx->ram + addr + 4);
-                u32 k = packet && !psx->gpu.ncmd && psx->gpu.xfer != 1 ? packet(r->self, w, n) : 0;
-                if (k < n)
-                    gpu_gp0_packet(psx, w + k, n - k);
-            } else
-                for (u32 i = 1; i <= n; i++)
-                    gpu_gp0(psx, rd(psx, addr + 4 * i));
-            words += n + 1;
-            addr = h & 0xFFFFFF;
-            if (addr & 0x800000)
-                break;
-            addr &= 0x1FFFFC;
-        }
+        words = dma_list_hook ? dma_list_hook(psx, addr) : dma_list_walk(psx, addr);
         c->madr = 0xFFFFFF;
     } else {
         u32 bs = c->bcr & 0xFFFF;

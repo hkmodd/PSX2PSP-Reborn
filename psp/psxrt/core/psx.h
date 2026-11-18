@@ -515,6 +515,8 @@ u32 dma_read(Psx *psx, u32 addr);
 void dma_write(Psx *psx, u32 addr, u32 v);
 void dma_done(Psx *psx, int ch);
 void dma_update(Psx *psx); /* completes channels whose transfer time has passed */
+u32 dma_list_walk(Psx *psx, u32 addr); /* the GPU's linked list from addr: its words */
+extern u32 (*dma_list_hook)(Psx *psx, u32 addr); /* walks it instead when set (psxrt's ME); NULL */
 
 /* timers.c */
 u32 timer_read(Psx *psx, u32 addr);
