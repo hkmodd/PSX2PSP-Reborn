@@ -1839,7 +1839,12 @@ pub fn convert_native(req: &ConvertRequest, monitor: &dyn Monitor) -> Result<Con
         }
     }
     let kuseg = exes.iter().any(|(_, b)| psx2psp_recomp::exe::PsxExe::parse(b).is_ok_and(|x| x.text_addr >> 29 == 0));
-    for d in &discs {
+    // PSX2PSP_NO_CAPTURE: static translation only, to measure what the interpreter still runs without the capture.
+    let static_only = std::env::var_os("PSX2PSP_NO_CAPTURE").is_some();
+    if static_only {
+        monitor.log("Native: PSX2PSP_NO_CAPTURE set, static translation only");
+    }
+    for d in discs.iter().filter(|_| !static_only) {
         let started = Instant::now();
         let mine = captured_code(&d.img, &d.patches(), kuseg);
         monitor.log(&format!("Native: disc {}: {} code runs captured in {CAPTURE_FRAMES} frames ({:.1} s)", d.disc_id, mine.len(), started.elapsed().as_secs_f64()));
