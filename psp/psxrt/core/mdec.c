@@ -795,6 +795,13 @@ u32 mdec_dma_block(Psx *psx, u32 *dst, u32 n)
     u32 k = (u32)(m->nout - m->rout);
     if (k > n)
         k = n;
+#ifdef __psp__
+    /* The words cover whole cache lines of RAM: those are made valid and dirty without the fetch a
+     * store miss would do (Allegrex cache 0x18, create dirty exclusive), then overwritten; ch2
+     * reads them back from the cache. */
+    for (u32 a = ((u32)dst + 63) & ~63u, e = ((u32)dst + k * 4) & ~63u; a < e; a += 64)
+        __asm__ volatile("cache 0x18, 0(%0)" : : "r"(a) : "memory");
+#endif
     memcpy(dst, &m->out[m->rout], k * 4);
     m->rout += (int)k;
     return k;
