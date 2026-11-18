@@ -463,6 +463,9 @@ static int reserve_fixed(void)
 /* ---- screen: PSP VRAM holds the GE's PS1 VRAM and two 565 display buffers (ge.h) ---- */
 static void *draw_buf; /* relative to the start of the PSP's VRAM */
 static int show_text; /* the log lines over the picture: drawn by the CPU, so off at start */
+/* The PS1 picture across the whole screen (16:9, 33% wider than the 4:3 TV it was made for);
+ * off: 4:3. L+R+SQUARE switches it. */
+static int screen_wide;
 static DiscInfo disc_info;
 /* The disc change by hand, for a game the automatic one (core/cdrom.c) does not serve: L+R+SELECT
  * opens the shell, LEFT/RIGHT pick the disc, CROSS closes it. read_pad sets the requests,
@@ -717,19 +720,26 @@ static int draw_ps1(Psx *psx)
         sceGuTexMode(GU_PSM_5551, 0, 0, 0);
         sceGuTexImage(0, 512, 512, VRAM_W, (void *)(0x04000000u + GE_PS1_VRAM + ((u32)g->disp_y * VRAM_W + (g->disp_x & ~7u)) * 2));
     }
+    /* 4:3 as on a TV: 362x272 in the middle, black at the sides (cleared every frame: the
+     * status and log lines are drawn over them); wide: the whole 480x272 screen */
+    const int sw = screen_wide ? 480 : 362, sx = (480 - sw) / 2;
+    if (!screen_wide) {
+        sceGuClearColor(0xFF000000);
+        sceGuClear(GU_COLOR_BUFFER_BIT);
+    }
     sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGB);
     sceGuTexFilter(GU_LINEAR, GU_LINEAR);
     sceGuTexFlush();
     sceGuEnable(GU_TEXTURE_2D);
-    const int n = (480 + SLICE_W - 1) / SLICE_W;
+    const int n = (sw + SLICE_W - 1) / SLICE_W;
     SliceVtx *v = (SliceVtx *)sceGuGetMemory(2 * n * sizeof(SliceVtx));
     int px0, py0, px1, py1; /* the part of the display area that holds the picture */
     gpu_picture(psx, w, h, &px0, &py0, &px1, &py1);
-    const float su = (float)(px1 - px0) / 480.0f;
+    const float su = (float)(px1 - px0) / (float)sw;
     for (int i = 0; i < n; i++) {
-        int x0 = i * SLICE_W, x1 = x0 + SLICE_W > 480 ? 480 : x0 + SLICE_W;
-        v[2 * i] = (SliceVtx){(float)px0 + (float)x0 * su, (float)py0, (float)x0, 0.0f, 0.0f};
-        v[2 * i + 1] = (SliceVtx){(float)px0 + (float)x1 * su, (float)py1, (float)x1, 272.0f, 0.0f};
+        int x0 = i * SLICE_W, x1 = x0 + SLICE_W > sw ? sw : x0 + SLICE_W;
+        v[2 * i] = (SliceVtx){(float)px0 + (float)x0 * su, (float)py0, (float)(sx + x0), 0.0f, 0.0f};
+        v[2 * i + 1] = (SliceVtx){(float)px0 + (float)x1 * su, (float)py1, (float)(sx + x1), 272.0f, 0.0f};
     }
     sceGuDrawArray(GU_SPRITES, GU_TEXTURE_32BITF | GU_VERTEX_32BITF | GU_TRANSFORM_2D, 2 * n, 0, v);
     sceGuDisable(GU_TEXTURE_2D);
@@ -960,9 +970,15 @@ static u16 read_pad(u32 frame_no)
     u32 snap = PSP_CTRL_LTRIGGER | PSP_CTRL_RTRIGGER | PSP_CTRL_START;
     if ((b & snap) == snap && (prev & snap) != snap)
         native_snap_req = 1;
+    /* L+R+SQUARE: 4:3 or the whole screen; the game does not see the three buttons */
+    u32 wide = PSP_CTRL_LTRIGGER | PSP_CTRL_RTRIGGER | PSP_CTRL_SQUARE;
+    if ((b & wide) == wide && (prev & wide) != wide)
+        screen_wide = !screen_wide;
     prev = b;
     if ((b & snap) == snap)
         b &= ~snap;
+    if ((b & wide) == wide)
+        b &= ~wide;
     u32 l2r2 = (d.Lx < 64 ? 1u : 0u) | (d.Lx > 192 ? 2u : 0u);
     return (u16) ~((b & 0xF0F9u) | ((b >> 8) & 3u) << 10 | l2r2 << 8);
 }
