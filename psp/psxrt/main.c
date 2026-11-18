@@ -819,14 +819,31 @@ static void ram_dump(Psx *psx, u32 frame_no)
     say("ram %s", path);
 }
 
+/* The status line's 8 rows as the debug screen draws them (5650, stride 512): printed again only
+ * when the text changes (once a second), copied over every picture instead of drawn there a
+ * pixel at a time on uncached VRAM (~13 ms/s). A character is 8x8 at a 7-pixel step, so the
+ * text covers 7 * chars + 1 pixels of each row; the picture stays beside it. */
+static u16 status_rows[512 * 8] __attribute__((aligned(64)));
+static char status_drawn[64];
+static u32 status_bytes;
+
 /* The status line and the log lines over a finished picture, then that picture to the display. */
 static void show(const char *status, int all)
 {
     u32 t = sceKernelGetSystemTimeLow();
-    pspDebugScreenSetBase((u32 *)(0x44000000u + (u32)draw_buf));
-    pspDebugScreenSetXY(0, 0);
-    pspDebugScreenSetTextColor(0xFF40FFFF);
-    pspDebugScreenPrintf("%-60s", status);
+    if (!status_drawn[0] || strcmp(status, status_drawn)) {
+        u32 len = (u32)snprintf(status_drawn, sizeof status_drawn, "%s", status);
+        len = len < 60 ? 60 : len < sizeof status_drawn ? len : sizeof status_drawn - 1;
+        status_bytes = (7 * len + 1) * 2;
+        pspDebugScreenSetBase((u32 *)status_rows);
+        pspDebugScreenSetXY(0, 0);
+        pspDebugScreenSetTextColor(0xFF40FFFF);
+        pspDebugScreenPrintf("%-60s", status_drawn);
+    }
+    u16 *fb = (u16 *)(0x44000000u + (u32)draw_buf);
+    for (int y = 0; y < 8; y++)
+        memcpy(fb + y * 512, status_rows + y * 512, status_bytes);
+    pspDebugScreenSetBase((u32 *)fb);
     if (show_text || all) {
         int n = all ? 32 : SHOWN;
         pspDebugScreenSetTextColor(0xFFFFFFFF);
