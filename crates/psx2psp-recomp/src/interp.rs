@@ -155,7 +155,9 @@ impl Cpu {
                 return Err(stop(trap));
             }
         };
-        // The previous load lands now, unless this instruction wrote the same register.
+        // The previous load lands now, unless this instruction wrote the same register, directly or
+        // by a load of its own (a second load drops the first: the slot after it still reads the
+        // value from before both, as cpu.c and DuckStation do).
         let mut landing = in_flight;
         match out {
             Out::None => {}
@@ -170,7 +172,12 @@ impl Cpu {
                 self.lo = lo;
             }
             Out::Load(r, v) => match self.isa {
-                Isa::R3000A => self.pending = Some((r, v)),
+                Isa::R3000A => {
+                    if landing.is_some_and(|(p, _)| p == r) {
+                        landing = None;
+                    }
+                    self.pending = Some((r, v));
+                }
                 Isa::Allegrex => self.gpr[r] = v,
             },
         }

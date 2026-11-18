@@ -85,6 +85,16 @@ fn r3000a_write_in_the_delay_slot_cancels_the_load() {
 }
 
 #[test]
+fn r3000a_second_load_to_the_same_register_drops_the_first() {
+    let code = [lw(V0, 0, A0), lw(V0, 4, A0), addu(V1, V0, ZERO), addu(A1, V0, ZERO), NOP];
+    let (mut cpu, mut ram) = setup(Isa::R3000A, &code);
+    cpu.gpr[V0 as usize] = 7;
+    cpu.gpr[A0 as usize] = DATA;
+    steps(&mut cpu, &mut ram, 4);
+    assert_eq!((cpu.gpr[V1 as usize], cpu.gpr[A1 as usize]), (7, 0x7766_5544));
+}
+
+#[test]
 fn lwr_lwl_pair_reads_an_unaligned_word_on_both_cpus() {
     let code = [i(0x26, A0, V0, 1), i(0x22, A0, V0, 4), NOP, NOP];
     for isa in [Isa::R3000A, Isa::Allegrex] {
