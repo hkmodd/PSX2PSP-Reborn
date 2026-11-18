@@ -56,6 +56,7 @@ static int get(SceUID fd, void *p, u32 n) { return sceIoRead(fd, p, n) == (int)n
 
 int snap_save(const char *path, Psx *psx, const DiscInfo *info, u32 host_pc, u32 frames)
 {
+    gpu_sync(psx, GPU_SYNC_OTHER); /* the ME's walk done: its GPU state in psx */
     SnapHeader h;
     header(&h, info);
     h.host_pc = host_pc, h.frames = frames, h.mdec_words = (u32)psx->mdec.nin;
@@ -72,6 +73,7 @@ int snap_save(const char *path, Psx *psx, const DiscInfo *info, u32 host_pc, u32
 
 int snap_load(const char *path, Psx *psx, const DiscInfo *info, u32 *host_pc, u32 *frames)
 {
+    gpu_sync(psx, GPU_SYNC_OTHER); /* no walk on the ME over the state read here */
     SceUID fd = sceIoOpen(path, PSP_O_RDONLY, 0);
     if (fd < 0)
         return -1;
@@ -102,6 +104,7 @@ int snap_load(const char *path, Psx *psx, const DiscInfo *info, u32 *host_pc, u3
           get(fd, mdec_in, h.mdec_words * 4) || native_load(fd);
     sceIoClose(fd);
     sceKernelDcacheWritebackInvalidateAll();
+    spu_ram_changed();
     if (bad)
         return -3;
     *host_pc = h.host_pc, *frames = h.frames;

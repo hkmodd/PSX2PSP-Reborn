@@ -515,6 +515,8 @@ u32 dma_read(Psx *psx, u32 addr);
 void dma_write(Psx *psx, u32 addr, u32 v);
 void dma_done(Psx *psx, int ch);
 void dma_update(Psx *psx); /* completes channels whose transfer time has passed */
+u32 dma_list_walk(Psx *psx, u32 addr); /* the GPU's linked list from addr: its words */
+extern u32 (*dma_list_hook)(Psx *psx, u32 addr); /* walks it instead when set (psxrt's ME); NULL */
 
 /* timers.c */
 u32 timer_read(Psx *psx, u32 addr);
@@ -561,6 +563,26 @@ void gpu_init(Psx *psx);
 extern u32 gpu_slow_us; /* us a second in polygons the renderer's fast lane turned away */
 extern u32 prof_bias; /* an empty timed interval times 16, in us: taken off every sampled time (0: not set) */
 extern u32 gpu_writes;  /* VRAM writes so far (draw commands and transfers): what is shown changed when it moved */
+/* psxrt's Media Engine (psp/psxrt/me.c) walks the GPU's lists on gpu_me_psx, a copy of the Psx
+ * with its own GPU state, while the CPU goes on. gpu_sync_hook waits for that walk and brings its
+ * GPU state back: every entry that reads or writes the GPU's state calls gpu_sync first. The walk
+ * counts its VRAM writes in *gpu_me_writes, on the ME's side. All three NULL everywhere else. */
+enum { GPU_SYNC_READ, GPU_SYNC_GP0, GPU_SYNC_GP1, GPU_SYNC_VBLANK, GPU_SYNC_DMA, GPU_SYNC_GE, GPU_SYNC_OTHER, GPU_SYNC_N };
+extern void (*gpu_sync_hook)(int why);
+extern Psx *gpu_me_psx;
+extern u32 *gpu_me_writes;
+static inline void gpu_sync(const Psx *psx, int why)
+{
+    if (gpu_sync_hook && psx != gpu_me_psx)
+        gpu_sync_hook(why);
+}
+static inline void gpu_count_writes(const Psx *psx, u32 n)
+{
+    if (psx == gpu_me_psx)
+        *gpu_me_writes += n;
+    else
+        gpu_writes += n;
+}
 u32 gpu_read(Psx *psx, int reg);
 void gpu_gp0(Psx *psx, u32 v);
 /* GP0 words of a DMA packet, in PS1 RAM (word aligned) */
@@ -586,6 +608,8 @@ void spu_write(Psx *psx, u32 addr, u16 v);
 void spu_dma_write(Psx *psx, u32 v);
 u32 spu_dma_read(Psx *psx);
 void spu_run(Psx *psx);
+/* SPU RAM was written other than through the SPU's ports (a snapshot loaded) */
+void spu_ram_changed(void);
 
 /* Voices played by a mixer of the host's (the PSP's sceSasCore on the Media Engine). Mode 0: the
  * SPU mixes every voice; 1: the host may take voices at key on; 2: the host takes them and the

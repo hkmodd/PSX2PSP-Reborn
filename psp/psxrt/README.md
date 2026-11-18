@@ -89,6 +89,7 @@ Files beside the EBOOT drive the runtime for development (`docs/recomp/S9.md`):
 | `psxrt.shots` | frame numbers to save as `shotNNNNN.bmp`; `rNNN` saves a RAM dump instead |
 | `psxrt.pad` | `frame buttons frames` lines: scripted presses |
 | `psxrt.spu` | `cpu`: the SPU mixes every voice; `both`: sceSasCore mixes its voices into a buffer nobody hears, beside the SPU, and the `-- sas` line compares the levels; anything else or no file: sceSasCore plays them (the default, S17) |
+| `psxrt.me` | the Media Engine taken from the firmware for psxrt's own loop (`me.c`, ME translator step 2b-1, needs ARK-4's KUBridge). It idles and answers a ping job a second; the `-- me` line counts the pings, and second 10's job reads the system timer from the ME (`-- me clock`). sceSasCore runs on the ME, so the SPU mixes every voice whatever `psxrt.spu` says. The GE path stays on the CPU. Restart the PSP after the run: the firmware does not take the ME back |
 
 Recipes (`crates/psx2psp-recomp/src/hooks.rs`) are library code found by its exact words and
 served by the runtime (`native.c`, "recipes") instead of its translation: libpad's

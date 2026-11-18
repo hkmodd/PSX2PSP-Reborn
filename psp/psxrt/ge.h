@@ -22,6 +22,8 @@
  *              RAM's copy never needs the GE's pixels (the sim, which has no GE, checks lists so). */
 enum { GE_NORMAL, GE_COMPARE, GE_SHADOW };
 void ge_init(Psx *psx, int mode);
+/* The Psx whose GPU state the renderer reads: psxrt's ME binds its copy for a walk, and back. */
+void ge_bind(Psx *psx);
 /* Opens the display list for host commands; the renderer sets its state again afterwards. */
 void ge_open(void);
 /* Ends the display list and waits for the GE. */

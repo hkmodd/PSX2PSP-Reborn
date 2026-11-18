@@ -145,7 +145,9 @@ static struct {
  * the fast lane look for newer tiles under these columns of its page, not the whole page. A T8
  * page at x 960 runs on past 1023 into x 0-63, a framebuffer the GE draws every frame; games use
  * only its first half there (MediEvil: a whole-VRAM readback at every such switch, 190 ms/s). */
-static int tu_lo, tu_hi = 255;
+/* 0-255 from ge_init: no initializer, so in .bss with the rest of ge.o's, not in a .data line
+ * another object shares (psxrt's ME writes it during a walk while the CPU runs). */
+static int tu_lo, tu_hi;
 /* The last page check passed on those columns only: tiles under the rest of the page are newer,
  * so nothing may keep the page as checked at this ge.nver. */
 static int tu_part;
@@ -213,8 +215,15 @@ static u32 stall_step = STALL_STEP;
 static int list_id;
 static u32 list_stall; /* bytes the GE may run */
 
+/* psxrt's ME (core/psx.h, gpu_sync_hook): the CPU's entries here wait for the ME's walk first. On
+ * the ME itself the hook returns at once (me.c). */
+#define GE_SYNC() (gpu_sync_hook ? gpu_sync_hook(GPU_SYNC_GE) : (void)0)
+
+void ge_bind(Psx *psx) { ge.psx = psx; }
+
 void ge_open(void)
 {
+    GE_SYNC();
     if (!list_open) {
         list_id = geh_list_start(list);
         list_stall = 0;
@@ -261,6 +270,7 @@ static void ge_kick(void)
 
 void ge_run(void)
 {
+    GE_SYNC();
     if (!list_open)
         return;
     u32 n = (u32)((u8 *)GL->current - (u8 *)GL->start);
@@ -272,6 +282,7 @@ void ge_run(void)
 
 void ge_sync(void)
 {
+    GE_SYNC();
     if (list_open) {
         u32 n = geh_list_finish();
         ring_flush();
@@ -609,10 +620,15 @@ static void rd_read(void *self, s32 x, s32 y, s32 w, s32 h)
     ge.s.rb_why[rb_why]++, ge.s.rb_last = (u32)x | (u32)y << 10 | (u32)w << 20;
 }
 
-void ge_read(int x, int y, int w, int h) { rd_read(&ge, x, y, w, h); }
+void ge_read(int x, int y, int w, int h)
+{
+    GE_SYNC();
+    rd_read(&ge, x, y, w, h);
+}
 
 const unsigned short *ge_compare_vram(void)
 {
+    GE_SYNC();
     if (!ge.compare)
         return NULL;
     begin();
@@ -659,6 +675,7 @@ static void sprite(s32 x1, s32 y1, s32 x2, s32 y2, u32 c)
  * VRAM: the oracle sizes the framebuffer by it, and shrinks one drawn in a small part only. */
 void ge_touch(void)
 {
+    GE_SYNC();
     begin();
     gel_pixel_mask(GL, 0xFFFFFFFF);
     scissor(0, 0, VRAM_W - 1, VRAM_H - 1);
@@ -1704,8 +1721,8 @@ static u32 rd_packet(void *self, const u32 *w, u32 n)
         if (need > n - k)
             break;
         g->n_kind[0]++;
-        gpu_writes++;
-        u32 t = t64++ % 64 ? 0 : geh_us();
+        gpu_count_writes(psx, 1);
+        u32 t = t64++ % 64 || psx == gpu_me_psx ? 0 : geh_us(); /* not timed on the ME: gpu_slow_us is the CPU's */
         if (tex)
             gpu_set_texpage(g, (g->texpage & ~0x1FFu) | (c[gour ? 5 : 4] >> 16 & 0x1FF));
         int r = rd_poly(NULL, c);
@@ -1871,6 +1888,7 @@ void ge_init(Psx *psx, int mode)
 {
     ge.psx = psx;
     ge.compare = mode == GE_COMPARE;
+    tu_lo = 0, tu_hi = 255;
     geh_region(list, sizeof list), geh_region(clut_pool, sizeof clut_pool), geh_region(fl_arena, sizeof fl_arena);
     geh_region(psx->gpu.vram, VRAM_W * VRAM_H * 2);
     if (!list_open) { /* the list is idle: gel.h against pspgu in it */
@@ -1971,6 +1989,7 @@ static int compare(char *buf, int cap)
 
 int ge_log(char *buf, int cap)
 {
+    GE_SYNC();
     const GeStats *s = &ge.s;
     u32 kb = s->kicks * prof_bias / 16, kick_us = s->kick_us > kb ? s->kick_us - kb : 0; /* less one clock read each */
     int n = clampn(snprintf(buf, (size_t)cap,

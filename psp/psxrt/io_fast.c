@@ -97,6 +97,7 @@ int io_fast_dev(Psx *psx, u32 p, u32 *v)
         return 0;
     }
     if (p - 0x1F801810 < 8) { /* core/gpu.c gpu_read; GPUREAD of a VRAM->CPU transfer moves pixels */
+        gpu_sync(psx, GPU_SYNC_READ);
         const Gpu *g = &psx->gpu;
         if (!(p & 4)) {
             if (g->xfer == 2)
