@@ -29,6 +29,7 @@
 #define GU_DITHER		(6)
 #define GU_CLIP_PLANES		(8)
 #define GU_TEXTURE_2D		(9)
+#define GU_COLOR_TEST		(17)
 #define GU_TEXTURE_SHIFT(n)	((n)<<0)
 #define GU_TEXTURE_16BIT	GU_TEXTURE_SHIFT(2)
 #define GU_TEXTURE_32BITF	GU_TEXTURE_SHIFT(3)

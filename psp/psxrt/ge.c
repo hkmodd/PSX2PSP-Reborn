@@ -80,13 +80,12 @@ typedef struct {
     u8 *data;
 } Page;
 
-/* 15-bit pages: an 8888 copy of the whole VRAM, alpha as in a converted CLUT, MIR_W texels a row
- * (columns 1024-1279 repeat 0-255, for pages that run past x 1023); a page is a pointer into it.
- * Each tile is converted when its generation moved on, only where a primitive samples. MediEvil's
- * attract mode drew 48-76 such sprites a second in software; Exoddus's menu samples 12 pages a
- * frame, which two page-sized slots converted again every frame (132 a second, ~400 ms/s). */
-#define MIR_W (VRAM_W + 256)
-#define MIR_BYTES (MIR_W * VRAM_H * 4)
+/* 15-bit pages are sampled where the GE keeps PS1 VRAM, as 5551 rows VRAM_W texels apart, as POPS
+ * does (POPS.md 3.1): that copy is never behind RAM's, so nothing is read back or converted. An
+ * 8888 copy in RAM, converted per tile from RAM's VRAM, cost Silent Hill's frame feedback (three
+ * 256x255 sprites of the last frame a frame) a readback of all VRAM, ~14 ms of conversion and a GE
+ * wait of 430-613 ms/s; it took 2.5 MB, which Sheep Dog did not have (15-bit in software there).
+ * A page that runs past x 1023 is drawn in software. */
 
 /* Games switch CLUTs per model, and models are drawn interleaved in depth order. A converted CLUT
  * is kept across lists in a slot of the pool, two ways per set, as long as its tiles' stamp holds
@@ -128,10 +127,6 @@ static struct {
     /* texture cache */
     Page pages[PAGE_SLOTS];
     int npages;
-    u32 *mir, *mir_u;                /* the 15-bit copy, cached and uncached (written); NULL: none */
-    u32 mir_gen[TILES_Y][TILES_X];  /* the gen each tile was converted at; ~0: never */
-    u32 mir_used[TILES_Y][TILES_X]; /* the list (ge.syncs) that last sampled the tile */
-    u8 mir_flags[TILES_Y][TILES_X]; /* its texels, as clut()'s flags */
     u32 syncs, ages; /* syncs: counts the lists run */
     u32 epoch;       /* bumped whenever any tile's generation changes */
     Page *last_page; /* the page last used, current as of last_epoch */
@@ -317,6 +312,7 @@ static void base_state(void)
     gel_disable(GL, GU_CLIP_PLANES);
     gel_scissor_on(GL, GSC);
     gel_enable(GL, GU_STENCIL_TEST); /* bit 15 = stencil: the mask bit is written and tested by it */
+    gel_disable(GL, GU_COLOR_TEST);  /* on only within a 15-bit draw (tex_draw) */
     gel_pixel_mask(GL, 0);
     gel_shade_model(GL, GU_SMOOTH);
     gel_set_dither(GL, ps1_dither);
@@ -711,7 +707,7 @@ static int tw_side(u32 and_, u32 or_)
 /* What the GE can sample: pages, and texture windows that repeat as the GE does. */
 static int tex_ok(const GpuPrim *p)
 {
-    if (p->depth >= 2 ? !ge.mir : !ge.npages) {
+    if (p->depth < 2 && !ge.npages) {
         ge.s.sw_tex15++;
         return 0;
     }
@@ -771,56 +767,14 @@ static const u8 *page(const GpuPrim *p)
     return s->data;
 }
 
-/* A tile of the 15-bit copy converted from RAM's VRAM (and its repeat past x 1023). */
-static void mir_tile(s32 tx, s32 ty)
+/* A 15-bit page whose sampled texels run past x 1023: the GE's rows would go on into the next
+ * one, so the primitive is drawn in software. After tu_set. */
+static int tex15_wraps(const GpuPrim *p)
 {
-    u32 fo = 0, fs = 0;
-    for (s32 y = ty * TILE_H; y < (ty + 1) * TILE_H; y++) {
-        const u16 *row = ge.psx->gpu.vram + y * VRAM_W + tx * TILE_W;
-        u32 *d = ge.mir_u + y * MIR_W + tx * TILE_W, *e = tx < 256 / TILE_W ? d + VRAM_W : NULL;
-        for (s32 x = 0; x < TILE_W; x++) {
-            u32 t = row[x];
-            u32 v = (t & 0x8000 ? 0x80000000u : t ? 0xFF000000u : 0) | (t >> 10 & 31) << 19 | (t >> 5 & 31) << 11 | (t & 31) << 3;
-            fo |= t & 0x8000 ? 0 : t, fs |= t & 0x8000;
-            d[x] = v;
-            if (e)
-                e[x] = v;
-        }
-    }
-    ge.mir_gen[ty][tx] = ge.gen[ty][tx];
-    ge.mir_flags[ty][tx] = (u8)((fo ? 1 : 0) | (fs ? 2 : 0));
-    ge.s.pages15++;
-}
-
-/* The 15-bit page as 8888 with the flags of the texels sampled (tu_lo-tu_hi, every row); RAM's
- * copy of it is current. A tile the open list samples is converted again only after a flush. */
-static const u8 *page15(const GpuPrim *p, int *flags)
-{
-    s32 c0 = ((s32)p->tpx + tu_lo) / TILE_W, c1 = ((s32)p->tpx + tu_hi) / TILE_W, r0 = (s32)p->tpy / TILE_H;
-    int stale = 0, f = 0;
-    for (s32 r = r0; r < r0 + 256 / TILE_H; r++)
-        for (s32 c = c0; c <= c1; c++) {
-            s32 ty = r & (TILES_Y - 1), tx = c & (TILES_X - 1);
-            if (ge.mir_gen[ty][tx] != ge.gen[ty][tx])
-                stale |= ge.mir_used[ty][tx] == ge.syncs ? 2 : 1;
-        }
-    if (stale & 2 && list_open) {
-        ge_sync();
-        ge.s.flushes++;
-        begin();
-    }
-    if (stale)
-        ge.tex_sent = NULL; /* the GE's texture cache may hold the old texels */
-    for (s32 r = r0; r < r0 + 256 / TILE_H; r++)
-        for (s32 c = c0; c <= c1; c++) {
-            s32 ty = r & (TILES_Y - 1), tx = c & (TILES_X - 1);
-            if (ge.mir_gen[ty][tx] != ge.gen[ty][tx])
-                mir_tile(tx, ty);
-            ge.mir_used[ty][tx] = ge.syncs;
-            f |= ge.mir_flags[ty][tx];
-        }
-    *flags = f;
-    return (const u8 *)(ge.mir + ((s32)p->tpy & (VRAM_H - 1)) * MIR_W + p->tpx);
+    if (p->depth < 2 || (s32)p->tpx + tu_hi < VRAM_W)
+        return 0;
+    ge.s.sw_tex15++;
+    return 1;
 }
 
 /* The CLUT as 8888, its alpha saying what the texel means: 0 for 0x0000 (not drawn), 0x80 with
@@ -893,7 +847,7 @@ static void tex_image(const GpuPrim *p, const u8 *t, int w, int h, int tbw, int 
 {
     u32 wh = (u32)w | (u32)h << 16;
     if (t != ge.tex_sent || wh != ge.tex_wh) {
-        gel_tex_mode(GL, p->depth >= 2 ? GU_PSM_8888 : p->depth ? GU_PSM_T8 : GU_PSM_T4, 0, 0, 0);
+        gel_tex_mode(GL, p->depth >= 2 ? GU_PSM_5551 : p->depth ? GU_PSM_T8 : GU_PSM_T4, 0, 0, 0);
         gel_tex_image(GL, 0, 1, 1, 64, t + 16); /* another address first: see upload_part */
         gel_tex_image(GL, 0, w, h, tbw, t);
         gel_tex_flush(GL);
@@ -914,8 +868,8 @@ static const u8 *tw_page;
  * rows copied into the list, 16 bytes apart. */
 static void tw_bind(const GpuPrim *p, int n, TexVtx *v)
 {
-    u32 bits = p->depth >= 2 ? 32 : p->depth ? 8 : 4, row = p->depth >= 2 ? MIR_W * 4 : 32 * bits;
-    int tbw = p->depth >= 2 ? MIR_W : 256, tmp = 0, size[2] = {256, 256};
+    u32 bits = p->depth >= 2 ? 16 : p->depth ? 8 : 4, row = p->depth >= 2 ? VRAM_W * 2 : 32 * bits;
+    int tbw = p->depth >= 2 ? VRAM_W : 256, tmp = 0, size[2] = {256, 256};
     const u8 *t = tw_page;
     float lo[2] = {v[0].u, v[0].v}, hi[2] = {v[0].u, v[0].v}, d[2] = {0, 0};
     for (int i = 1; i < n; i++) {
@@ -964,7 +918,7 @@ static void bind(const GpuPrim *p, const u8 *pg, const u32 *cl)
     /* a texture window's texture depends on the texels its vertices sample: tw_bind */
     tw_page = p->tw_and_u != 0xFF || p->tw_and_v != 0xFF ? pg : NULL;
     if (!tw_page)
-        tex_image(p, pg, 256, 256, p->depth >= 2 ? MIR_W : 256, 0);
+        tex_image(p, pg, 256, 256, p->depth >= 2 ? VRAM_W : 256, 0);
     int fn = p->raw;
     if (fn != ge.texfn) {
         ge.texfn = fn;
@@ -974,7 +928,8 @@ static void bind(const GpuPrim *p, const u8 *pg, const u32 *cl)
 }
 
 /* Opens the list for a primitive and binds its texture. Returns the texels it has (clut's
- * flags; 3 untextured), 0 when nothing would be drawn. No flush may follow until it is drawn. */
+ * flags; 3 untextured or 15-bit), 0 when nothing would be drawn. No flush may follow until it is
+ * drawn. */
 static int prim_begin(const GpuPrim *p)
 {
     tu_part = 0;
@@ -982,28 +937,27 @@ static int prim_begin(const GpuPrim *p)
         begin();
         return 3;
     }
+    if (p->depth >= 2) { /* the GE's own copy: bound again, as it may have been drawn since */
+        begin();
+        ge.tex_sent = NULL;
+        bind(p, (const u8 *)VRAM_PTR + ((s32)p->tpy * VRAM_W + (s32)p->tpx) * 2, NULL);
+        ge.s.pages15++;
+        return 3;
+    }
     /* While no tile turned newer, a page and CLUT checked before need no readback. */
     u32 tk = 1 + (p->tpx | p->tpy << 10 | p->depth << 20), ck = p->clut_x | p->clut_y << 10 | p->depth << 20;
     if (tk != ge.rk_tex || ck != ge.rk_clut || ge.nver != ge.rk_ver) {
         ge.s.rd_checks++;
-        int sh = p->depth >= 2 ? 0 : p->depth ? 1 : 2;
+        int sh = p->depth ? 1 : 2;
         rb_why = 1;
         rd_read(&ge, (s32)p->tpx + (tu_lo >> sh), (s32)p->tpy, (tu_hi >> sh) - (tu_lo >> sh) + 1, 256);
         rb_why = 2;
-        if (p->depth < 2)
-            rd_read(&ge, (s32)p->clut_x, (s32)p->clut_y, p->depth ? 256 : 16, 1);
+        rd_read(&ge, (s32)p->clut_x, (s32)p->clut_y, p->depth ? 256 : 16, 1);
         rb_why = 0;
         tu_part = newer((s32)p->tpx, (s32)p->tpy, 256 >> sh, 256);
         ge.rk_tex = tu_part ? 0 : tk, ge.rk_clut = ck, ge.rk_ver = ge.nver;
     }
     begin();
-    if (p->depth >= 2) {
-        int flags;
-        const u8 *pg = page15(p, &flags);
-        if (flags)
-            bind(p, pg, NULL);
-        return flags;
-    }
     const u8 *pg = page(p);
     int flags;
     const u32 *cl = clut(p, &flags);
@@ -1021,13 +975,26 @@ static void tex_pass(const GpuPrim *p, int func, int ref, int mode, int set, int
 }
 
 /* Texels without STP are opaque and written with the mask setting; texels with STP are blended
- * when the primitive is semi-transparent and set bit 15. A CLUT with both takes two passes. */
+ * when the primitive is semi-transparent and set bit 15. A CLUT with both takes two passes. A
+ * 15-bit page always does, as POPS draws it: its alpha is STP, and 0x0000 is the one texel with
+ * neither STP nor colour, which the colour test drops (the colour after the texture function: a
+ * texel modulated to black is dropped too, where the PS1 writes black). */
 static void tex_draw(const GpuPrim *p, int flags, int prim, int n, TexVtx *v)
 {
     if (tw_page)
         tw_bind(p, n, v);
     int semi = p->semi ? (int)p->abr : -1, set = p->mask_set != 0;
     tex_mode(1);
+    if (p->depth >= 2) {
+        tex_pass(p, GU_GREATER, 0, semi, 1, prim, n, v);
+        gel_cmd(GL, 0xD8, GU_NOTEQUAL); /* the colour test, as sceGuColorFunc(GU_NOTEQUAL, 0, 0xFFFFFF) */
+        gel_cmd(GL, 0xD9, 0);
+        gel_cmd(GL, 0xDA, 0xFFFFFF);
+        gel_enable(GL, GU_COLOR_TEST);
+        tex_pass(p, GU_EQUAL, 0, -1, set, prim, n, v);
+        gel_disable(GL, GU_COLOR_TEST);
+        return;
+    }
     if (flags == 1)
         tex_pass(p, GU_GREATER, 0, -1, set, prim, n, v);
     else if (flags == 2)
@@ -1100,6 +1067,8 @@ static int polygon(const GpuPrim *p, const GpuVtx *const *v, int n)
         for (int i = 1; i < n; i++)
             ulo = v[i]->u < ulo ? v[i]->u : ulo, uhi = v[i]->u > uhi ? v[i]->u : uhi;
         tu_set(p, ulo, uhi);
+        if (tex15_wraps(p))
+            return GPU_SW;
     }
     int flags = prim_begin(p);
     if (!flags)
@@ -1183,6 +1152,8 @@ static int rd_rect(void *self, const GpuPrim *p, s32 x, s32 y, s32 w, s32 h, con
         return DONE;
     if (p->textured) /* u0 + x, or u0 - x flipped, for x up to w - 1 */
         tu_set(p, flip_x ? c->u - (w - 1) : c->u, flip_x ? c->u : c->u + w - 1);
+    if (p->textured && tex15_wraps(p))
+        return GPU_SW;
     int flags = prim_begin(p);
     if (!flags)
         return DONE;
@@ -1916,12 +1887,6 @@ void ge_init(Psx *psx, int mode)
         geh_wbinv(r, b); /* first written through the uncached mirror */
         fl.ring_c = r, fl.ring_u = fl.ring = GEH_UNCACHED(r), fl.ring_bytes = b;
     }
-    ge.mir = geh_alloc("psxrt ge 15-bit", MIR_BYTES);
-    if (ge.mir) {
-        geh_wbinv(ge.mir, MIR_BYTES); /* written uncached from now on */
-        ge.mir_u = GEH_UNCACHED(ge.mir);
-    }
-    memset(ge.mir_gen, 0xFF, sizeof ge.mir_gen);
     if (fl.ring)
         ring_bench(psx), busy_bench(psx);
     for (int i = 0; i < 1 << FL_BITS; i++)
@@ -1930,7 +1895,7 @@ void ge_init(Psx *psx, int mode)
     ge.r = (GpuRenderer){&ge, rd_triangle, rd_quad, rd_rect, rd_line, rd_fill, rd_copy, rd_read, rd_wrote, fl.ring ? rd_poly : NULL,
                          fl.ring ? rd_packet : NULL};
     ge.syncs = 1; /* no slot (used 0) is in the list */
-    psx_log(psx, "ge: %d texture page slots, 15-bit copy %s, %u KB vertex ring; %u KB free", ge.npages, ge.mir ? "on" : "OFF (software)",
+    psx_log(psx, "ge: %d texture page slots, 15-bit pages from the GE's VRAM, %u KB vertex ring; %u KB free", ge.npages,
             (unsigned)(fl.ring_bytes / 1024), (unsigned)(geh_free() / 1024));
     rd_fill(&ge, 0, 0, VRAM_W, VRAM_H, 0); /* also makes the oracle create the framebuffer */
     ge_sync();
@@ -1994,7 +1959,7 @@ int ge_log(char *buf, int cap)
     u32 kb = s->kicks * prof_bias / 16, kick_us = s->kick_us > kb ? s->kick_us - kb : 0; /* less one clock read each */
     int n = clampn(snprintf(buf, (size_t)cap,
                             "-- ge: tri %u+%u tex, rect %u+%u tex, fill %u, line %u (%u runs); sw tex15 %u texwin %u (ge %u, %u axes repeated, %u copied) "
-                            "copy %u+%u sw+%u null (%u kpx, %u from ge); pages %u, 15-bit tiles %u, cluts %u+%u in list, readback %u (%u tiles, %u ms), upload %u "
+                            "copy %u+%u sw+%u null (%u kpx, %u from ge); pages %u, 15-bit binds %u, cluts %u+%u in list, readback %u (%u tiles, %u ms), upload %u "
                             "(%u kpx, %u ms), flush %u; bind %u tex %u clut, kick %u (%u ms), rd check %u; fast %u (%u setups %u ms, %u cached, mru %u), slow tex %u big %u, flat %u, clipped %u; ring %s (wb %u ms), step %u; readback page/clut/other %u/%u/%u, last at %u,%u w %u\n",
                             (unsigned)s->tris, (unsigned)s->ttris, (unsigned)s->rects, (unsigned)s->trects,
                             (unsigned)s->fills, (unsigned)s->lines, (unsigned)s->line_runs, (unsigned)s->sw_tex15,
