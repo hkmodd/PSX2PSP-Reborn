@@ -144,6 +144,7 @@ typedef struct Image {
     int installed; /* its table slice is in TABLE (resident, and no other slice loaded over it) */
     int patched;   /* its code holds immediates the game rewrote: read again before reinstalling */
     u32 gen, checked; /* disc loads over its text; gen at the last check */
+    u32 agen;         /* gen at ahead_check's last look */
 } Image;
 
 #define MAX_IMAGES 256
@@ -632,14 +633,99 @@ static void evict(Image *m)
     m->resident = m->installed = 0;
 }
 
+/* ---- an executable read ahead ----
+ * The text of the next executable is in RAM long before its Exec (Sheep Dog: WHEEL's, some 20 s
+ * of a film before). At each PS1 vblank ahead_check knows it by its head (HEAD_LEN bytes, as
+ * try_load) and has disc.c's worker, below the CPU thread, read and inflate its code and table
+ * into `stage` while the CPU thread sleeps; load() copies them from there instead of reading the
+ * disc (WHEEL: 1 MB read and 3.9 MB inflated, ~0.55 s of the CPU thread, against a ~40 ms copy).
+ * The slot is written only by load(), as before: what runs there, and its return addresses in the
+ * guest stack, stays until the Exec. The stage keeps the last executable read: the disc does not
+ * change under it. */
+static u8 *stage;
+static int stage_img = -1; /* the image in stage, or being read there */
+static int stage_ready, stage_off;
+static u32 stage_us; /* the read's wall time */
+
+static u32 code_room(const CodeEntry *e) { return (e->code_len + 63) & ~63u; }
+static u32 table_len(const CodeEntry *e) { return (e->text_size + 3) & ~3u; }
+
+/* The read in flight is collected: 0 ready, 1 still reading (only when not `wait`), -1 failed
+ * (the stage is empty). */
+static int stage_collect(int wait)
+{
+    if (stage_img < 0)
+        return -1;
+    if (stage_ready)
+        return 0;
+    int r = disc_ahead_wait(wait, &stage_us);
+    if (r > 0)
+        return 1;
+    if (r < 0) {
+        say("native: the read ahead of %.16s failed", img[stage_img].e->name);
+        stage_img = -1;
+        return -1;
+    }
+    stage_ready = 1;
+    return 0;
+}
+
+static void ahead_check(void)
+{
+    if (stage_off || stage_collect(0) > 0)
+        return;
+    u32 ht = ~0u, hl = 0, hh = 0; /* the last head hashed: images often share a text address */
+    for (int i = 0; i < nimg; i++) {
+        Image *m = &img[i];
+        if (m->agen == m->gen)
+            continue;
+        m->agen = m->gen;
+        if (i == stage_img || (m->resident && !m->patched))
+            continue;
+        u32 head = m->e->text_size < HEAD_LEN ? m->e->text_size : HEAD_LEN;
+        if (m->text != ht || head != hl)
+            ht = m->text, hl = head, hh = fnv1a(P->ram + m->text, head);
+        if (hh != m->e->head_hash)
+            continue;
+        const CodeEntry *e = m->e;
+        if (!stage) {
+            u32 len = 0;
+            for (int k = 0; k < nimg; k++) {
+                u32 l = code_room(img[k].e) + table_len(img[k].e);
+                len = l > len ? l : len;
+            }
+            SceUID uid = sceKernelAllocPartitionMemory(2, "psxrt stage", PSP_SMEM_High, len, NULL);
+            if (uid < 0) {
+                say("native: no %u KB for reading executables ahead (%08X)", (unsigned)(len >> 10), (unsigned)uid);
+                stage_off = 1;
+                return;
+            }
+            stage = sceKernelGetBlockHeadAddr(uid);
+        }
+        DiscBlob b[2] = {{e->code_off, e->code_stored, stage, e->code_len},
+                         {e->table_off, e->table_stored, stage + code_room(e), table_len(e)}};
+        if (disc_ahead(b, 2) < 0) {
+            say("native: no worker for reading executables ahead");
+            stage_off = 1;
+            return;
+        }
+        stage_img = i, stage_ready = 0;
+        return;
+    }
+}
+
 static int load(Image *m)
 {
     const CodeEntry *e = m->e;
+    u32 t = sceKernelGetSystemTimeLow();
+    int staged = stage_img == m - img && stage_collect(1) == 0;
     if (!m->resident || m->patched) {
         for (int i = 0; i < nimg; i++)
             if (&img[i] != m && img[i].resident && img[i].e->host_base == e->host_base)
                 evict(&img[i]);
-        if (disc_blob(e->code_off, e->code_stored, (void *)e->host_base, e->code_len) < 0) {
+        if (staged) {
+            memcpy((void *)e->host_base, stage, e->code_len);
+        } else if (disc_blob(e->code_off, e->code_stored, (void *)e->host_base, e->code_len) < 0) {
             say("native: cannot read the code of %.16s", e->name);
             m->resident = 0;
             return -1;
@@ -647,7 +733,9 @@ static int load(Image *m)
         m->resident = 1;
         m->patched = 0;
     }
-    if (disc_blob(e->table_off, e->table_stored, &table[m->text >> 2], (e->text_size + 3) & ~3u) < 0) {
+    if (staged)
+        memcpy(&table[m->text >> 2], stage + code_room(e), table_len(e));
+    else if (disc_blob(e->table_off, e->table_stored, &table[m->text >> 2], table_len(e)) < 0) {
         say("native: cannot read the table of %.16s", e->name);
         evict(m);
         return -1;
@@ -660,7 +748,12 @@ static int load(Image *m)
     blk_resum(m->text, e->text_size);
     flush_code();
     native_stats.loads++;
-    say("native: %.16s at %08X (%u B of code)", e->name, (unsigned)e->text_addr, (unsigned)e->code_len);
+    t = sceKernelGetSystemTimeLow() - t;
+    if (staged)
+        say("native: %.16s at %08X (%u B of code, %u ms; read ahead in %u ms)", e->name, (unsigned)e->text_addr, (unsigned)e->code_len,
+            (unsigned)(t / 1000), (unsigned)(stage_us / 1000));
+    else
+        say("native: %.16s at %08X (%u B of code, %u ms)", e->name, (unsigned)e->text_addr, (unsigned)e->code_len, (unsigned)(t / 1000));
     return 0;
 }
 
@@ -881,6 +974,7 @@ void native_vsync(void)
  * swap would replace the last frame's before that one was shown. */
 void native_vsync_early(void)
 {
+    ahead_check();
     u32 v = sceDisplayGetVcount();
     if ((s32)(vc - v) <= 0)
         return;
@@ -2077,7 +2171,7 @@ const char *native_init(Psx *psx, const DiscInfo *info)
         if (text >= RAM_SIZE * 4 || (text & 3) || (text & (RAM_SIZE - 1)) + e->text_size > RAM_SIZE || e->host_base < img_lo ||
             e->host_base + e->code_len > code_hi || (e->host_base & 3))
             return "DATA.PSAR code directory is out of range";
-        img[i] = (Image){e, text & (RAM_SIZE - 4), 0, 0, 0, 0, ~0u};
+        img[i] = (Image){e, text & (RAM_SIZE - 4), 0, 0, 0, 0, ~0u, 0};
     }
     nimg = (int)info->images;
     if (info->fl_len) {

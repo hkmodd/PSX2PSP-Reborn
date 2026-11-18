@@ -9,7 +9,7 @@
  * inflate both. Above it, the worker's file read overlaps the frame (the thread blocks in the
  * driver) and only the inflate takes the CPU. If the CPU thread needs the block in flight it waits
  * for it. After the blocks come the translated executables (native.c), read with
- * disc_blob(). A game of more than one disc has each disc's blocks and index, listed in the disc
+ * disc_blob(), or by a second worker below the CPU thread (disc_ahead) while it sleeps. A game of more than one disc has each disc's blocks and index, listed in the disc
  * table; disc_select() changes the one in the drive.
  */
 #include "disc.h"
@@ -31,6 +31,9 @@
 #define SLOTS 3
 /* above the CPU thread (0x20), below audio (0x12) and callbacks (0x11) */
 #define PREFETCH_PRIORITY 0x1F
+/* below the CPU thread: disc_ahead's reads take only the time the CPU thread sleeps */
+#define AHEAD_PRIORITY 0x30
+#define AHEAD_JOBS 2
 
 typedef struct {
     char magic[8];
@@ -81,6 +84,14 @@ static u32 clock;
 static SceUID pf_req = -1, pf_done = -1;
 static Cached *pf_slot;
 static u32 pf_block, pf_busy;
+/* disc_ahead's worker: `ah_job` is the worker's while `ah_busy`, which only the CPU thread sets
+ * and clears; `ah_ok` and `ah_us` are written before `ah_done` is signalled. */
+static Reader ah_rd = {.fd = -1, .quiet = 1, .who = 1};
+static SceUID ah_req = -1, ah_done = -1;
+static DiscBlob ah_job[AHEAD_JOBS];
+static u32 ah_n, ah_busy;
+static volatile int ah_ok;
+static volatile u32 ah_us;
 
 static void *alloc(const char *name, u32 size)
 {
@@ -105,6 +116,7 @@ static const char *reader_open(Reader *r, const char *path)
 }
 
 static int load(Reader *r, Cached *c, u32 b);
+static int blob(Reader *r, u32 off, u32 stored, void *dst, u32 raw_len);
 
 static int prefetch_thread(SceSize args, void *argp)
 {
@@ -114,6 +126,76 @@ static int prefetch_thread(SceSize args, void *argp)
         sceKernelSignalSema(pf_done, 1);
     }
     return 0;
+}
+
+static int ahead_thread(SceSize args, void *argp)
+{
+    (void)args, (void)argp;
+    while (sceKernelWaitSema(ah_req, 1, NULL) >= 0) {
+        u32 t = sceKernelGetSystemTimeLow();
+        int ok = 1;
+        for (u32 i = 0; i < ah_n && ok; i++)
+            ok = blob(&ah_rd, ah_job[i].off, ah_job[i].stored, ah_job[i].dst, ah_job[i].raw_len) == 0;
+        ah_us = sceKernelGetSystemTimeLow() - t;
+        ah_ok = ok;
+        sceKernelSignalSema(ah_done, 1);
+    }
+    return 0;
+}
+
+/* The worker's zlib window is allocated here, on the CPU thread, by a one-byte stored block: the
+ * first inflate that is not Z_FINISH allocates it from the heap, which takes no lock. 0, or -1. */
+static int prime(Reader *r)
+{
+    static const u8 one[6] = {0x01, 0x01, 0x00, 0xFE, 0xFF, 0};
+    u8 out[1];
+    r->zs.next_in = (u8 *)one, r->zs.avail_in = sizeof one;
+    r->zs.next_out = out, r->zs.avail_out = 1;
+    return inflate(&r->zs, Z_NO_FLUSH) == Z_STREAM_END ? 0 : -1;
+}
+
+/* disc_ahead's worker, its own file and zlib stream. Without it, disc_ahead says -1. */
+static void ahead_open(const char *path)
+{
+    if (reader_open(&ah_rd, path) || prime(&ah_rd))
+        return;
+    ah_req = sceKernelCreateSema("psxrt ah req", 0, 0, 1, NULL);
+    ah_done = sceKernelCreateSema("psxrt ah done", 0, 0, 1, NULL);
+    SceUID th = sceKernelCreateThread("psxrt ahead", ahead_thread, AHEAD_PRIORITY, 0x2000, PSP_THREAD_ATTR_USER, NULL);
+    if (ah_req < 0 || ah_done < 0 || th < 0 || sceKernelStartThread(th, 0, NULL) < 0)
+        ah_req = -1;
+}
+
+int disc_ahead(const DiscBlob *b, u32 n)
+{
+    if (ah_req < 0 || ah_busy || !n || n > AHEAD_JOBS)
+        return -1;
+    memcpy(ah_job, b, n * sizeof *b);
+    ah_n = n, ah_busy = 1;
+    sceKernelSignalSema(ah_req, 1);
+    return 0;
+}
+
+int disc_ahead_wait(int wait, u32 *us)
+{
+    if (!ah_busy || ah_req < 0)
+        return -1;
+    if (!wait) {
+        if (sceKernelPollSema(ah_done, 1) < 0)
+            return 1;
+    } else {
+        SceUInt t = 5000000; /* the worker, alone on the CPU, needs well under a second */
+        if (sceKernelWaitSema(ah_done, 1, &t) < 0) {
+            /* it may still write into its destinations: the caller drops them, and no request
+             * reaches it again */
+            disc_log("disc: read ahead not done in 5 s: off");
+            ah_req = -1;
+            return -1;
+        }
+    }
+    ah_busy = 0;
+    *us = ah_us;
+    return ah_ok ? 0 : -1;
 }
 
 const char *disc_open(const char *path, DiscInfo *info)
@@ -166,6 +248,7 @@ const char *disc_open(const char *path, DiscInfo *info)
         if (pf_req < 0 || pf_done < 0 || th < 0 || sceKernelStartThread(th, 0, NULL) < 0)
             pf_req = -1;
     }
+    ahead_open(path);
     memcpy(info->disc_id, h.disc_id, sizeof info->disc_id);
     memcpy(info->title, h.title, sizeof info->title);
     info->disc_id[sizeof info->disc_id - 1] = 0;
@@ -224,26 +307,28 @@ u32 disc_select(u32 n)
     return sectors;
 }
 
-int disc_blob(u32 off, u32 stored, void *dst, u32 raw_len)
+static int blob(Reader *r, u32 off, u32 stored, void *dst, u32 raw_len)
 {
     if (stored == raw_len)
-        return read_at(&rd, off, dst, raw_len) ? 0 : -1;
-    if (stored > raw_len || inflateReset(&rd.zs) != Z_OK)
+        return read_at(r, off, dst, raw_len) ? 0 : -1;
+    if (stored > raw_len || inflateReset(&r->zs) != Z_OK)
         return -1;
-    rd.zs.next_out = dst, rd.zs.avail_out = raw_len;
-    int r = Z_OK;
+    r->zs.next_out = dst, r->zs.avail_out = raw_len;
+    int z = Z_OK;
     for (u32 done = 0; done < stored;) {
         u32 n = stored - done < BLOCK_LEN ? stored - done : BLOCK_LEN;
-        if (!read_at(&rd, off + done, rd.zbuf, n))
+        if (!read_at(r, off + done, r->zbuf, n))
             return -1;
         done += n;
-        rd.zs.next_in = rd.zbuf, rd.zs.avail_in = n;
-        r = inflate(&rd.zs, done == stored ? Z_FINISH : Z_NO_FLUSH);
-        if (r != Z_OK && r != Z_STREAM_END)
+        r->zs.next_in = r->zbuf, r->zs.avail_in = n;
+        z = inflate(&r->zs, done == stored ? Z_FINISH : Z_NO_FLUSH);
+        if (z != Z_OK && z != Z_STREAM_END)
             break;
     }
-    return r == Z_STREAM_END && !rd.zs.avail_out ? 0 : -1;
+    return z == Z_STREAM_END && !r->zs.avail_out ? 0 : -1;
 }
+
+int disc_blob(u32 off, u32 stored, void *dst, u32 raw_len) { return blob(&rd, off, stored, dst, raw_len); }
 
 static void fail(Reader *r, u32 b, const char *what, int code)
 {

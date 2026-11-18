@@ -68,6 +68,19 @@ int disc_read_sector(void *user, u32 lba, u8 *raw);
 /* Reads `raw_len` bytes stored at `off` (`stored` bytes, raw deflate unless equal) into `dst`:
  * 0, or -1. */
 int disc_blob(u32 off, u32 stored, void *dst, u32 raw_len);
+/* One disc_blob for disc_ahead. */
+typedef struct DiscBlob {
+    u32 off, stored;
+    void *dst;
+    u32 raw_len;
+} DiscBlob;
+/* Starts reading the `n` (at most 2) blobs in `b` in the background, by a worker below the CPU
+ * thread: it runs while the CPU thread sleeps, or waits. 0, or -1 when the worker is busy or
+ * missing. CPU thread only. */
+int disc_ahead(const DiscBlob *b, u32 n);
+/* The read disc_ahead started: 1 not done yet (only when not `wait`), 0 done (`us`: its wall
+ * time), -1 failed, or none started. Once it answers 0 or -1 the worker is free. */
+int disc_ahead_wait(int wait, u32 *us);
 /* Provided by the runtime: one line of diagnostics. */
 void disc_log(const char *line);
 
