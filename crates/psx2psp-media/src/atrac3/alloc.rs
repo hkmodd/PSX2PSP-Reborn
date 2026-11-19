@@ -2,7 +2,7 @@
 //!
 //! Every subband is quantised up front at each of the 7 selectors (word lengths), recording the
 //! squared error and the exact cost in bits. Allocation is then a greedy rate–distortion descent:
-//! repeatedly take the upgrade with the best squared-error drop per bit that still fits the
+//! repeatedly take the upgrade with the best masking-weighted error drop per bit that still fits the
 //! frame, counting the side information it drags in (selector fields up to that subband, gain
 //! fields of a newly coded QMF band, the scale factor). It is run once with Huffman costs and
 //! once with constant-length costs; the sound unit keeps whichever ends with less distortion.
@@ -116,11 +116,20 @@ impl Plan {
     }
 }
 
+/// Exponent of the masking weight: each subband's squared error counts divided by the power per
+/// line of the signal there (both units of a frame summed, as L/R hear M and S together) raised to
+/// this. 0 is plain squared error, which starves the quiet high bands (−11 dB above 12 kHz on a
+/// bright track at 66 kbps); 0.5 keeps the SNR at atracdenc's (+0.6 dB mean over 3 tracks × 3
+/// rates, decoded by FFmpeg) with the high bands within ±3 dB of it; beyond, SNR falls ~3 dB per
+/// 0.1 for little high-band gain.
+const MASKING: f32 = 0.5;
+
 /// Greedy allocation of `budget` bits across the subbands of one or more sound units (several
-/// when they share a frame, as the two halves of joint stereo do). Returns the plans and the
-/// remaining distortion. Plain squared error is the right target for joint stereo too: with
-/// L = M + S and R = M − S, the L/R error energy is twice the M plus S error energy.
-fn greedy(units: &[Vec<Subband>], fixed: &[u32], budget: u32, vlc: bool) -> (Vec<Plan>, f32) {
+/// when they share a frame, as the two halves of joint stereo do), each subband's error weighted
+/// by `w` ([`MASKING`]). Returns the plans and the remaining weighted distortion. With
+/// L = M + S and R = M − S, the L/R error energy is twice the M plus S error energy, so the
+/// joint-stereo units share one scale.
+fn greedy(units: &[Vec<Subband>], w: &[f32; 32], fixed: &[u32], budget: u32, vlc: bool) -> (Vec<Plan>, f32) {
     let bits = |c: &Choice| i64::from(if vlc { c.vlc } else { c.clc });
     let budget = i64::from(budget);
     let mut sel = vec![[0u8; 32]; units.len()];
@@ -137,7 +146,7 @@ fn greedy(units: &[Vec<Subband>], fixed: &[u32], budget: u32, vlc: bool) -> (Vec
                 let side = if s + 1 > coded[u] { i64::from(side_bits(s + 1) - side_bits(coded[u])) } else { 0 };
                 for ns in sel[u][s] + 1..8 {
                     let next = &sb.choice[usize::from(ns)];
-                    let gain = cur.dist - next.dist;
+                    let gain = (cur.dist - next.dist) * w[s];
                     // A finer selector can cost fewer Huffman bits: then it is a free win.
                     let cost = bits(next) + side - bits(cur);
                     if gain <= 0.0 || used + cost > budget {
@@ -163,7 +172,7 @@ fn greedy(units: &[Vec<Subband>], fixed: &[u32], budget: u32, vlc: bool) -> (Vec
             let mut sf = [0u8; 32];
             for (s, sb) in subbands.iter().enumerate() {
                 let c = &sb.choice[usize::from(sel[s])];
-                dist += c.dist;
+                dist += c.dist * w[s];
                 sf[s] = c.sf;
             }
             Plan { sel: *sel, sf, vlc }
@@ -175,8 +184,13 @@ fn greedy(units: &[Vec<Subband>], fixed: &[u32], budget: u32, vlc: bool) -> (Vec
 /// Allocates the units sharing `budget` bits, trying Huffman and constant-length coding.
 pub fn allocate(spectra: &[&[f32]], fixed: &[u32], budget: u32) -> Vec<Plan> {
     let units: Vec<Vec<Subband>> = spectra.iter().map(|s| analyse(s)).collect();
-    let (a, da) = greedy(&units, fixed, budget, true);
-    let (b, db) = greedy(&units, fixed, budget, false);
+    let mut w = [1.0f32; 32];
+    for (s, w) in w.iter_mut().enumerate() {
+        let power: f32 = units.iter().map(|u| u[s].choice[0].dist).sum::<f32>() / (SUBBAND[s + 1] - SUBBAND[s]) as f32;
+        *w = power.max(1.0).powf(-MASKING);
+    }
+    let (a, da) = greedy(&units, &w, fixed, budget, true);
+    let (b, db) = greedy(&units, &w, fixed, budget, false);
     assert!(da.is_finite() || db.is_finite(), "frame budget below the fixed side information");
     if da <= db { a } else { b }
 }

@@ -269,9 +269,10 @@ mod tests {
         let mut acc = 0.0;
         let brown: Vec<f32> = noise(n, 3).iter().map(|v| (acc += 0.08 * (v - acc), acc).1).collect();
         let (l, r) = (sine(n, 1000.0, 12_000.0), brown);
-        // Floors ~1.5 dB under the measured noise SNR (66: 9.0, 105: 12.5, 132: 13.8); the tone
-        // sits at the format's ~35 dB ceiling (mantissas ≤ ±31, no tonal components).
-        for (kbps, min_snr) in [(66, 7.5), (105, 11.0), (132, 12.3)] {
+        // Floors ~1.5 dB under the measured SNR (tone 66: 28.7, noise 66: 7.4, 105: 11.5, 132: 12.5);
+        // the tone sits at the format's ~35 dB ceiling (mantissas ≤ ±31, no tonal components) where
+        // the rate allows it, and at 66 kbps gives bits to the noise's quiet highs (masking weight).
+        for (kbps, tone_snr, min_snr) in [(66, 27.0, 5.9), (105, 33.0, 10.0), (132, 33.0, 11.0)] {
             let file = encode(&interleave(&l, &r), kbps, &()).unwrap();
             let block = usize::from(at3_block_align(kbps).unwrap());
             assert!(crate::tools::is_psp_atrac3(&file), "{kbps}");
@@ -282,7 +283,7 @@ mod tests {
             assert_eq!(&file[36..52], &[14, 0, 1, 0, 0x10, 0, 0, 0, u8::from(kbps == 66), 0, u8::from(kbps == 66), 0, 1, 0, 0, 0]);
             let y = decode_riff(&file);
             assert_eq!(align(&r, &channel(&y, 1), 2 * FRAME).0, DELAY, "{kbps} kbps");
-            for (c, x, floor) in [(0, &l, 33.0), (1, &r, min_snr)] {
+            for (c, x, floor) in [(0, &l, tone_snr), (1, &r, min_snr)] {
                 let (g, snr) = snr_at(x, &channel(&y, c), DELAY);
                 eprintln!("{kbps} kbps ch{c}: gain {g:.3} snr {snr:.1} dB");
                 assert!((0.8..1.1).contains(&g), "{kbps} kbps ch{c}: gain {g}");
