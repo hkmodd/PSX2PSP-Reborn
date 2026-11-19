@@ -72,7 +72,7 @@ pub fn parse(d: &[u8]) -> Result<Entries> {
         if d.is_empty() || !d.len().is_multiple_of(15) {
             return Err(Error::format("LSD", "not an SBI file and not a whole number of 15-byte LSD records"));
         }
-        for r in d.chunks_exact(15) {
+        for r in d.as_chunks::<15>().0 {
             let q = &r[3..15];
             let valid = q[10..12] == (!crc16(&q[..10])).to_be_bytes();
             out.insert(sector("LSD", r[0], r[1], r[2])?, valid.then(|| [q[1], q[2], q[3], q[4], q[5], q[7], q[8], q[9]]));

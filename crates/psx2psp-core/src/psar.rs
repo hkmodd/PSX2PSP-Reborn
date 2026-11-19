@@ -240,7 +240,7 @@ pub struct TocTrack {
 pub fn parse_toc(toc: &[u8]) -> (Vec<TocTrack>, Option<u32>) {
     let mut tracks = Vec::new();
     let mut leadout = None;
-    for e in toc.chunks_exact(10) {
+    for e in toc.as_chunks::<10>().0 {
         if e.iter().all(|&b| b == 0) {
             break;
         }
@@ -660,7 +660,7 @@ pub fn read_discs<R: Read + Seek>(r: &mut R, psar: u64) -> Result<Vec<PsarDisc>>
         let disc_id: String = h[0x401..0x405].iter().chain(&h[0x406..0x40B]).map(|&c| c as char).collect();
         let title_raw = &h[0x122C..0x12AC];
         let title = String::from_utf8_lossy(&title_raw[..title_raw.iter().position(|&c| c == 0).unwrap_or(128)]).into_owned();
-        let toc_len = h[TOC_AT..TOC_AT + TOC_MAX].chunks_exact(10).take_while(|e| e.iter().any(|&b| b != 0)).count() * 10;
+        let toc_len = h[TOC_AT..TOC_AT + TOC_MAX].as_chunks::<10>().0.iter().take_while(|e| e.iter().any(|&b| b != 0)).count() * 10;
         let toc = h[TOC_AT..TOC_AT + toc_len].to_vec();
         let (sub_at, sub_n) = (rd32(&h, SUBQ_PTR_AT) as usize, rd32(&h, SUBQ_PTR_AT + 4) as usize);
         let subchannels = match sub_n.checked_mul(SUBQ_ENTRY).map(|n| sub_at..sub_at + n) {

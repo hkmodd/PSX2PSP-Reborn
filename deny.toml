@@ -36,3 +36,15 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 
 [advisories]
 yanked = "deny"
+# "Unmaintained" notices (no known vulnerability) on crates iced 0.14 pulls in and we cannot
+# swap without leaving iced: the wgpu Metal backend (paste), the font stack of cosmic-text
+# (ttf-parser, rustybuzz) and the D-Bus settings reader of iced_winit (zvariant, zbus_names).
+# Drop each entry when iced moves off that crate.
+ignore = [
+    { id = "RUSTSEC-2024-0436", reason = "paste: proc-macro of metal (wgpu-hal), via iced" },
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser: fontdb/cosmic-text, via iced" },
+    { id = "RUSTSEC-2026-0206", reason = "rustybuzz: cosmic-text, via iced" },
+    { id = "RUSTSEC-2026-0370", reason = "zvariant: zbus of mundy (iced_winit), Linux only" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names: zbus of mundy (iced_winit), Linux only" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive: zbus of mundy (iced_winit), Linux only" },
+]
