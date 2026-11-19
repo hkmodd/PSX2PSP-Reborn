@@ -107,9 +107,10 @@ pub fn asset_name(program: Program, os: &str, arch: &str) -> Option<String> {
         Program::Gui => "psx2psp-reborn",
         Program::Cli => "psx2psp",
     };
+    // Windows, Linux and macOS, each on x86_64 and aarch64: the six builds of release.yml.
     let ext = match (os, arch) {
-        ("windows", "x86_64") => ".exe",
-        ("linux", "x86_64") | ("macos", "aarch64") => "",
+        ("windows", "x86_64" | "aarch64") => ".exe",
+        ("linux" | "macos", "x86_64" | "aarch64") => "",
         _ => return None,
     };
     Some(format!("{stem}-{os}-{arch}{ext}"))
@@ -454,7 +455,13 @@ mod tests {
         assert_eq!(n(Program::Cli, "windows", "x86_64").as_deref(), Some("psx2psp-windows-x86_64.exe"));
         assert_eq!(n(Program::Cli, "linux", "x86_64").as_deref(), Some("psx2psp-linux-x86_64"));
         assert_eq!(n(Program::Cli, "macos", "aarch64").as_deref(), Some("psx2psp-macos-aarch64"));
-        for (os, arch) in [("windows", "aarch64"), ("linux", "aarch64"), ("macos", "x86_64"), ("freebsd", "x86_64")] {
+        assert_eq!(n(Program::Gui, "windows", "aarch64").as_deref(), Some("psx2psp-reborn-windows-aarch64.exe"));
+        assert_eq!(n(Program::Cli, "windows", "aarch64").as_deref(), Some("psx2psp-windows-aarch64.exe"));
+        assert_eq!(n(Program::Gui, "linux", "aarch64").as_deref(), Some("psx2psp-reborn-linux-aarch64"));
+        assert_eq!(n(Program::Cli, "linux", "aarch64").as_deref(), Some("psx2psp-linux-aarch64"));
+        assert_eq!(n(Program::Gui, "macos", "x86_64").as_deref(), Some("psx2psp-reborn-macos-x86_64"));
+        assert_eq!(n(Program::Cli, "macos", "x86_64").as_deref(), Some("psx2psp-macos-x86_64"));
+        for (os, arch) in [("windows", "x86"), ("linux", "arm"), ("linux", "riscv64"), ("freebsd", "x86_64")] {
             assert_eq!(n(Program::Gui, os, arch), None, "{os}-{arch}");
         }
     }

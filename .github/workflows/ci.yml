@@ -23,7 +23,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest]
+        # One runner per OS and CPU the releases ship for (release.yml).
+        os: [windows-latest, windows-11-arm, ubuntu-latest, ubuntu-22.04-arm, macos-15, macos-15-intel]
     steps:
       - uses: actions/checkout@v4
 
