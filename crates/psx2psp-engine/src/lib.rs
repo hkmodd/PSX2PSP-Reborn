@@ -1267,6 +1267,8 @@ pub struct FloatingFile {
 /// covered (the runtime patches them or sends their block to the interpreter): a measure of
 /// discovery, not of self-modifying code. `every` sets how often the maps are read. `pad`, when
 /// given, is the input instead: (first frame, frames, PS1 buttons) presses, as [`pad_script`] reads.
+/// `pokes` (frame, RAM address, bytes) are written before their frame runs, as a cheat code: a
+/// test's way into a scene the input does not reach (a level picked by its number).
 pub fn static_coverage(
     img: &DiscImage,
     patches: &[&dyn ImagePatch],
@@ -1274,6 +1276,7 @@ pub fn static_coverage(
     frames: u32,
     every: u32,
     pad: Option<&[(u32, u32, u16)]>,
+    pokes: &[(u32, u32, Vec<u8>)],
 ) -> std::result::Result<Coverage, String> {
     use psx2psp_sim::{Machine, RAM};
     let (exes, overlays) = (disc_executables(img, patches), disc_overlay_files(img, patches, cipher));
@@ -1314,6 +1317,11 @@ pub fn static_coverage(
     let every = every.max(1);
     for f in 1..=frames {
         let held = pad.map_or_else(|| capture_pad(f), |p| p.iter().filter(|&&(at, n, _)| f >= at && f - at < n).fold(0, |m, &(.., b)| m | b));
+        for (_, at, b) in pokes.iter().filter(|p| p.0 == f) {
+            if !m.poke(*at, b) {
+                return Err(format!("poke at {at:#x} ({} bytes) is outside RAM", b.len()));
+            }
+        }
         let alive = m.frame(held);
         cov.frames = f;
         for (k, &id) in ids.iter().enumerate() {

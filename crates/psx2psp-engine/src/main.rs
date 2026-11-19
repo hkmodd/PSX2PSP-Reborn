@@ -24,6 +24,7 @@ USAGE:
                                      the patch database's entries for the game, with hits
   psx2psp libs    <disc.cue|disc.bin>  the PsyQ library functions in each executable
   psx2psp coverage <disc.cue|disc.bin> [--frames N] [--every N] [--pad psxrt.pad]
+                   [--poke FRAME:ADDR:HEX,...]
                                      the code the game runs in the sim that the static
                                      translation finds (no capture), and where it misses
   psx2psp clip    <video|audio|URL> [clip options] [-o <dir>]   → ICON1.PMF / SND0.AT3
@@ -488,8 +489,20 @@ fn cmd_libs(disc: &Path) -> R {
     Ok(())
 }
 
+/// `FRAME:ADDR:HEX`: ADDR in hex (any RAM mirror), HEX an even run of hex digits.
+fn coverage_poke(p: &str) -> Option<(u32, u32, Vec<u8>)> {
+    let mut it = p.split(':');
+    let (f, a, h) = (it.next()?.parse().ok()?, it.next()?, it.next()?);
+    let a = u32::from_str_radix(a.trim_start_matches("0x"), 16).ok()?;
+    if h.is_empty() || h.len() % 2 != 0 || it.next().is_some() {
+        return None;
+    }
+    let b = (0..h.len()).step_by(2).map(|i| u8::from_str_radix(h.get(i..i + 2)?, 16).ok()).collect::<Option<Vec<u8>>>()?;
+    Some((f, a, b))
+}
+
 fn cmd_coverage(args: &[String]) -> R {
-    let (mut disc, mut frames, mut every, mut pad) = (None, psx2psp_engine::CAPTURE_FRAMES, 60, None);
+    let (mut disc, mut frames, mut every, mut pad, mut pokes) = (None, psx2psp_engine::CAPTURE_FRAMES, 60, None, Vec::new());
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut val = || it.next().ok_or_else(|| format!("{a} needs a value"));
@@ -501,6 +514,11 @@ fn cmd_coverage(args: &[String]) -> R {
                 let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
                 pad = Some(psx2psp_engine::pad_script(&text).map_err(|e| format!("{path}: {e}"))?);
             }
+            "--poke" => {
+                for p in val()?.split(',') {
+                    pokes.push(coverage_poke(p).ok_or_else(|| format!("bad poke {p} (FRAME:ADDR:HEX)"))?);
+                }
+            }
             s if s.starts_with('-') => return Err(format!("unknown flag {s}").into()),
             s => disc = Some(PathBuf::from(s)),
         }
@@ -510,7 +528,7 @@ fn cmd_coverage(args: &[String]) -> R {
     let t = std::time::Instant::now();
     let db = load_patches();
     let cipher = img.probe().disc_id.and_then(|id| db.cipher(&db.pops_id(&id)));
-    let c = psx2psp_engine::static_coverage(&img, &[], cipher, frames, every, pad.as_deref())?;
+    let c = psx2psp_engine::static_coverage(&img, &[], cipher, frames, every, pad.as_deref(), &pokes)?;
     let pct = if c.ran == 0 { 100.0 } else { 100.0 * c.covered as f64 / c.ran as f64 };
     println!(
         "coverage {pct:.2}%: {} of {} instructions run are in the static translation ({} images, {} frames, {:.1} s); kernel area {} words, not counted",
@@ -681,4 +699,16 @@ fn cmd_info(p: &Path) -> R {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn coverage_poke_reads_frame_address_bytes() {
+        assert_eq!(super::coverage_poke("4000:8001008E:05"), Some((4000, 0x8001_008E, vec![5])));
+        assert_eq!(super::coverage_poke("1:0x10000:5c4c00"), Some((1, 0x1_0000, vec![0x5C, 0x4C, 0])));
+        for bad in ["4000:10000", "4000:10000:5", "x:10000:05", "1:zz:05", "1:10000:0g", "1:2:03:4"] {
+            assert_eq!(super::coverage_poke(bad), None, "{bad}");
+        }
+    }
 }

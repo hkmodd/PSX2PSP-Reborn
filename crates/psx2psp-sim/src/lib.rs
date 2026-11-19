@@ -165,6 +165,18 @@ impl<'a> Machine<'a> {
         unsafe { std::slice::from_raw_parts(ffi::sim_ram(self.sim), RAM) }
     }
 
+    /// Writes `bytes` into RAM at `at & 0x1FFFFF` between frames, like a cheat code; false (and
+    /// nothing written) when they do not fit.
+    pub fn poke(&mut self, at: u32, bytes: &[u8]) -> bool {
+        let a = (at & 0x1F_FFFF) as usize;
+        if a + bytes.len() > RAM {
+            return false;
+        }
+        // SAFETY: as `ram`, the range checked above; the core does not run outside `frame`.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ffi::sim_ram(self.sim).add(a), bytes.len()) };
+        true
+    }
+
     /// The words of RAM the guest ran since boot or the last call, 1 byte per word (RAM / 4
     /// bytes, nonzero where it ran); the map is cleared for the next frames.
     pub fn take_ran(&mut self) -> Vec<u8> {
