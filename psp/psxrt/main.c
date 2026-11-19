@@ -1076,7 +1076,7 @@ static void frame(void)
                 n += snprintf(line + n, sizeof line - (size_t)n,
                               "-- ms: interp %u io %u (draw %u mdec %u spu %u) update %u present %u (wait %u draw %u text %u rgb24 %u) sleep %u;"
                               " audio drops %u gaps %u trims %u peak %u/%u late %u (max %u us) pops %u (max d2 %u) step %u-%u; vsync wait %u (%u ms) late %u (avg %u max %u us) skipped %u short %u"
-                              " (stall asked %u k ran %u k; held: taken %u timer %u queue %u, I_STAT %X cd mask %X; replaced %u, jumps %u+%u, cd waited %u k)\n",
+                              " (stall asked %u k ran %u k; held: taken %u timer %u queue %u, I_STAT %X cd mask %X; replaced %u, jumps %u+%u, cd waited %u k, at IEc 0 %u)\n",
                               ms_of(s->us_interp - n0.us_interp), ms_of(s->us_io - n0.us_io),
                               ms_of(psx.gpu.us_draw - draw0), ms_of(psx.mdec.us_decode - mdec0),
                               ms_of(psx.spu.us_mix - spu0),
@@ -1094,7 +1094,7 @@ static void frame(void)
                               (unsigned)(s->st_cut[0] - n0.st_cut[0]), (unsigned)(s->st_cut[1] - n0.st_cut[1]),
                               (unsigned)(s->st_cut[2] - n0.st_cut[2]), (unsigned)s->st_bits, (unsigned)s->st_cdmask,
                               (unsigned)(s->st_repl - n0.st_repl), (unsigned)(s->st_jump[0] - n0.st_jump[0]), (unsigned)(s->st_jump[1] - n0.st_jump[1]),
-                              (unsigned)(s->st_cdwait - n0.st_cdwait) / 1000);
+                              (unsigned)(s->st_cdwait - n0.st_cdwait) / 1000, (unsigned)(s->st_iec - n0.st_iec));
                 native_stats.st_bits = native_stats.st_cdmask = 0;
                 static u32 upd0[UPD_PARTS];
                 static const char *const upd_names[UPD_PARTS] = UPD_PART_NAMES;

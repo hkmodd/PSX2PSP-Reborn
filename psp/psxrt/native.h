@@ -41,6 +41,7 @@ typedef struct NativeStats {
      * PS1 kcycles of stall asked and run; CD sectors replaced while it ran; parts ended on 1024
      * events, events found due and not run; PS1 cycles the CD drive waited in it for the guest */
     u32 st_cut[3], st_bits, st_cdmask, st_ask_k, st_done, st_repl, st_jump[2], st_cdwait;
+    u32 st_iec; /* updates that left the stall to the next one: the CPU was in a handler or a critical section (SR.IEc 0) */
 } NativeStats;
 
 extern NativeStats native_stats;

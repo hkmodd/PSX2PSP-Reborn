@@ -1093,7 +1093,15 @@ static void update_once(void);
  * raised bit held the stall through Sheep Dog's whole frame, run with a vblank or CD bit raised,
  * so it ran only in the vblank wait and every flip stayed one vblank: 45% speed in the hub), and
  * the CD reads nothing while the guest owes it (cd_waits). It never jumps past an event: one due
- * and not run, or 1024 in a row, end its part there. */
+ * and not run, or 1024 in a row, end its part there. It runs only where the CPU takes interrupts
+ * (SR.IEc 1): the next update after a vblank is most often inside the game's vblank handler, and a
+ * stall there kept the CD's INT1 untaken for the rest of the frame, the drive held by cd_waits
+ * 8.3M PS1 cycles a second in Sheep Dog's FMV (data 120 -> 93 sectors/s, XA 16 -> 12, 13 -> 10 fps).
+ * In the sim the guest runs 1-4% of its code at IEc 0, and at IEc 1 no CD interrupt is ever left
+ * unacknowledged: the PS1 spends that time in the main loop, which takes the CD's at once. A stall
+ * left at IEc 0 asks for an update STALL_RETRY cycles on: waiting for the next device event let the
+ * guest run on, unstalled, half the time asked (DBGT 264M of 521M in PPSSPP with psxrt.slow). */
+#define STALL_RETRY 4096u
 static void update_stall(void);
 /* Brackets one non-vblank update in PB_EVERY (a vblank's presents and sleeps: other threads run
  * inside it, on the same counters). */
@@ -1145,6 +1153,11 @@ static int cd_waits(const Cdrom *cd)
 static void update_stall(void)
 {
     update_once();
+    if (stall_to > P->cycles && !(P->cpu.sr & 1)) { /* in a handler or a critical section: an update soon */
+        native_stats.st_iec++;
+        psx_schedule(P, P->cycles + STALL_RETRY);
+        return;
+    }
     u32 repl = P->cd.n_replaced;
     for (int k = 0; stall_to > P->cycles && !guest_owes(P); k++) {
         u64 to = stall_to < P->next_event ? stall_to : P->next_event;
