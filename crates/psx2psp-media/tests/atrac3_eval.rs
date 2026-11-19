@@ -16,7 +16,7 @@ fn ffmpeg_pcm(ff: &Ffmpeg, at3: &Path) -> Vec<i16> {
     assert!(ok.success(), "FFmpeg could not decode {}", at3.display());
     let b = std::fs::read(&raw).unwrap();
     std::fs::remove_file(&raw).unwrap();
-    b.chunks_exact(2).map(|s| i16::from_le_bytes([s[0], s[1]])).collect()
+    b.as_chunks::<2>().0.iter().map(|&s| i16::from_le_bytes(s)).collect()
 }
 
 /// SNR (dB) of `pol · y` against `x` delayed by `lag` stereo frames, over frames `from..to`.

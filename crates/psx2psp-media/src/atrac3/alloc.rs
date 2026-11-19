@@ -54,7 +54,7 @@ fn clc_pair(v: i32) -> u32 {
 /// Huffman cost of mantissas `m` at selector `sel`.
 fn vlc_bits(m: &[i32], sel: usize) -> u32 {
     let t = &tables().vlc[sel - 1];
-    if sel == 1 { m.chunks_exact(2).map(|p| t[31 + pair_index(p[0], p[1])].len).sum() } else { m.iter().map(|&v| t[(v + 31) as usize].len).sum() }
+    if sel == 1 { m.as_chunks::<2>().0.iter().map(|p| t[31 + pair_index(p[0], p[1])].len).sum() } else { m.iter().map(|&v| t[(v + 31) as usize].len).sum() }
 }
 
 fn clc_bits(len: usize, sel: usize) -> u32 {
@@ -217,7 +217,7 @@ pub fn write_unit(w: &mut BitWriter, spectrum: &[f32], plan: &Plan, joint_second
         quantize(x, sel, usize::from(plan.sf[s]), m);
         match (plan.vlc, sel) {
             (true, 1) => {
-                for p in m.chunks_exact(2) {
+                for p in m.as_chunks::<2>().0 {
                     let c = t.vlc[0][31 + pair_index(p[0], p[1])];
                     w.put(c.bits, c.len);
                 }
@@ -229,7 +229,7 @@ pub fn write_unit(w: &mut BitWriter, spectrum: &[f32], plan: &Plan, joint_second
                 }
             }
             (false, 1) => {
-                for p in m.chunks_exact(2) {
+                for p in m.as_chunks::<2>().0 {
                     w.put(clc_pair(p[0]) << 2 | clc_pair(p[1]), 4);
                 }
             }

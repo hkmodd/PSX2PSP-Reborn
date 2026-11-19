@@ -119,8 +119,10 @@ pub fn riff(frames: &[u8], block_align: usize, joint: bool) -> Vec<u8> {
     b.extend_from_slice(&(block_align as u16).to_le_bytes());
     b.extend_from_slice(&0u16.to_le_bytes()); // bits per sample
     b.extend_from_slice(&14u16.to_le_bytes()); // extradata size
-    for v in [1u16, 0x1000, 0, mode, mode, 1, 0] {
-        b.extend_from_slice(&v.to_le_bytes()); // version, samples/frame (u32 LE), mode ×2, frame factor, 0
+    // version, u32 LE 0x10, mode ×2, frame factor, 0: the bytes of the SND0.AT3 files that play in
+    // the XMB (FFmpeg skips bytes 2-5, so only a PSP tells a wrong value there).
+    for v in [1u16, 0x0010, 0, mode, mode, 1, 0] {
+        b.extend_from_slice(&v.to_le_bytes());
     }
     b.extend_from_slice(b"data");
     b.extend_from_slice(&(frames.len() as u32).to_le_bytes());
@@ -147,7 +149,7 @@ pub fn read_wav(b: &[u8]) -> Option<Vec<i16>> {
                 fmt_ok = pcm && u16_at(2)? == 2 && body.get(4..8)? == 44_100u32.to_le_bytes() && u16_at(14)? == 16;
             }
             // FFmpeg streaming to a pipe writes 0xFFFFFFFF: the data runs to the end of the file.
-            b"data" if fmt_ok => return Some(body.chunks_exact(2).map(|s| i16::from_le_bytes([s[0], s[1]])).collect()),
+            b"data" if fmt_ok => return Some(body.as_chunks::<2>().0.iter().map(|&s| i16::from_le_bytes(s)).collect()),
             _ => {}
         }
         p = p.saturating_add(8).saturating_add(len).saturating_add(len & 1);
@@ -233,7 +235,7 @@ mod tests {
         let x = noise(16 * FRAME, 1);
         let (mut a, mut s) = (Analysis::default(), Synthesis::default());
         let (mut spec, mut out, mut y) = (vec![0.0; FRAME], vec![0.0; FRAME], Vec::new());
-        for f in x.chunks_exact(FRAME) {
+        for f in x.as_chunks::<FRAME>().0 {
             a.frame(f, &mut spec);
             s.frame(&spec, &mut out);
             y.extend_from_slice(&out);
@@ -277,7 +279,7 @@ mod tests {
             assert_eq!(file.len(), 60 + (n + DELAY).div_ceil(FRAME) * block);
             assert_eq!(u32::from_le_bytes(file[4..8].try_into().unwrap()) as usize, file.len() - 8);
             assert_eq!(u32::from_le_bytes(file[56..60].try_into().unwrap()) as usize, file.len() - 60);
-            assert_eq!(&file[36..52], &[14, 0, 1, 0, 0, 0x10, 0, 0, u8::from(kbps == 66), 0, u8::from(kbps == 66), 0, 1, 0, 0, 0]);
+            assert_eq!(&file[36..52], &[14, 0, 1, 0, 0x10, 0, 0, 0, u8::from(kbps == 66), 0, u8::from(kbps == 66), 0, 1, 0, 0, 0]);
             let y = decode_riff(&file);
             assert_eq!(align(&r, &channel(&y, 1), 2 * FRAME).0, DELAY, "{kbps} kbps");
             for (c, x, floor) in [(0, &l, 33.0), (1, &r, min_snr)] {
@@ -323,5 +325,21 @@ mod tests {
         assert!(encode(&[0; 4], 64, &()).is_err());
         let cancel = std::sync::atomic::AtomicBool::new(true);
         assert!(matches!(encode(&[0; 4096], 66, &cancel), Err(MediaError::Cancelled)));
+    }
+
+    /// The fmt chunk of a 66 kbps SND0.AT3 that plays in the XMB of a PSP-3000 (taken from a
+    /// working EBOOT), byte for byte; 132 kbps differs only in byte rate, block align and mode.
+    #[test]
+    fn fmt_chunk_is_the_one_the_xmb_plays() {
+        let xmb_66: [u8; 40] = [
+            b'f', b'm', b't', b' ', 0x20, 0, 0, 0, 0x70, 0x02, 0x02, 0, 0x44, 0xac, 0, 0, 0x4c, 0x20, 0, 0, 0xc0, 0, 0, 0,
+            0x0e, 0, 0x01, 0, 0x10, 0, 0, 0, 0x01, 0, 0x01, 0, 0x01, 0, 0, 0,
+        ];
+        assert_eq!(riff(&[], 192, true)[12..52], xmb_66);
+        let mut xmb_132 = xmb_66;
+        xmb_132[16..18].copy_from_slice(&0x4099u16.to_le_bytes());
+        xmb_132[20..22].copy_from_slice(&384u16.to_le_bytes());
+        xmb_132[32..36].fill(0);
+        assert_eq!(riff(&[], 384, false)[12..52], xmb_132);
     }
 }

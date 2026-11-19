@@ -106,7 +106,7 @@ pub fn decode(path: &Path, start: f64, max_secs: f64, mon: &dyn Monitor) -> Resu
 /// Applies the closing fade and converts to s16.
 fn finish(x: &mut [f32], max_secs: f64) -> Vec<i16> {
     let fade_from = (max_secs - FADE_SECS).max(0.0);
-    for (i, f) in x.chunks_exact_mut(2).enumerate() {
+    for (i, f) in x.as_chunks_mut::<2>().0.iter_mut().enumerate() {
         let t = i as f64 / f64::from(RATE);
         if t > fade_from {
             let g = ((max_secs - t) / FADE_SECS).clamp(0.0, 1.0) as f32;
