@@ -69,6 +69,10 @@ static void tty_fwd(void *user, const char *s, int n)
 /* The RAM psxrt_pc_trace reads the instructions that run in (ran_word). */
 static const u8 *ran_ram;
 
+/* PSX2PSP_SIM_WATCH: the words watched, their last value, the instruction that ran last, the frame. */
+static u32 watchw_at[8], watchw_val[8], watchw_pc, watchw_frame;
+static int nwatchw;
+
 Sim *sim_new(void *user, ReadFn rd, u32 disc_end, TextFn tty, TextFn log)
 {
     Sim *s = (Sim *)calloc(1, sizeof(Sim));
@@ -100,6 +104,18 @@ Sim *sim_new(void *user, ReadFn rd, u32 disc_end, TextFn tty, TextFn log)
     }
     psx_init(&s->psx, &s->host, s->ram, s->scratch, s->vram, s->spu_ram, s->mdec_in, MDEC_CAP);
     ran_ram = s->ram;
+    /* PSX2PSP_SIM_WATCH=ADDR,...: RAM words (hex, KSEG0/1 or physical, up to 8) whose every
+     * change is printed with the instruction before it (a DMA's shows the last one that ran). */
+    nwatchw = 0;
+    for (const char *p = getenv("PSX2PSP_SIM_WATCH"); p && *p && nwatchw < 8;) {
+        char *end;
+        u32 a = (u32)strtoul(p, &end, 16) & (RAM_SIZE - 4);
+        if (end == p)
+            break;
+        watchw_at[nwatchw] = a;
+        memcpy(&watchw_val[nwatchw++], s->ram + a, 4);
+        p = *end == ',' ? end + 1 : end;
+    }
     /* PSX2PSP_SIM_GE=1: the PSP's GE translator (ge.c) runs beside the software rasterizer and
      * logs a hash of its display lists each frame (psp/psxrt/ge_host_pc.c); pictures unchanged. */
     if (getenv("PSX2PSP_SIM_GE")) {
@@ -391,6 +407,16 @@ void sim_ran_clear(void) { memset(ran, 0, sizeof ran), memset(ran_held, 0, sizeo
 
 void psxrt_pc_trace(u32 pc)
 {
+    for (int i = 0; i < nwatchw; i++) {
+        u32 v;
+        memcpy(&v, ran_ram + watchw_at[i], 4);
+        if (v != watchw_val[i]) {
+            fprintf(stderr, "[watch] f%u %06X: %08X -> %08X after pc %08X\n", (unsigned)watchw_frame,
+                    (unsigned)watchw_at[i], (unsigned)watchw_val[i], (unsigned)v, (unsigned)watchw_pc);
+            watchw_val[i] = v;
+        }
+    }
+    watchw_pc = pc;
     /* Cache isolated (SR bit 16): its end is a flush, as in native.c. */
     if (watch_cpu) {
         if (watch_cpu->sr & 0x10000)
@@ -508,7 +534,7 @@ int sim_boot(Sim *s) { return psx_boot(&s->psx); }
 /* Runs until the next vblank has been handled; returns the exit state (0 running). */
 int sim_frame(Sim *s)
 {
-    u32 f = s->frames;
+    u32 f = watchw_frame = s->frames;
     while (s->frames == f && !s->psx.exiting)
         cpu_run(&s->psx, s->psx.cycles + 4096);
     if (sim_ge)
