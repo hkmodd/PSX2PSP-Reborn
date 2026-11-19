@@ -459,6 +459,7 @@ mod tests {
 
     #[test]
     fn clock_is_none_until_playing() {
+        let _hw = crate::hardware_test();
         let p = Player::new();
         let c = p.clock();
         assert_eq!(c.secs(), None);

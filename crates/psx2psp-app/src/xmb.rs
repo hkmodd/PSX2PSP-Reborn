@@ -485,6 +485,7 @@ mod tests {
         Pixels::new(w, h, rgba.repeat((w * h) as usize))
     }
 
+    /// Callers hold [`crate::hardware_test`] while the device lives.
     fn gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
@@ -583,6 +584,7 @@ mod tests {
     /// ICON1 frames replace ICON0 and advance in place on the same pipeline (texture rewrite path).
     #[test]
     fn movie_frames_play_in_icon0_slot() {
+        let _hw = crate::hardware_test();
         let Some((device, queue)) = gpu() else { return };
         let mut pipeline = XmbPipeline::new(&device, &queue, wgpu::TextureFormat::Rgba8UnormSrgb);
         let mut layers: [Option<Arc<Pixels>>; 4] = Default::default();
@@ -601,6 +603,7 @@ mod tests {
 
     #[test]
     fn screens_composite_layers_correctly() {
+        let _hw = crate::hardware_test();
         let Some((device, queue)) = gpu() else {
             eprintln!("no GPU adapter: skipping off-screen render test");
             return;

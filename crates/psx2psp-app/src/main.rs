@@ -16,6 +16,17 @@ mod updater;
 mod worker;
 mod xmb;
 
+/// Tests that open a GPU device or an audio output take this first: created at the same time on
+/// the software stack of a GPU-less Windows ARM runner (WARP) they crash the test process; one at
+/// a time they pass. The app itself opens one device per process.
+#[cfg(test)]
+static HARDWARE_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+fn hardware_test() -> std::sync::MutexGuard<'static, ()> {
+    HARDWARE_TESTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
