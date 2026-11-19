@@ -7071,11 +7071,11 @@ SOFTWARE.
 ## MIT License
 
 Used by:
-- [psx2psp-app 0.1.0](https://crates.io/crates/psx2psp-app)
-- [psx2psp-core 0.1.0](https://crates.io/crates/psx2psp-core)
-- [psx2psp-engine 0.1.0](https://crates.io/crates/psx2psp-engine)
-- [psx2psp-media 0.1.0](https://crates.io/crates/psx2psp-media)
-- [psx2psp-patching 0.1.0](https://crates.io/crates/psx2psp-patching)
+- [psx2psp-app 1.0.0](https://crates.io/crates/psx2psp-app)
+- [psx2psp-core 1.0.0](https://crates.io/crates/psx2psp-core)
+- [psx2psp-engine 1.0.0](https://crates.io/crates/psx2psp-engine)
+- [psx2psp-media 1.0.0](https://crates.io/crates/psx2psp-media)
+- [psx2psp-patching 1.0.0](https://crates.io/crates/psx2psp-patching)
 - [block2 0.5.1](https://github.com/madsmtm/objc2)
 - [block2 0.6.2](https://github.com/madsmtm/objc2)
 - [block 0.1.6](http://github.com/SSheldon/rust-block)
