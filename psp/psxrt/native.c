@@ -1099,8 +1099,11 @@ static void update_once(void);
  * 8.3M PS1 cycles a second in Sheep Dog's FMV (data 120 -> 93 sectors/s, XA 16 -> 12, 13 -> 10 fps).
  * In the sim the guest runs 1-4% of its code at IEc 0, and at IEc 1 no CD interrupt is ever left
  * unacknowledged: the PS1 spends that time in the main loop, which takes the CD's at once. A stall
- * left at IEc 0 asks for an update STALL_RETRY cycles on: waiting for the next device event let the
- * guest run on, unstalled, half the time asked (DBGT 264M of 521M in PPSSPP with psxrt.slow). */
+ * left at IEc 0, or with a part cut short (an interrupt the CPU takes, an event due, 1024 in a row),
+ * asks for an update STALL_RETRY cycles on: waiting for the next device event let the guest run on,
+ * unstalled, half the time asked (DBGT 264M of 521M in PPSSPP with psxrt.slow), and after the cuts
+ * alone Sheep Dog's hub ran 13M of the 22M PS1 cycles a second asked on the PSP (75% speed); in the
+ * sim, stalled every frame, 0-1M of 35.7M, and with the update after a cut 22-35M, no sector lost. */
 #define STALL_RETRY 4096u
 static void update_stall(void);
 /* Brackets one non-vblank update in PB_EVERY (a vblank's presents and sleeps: other threads run
@@ -1183,6 +1186,8 @@ static void update_stall(void)
     native_stats.st_repl += P->cd.n_replaced - repl;
     if (stall_to <= P->cycles)
         stall_to = 0;
+    else /* cut short: the guest serves what it owes, and the stall goes on soon after */
+        psx_schedule(P, P->cycles + STALL_RETRY);
 }
 
 static void update_once(void)
