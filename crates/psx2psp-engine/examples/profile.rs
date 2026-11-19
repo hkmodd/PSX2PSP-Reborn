@@ -65,6 +65,23 @@ fn main() {
         e.bytes += end - s;
     }
     let all: u64 = (0..raw.len() / 4).map(|k| count(4 * k as u32)).sum();
+    // Loads and stores of the work: alone (their own check), a group's first (one check for the
+    // group) or inside a group (one host word each, no span of their own).
+    let heads: BTreeMap<u32, u32> = t.spans.iter().map(|&(pc, s, e)| (pc, (e - s) / 4)).collect();
+    let (mut alone, mut first, mut inside, mut slot, mut alone_words) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    for &pc in &code {
+        let f = of(pc).unwrap_or(0);
+        if idle.contains(&f) || !matches!(decode(Insn(word(pc)), Isa::R3000A), Kind::Lb | Kind::Lh | Kind::Lwl | Kind::Lw | Kind::Lbu | Kind::Lhu | Kind::Lwr | Kind::Sb | Kind::Sh | Kind::Swl | Kind::Sw | Kind::Swr) {
+            continue;
+        }
+        let n = count(pc);
+        match heads.get(&pc) {
+            None if d.delay_slots.contains_key(&pc) => slot += n,
+            None => inside += n,
+            Some(_) if !heads.contains_key(&(pc + 4)) && code.contains(&(pc + 4)) => first += n,
+            Some(&w) => (alone, alone_words) = (alone + n, alone_words + n * u64::from(w)),
+        }
+    }
     let (guest, host) = fs.values().fold((0, 0), |(g, h), f| (g + f.guest, h + f.host));
     let per = |v: u64| v as f64 / frames;
     println!(
@@ -120,6 +137,15 @@ fn main() {
         }
         println!("{p}% of the work's host words: {n} functions, {:.1} KB of main-pass code (I-cache 16 KB)", f64::from(b) / 1024.0);
     }
+    println!(
+        "loads/stores of the work: {:.0}/frame; alone {:.0} ({:.1} host words each), first of a group {:.0}, inside a group {:.0} (1 word), in a delay slot {:.0}",
+        per(alone + first + inside + slot),
+        per(alone),
+        alone_words as f64 / alone.max(1) as f64,
+        per(first),
+        per(inside),
+        per(slot)
+    );
     let lib: Vec<_> = v.iter().filter(|(k, _)| !names[k].starts_with("fn_")).collect();
     let lh: u64 = lib.iter().map(|(_, f)| f.host).sum();
     let lr: u64 = lib.iter().map(|(_, f)| f.rt).sum();
