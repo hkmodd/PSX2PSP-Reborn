@@ -1,8 +1,9 @@
 //! One-click provisioning of the external tools into `<exe dir>/tools/`, where
 //! [`crate::tools::which`] looks after the executable's own folder.
 //!
-//! Official release binaries only: yt-dlp (Unlicense) and FFmpeg GPL static builds by BtbN
-//! (include libx264). Downloads go through the OS's own `curl`
+//! Official release binaries only: yt-dlp (Unlicense), FFmpeg GPL static builds by BtbN (include
+//! libx264) and, for macOS, which BtbN does not build, Martin Riedl's signed static builds (also with
+//! libx264), pinned and checked by SHA-256. Downloads go through the OS's own `curl`
 //! and archives are unpacked by `tar` (bsdtar on Windows 10+ reads `.zip`), so no HTTP/TLS/zip
 //! code is linked into the app.
 
@@ -41,19 +42,24 @@ impl Tool {
     pub fn asset(self) -> Option<Asset> {
         let (os, arm) = (std::env::consts::OS, std::env::consts::ARCH == "aarch64");
         let gh = |repo: &str, tag: &str, file: &str| format!("https://github.com/{repo}/releases/{tag}/{file}");
-        let (url, archive, mb) = match (self, os, arm) {
-            (Self::YtDlp, "windows", false) => (gh("yt-dlp/yt-dlp", "latest/download", "yt-dlp.exe"), false, 23),
-            (Self::YtDlp, "windows", true) => (gh("yt-dlp/yt-dlp", "latest/download", "yt-dlp_arm64.exe"), false, 23),
-            (Self::YtDlp, "linux", false) => (gh("yt-dlp/yt-dlp", "latest/download", "yt-dlp_linux"), false, 34),
-            (Self::YtDlp, "linux", true) => (gh("yt-dlp/yt-dlp", "latest/download", "yt-dlp_linux_aarch64"), false, 34),
-            (Self::YtDlp, "macos", _) => (gh("yt-dlp/yt-dlp", "latest/download", "yt-dlp_macos"), false, 35),
-            (Self::Ffmpeg, "windows", false) => (gh("BtbN/FFmpeg-Builds", "download/latest", "ffmpeg-master-latest-win64-gpl.zip"), true, 193),
-            (Self::Ffmpeg, "windows", true) => (gh("BtbN/FFmpeg-Builds", "download/latest", "ffmpeg-master-latest-winarm64-gpl.zip"), true, 136),
-            (Self::Ffmpeg, "linux", false) => (gh("BtbN/FFmpeg-Builds", "download/latest", "ffmpeg-master-latest-linux64-gpl.tar.xz"), true, 150),
-            (Self::Ffmpeg, "linux", true) => (gh("BtbN/FFmpeg-Builds", "download/latest", "ffmpeg-master-latest-linuxarm64-gpl.tar.xz"), true, 126),
+        // Pinned rather than `redirect/latest/...`, which answered 404 on alternate requests
+        // (2026-11-19); the sums are the ones published beside each zip. FFmpeg 9.0.2, x264 0.165.
+        let mr = |build: &str| format!("https://ffmpeg.martin-riedl.de/download/macos/{build}/ffmpeg.zip");
+        let (url, archive, mb, sha256) = match (self, os, arm) {
+            (Self::YtDlp, "windows", false) => (gh("yt-dlp/yt-dlp", "latest/download", "yt-dlp.exe"), false, 23, None),
+            (Self::YtDlp, "windows", true) => (gh("yt-dlp/yt-dlp", "latest/download", "yt-dlp_arm64.exe"), false, 23, None),
+            (Self::YtDlp, "linux", false) => (gh("yt-dlp/yt-dlp", "latest/download", "yt-dlp_linux"), false, 34, None),
+            (Self::YtDlp, "linux", true) => (gh("yt-dlp/yt-dlp", "latest/download", "yt-dlp_linux_aarch64"), false, 34, None),
+            (Self::YtDlp, "macos", _) => (gh("yt-dlp/yt-dlp", "latest/download", "yt-dlp_macos"), false, 35, None),
+            (Self::Ffmpeg, "windows", false) => (gh("BtbN/FFmpeg-Builds", "download/latest", "ffmpeg-master-latest-win64-gpl.zip"), true, 193, None),
+            (Self::Ffmpeg, "windows", true) => (gh("BtbN/FFmpeg-Builds", "download/latest", "ffmpeg-master-latest-winarm64-gpl.zip"), true, 136, None),
+            (Self::Ffmpeg, "linux", false) => (gh("BtbN/FFmpeg-Builds", "download/latest", "ffmpeg-master-latest-linux64-gpl.tar.xz"), true, 150, None),
+            (Self::Ffmpeg, "linux", true) => (gh("BtbN/FFmpeg-Builds", "download/latest", "ffmpeg-master-latest-linuxarm64-gpl.tar.xz"), true, 126, None),
+            (Self::Ffmpeg, "macos", false) => (mr("amd64/1789931006_9.0.2"), true, 34, Some("7c6b4125b191cbf773832dc51f424cf2b6bb7da43007d1e066f95909e47cacd4")),
+            (Self::Ffmpeg, "macos", true) => (mr("arm64/1789931890_9.0.2"), true, 29, Some("c8ed4c4e6978a03c485edbfe4e0a5dc2380f8a30bba5150531b31b094492d924")),
             _ => return None,
         };
-        Some(Asset { tool: self, url, archive, approx_mb: mb })
+        Some(Asset { tool: self, url, archive, approx_mb: mb, sha256 })
     }
 
     /// What to do on platforms without a published binary.
@@ -72,6 +78,23 @@ pub struct Asset {
     pub archive: bool,
     /// Download size, for the confirmation prompt.
     pub approx_mb: u32,
+    /// Expected SHA-256 (lower-case hex) of the download, for files pinned outside GitHub releases.
+    pub sha256: Option<&'static str>,
+}
+
+fn sha256_file(p: &Path) -> Result<String, MediaError> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut f = std::fs::File::open(p).map_err(io(p))?;
+    let (mut h, mut buf) = (Sha256::new(), vec![0u8; 64 << 10]);
+    loop {
+        let n = f.read(&mut buf).map_err(io(p))?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// Tools that are missing and installable here.
@@ -99,7 +122,10 @@ fn io(p: &Path) -> impl FnOnce(std::io::Error) -> MediaError + '_ {
 
 /// Downloads and installs one tool into [`tools::tools_dir`]; returns the installed executable.
 pub fn install(asset: &Asset, log: &dyn Fn(&str)) -> Result<PathBuf, MediaError> {
-    let dir = tools::tools_dir().ok_or(MediaError::Missing("executable directory"))?;
+    install_into(asset, &tools::tools_dir().ok_or(MediaError::Missing("executable directory"))?, log)
+}
+
+fn install_into(asset: &Asset, dir: &Path, log: &dyn Fn(&str)) -> Result<PathBuf, MediaError> {
     let tmp = dir.join(format!(".dl-{}", asset.tool.exe()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).map_err(io(&tmp))?;
@@ -108,6 +134,12 @@ pub fn install(asset: &Asset, log: &dyn Fn(&str)) -> Result<PathBuf, MediaError>
         log(&format!("Downloading {} (~{} MB) from {}", asset.tool.exe(), asset.approx_mb, asset.url));
         let curl = tools::which("curl").ok_or(MediaError::Missing("curl"))?;
         tools::run(&curl, &["-fsSL".as_ref(), "--retry".as_ref(), "3".as_ref(), "-o".as_ref(), file.as_os_str(), asset.url.as_ref()])?;
+        if let Some(want) = asset.sha256 {
+            let got = sha256_file(&file)?;
+            if got != want {
+                return Err(MediaError::Tool { tool: asset.tool.exe().into(), detail: format!("download has SHA-256 {got}, expected {want}") });
+            }
+        }
         let exe = tools::exe_name(asset.tool.exe());
         let src = if asset.archive {
             log(&format!("Unpacking {}", file.display()));
@@ -151,13 +183,35 @@ mod tests {
     fn assets_point_at_official_releases() {
         for t in Tool::ALL {
             if let Some(a) = t.asset() {
-                assert!(a.url.starts_with("https://github.com/") && a.url.contains("/releases/"), "{}", a.url);
+                let release = a.url.starts_with("https://github.com/") && a.url.contains("/releases/");
+                let pinned = a.url.starts_with("https://") && a.sha256.is_some_and(|s| s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
+                assert!(release || pinned, "{}: a GitHub release, or pinned by its SHA-256", a.url);
                 assert_eq!(a.archive, a.url.ends_with(".zip") || a.url.ends_with(".tar.xz"), "{}", a.url);
             }
         }
-        if cfg!(all(windows, target_arch = "x86_64")) {
-            assert!(Tool::ALL.iter().all(|t| t.asset().is_some()), "Windows x64 is fully provisionable");
+        // Every target the releases ship for (release.yml).
+        if cfg!(all(any(windows, target_os = "linux", target_os = "macos"), any(target_arch = "x86_64", target_arch = "aarch64"))) {
+            assert!(Tool::ALL.iter().all(|t| t.asset().is_some()), "every shipped OS/CPU is fully provisionable");
         }
+    }
+
+    #[test]
+    fn sha256_of_a_file() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("abc");
+        std::fs::write(&f, b"abc").unwrap();
+        assert_eq!(sha256_file(&f).unwrap(), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    }
+
+    /// Downloads and runs the real FFmpeg for this OS/CPU (CI runs it on macOS, where the build is
+    /// pinned outside GitHub): checksum, unpack, the binary starts, and it has libx264.
+    #[test]
+    #[ignore = "downloads ~30-190 MB"]
+    fn live_ffmpeg_install() {
+        let a = Tool::Ffmpeg.asset().expect("FFmpeg is provisionable here");
+        let d = tempfile::tempdir().unwrap();
+        let exe = install_into(&a, d.path(), &|m| eprintln!("{m}")).unwrap();
+        assert!(Ffmpeg { path: exe }.has_x264(), "installed FFmpeg lacks libx264");
     }
 
     #[test]

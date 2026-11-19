@@ -49,6 +49,12 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+      # Install missing fetches FFmpeg on macOS from a build pinned outside GitHub: check that it is
+      # still there, matches its SHA-256, starts, and has libx264.
+      - name: FFmpeg install (macOS)
+        if: runner.os == 'macOS'
+        run: cargo test -p psx2psp-media --locked provision::tests::live_ffmpeg_install -- --ignored --exact
+
   deny:
     name: Dependencies (advisories, licences, sources)
     runs-on: ubuntu-latest

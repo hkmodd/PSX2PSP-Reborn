@@ -2773,7 +2773,7 @@ checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
 
 [[package]]
 name = "psx2psp-app"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "bytemuck",
  "cpal",
@@ -2792,7 +2792,7 @@ dependencies = [
 
 [[package]]
 name = "psx2psp-core"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "miniz_oxide 0.9.1",
  "rayon",
@@ -2802,7 +2802,7 @@ dependencies = [
 
 [[package]]
 name = "psx2psp-engine"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "miniz_oxide 0.9.1",
  "psx2psp-core",
@@ -2818,10 +2818,11 @@ dependencies = [
 
 [[package]]
 name = "psx2psp-media"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "image",
  "psx2psp-core",
+ "sha2",
  "symphonia",
  "tempfile",
  "thiserror 2.0.21",
@@ -2830,7 +2831,7 @@ dependencies = [
 
 [[package]]
 name = "psx2psp-patching"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "psx2psp-core",
  "thiserror 2.0.21",

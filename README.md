@@ -381,7 +381,8 @@ Only for ICON1 videos and YouTube. Plain EBOOTs, artwork, patches, the preview a
 local audio file need nothing: the ATRAC3 encoder is built in (ffmpeg is still used for audio
 formats it can't read, such as Opus or WebM, and to play SND0 back in the preview). The tools are
 looked up next to the executable, in `<exe>/tools/` and on `PATH`. **Install missing** fetches both
-on Windows and Linux, and yt-dlp on macOS; there, `brew install ffmpeg`. To use an external
+on every platform the releases ship for (on macOS, FFmpeg is Martin Riedl's signed static build,
+checked by its SHA-256). To use an external
 encoder instead (atracdenc or Sony's at3tool), set `PSX2PSP_ATRAC3` to its path.
 </details>
 
