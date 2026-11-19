@@ -86,8 +86,11 @@ static inline int native_poll_note(NativePoll *q, u32 pc, u32 tick, u64 now, u64
 /* main.c, with psxrt.prof: the profiler's counters around the runtime's own work, sampled, each
  * kept sample counted `weight` times. PB_CALL host calls of translated code, PB_UPDATE device
  * updates, PB_EMPTY a bracket around nothing taken like PB_CALL's (what the counter reads add to
- * each sample). prof_begin returns 0 when not sampling; `drop`: other bracketed work ran inside. */
-enum { PB_CALL, PB_UPDATE, PB_EMPTY, PB_PARTS };
+ * each sample), PB_VBLANK every vblank's update, weight 1: the devices' vblank work, the host's
+ * (present, the log second, sleeps) and the other threads that run while it waits, less the GPU
+ * DMAs inside it. prof_begin returns 0 when not sampling, and when another bracket is open (then
+ * the sample is counted dropped); `drop`: other bracketed work ran inside. */
+enum { PB_CALL, PB_UPDATE, PB_EMPTY, PB_VBLANK, PB_PARTS };
 #define PB_EVERY 64u
 int prof_begin(int part, u32 weight);
 void prof_end(int part, int drop);

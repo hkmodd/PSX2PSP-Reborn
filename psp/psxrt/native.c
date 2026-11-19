@@ -1106,17 +1106,18 @@ static void update_once(void);
  * sim, stalled every frame, 0-1M of 35.7M, and with the update after a cut 22-35M, no sector lost. */
 #define STALL_RETRY 4096u
 static void update_stall(void);
-/* Brackets one non-vblank update in PB_EVERY (a vblank's presents and sleeps: other threads run
- * inside it, on the same counters). */
+/* Brackets one non-vblank update in PB_EVERY, and every vblank's apart (its presents and sleeps:
+ * other threads run inside it, on the same counters). */
 static void update(void)
 {
     static u32 k;
     u32 calls = native_stats.calls;
-    int b = P->cycles < P->next_vblank && !(k++ % PB_EVERY) && prof_begin(PB_UPDATE, PB_EVERY);
+    int vbl = P->cycles >= P->next_vblank;
+    int b = vbl ? prof_begin(PB_VBLANK, 1) : !(k++ % PB_EVERY) && prof_begin(PB_UPDATE, PB_EVERY);
     native_stats.updates++;
     update_stall();
     if (b)
-        prof_end(PB_UPDATE, native_stats.calls != calls);
+        prof_end(vbl ? PB_VBLANK : PB_UPDATE, !vbl && native_stats.calls != calls);
 }
 
 /* Running the devices on would lose the guest an interrupt: one the CPU takes now (it serves it

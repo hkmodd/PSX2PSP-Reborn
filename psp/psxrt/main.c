@@ -101,17 +101,22 @@ static void host_gpu_dma(void *user, int end)
 
 /* The same counters around the runtime's own work (native.h): sums of the kept samples times
  * their weight, the weights' sum, the samples kept and dropped. A sample across the log's clear
- * (the counters went back) is dropped too. */
-static u32 pb_at[4], pb_w, pb_gd, pb_sum[PB_PARTS][4], pb_wsum[PB_PARTS], pb_kept[PB_PARTS], pb_drop[PB_PARTS];
+ * (the counters went back) is dropped too, and one across a GPU DMA, but for PB_VBLANK, which
+ * keeps it less the DMA's share (gd_sum). */
+static u32 pb_at[4], pb_gs[4], pb_w, pb_gd, pb_sum[PB_PARTS][4], pb_wsum[PB_PARTS], pb_kept[PB_PARTS], pb_drop[PB_PARTS];
 static int pb_open = -1;
 
 int prof_begin(int part, u32 weight)
 {
-    if (!prof_on || pb_open >= 0)
+    if (!prof_on)
         return 0;
+    if (pb_open >= 0) {
+        pb_drop[part]++;
+        return 0;
+    }
     pb_open = part, pb_w = weight, pb_gd = gd_runs;
     for (int k = 0; k < 4; k++)
-        pb_at[k] = kuKernelPeekw(PROF_REG(gd_reg[k]));
+        pb_gs[k] = gd_sum[k], pb_at[k] = kuKernelPeekw(PROF_REG(gd_reg[k]));
     return 1;
 }
 
@@ -121,13 +126,13 @@ void prof_end(int part, int drop)
     for (int k = 0; k < 4; k++)
         r[k] = kuKernelPeekw(PROF_REG(gd_reg[k]));
     pb_open = -1;
-    if (drop || pb_gd != gd_runs || r[0] < pb_at[0]) {
+    if (drop || (pb_gd != gd_runs && part != PB_VBLANK) || r[0] < pb_at[0]) {
         pb_drop[part]++;
         return;
     }
     pb_kept[part]++, pb_wsum[part] += pb_w;
     for (int k = 0; k < 4; k++)
-        pb_sum[part][k] += (r[k] - pb_at[k]) * pb_w;
+        pb_sum[part][k] += (r[k] - pb_at[k] - (gd_sum[k] - pb_gs[k])) * pb_w;
 }
 
 /* Host calls by site (guest pc and flag bits), the most frequent logged each second. */
@@ -1183,7 +1188,7 @@ static void frame(void)
                               (unsigned)(r[13] / 1000), (unsigned)(r[14] / 1000), (unsigned)(r[15] / 1000), (unsigned)(gd_sum[0] / 1000),
                               (unsigned)(gd_sum[1] / 1000), (unsigned)(gd_sum[2] / 1000), (unsigned)(gd_sum[3] / 1000));
                 memset(gd_sum, 0, sizeof gd_sum);
-                static const char *const pb_names[PB_PARTS] = {"calls", "update", "empty"};
+                static const char *const pb_names[PB_PARTS] = {"calls", "update", "empty", "vblank"};
                 n += snprintf(line + n, sizeof line - (size_t)n, "-- rt (k, sampled 1/%u):", (unsigned)PB_EVERY);
                 for (int p = 0; p < PB_PARTS; p++)
                     n += snprintf(line + n, sizeof line - (size_t)n, " %s ck %u memory %u i_miss %u d_miss %u (w %u kept %u dropped %u)%s",
