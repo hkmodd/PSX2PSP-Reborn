@@ -397,16 +397,18 @@ mod tests {
     #[test]
     fn stdout_counts_as_life() {
         let Some((p, args)) = shell(
-            "1..6 | % { [Console]::Out.WriteLine('x' * 1000); [Console]::Out.Flush(); Start-Sleep -Milliseconds 700 }; exit 3",
-            "for i in 1 2 3 4 5 6; do printf '%01000d\\n' 0; sleep 0.7; done; exit 3",
+            "1..8 | % { [Console]::Out.WriteLine('x' * 1000); [Console]::Out.Flush(); Start-Sleep -Milliseconds 1000 }; exit 3",
+            "for i in 1 2 3 4 5 6 7 8; do printf '%01000d\\n' 0; sleep 1; done; exit 3",
         ) else {
             return;
         };
         let args: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
-        // ~4.2 s of stdout-only output against a 2.5 s idle limit.
-        let out = run_any(&p, &args, &(), Some(Duration::from_millis(2500))).unwrap();
+        // ~8 s of stdout-only output, 1 s apart, against a 6 s idle limit. The limit also covers
+        // the shell's start: PowerShell took over 2.5 s to print its first line on the Windows
+        // ARM runner with the crate's tests in parallel.
+        let out = run_any(&p, &args, &(), Some(Duration::from_secs(6))).unwrap();
         assert_eq!(out.status.code(), Some(3));
-        assert_eq!(String::from_utf8_lossy(&out.stdout).lines().filter(|l| l.len() == 1000).count(), 6);
+        assert_eq!(String::from_utf8_lossy(&out.stdout).lines().filter(|l| l.len() == 1000).count(), 8);
         let (p, args) = shell("exit 3", "exit 3").unwrap();
         let args: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
         assert!(matches!(run_watched(&p, &args, &(), &mut |_| {}, None), Err(MediaError::Tool { .. })));
