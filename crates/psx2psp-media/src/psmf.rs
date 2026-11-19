@@ -397,7 +397,7 @@ pub fn parse(pmf: &[u8]) -> Result<PsmfInfo, MediaError> {
                 0xBF if body.len() >= 18 && body[..2] == [0x01, 0xE0] => {
                     let n = u16::from_be_bytes([body[16], body[17]]) as usize;
                     let ents = body.get(18..18 + 4 * n).ok_or_else(|| fmt(format!("pack {k}: AU table truncated")))?;
-                    info.table_sizes.extend(ents.chunks_exact(4).map(|e| u16::from_be_bytes([e[2], e[3]]) as usize));
+                    info.table_sizes.extend(ents.as_chunks::<4>().0.iter().map(|e| u16::from_be_bytes([e[2], e[3]]) as usize));
                     info.groups += 1;
                 }
                 _ => {}

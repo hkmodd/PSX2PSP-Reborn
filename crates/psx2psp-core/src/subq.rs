@@ -169,7 +169,7 @@ mod tests {
     }
 
     fn entries(t: &[u8]) -> Vec<(u32, [u8; 8])> {
-        t.chunks_exact(SUBQ_ENTRY).map(|e| (u32::from_le_bytes(e[..4].try_into().unwrap()), e[4..].try_into().unwrap())).collect()
+        t.as_chunks::<SUBQ_ENTRY>().0.iter().map(|e| (u32::from_le_bytes(e[..4].try_into().unwrap()), e[4..].try_into().unwrap())).collect()
     }
 
     /// The magic-word table models a disc whose both pair sectors are damaged; the same disc as

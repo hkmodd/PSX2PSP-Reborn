@@ -283,7 +283,7 @@ pub fn snd0_pcm(ff: &Ffmpeg, at3: &[u8], work: &Path) -> Result<Vec<i16>, MediaE
         "-f".as_ref(), "s16le".as_ref(), "-ac".as_ref(), "2".as_ref(), "-ar".as_ref(), rate.as_ref(), "-".as_ref(),
     ]);
     let _ = std::fs::remove_file(&f);
-    let pcm: Vec<i16> = r?.stdout.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
+    let pcm: Vec<i16> = r?.stdout.as_chunks::<2>().0.iter().map(|&b| i16::from_le_bytes(b)).collect();
     // Under 1024 frames (one ATRAC3 frame) means the decoder produced nothing useful.
     if pcm.len() < 2 * 1024 {
         return Err(bad("SND0.AT3 decoded to no audio"));

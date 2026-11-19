@@ -62,11 +62,10 @@ impl Md5 {
             let b = self.buf;
             self.block(&b);
         }
-        let mut chunks = data.chunks_exact(64);
-        for c in &mut chunks {
-            self.block(c.try_into().unwrap());
+        let (blocks, r) = data.as_chunks::<64>();
+        for c in blocks {
+            self.block(c);
         }
-        let r = chunks.remainder();
         self.buf[..r.len()].copy_from_slice(r);
     }
 
@@ -78,8 +77,8 @@ impl Md5 {
         }
         self.update(&bits.to_le_bytes());
         let mut out = [0u8; 16];
-        for (o, s) in out.chunks_exact_mut(4).zip(self.state) {
-            o.copy_from_slice(&s.to_le_bytes());
+        for (o, s) in out.as_chunks_mut::<4>().0.iter_mut().zip(self.state) {
+            *o = s.to_le_bytes();
         }
         out
     }

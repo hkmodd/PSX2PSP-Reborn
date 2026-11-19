@@ -123,8 +123,7 @@ impl PatternPatch {
     /// Rules run in sequence on a copy, exactly as [`Self::apply_sector`] would.
     pub fn hits(&self, block: &[u8]) -> Vec<usize> {
         let mut n = vec![0; self.rules.len()];
-        for chunk in block.chunks_exact(SECTOR) {
-            let s: &[u8; SECTOR] = chunk.try_into().unwrap();
+        for s in block.as_chunks::<SECTOR>().0 {
             let Some(range) = sector::user_data_range(sector::mode(s)) else { continue };
             let mut user = s[range].to_vec();
             for (k, r) in n.iter_mut().zip(&self.rules) {
@@ -180,8 +179,8 @@ pub fn pal_to_ntsc() -> PatternPatch {
 
 impl ImagePatch for PatternPatch {
     fn apply(&self, _offset: u64, block: &mut [u8]) {
-        for chunk in block.chunks_exact_mut(SECTOR) {
-            self.apply_sector(chunk.try_into().unwrap());
+        for chunk in block.as_chunks_mut::<SECTOR>().0 {
+            self.apply_sector(chunk);
         }
     }
 
