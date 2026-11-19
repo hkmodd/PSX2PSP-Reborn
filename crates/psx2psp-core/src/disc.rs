@@ -87,6 +87,9 @@ pub struct DiscImage {
     pub tracks: Vec<Track>,
     segments: Vec<Segment>,
     sectors: u32,
+    /// CUE `FILE` names that were not in the folder, with the file used instead
+    /// ([`resolve_cue_names`]): the caller tells the user.
+    pub renamed: Vec<(String, String)>,
 }
 
 /// Information probed from the ISO9660 filesystem of the first data track.
@@ -145,6 +148,103 @@ fn tokenize(line: &str) -> Vec<String> {
     out
 }
 
+/// What the `FILE` names of a CUE sheet become in a folder where the files were renamed after the
+/// sheet was written (a dump renamed by hand: `Game.cue` + `Game.bin` whose sheet still names
+/// `Game (USA).bin`). `dir` lists the folder's files with their sizes; a name present as written
+/// stays. A missing one is, in order: the one file of the same name but for case; the sheet's
+/// name in place of the part all the names share up to their tags (`New (Track 2).bin` for
+/// `Old (USA) (Track 2).bin` in `New.cue`; with one FILE, `New.bin`); with one FILE, the
+/// folder's only .bin/.img whose size is whole 2352-byte sectors. More than one candidate, or
+/// none, is an error naming them: never a guess.
+pub fn resolve_cue_names(cue_stem: &str, names: &[String], dir: &[(String, u64)]) -> std::result::Result<Vec<String>, String> {
+    let ci = |want: &str| -> Vec<&str> { dir.iter().map(|(n, _)| n.as_str()).filter(|n| n.eq_ignore_ascii_case(want)).collect() };
+    let one = |found: Vec<&str>, name: &str| -> std::result::Result<Option<String>, String> {
+        match found.as_slice() {
+            [] => Ok(None),
+            [f] => Ok(Some((*f).to_string())),
+            many => Err(format!("the cue names “{name}”, not in the folder; candidates: {}", many.join(", "))),
+        }
+    };
+    // The part every name shares, cut before its last " (" tag: "Game (USA) (Track " -> "Game (USA)".
+    let shared = names.iter().skip(1).fold(names.first().map_or("", String::as_str), |p, n| {
+        let k = p.char_indices().zip(n.chars()).take_while(|((_, a), b)| a == b).last().map_or(0, |((i, a), _)| i + a.len_utf8());
+        &p[..k]
+    });
+    let shared = shared.rfind(" (").map(|i| &shared[..i]);
+    let mut out = Vec::with_capacity(names.len());
+    for name in names {
+        if dir.iter().any(|(n, _)| n == name) {
+            out.push(name.clone());
+            continue;
+        }
+        if let Some(f) = one(ci(name), name)? {
+            out.push(f);
+            continue;
+        }
+        let by_stem = if names.len() == 1 {
+            let ext = Path::new(name).extension().and_then(|e| e.to_str()).unwrap_or("bin");
+            Some(format!("{cue_stem}.{ext}"))
+        } else {
+            shared.map(|p| format!("{cue_stem}{}", &name[p.len()..]))
+        };
+        if let Some(f) = by_stem.map(|c| one(ci(&c), name)).transpose()?.flatten() {
+            out.push(f);
+            continue;
+        }
+        if names.len() == 1 {
+            let image = |n: &str| Path::new(n).extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("bin") || e.eq_ignore_ascii_case("img"));
+            let bins: Vec<&str> = dir.iter().filter(|(n, len)| image(n) && *len > 0 && len % RAW_SECTOR == 0).map(|(n, _)| n.as_str()).collect();
+            if let Some(f) = one(bins, name)? {
+                out.push(f);
+                continue;
+            }
+        }
+        return Err(format!("the cue names “{name}”, which is not in the folder"));
+    }
+    Ok(out)
+}
+
+/// The files of the folder `dir`, with their sizes (for [`resolve_cue_names`]).
+fn folder(dir: &Path) -> Vec<(String, u64)> {
+    let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter_map(|e| {
+                    let m = e.metadata().ok().filter(|m| m.is_file())?;
+                    Some((e.file_name().to_string_lossy().into_owned(), m.len()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `FILE` names of the sheet at `cue_path` that are not in its folder, with the file each one
+/// resolves to ([`resolve_cue_names`]).
+fn cue_renames(text: &str, cue_path: &Path) -> Result<Vec<(String, String)>> {
+    let base = cue_path.parent().unwrap_or(Path::new(""));
+    let names = cue_file_names(text);
+    if names.iter().all(|n| base.join(n).is_file()) {
+        return Ok(Vec::new());
+    }
+    let stem = cue_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let used = resolve_cue_names(&stem, &names, &folder(base)).map_err(|e| Error::format("CUE", e))?;
+    Ok(names.into_iter().zip(used).filter(|(n, _)| !base.join(n).is_file()).collect())
+}
+
+/// The files a `.cue` sheet uses, in order: its `FILE` names, resolved as [`DiscImage::open`]
+/// does when the files were renamed.
+pub fn cue_files(cue: &Path) -> Result<Vec<PathBuf>> {
+    let text = std::fs::read(cue).map_err(Error::io_path(cue))?;
+    let text = String::from_utf8_lossy(&text);
+    let renamed = cue_renames(&text, cue)?;
+    let base = cue.parent().unwrap_or(Path::new(""));
+    Ok(cue_file_names(&text)
+        .into_iter()
+        .map(|n| base.join(renamed.iter().find(|(w, _)| *w == n).map_or(n.as_str(), |(_, u)| u.as_str())))
+        .collect())
+}
+
 /// Names of the files a CUE sheet references (`FILE "<name>" <type>`), in order of appearance.
 pub fn cue_file_names(text: &str) -> Vec<String> {
     text.lines()
@@ -181,6 +281,7 @@ impl DiscImage {
             tracks: vec![Track { number: 1, kind: TrackKind::Mode2, start: 0, index0: None }],
             segments: vec![Segment::File { path: path.to_path_buf(), offset: 0, len }],
             sectors,
+            renamed: Vec::new(),
         })
     }
 
@@ -188,14 +289,23 @@ impl DiscImage {
         let path = path.as_ref();
         let text = std::fs::read(path).map_err(Error::io_path(path))?;
         let text = String::from_utf8_lossy(&text);
-        Self::from_cue_str(&text, path, |p| std::fs::metadata(p).map(|m| m.len()))
+        let renamed = cue_renames(&text, path)?;
+        let mut d = Self::parse_cue(&text, path, |p| std::fs::metadata(p).map(|m| m.len()), &renamed)?;
+        d.renamed = renamed;
+        Ok(d)
     }
 
     /// CUE parser with an injectable file-size oracle (pure + unit-testable).
-    pub fn from_cue_str(
+    pub fn from_cue_str(text: &str, cue_path: &Path, file_len: impl FnMut(&Path) -> io::Result<u64>) -> Result<Self> {
+        Self::parse_cue(text, cue_path, file_len, &[])
+    }
+
+    /// `renamed`: (FILE name, file used) for the names not in the folder.
+    fn parse_cue(
         text: &str,
         cue_path: &Path,
         mut file_len: impl FnMut(&Path) -> io::Result<u64>,
+        renamed: &[(String, String)],
     ) -> Result<Self> {
         let base = cue_path.parent().unwrap_or(Path::new(""));
         let mut segments = Vec::new();
@@ -218,7 +328,8 @@ impl DiscImage {
                     if kind != "BINARY" {
                         return Err(Error::Unsupported(format!("CUE FILE type {kind} (only BINARY)")));
                     }
-                    let fpath = base.join(name);
+                    let used = renamed.iter().find(|(w, _)| w == name).map_or(name.as_str(), |(_, u)| u.as_str());
+                    let fpath = base.join(used);
                     let len = file_len(&fpath).map_err(Error::io_path(&fpath))?;
                     if len % RAW_SECTOR != 0 {
                         return Err(err(&format!("{} size {len} not a multiple of 2352", fpath.display())));
@@ -304,7 +415,7 @@ impl DiscImage {
         }
         let total: u64 = segments.iter().map(Segment::len).sum();
         let sectors = u32::try_from(total / RAW_SECTOR).map_err(|_| Error::format("CUE", "image too large"))?;
-        Ok(Self { source: cue_path.to_path_buf(), tracks, segments, sectors })
+        Ok(Self { source: cue_path.to_path_buf(), tracks, segments, sectors, renamed: Vec::new() })
     }
 
     pub fn sectors(&self) -> u32 {
@@ -525,6 +636,58 @@ impl Seek for DiscReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn names(n: &[&str]) -> Vec<String> {
+        n.iter().map(|s| s.to_string()).collect()
+    }
+    fn dir(d: &[(&str, u64)]) -> Vec<(String, u64)> {
+        d.iter().map(|(n, l)| (n.to_string(), *l)).collect()
+    }
+
+    #[test]
+    fn renamed_single_bin_takes_the_sheets_name() {
+        // Dragon Ball GT - Final Bout as found: both files renamed, the sheet's line not.
+        let d = dir(&[("Dragon Ball GT Final Bout.bin", 158_811_744), ("Dragon Ball GT Final Bout.cue", 90)]);
+        let r = resolve_cue_names("Dragon Ball GT Final Bout", &names(&["Dragon Ball GT - Final Bout (USA).bin"]), &d);
+        assert_eq!(r.unwrap(), ["Dragon Ball GT Final Bout.bin"]);
+    }
+
+    #[test]
+    fn renamed_tracks_keep_their_tags() {
+        let d = dir(&[("New (Track 1).bin", 2352 * 10), ("New (Track 2).bin", 2352 * 4), ("New.cue", 300)]);
+        let r = resolve_cue_names("New", &names(&["Game (USA) (Track 1).bin", "Game (USA) (Track 2).bin"]), &d);
+        assert_eq!(r.unwrap(), ["New (Track 1).bin", "New (Track 2).bin"]);
+    }
+
+    #[test]
+    fn present_names_stay_and_case_alone_resolves() {
+        let d = dir(&[("game.bin", 2352), ("Game.cue", 50)]);
+        assert_eq!(resolve_cue_names("Game", &names(&["game.bin"]), &d).unwrap(), ["game.bin"]);
+        assert_eq!(resolve_cue_names("Other", &names(&["GAME.BIN"]), &d).unwrap(), ["game.bin"]);
+    }
+
+    #[test]
+    fn the_only_image_serves_one_file_and_two_are_an_error() {
+        let one = dir(&[("whatever.img", 2352 * 3), ("notes.txt", 7), ("odd.bin", 1000)]);
+        assert_eq!(resolve_cue_names("Y", &names(&["X.bin"]), &one).unwrap(), ["whatever.img"]);
+        let two = dir(&[("a.bin", 2352), ("b.bin", 4704)]);
+        let e = resolve_cue_names("Y", &names(&["X.bin"]), &two).unwrap_err();
+        assert!(e.contains("a.bin") && e.contains("b.bin"), "{e}");
+        // several FILE lines never fall back to "the only image"
+        assert!(resolve_cue_names("Y", &names(&["X (Track 1).bin", "X (Track 2).bin"]), &dir(&[("a.bin", 2352)])).is_err());
+    }
+
+    #[test]
+    fn a_renamed_dump_opens_from_its_sheet() {
+        let t = tempfile::tempdir().unwrap();
+        std::fs::write(t.path().join("Short.bin"), vec![0u8; 2352 * 20]).unwrap();
+        let cue = t.path().join("Short.cue");
+        std::fs::write(&cue, "FILE \"Long Name (USA).bin\" BINARY\r\n  TRACK 01 MODE2/2352\r\n    INDEX 01 00:00:00\r\n").unwrap();
+        let d = DiscImage::open(&cue).unwrap();
+        assert_eq!(d.sectors(), 20);
+        assert_eq!(d.renamed, [("Long Name (USA).bin".to_string(), "Short.bin".to_string())]);
+        assert_eq!(cue_files(&cue).unwrap(), [t.path().join("Short.bin")]);
+    }
 
     fn sizes<'a>(map: &'a [(&'a str, u64)]) -> impl FnMut(&Path) -> io::Result<u64> + 'a {
         move |p| {
