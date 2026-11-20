@@ -566,11 +566,14 @@ extern u32 gpu_writes;  /* VRAM writes so far (draw commands and transfers): wha
 /* psxrt's Media Engine (psp/psxrt/me.c) walks the GPU's lists on gpu_me_psx, a copy of the Psx
  * with its own GPU state, while the CPU goes on. gpu_sync_hook waits for that walk and brings its
  * GPU state back: every entry that reads or writes the GPU's state calls gpu_sync first. The walk
- * counts its VRAM writes in *gpu_me_writes, on the ME's side. All three NULL everywhere else. */
+ * counts its VRAM writes in *gpu_me_writes, on the ME's side. All three NULL everywhere else.
+ * gpu_me_busy is nonzero while a walk is in flight (set and cleared by me.c, on the CPU): code
+ * that must not call out (io_fast.c) leaves the GPU's state alone while it is. */
 enum { GPU_SYNC_READ, GPU_SYNC_GP0, GPU_SYNC_GP1, GPU_SYNC_VBLANK, GPU_SYNC_DMA, GPU_SYNC_GE, GPU_SYNC_OTHER, GPU_SYNC_N };
 extern void (*gpu_sync_hook)(int why);
 extern Psx *gpu_me_psx;
 extern u32 *gpu_me_writes;
+extern volatile int gpu_me_busy;
 static inline void gpu_sync(const Psx *psx, int why)
 {
     if (gpu_sync_hook && psx != gpu_me_psx)

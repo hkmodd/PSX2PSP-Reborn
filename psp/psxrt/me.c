@@ -235,8 +235,7 @@ static u32 seq, kicked_job, beat0, pings, pings_ok, late, n_dead;
 static u32 st_seen, rpc_seen;
 
 /* The walk in flight: the game's Psx, its list, the words the CPU counted, when it was kicked and
- * first seen done (0: not yet). */
-static volatile int busy;
+ * first seen done (0: not yet). In flight while gpu_me_busy (core/psx.h). */
 static Psx *walk_psx;
 static u32 walk_addr, walk_words, t_kick, t_done;
 
@@ -343,7 +342,7 @@ static void walk_end(void)
     st.words_bad += ctl->res[0] != walk_words;
     st.walk_us += (t_done ? t_done : now()) - t_kick;
     kicked_job = JOB_NONE;
-    busy = 0;
+    gpu_me_busy = 0;
 }
 
 /* The ME stopped in a walk: back in reset, and the walk again on the SC from the GPU state before
@@ -355,7 +354,7 @@ static void walk_lost(void)
     Psx *psx = walk_psx;
     ge_bind(psx);
     kicked_job = JOB_NONE;
-    busy = 0;
+    gpu_me_busy = 0;
     st.lost++;
     dma_list_walk(psx, walk_addr);
 }
@@ -364,7 +363,7 @@ static void walk_lost(void)
  * (ge.c's entries call it there too). */
 static void me_sync(int why)
 {
-    if (geh_me() || !busy)
+    if (geh_me() || !gpu_me_busy)
         return;
     u32 t0 = now(), tp = t0;
     for (;;) {
@@ -396,7 +395,7 @@ static int serve_main(SceSize n, void *arg)
     (void)n, (void)arg;
     while (!quit) {
         sceKernelWaitSema(kick_sema, 1, NULL);
-        while (!quit && busy) {
+        while (!quit && gpu_me_busy) {
             u32 tp = 0;
             int done = 0;
             if (!in_main) {
@@ -460,7 +459,7 @@ static u32 me_walk(Psx *psx, u32 addr)
     ctl->sc_us = now();
     sceKernelDcacheWritebackAll();
     kick(JOB_WALK, (u32)&mj.psx, addr);
-    busy = 1;
+    gpu_me_busy = 1;
     t_kick = now();
     st.walks++, st.head_us += t_kick - t0;
     if (kick_sema >= 0)
@@ -536,7 +535,7 @@ int me_log(char *line, int cap)
                      (unsigned)(ME_TIMEOUT / 1000), (unsigned)n_dead, (unsigned)st.lost, (unsigned)kicked_job, (unsigned)ctl->err);
     } else {
         u32 b = ctl->beat;
-        if (!busy) { /* the next ping only when no walk is in flight and the last job is done */
+        if (!gpu_me_busy) { /* the next ping only when no walk is in flight and the last job is done */
             if (ctl->done == seq) {
                 ping_check();
                 kick(JOB_PING, seq + 1, 0);

@@ -6,8 +6,8 @@
  * a library call (no 64-bit division).
  *
  * Served: naturally aligned reads of the pad port (SIO0, core/sio.c), the DMA registers, GPUSTAT
- * and GPUREAD outside a VRAM->CPU transfer, word reads of I_STAT, I_MASK and the root
- * counters' count, mode and target, for a counter on the system clock, timer 2's eighth of it or
+ * and GPUREAD outside a VRAM->CPU transfer and with no ME walk in flight, word reads of I_STAT,
+ * I_MASK and the root counters' count, mode and target, for a counter on the system clock, timer 2's eighth of it or
  * timer 1's hblanks and not stopped, when no device event is due, no interrupt is pending and the
  * read raises none. What they return and
  * leave behind is what psx_read's would (native_init checks it on random counters, both video
@@ -97,7 +97,11 @@ int io_fast_dev(Psx *psx, u32 p, u32 *v)
         return 0;
     }
     if (p - 0x1F801810 < 8) { /* core/gpu.c gpu_read; GPUREAD of a VRAM->CPU transfer moves pixels */
-        gpu_sync(psx, GPU_SYNC_READ);
+        /* With an ME walk in flight the GPU's state is the ME's until gpu_sync brings it back, and
+         * gpu_sync calls me.c's hook, which keeps none of the registers this file is built to keep
+         * (Makefile): such a read goes on as a host call, where gpu_read syncs. */
+        if (gpu_me_busy)
+            return 1;
         const Gpu *g = &psx->gpu;
         if (!(p & 4)) {
             if (g->xfer == 2)
