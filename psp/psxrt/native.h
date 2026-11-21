@@ -51,6 +51,25 @@ extern NativeStats native_stats;
  * the interrupt alarm subtracts NATIVE_FORCED to make the next back-edge enter. */
 #define NATIVE_BUDGET (PSX_CLOCK / 1000)
 #define NATIVE_FORCED 0x40000000u
+/* Deterministic bench (main.c: set when psxrt.pad is present): PS1 time comes only from the
+ * guest's cycles. No 500 us alarm (it took interrupts at wall-clock points, and its 2000 kernel
+ * interrupts a second evict I-cache lines); the budget runs to the next device event instead;
+ * no owed-vblank stall (it moved the count by the PSP's lateness); the physical pad is ignored. */
+extern int native_det;
+/* What CTX.BUDGET was last refilled to: NATIVE_BUDGET, or with native_det native_budget()'s.
+ * The cycles a stretch of translated code spent are (native_refill - CTX.BUDGET) >> shift. */
+extern u32 native_refill;
+/* The budget of the next stretch of translated code: NATIVE_BUDGET, or with native_det no more
+ * than the cycles to the next device event (at least 1: an event due enters at the next back-edge). */
+static inline u32 native_budget(const Psx *psx, u32 shift)
+{
+    if (!native_det)
+        return NATIVE_BUDGET;
+    u64 d = psx->next_event > psx->cycles ? psx->next_event - psx->cycles : 0;
+    if (d >= (u64)(NATIVE_BUDGET >> shift))
+        return NATIVE_BUDGET;
+    return d ? (u32)d << shift : 1;
+}
 /* Timer reads of a polling loop (native.c poll_skip): a pair's second read comes within
  * NATIVE_POLL_PAIR cycles of its first, a loop's next pass within NATIVE_POLL_GAP. */
 #define NATIVE_POLL_PAIR 16u

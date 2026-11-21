@@ -136,6 +136,8 @@ int io_fast_dev(Psx *psx, u32 p, u32 *v);
 u32 native_host_sp, native_host_gp;
 
 NativeStats native_stats;
+int native_det;
+u32 native_refill = BUDGET;
 
 static volatile u32 *const ctx = (volatile u32 *)CTX_ADDR;
 static u32 *const table = (u32 *)TABLE_ADDR;
@@ -1055,7 +1057,7 @@ void native_vsync(void)
         t_base = t_lock + VS_US(vc - v_lock) - VS_MARGIN;
         /* the next slot has passed too: the CPU stalls to VS_SHORT before its vblank (psx_update
          * has moved next_vblank a frame on already; update() runs the stall, event by event) */
-        if ((s32)(v - vc) >= 0 && P->cycles + VS_SHORT < P->next_vblank) {
+        if (!native_det && (s32)(v - vc) >= 0 && P->cycles + VS_SHORT < P->next_vblank) {
             stall_to = P->next_vblank - VS_SHORT, native_stats.vs_short++;
             native_stats.st_ask_k += (u32)((stall_to - P->cycles) / 1000);
         }
@@ -1216,8 +1218,21 @@ static void charge(void)
     u32 b = ctx[C_BUDGET];
     if ((s32)b < -(s32)(FORCED / 2))
         b += FORCED;
-    P->cycles += (u32)((s32)BUDGET - (s32)b) >> cpu_shift;
-    ctx[C_BUDGET] = BUDGET;
+    u32 spent = native_refill - b, r = native_budget(P, cpu_shift);
+    P->cycles += spent >> cpu_shift;
+    ctx[C_BUDGET] = r - (native_det ? spent & ((1u << cpu_shift) - 1) : 0); /* the remainder carried */
+    native_refill = r;
+}
+
+/* With native_det, after work that moved the next device event (updates, device writes): the
+ * budget refilled to it, what was spent since the refill (and a forced entry) kept. */
+static void retarget(void)
+{
+    if (!native_det)
+        return;
+    u32 r = native_budget(P, cpu_shift);
+    ctx[C_BUDGET] += r - native_refill;
+    native_refill = r;
 }
 
 static SceUInt alarm(void *common)
@@ -1705,6 +1720,7 @@ u32 native_io_write(u32 a)
         native_stats.io_forced++;
     }
     P->cycles += 2;
+    retarget();
     if (timed) {
         t = (sceKernelGetSystemTimeLow() - t) * PROF_EVERY - prof_bias;
         native_stats.us_io += t;
@@ -1726,6 +1742,7 @@ static int guest_calls; /* native_call() depth */
 static u32 leave(Cpu *c, u32 host)
 {
     to_ctx(c, host);
+    retarget();
     if (native_snap_req && !guest_calls) {
         native_snap_req = 0;
         runtime_snapshot(host);
@@ -2430,8 +2447,11 @@ void native_run(u32 host_pc)
     t_base = t_lock = sceKernelGetSystemTimeWide();
     c_base = P->cycles;
     v_lock = vc = sceDisplayGetVcount();
-    if (sceKernelSetAlarm(ALARM_US, alarm, NULL) < 0)
+    if (native_det)
+        say("native: deterministic bench: no alarm, no owed-vblank stall, PS1 time from the guest's cycles");
+    else if (sceKernelSetAlarm(ALARM_US, alarm, NULL) < 0)
         say("native: no alarm, interrupts wait for host calls");
+    retarget();
     if (!host_pc) {
         c->load_reg = 0;
         jump(c, c->pc);
@@ -2450,11 +2470,13 @@ int native_save(int fd)
     u32 st[MAX_IMAGES][4], n = (u32)nimg;
     for (u32 i = 0; i < n; i++)
         st[i][0] = (u32)img[i].resident, st[i][1] = (u32)img[i].installed, st[i][2] = img[i].gen, st[i][3] = img[i].checked;
-    u32 top = gret_top;
+    u32 top = gret_top, b = ctx[C_BUDGET];
+    ctx[C_BUDGET] = b + BUDGET - native_refill; /* saved as refilled to BUDGET (native_load) */
     int w = sceIoWrite(fd, (const void *)CTX_ADDR, CTX_BYTES) != (int)CTX_BYTES || sceIoWrite(fd, &n, 4) != 4 ||
             sceIoWrite(fd, st, n * 16) != (int)(n * 16) || sceIoWrite(fd, &top, 4) != 4 || sceIoWrite(fd, gret, sizeof gret) != (int)sizeof gret ||
             sceIoWrite(fd, table, TABLE_WORDS * 4) != (int)(TABLE_WORDS * 4) || sceIoWrite(fd, &ar.n, 4) != 4 ||
             sceIoWrite(fd, ar.p, ar.n * sizeof *ar.p) != (int)(ar.n * sizeof *ar.p);
+    ctx[C_BUDGET] = b;
     return w ? -1 : 0;
 }
 
@@ -2466,6 +2488,7 @@ int native_load(int fd)
         sceIoRead(fd, table, TABLE_WORDS * 4) != (int)(TABLE_WORDS * 4) || sceIoRead(fd, &ar.n, 4) != 4 || ar.n > (fl.w ? FL_PLACES : 0) ||
         sceIoRead(fd, ar.p, ar.n * sizeof *ar.p) != (int)(ar.n * sizeof *ar.p))
         return ar.n = 0, -1;
+    native_refill = BUDGET; /* native_save's */
     for (u32 i = 0; i < ar.n; i++) {
         const FlPlace *q = &ar.p[i];
         if (q->unit >= fl.units || q->len < 4 * fl_body_words(fl_unit(&fl, q->unit)) || q->host < (i ? ar.p[i - 1].host + ar.p[i - 1].len : ar.lo) ||

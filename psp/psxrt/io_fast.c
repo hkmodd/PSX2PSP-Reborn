@@ -166,8 +166,10 @@ u32 native_io_read(u32 a)
     if ((p & (size - 1)) || (!sio && !dma && !gpu && ((p & 3) || (p - 0x1F801070 >= 8 && p - 0x1F801100 >= 0x30))) ||
         (s32)b < -(s32)(NATIVE_FORCED / 2))
         return 1;
-    psx->cycles += (u32)((s32)NATIVE_BUDGET - (s32)b) >> io_fast_shift;
-    ctx[C_BUDGET] = NATIVE_BUDGET;
+    u32 spent = native_refill - b, r = native_budget(psx, io_fast_shift);
+    psx->cycles += spent >> io_fast_shift;
+    ctx[C_BUDGET] = r - (native_det ? spent & ((1u << io_fast_shift) - 1) : 0); /* the remainder carried */
+    native_refill = r;
     int timer = p - 0x1F801100 < 0x30;
     NativePoll q = native_poll;
     u32 v, tick = timer && !(p & 0xF) ? tmr_cpt(psx, (int)((p >> 4) & 3)) : 0;

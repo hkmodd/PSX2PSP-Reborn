@@ -948,7 +948,7 @@ static u16 read_pad(u32 frame_no)
     static u32 prev;
     SceCtrlData d;
     sceCtrlPeekBufferPositive(&d, 1);
-    u32 b = d.Buttons;
+    u32 b = pad_n ? 0 : d.Buttons; /* a script (the deterministic bench, native_det): it alone */
     for (int i = 0; i < pad_n; i++)
         if (frame_no - pad_script[i].frame < pad_script[i].frames)
             b |= pad_script[i].buttons;
@@ -986,7 +986,7 @@ static u16 read_pad(u32 frame_no)
         b &= ~snap;
     if ((b & wide) == wide)
         b &= ~wide;
-    u32 l2r2 = (d.Lx < 64 ? 1u : 0u) | (d.Lx > 192 ? 2u : 0u);
+    u32 l2r2 = pad_n ? 0 : (d.Lx < 64 ? 1u : 0u) | (d.Lx > 192 ? 2u : 0u);
     return (u16) ~((b & 0xF0F9u) | ((b >> 8) & 3u) << 10 | l2r2 << 8);
 }
 
@@ -1673,8 +1673,10 @@ int main(int argc, char **argv)
     present(&psx, "booting");
     log_flush();
     log_keep();
-    if (native)
+    if (native) {
+        native_det = pad_n > 0;
         native_run(resume);
+    }
 
     for (;;) {
         u32 f = frames;
