@@ -6,7 +6,8 @@
  * a library call (no 64-bit division).
  *
  * Served: naturally aligned reads of the pad port (SIO0, core/sio.c), the DMA registers, GPUSTAT
- * and GPUREAD outside a VRAM->CPU transfer and with no ME walk in flight, word reads of I_STAT,
+ * (with an ME walk in flight, the end its kick's scan found) and GPUREAD outside a VRAM->CPU
+ * transfer and with no ME walk in flight, word reads of I_STAT,
  * I_MASK and the root counters' count, mode and target, for a counter on the system clock, timer 2's eighth of it or
  * timer 1's hblanks and not stopped, when no device event is due, no interrupt is pending and the
  * read raises none. What they return and
@@ -99,18 +100,25 @@ int io_fast_dev(Psx *psx, u32 p, u32 *v)
     if (p - 0x1F801810 < 8) { /* core/gpu.c gpu_read; GPUREAD of a VRAM->CPU transfer moves pixels */
         /* With an ME walk in flight the GPU's state is the ME's until gpu_sync brings it back, and
          * gpu_sync calls me.c's hook, which keeps none of the registers this file is built to keep
-         * (Makefile): such a read goes on as a host call, where gpu_read syncs. */
-        if (gpu_me_busy)
-            return 1;
+         * (Makefile). GPUSTAT then is the walk's end, scanned at its kick, as gpu_read gives it
+         * (gpu_me_stat while gpu_me_stat_ok, no transfer to the CPU); GPUREAD, or a list the scan
+         * could not follow, goes on as a host call, where gpu_read syncs. */
         const Gpu *g = &psx->gpu;
-        if (!(p & 4)) {
-            if (g->xfer == 2)
+        u32 s = g->stat, xfer = g->xfer;
+        if (gpu_me_busy) {
+            if (!(p & 4) || !gpu_me_stat_ok)
+                return 1;
+            s = gpu_me_stat, xfer = 0;
+            gpu_me_reads_kept++;
+        } else if (!(p & 4)) {
+            if (xfer == 2)
                 return 1;
             *v = g->gpuread;
             return 0;
         }
-        u32 s = (g->stat | 0x1C000000u) & ~(1u << 25), dir = (s >> 29) & 3;
-        if (dir == 1 || dir == 2 || (dir == 3 && g->xfer == 2))
+        s = (s | 0x1C000000u) & ~(1u << 25);
+        u32 dir = (s >> 29) & 3;
+        if (dir == 1 || dir == 2 || (dir == 3 && xfer == 2))
             s |= 1u << 25;
         *v = s;
         return 0;

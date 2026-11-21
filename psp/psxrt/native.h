@@ -30,7 +30,7 @@ typedef struct NativeStats {
      * (the next one comes early); waited us */
     u32 vs_wait, vs_late, vs_adv, vs_short, us_vs_wait, us_late, us_late_max;
     u32 updates; /* device updates (psx_update, the stall's included) */
-    u32 io_lean; /* of the host calls, device reads served by io_fast.c (IO_READ) and pad/IRQ writes by native_io_write (IO_WRITE) */
+    u32 io_lean; /* of the host calls, device reads served by io_fast.c (IO_READ) and device writes by native_io_write (IO_WRITE) */
     u32 io_fall[6]; /* timer/IRQ/pad accesses those left to the host call: event due, IRQ pending (or unmasked by the write), poll, then tmr_sync 1-3 */
     u32 io_host; /* timer/IRQ/pad instructions run as host calls (recipes' own reads not counted) */
     u32 vsync_passes; /* v_wait passes counted down at once by hook_vsync_wait (not run as guest code) */
@@ -42,6 +42,7 @@ typedef struct NativeStats {
      * events, events found due and not run; PS1 cycles the CD drive waited in it for the guest */
     u32 st_cut[3], st_bits, st_cdmask, st_ask_k, st_done, st_repl, st_jump[2], st_cdwait;
     u32 st_iec; /* updates that left the stall to the next one: the CPU was in a handler or a critical section (SR.IEc 0) */
+    u32 io_forced; /* lean device writes that raised an interrupt: taken at the next poll, forced (native_io_write) */
 } NativeStats;
 
 extern NativeStats native_stats;

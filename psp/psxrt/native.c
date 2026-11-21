@@ -1670,34 +1670,48 @@ static int io_fast(u32 pc, u32 insn, u32 back, u32 *next)
     return 1;
 }
 
-/* IO_WRITE (psxrt_io_write) with the guest address `a`: an aligned store to the pad port, I_STAT
- * or I_MASK runs here as io_fast() runs it, the value from CTX, without the host-call path (no
- * CPU state copy, no clock read). None of these raises an interrupt but an I_MASK write that
- * unmasks a pending one: that write is undone and, like any write when a device event is due or
- * an interrupt pending, goes on as a host call (nonzero). */
+/* IO_WRITE (psxrt_io_write) with the guest address `a`: an aligned store to a device register
+ * (0x1F801000-0x1F801FFF: DMA, GPU, CD, SPU, MDEC, timers, pad, I_STAT/I_MASK) runs here as
+ * io_fast() runs it, the value from CTX, without the host-call path (no register save of the
+ * whole guest, no CPU state copy, no clock sync). Not when a device event is due or an interrupt
+ * pending: nonzero, the site goes on as a host call, which serves those first. An interrupt the
+ * write raises is not taken after it here, as io_fast() does, but at the next poll, forced, or
+ * the next entry: every entry looks for one first (the alarm's latency, 500 us, at worst). An
+ * I_MASK write that unmasks a pending one is undone and goes on as a host call, which takes it
+ * before the store as before. Timed 1 in PROF_EVERY like io_fast(), the pad and IRQ writes not. */
 u32 native_io_write(u32 a)
 {
     const u32 *site = (const u32 *)ctx[C_SITE];
     u32 insn = site[1], op = insn >> 26, rt = (insn >> 16) & 31, p = a & 0x1FFFFFFFu;
     u32 size = op == 0x2B ? 4 : op == 0x29 ? 2 : 1;
-    int sio = p - 0x1F801040 < 0x20;
-    if ((a & (size - 1)) || (!sio && p - 0x1F801070 >= 8) || (s32)ctx[C_BUDGET] < -(s32)(FORCED / 2))
+    if ((a & (size - 1)) || p - 0x1F801000 >= 0x1000 || (s32)ctx[C_BUDGET] < -(s32)(FORCED / 2))
         return 1;
     charge();
     if (P->cycles >= P->next_event || psx_irq_pending(P)) {
         native_stats.io_fall[P->cycles >= P->next_event ? 0 : 1]++;
         return 1;
     }
-    u32 mask = P->i_mask;
+    static u32 n;
+    int kind = io_kind_at(p), timed = kind != IO_PAD && kind != IO_IRQ && !(n++ % PROF_EVERY);
+    u32 t = timed ? sceKernelGetSystemTimeLow() : 0, mask = P->i_mask;
     psx_write(P, a, rt ? ctx[rt] : 0, (int)size);
     if (psx_irq_pending(P)) {
-        P->i_mask = mask;
-        native_stats.io_fall[1]++;
-        return 1;
+        if (p - 0x1F801074 < 4) {
+            P->i_mask = mask;
+            native_stats.io_fall[1]++;
+            return 1;
+        }
+        ctx[C_BUDGET] -= FORCED; /* refilled by charge(): not forced yet */
+        native_stats.io_forced++;
     }
     P->cycles += 2;
+    if (timed) {
+        t = (sceKernelGetSystemTimeLow() - t) * PROF_EVERY - prof_bias;
+        native_stats.us_io += t;
+        native_stats.us_io_kind[kind] += t;
+    }
     native_stats.calls++;
-    native_stats.n_io[sio ? IO_PAD : IO_IRQ]++;
+    native_stats.n_io[kind]++;
     native_stats.io_lean++;
     return 0;
 }

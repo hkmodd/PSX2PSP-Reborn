@@ -1072,7 +1072,7 @@ static void frame(void)
             }
             if (native) {
                 const NativeStats *s = &native_stats;
-                n += snprintf(line + n, sizeof line - (size_t)n, "-- native: %u calls (%u lean, %u timer/irq/pad host; not: event %u irq %u poll %u source %u hit %u once %u), %u misses, %u steps, %u bios, %u hashes, %u loads, %u placed (%u again, %u dropped, %u full), %u poll skips (%u far, %u ra scans), %u hooks (%u v_wait passes), %u updates\n",(unsigned)(s->calls - n0.calls), (unsigned)(s->io_lean - n0.io_lean), (unsigned)(s->io_host - n0.io_host),
+                n += snprintf(line + n, sizeof line - (size_t)n, "-- native: %u calls (%u lean, %u forced, %u timer/irq/pad host; not: event %u irq %u poll %u source %u hit %u once %u), %u misses, %u steps, %u bios, %u hashes, %u loads, %u placed (%u again, %u dropped, %u full), %u poll skips (%u far, %u ra scans), %u hooks (%u v_wait passes), %u updates\n",(unsigned)(s->calls - n0.calls), (unsigned)(s->io_lean - n0.io_lean), (unsigned)(s->io_forced - n0.io_forced), (unsigned)(s->io_host - n0.io_host),
                               (unsigned)(s->io_fall[0] - n0.io_fall[0]), (unsigned)(s->io_fall[1] - n0.io_fall[1]), (unsigned)(s->io_fall[2] - n0.io_fall[2]), (unsigned)(s->io_fall[3] - n0.io_fall[3]), (unsigned)(s->io_fall[4] - n0.io_fall[4]), (unsigned)(s->io_fall[5] - n0.io_fall[5]),
                               (unsigned)(s->misses - n0.misses), (unsigned)(s->steps - n0.steps), (unsigned)(s->bios - n0.bios), (unsigned)(s->hashes - n0.hashes),
                               (unsigned)s->loads, (unsigned)(s->fl_places - n0.fl_places), (unsigned)(s->fl_reused - n0.fl_reused),

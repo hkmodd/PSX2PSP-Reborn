@@ -136,6 +136,36 @@ u32 dma_list_walk(Psx *psx, u32 addr)
     return words;
 }
 
+/* OTC's ordering table of `words` ending at `top`: each word links to the one below it, the lowest
+ * ends the list. Inside RAM (no wrap below 0) the words from the lowest up are an ascending run,
+ * written a cache line at a time on the PSP: the line is made valid and dirty without the fetch a
+ * store miss would do (Allegrex cache 0x18, create dirty exclusive, as core/mdec.c), then
+ * overwritten whole. 2048 words: ~3k cycles against ~53k a word at a time with the misses. */
+static void otc(Psx *psx, u32 top, u32 words)
+{
+    if (!words)
+        return;
+    if (words > top / 4 + 1) { /* wraps below 0 */
+        for (u32 i = 0, addr = top; i < words; i++, addr = (addr - 4) & 0x1FFFFC)
+            wr(psx, addr, i == words - 1 ? 0xFFFFFF : (addr - 4) & 0x1FFFFF);
+        return;
+    }
+    u32 bot = top - 4 * (words - 1), v = bot;
+    u32 *q = (u32 *)(psx->ram + bot), *end = q + words;
+    *q++ = 0xFFFFFF;
+#ifdef __psp__
+    for (; q < end && ((u32)q & 63); q++, v += 4)
+        *q = v;
+    for (; end - q >= 16; q += 16, v += 64) {
+        __asm__ volatile("cache 0x18, 0(%0)" : : "r"(q) : "memory");
+        q[0] = v, q[1] = v + 4, q[2] = v + 8, q[3] = v + 12, q[4] = v + 16, q[5] = v + 20, q[6] = v + 24, q[7] = v + 28;
+        q[8] = v + 32, q[9] = v + 36, q[10] = v + 40, q[11] = v + 44, q[12] = v + 48, q[13] = v + 52, q[14] = v + 56, q[15] = v + 60;
+    }
+#endif
+    for (; q < end; q++, v += 4)
+        *q = v;
+}
+
 static void transfer(Psx *psx, int ch)
 {
     DmaChan *c = &psx->dma.ch[ch];
@@ -148,10 +178,9 @@ static void transfer(Psx *psx, int ch)
     } else {
         u32 bs = c->bcr & 0xFFFF;
         words = sync == 0 ? (bs ? bs : 0x10000) : bs * (c->bcr >> 16);
-        if (ch == 6) { /* OTC: reverse-linked empty ordering table */
-            for (u32 i = 0; i < words; i++, addr = (addr - 4) & 0x1FFFFC)
-                wr(psx, addr, i == words - 1 ? 0xFFFFFF : (addr - 4) & 0x1FFFFF);
-        } else if (from_ram) {
+        if (ch == 6) /* OTC: reverse-linked empty ordering table */
+            otc(psx, addr, words);
+        else if (from_ram) {
             for (u32 i = 0; i < words;) {
                 /* image data for VRAM: whole rows at a time, up to the end of RAM */
                 if (ch == 2 && step == 4 && psx->gpu.xfer == 1) {
