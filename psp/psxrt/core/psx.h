@@ -162,12 +162,15 @@ typedef struct Cdrom {
     u32 xa_phase; /* 16.16 position between xa_last and the next decoded sample */
     s16 xa_fifo[CD_XA_FIFO * 2];
     u32 xa_rd, xa_wr; /* xa_rd: the play cursor, one sample per SPU sample while xa_on */
-    int xa_on; /* the cursor runs: a stream plays, CD_XA_LEAD samples after its sectors arrive */
     u8 vol[4]; /* LL LR RL RR */
     u8 vol_next[4];
     int muted;
     /* the shell (cd_lid): CD_LID_CLOSED, CD_LID_OPEN, or CD_LID_SPINUP until lid_due */
     u8 lid;
+    /* the XA cursor runs: a stream plays, CD_XA_LEAD samples after its sectors arrive. In the
+     * padding before lid_due, so no field moves: a snapshot from before it loads with 0 there,
+     * the cursor stopped, and the next sector re-arms it. */
+    u8 xa_on;
     u64 lid_due;
     /* the disc in the drive (0-based) and the automatic change (cd_update): a game waiting for
      * another disc polls Getstat and nothing else; poll_n Getstat since poll_t0, poll_hot
