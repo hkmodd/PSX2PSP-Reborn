@@ -76,7 +76,7 @@ static int otc_on_walk(Psx *psx)
     const DmaChan *c = &psx->dma.ch[6];
     u32 bs = c->bcr & 0xFFFF, top = c->madr & 0x1FFFFC;
     u32 words = ((c->chcr >> 9) & 3) == 0 ? (bs ? bs : 0x10000) : bs * (c->bcr >> 16);
-    for (int w = 0; w < gpu_me_busy && w < 2; w++) { /* each walk in flight */
+    for (int w = 0; w < gpu_me_busy && w < GPU_ME_WALKS; w++) { /* each walk in flight */
         u32 a = gpu_me_head[w];
         for (int k = 0; k < 4; k++) {
             if (((top - a) & 0x1FFFFC) < 4 * words || words >= 0x80000)

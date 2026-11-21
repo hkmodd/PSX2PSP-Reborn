@@ -344,7 +344,7 @@ void (*gpu_sync_hook)(int why);
 Psx *gpu_me_psx;
 u32 *gpu_me_writes;
 volatile int gpu_me_busy;
-volatile u32 gpu_me_head[2];
+volatile u32 gpu_me_head[GPU_ME_WALKS];
 int gpu_me_keep04;
 u32 gpu_me_gp1_04, gpu_me_gp1_kept;
 static int poly_slow; /* read only with a clock (never on the ME), so never written there */

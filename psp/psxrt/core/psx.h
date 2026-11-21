@@ -579,16 +579,17 @@ extern u32 gpu_writes;  /* VRAM writes so far (draw commands and transfers): wha
  * counts its VRAM writes in *gpu_me_writes, on the ME's side. All three NULL everywhere else.
  * gpu_me_busy is nonzero while a walk is in flight (set and cleared by me.c, on the CPU): code
  * that must not call out (io_fast.c) leaves the GPU's state alone while it is. */
-/* Why: the GPU's entries; OTC over a list in flight; a list kicked with two in flight (KICK3) or
+/* Why: the GPU's entries; OTC over a list in flight; a list kicked with the queue full (FULL) or
  * after one the scan could not follow (UNSCANNED), so not queued behind it. */
 enum { GPU_SYNC_READ, GPU_SYNC_GP0, GPU_SYNC_GP1, GPU_SYNC_VBLANK, GPU_SYNC_DMA, GPU_SYNC_GE, GPU_SYNC_OTHER,
-       GPU_SYNC_OTC, GPU_SYNC_KICK3, GPU_SYNC_UNSCANNED, GPU_SYNC_N };
+       GPU_SYNC_OTC, GPU_SYNC_FULL, GPU_SYNC_UNSCANNED, GPU_SYNC_N };
 extern void (*gpu_sync_hook)(int why);
 extern Psx *gpu_me_psx;
 extern u32 *gpu_me_writes;
-/* walks in flight: 1, or 2 with a list queued behind the first (the hook's, gpu_me_keep04) */
+/* walks in flight: 1, or up to GPU_ME_WALKS with lists queued behind the first (the hook's, gpu_me_keep04) */
+#define GPU_ME_WALKS 3
 extern volatile int gpu_me_busy;
-extern volatile u32 gpu_me_head[2]; /* each walk's first word, physical (me.c; core/dma.c's OTC) */
+extern volatile u32 gpu_me_head[GPU_ME_WALKS]; /* each walk's first word, physical (me.c; core/dma.c's OTC) */
 extern u32 dma_otc_kept, dma_otc_synced; /* OTCs with a walk in flight that went on, that waited for it */
 /* GPUSTAT with a walk in flight: gpu_list_scan's for the last list kicked (me.c sets both at the
  * kick), read without waiting while gpu_me_stat_ok; gpu_me_reads_kept counts such reads (me.c clears it). */
