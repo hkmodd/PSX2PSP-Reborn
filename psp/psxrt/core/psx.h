@@ -434,11 +434,13 @@ void psx_video_mode(Psx *psx); /* after a GPUSTAT video mode change: the frame l
 /* mem.c */
 u32 psx_read(Psx *psx, u32 addr, int size);
 void psx_write(Psx *psx, u32 addr, u32 v, int size);
+/* The GPUSTAT bits a texpage sets (gpu_set_texpage; core/gpu.c's list scan) */
+static inline u32 gpu_texpage_stat(u32 stat, u32 tp) { return (stat & ~0x87FFu) | (tp & 0x7FF) | ((tp & 0x800) << 4); }
 /* GP0 E1 (and a textured polygon's texpage word): the texpage and the GPUSTAT bits it sets. */
 static inline void gpu_set_texpage(Gpu *g, u32 tp)
 {
     g->texpage = tp & 0x9FF;
-    g->stat = (g->stat & ~0x87FFu) | (tp & 0x7FF) | ((tp & 0x800) << 4);
+    g->stat = gpu_texpage_stat(g->stat, tp);
 }
 
 static inline u8 *psx_ram_ptr(Psx *psx, u32 addr) { return psx->ram + (addr & (RAM_SIZE - 1)); }
@@ -576,6 +578,13 @@ extern u32 *gpu_me_writes;
 extern volatile int gpu_me_busy;
 extern volatile u32 gpu_me_head; /* the walk's first word, physical (me.c; core/dma.c's OTC) */
 extern u32 dma_otc_kept, dma_otc_synced; /* OTCs with a walk in flight that went on, that waited for it */
+/* GPUSTAT with a walk in flight: gpu_list_scan's for the list walked (me.c sets both at the kick),
+ * read without waiting while gpu_me_stat_ok; gpu_me_reads_kept counts such reads (me.c clears it). */
+extern u32 gpu_me_stat, gpu_me_stat_ok, gpu_me_reads_kept;
+/* The GPU's linked list from addr, read ahead of its walk: its words (dma_list_walk's) and, in *stat,
+ * GPUSTAT as the walk leaves it; *stat_ok 0 when that depends on what the scan does not follow (an
+ * IRQ command, an image transfer, a command or transfer in progress at the start). */
+u32 gpu_list_scan(const Psx *psx, u32 addr, u32 *stat, u32 *stat_ok);
 static inline void gpu_sync(const Psx *psx, int why)
 {
     if (gpu_sync_hook && psx != gpu_me_psx)

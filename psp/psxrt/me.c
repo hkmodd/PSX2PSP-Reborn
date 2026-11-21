@@ -247,7 +247,7 @@ static volatile int in_main, in_serve, quit;
 static SceUID kick_sema = -1, serve_thread = -1;
 
 static struct {
-    u32 walks, cpu_walks, walk_us, head_us, words_bad, rpcs, stalls, polls, lost;
+    u32 walks, cpu_walks, walk_us, head_us, words_bad, rpcs, stalls, polls, lost, unscanned, stat_bad;
     u32 waits[GPU_SYNC_N], wait_us[GPU_SYNC_N];
 } st;
 
@@ -340,6 +340,7 @@ static void walk_end(void)
         psx_raise(psx, IRQ_GPU);
     ge_bind(psx);
     st.words_bad += ctl->res[0] != walk_words;
+    st.stat_bad += gpu_me_stat_ok && (mj.psx.gpu.stat != gpu_me_stat || mj.psx.gpu.xfer);
     st.walk_us += (t_done ? t_done : now()) - t_kick;
     kicked_job = JOB_NONE;
     gpu_me_busy = 0;
@@ -413,23 +414,6 @@ static int serve_main(SceSize n, void *arg)
     return 0;
 }
 
-/* The GPU list's words, from its headers: what dma_list_walk returns for it, so the DMA's time is
- * the same as with the walk on the SC. */
-static u32 list_words(const Psx *psx, u32 addr)
-{
-    u32 words = 0;
-    for (int guard = 0; guard < 0x40000; guard++) {
-        u32 h;
-        memcpy(&h, psx->ram + (addr & (RAM_SIZE - 4)), 4);
-        words += (h >> 24) + 1;
-        addr = h & 0xFFFFFF;
-        if (addr & 0x800000)
-            break;
-        addr &= 0x1FFFFC;
-    }
-    return words;
-}
-
 /* dma_list_hook: the walk goes to the ME on a copy of the GPU state and the CPU goes on; the GPU's
  * entries (gpu_sync) wait for it. Before the kick the SC's cache goes to RAM, so the ME reads the
  * list and the state as they are now. With a trace on the walk stays on the SC (the ME has no
@@ -442,7 +426,9 @@ static u32 me_walk(Psx *psx, u32 addr)
         return dma_list_walk(psx, addr);
     }
     u32 t0 = now();
-    u32 words = list_words(psx, addr);
+    /* the list's words, so the DMA's time is the same as with the walk on the SC; GPUSTAT at its end */
+    u32 words = gpu_list_scan(psx, addr, &gpu_me_stat, &gpu_me_stat_ok);
+    st.unscanned += !gpu_me_stat_ok;
     if (!mj_init)
         mj.psx = *psx, mj_init = 1;
     mj.psx.gpu = psx->gpu;
@@ -558,9 +544,10 @@ int me_log(char *line, int cap)
             n += snprintf(line + n, (size_t)(cap - n), "%s%s %u/%u", k ? ", " : "", why_name[k], (unsigned)st.waits[k],
                           (unsigned)(st.wait_us[k] / 1000));
         if (n < cap)
-            n += snprintf(line + n, (size_t)(cap - n), " n/ms); list calls %u, stalls %u, polls %u; otc kept %u synced %u\n",
-                          (unsigned)st.rpcs, (unsigned)st.stalls, (unsigned)st.polls, (unsigned)dma_otc_kept, (unsigned)dma_otc_synced);
-        dma_otc_kept = dma_otc_synced = 0;
+            n += snprintf(line + n, (size_t)(cap - n), " n/ms); list calls %u, stalls %u, polls %u; otc kept %u synced %u; reads kept %u, lists unscanned %u, stat bad %u\n",
+                          (unsigned)st.rpcs, (unsigned)st.stalls, (unsigned)st.polls, (unsigned)dma_otc_kept, (unsigned)dma_otc_synced,
+                          (unsigned)gpu_me_reads_kept, (unsigned)st.unscanned, (unsigned)st.stat_bad);
+        dma_otc_kept = dma_otc_synced = gpu_me_reads_kept = 0;
         beat0 = b;
     }
     u32 lost = st.lost;

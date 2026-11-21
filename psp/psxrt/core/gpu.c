@@ -867,20 +867,99 @@ void gpu_gp1(Psx *psx, u32 v)
     }
 }
 
+/* GPUSTAT from the GPU's state word: ready for commands, VRAM reads and DMA blocks */
+static u32 stat_word(u32 stat, int xfer)
+{
+    u32 s = stat | 0x1C000000u, dir = (s >> 29) & 3;
+    s &= ~(1u << 25);
+    if (dir == 1 || dir == 2 || (dir == 3 && xfer == 2))
+        s |= 1u << 25;
+    return s;
+}
+
+u32 gpu_me_stat, gpu_me_stat_ok, gpu_me_reads_kept;
+
+static u32 list_rd(const Psx *psx, u32 a)
+{
+    u32 v;
+    memcpy(&v, psx->ram + (a & (RAM_SIZE - 4)), 4);
+    return v;
+}
+
+/* The words as dma_list_walk hands them to gpu_gp0 (or gpu_gp0_packet, the renderer's packet: the
+ * same commands): each command's length from its first word (cmd_words), a polyline to its
+ * terminator or a full cmd[], as gpu_gp0 ends it. A command's texpage change counts once it is whole. */
+u32 gpu_list_scan(const Psx *psx, u32 addr, u32 *stat, u32 *stat_ok)
+{
+    const Gpu *g = &psx->gpu;
+    u32 words = 0, st = g->stat, tp = g->texpage, ok = !g->ncmd && !g->xfer;
+    /* the command's words still to come; 1 + the texpage word's index among them (0: none); the
+     * texpage it sets; the polyline's words so far (0: none) */
+    u32 left = 0, tpw = 0, tpv = 0, line = 0;
+    int tex = 0;
+    for (int guard = 0; guard < 0x40000; guard++) {
+        u32 h = list_rd(psx, addr), n = h >> 24;
+        for (u32 i = 1; ok && i <= n;) {
+            u32 a = addr + 4 * i;
+            if (line) {
+                u32 v = list_rd(psx, a);
+                i++;
+                if (line >= 3 && (v & 0xF000F000u) == 0x50005000u)
+                    line = 0;
+                else if (++line >= sizeof g->cmd / sizeof g->cmd[0])
+                    line = 0;
+                continue;
+            }
+            if (left) {
+                u32 m = n + 1 - i < left ? n + 1 - i : left;
+                if (tpw && tpw <= m)
+                    tpv = list_rd(psx, a + 4 * (tpw - 1)) >> 16 & 0x1FF, tpw = 0;
+                else if (tpw)
+                    tpw -= m;
+                i += m;
+                if ((left -= m) == 0 && tex) {
+                    u32 t = (tp & ~0x1FFu) | tpv;
+                    tp = t & 0x9FF, st = gpu_texpage_stat(st, t);
+                }
+                continue;
+            }
+            u32 v = list_rd(psx, a), cmd = v >> 24;
+            int pl, need = cmd_words(cmd, &pl);
+            i++;
+            if (cmd == 0x1F || (cmd >= 0xA0 && cmd < 0xE0))
+                ok = 0;
+            else if (pl)
+                line = 1;
+            else if (cmd == 0xE1)
+                tp = v & 0x9FF, st = gpu_texpage_stat(st, v);
+            else if (cmd == 0xE6)
+                st = (st & ~0x1800u) | ((v & 3) << 11);
+            else {
+                left = (u32)need - 1;
+                tex = cmd >= 0x20 && cmd < 0x40 && (cmd >> 2 & 1);
+                tpw = tex ? ((cmd >> 4 & 1) ? 5 : 4) : 0;
+            }
+        }
+        words += n + 1;
+        addr = h & 0xFFFFFF;
+        if (addr & 0x800000)
+            break;
+        addr &= 0x1FFFFC;
+    }
+    *stat = st, *stat_ok = ok;
+    return words;
+}
+
 u32 gpu_read(Psx *psx, int reg)
 {
+    if (reg && gpu_me_stat_ok && gpu_me_busy && psx != gpu_me_psx) { /* the walk's end, scanned at its kick */
+        gpu_me_reads_kept++;
+        return stat_word(gpu_me_stat, 0);
+    }
     gpu_sync(psx, GPU_SYNC_READ);
     Gpu *g = &psx->gpu;
-    if (reg) {
-        u32 s = g->stat | 0x1C000000u; /* ready for commands, VRAM reads and DMA blocks */
-        u32 dir = (s >> 29) & 3;
-        s &= ~(1u << 25);
-        if (dir == 1 || dir == 2)
-            s |= 1u << 25;
-        else if (dir == 3 && g->xfer == 2)
-            s |= 1u << 25;
-        return s;
-    }
+    if (reg)
+        return stat_word(g->stat, g->xfer);
     if (g->xfer == 2) {
         u16 lo = 0, hi = 0;
         if (!xfer_pixel(psx, &lo, 0))
