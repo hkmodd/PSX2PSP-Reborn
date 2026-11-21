@@ -634,6 +634,61 @@ void spu_run(Psx *psx);
 void spu_sync(Psx *psx);
 /* SPU RAM was written other than through the SPU's ports (a snapshot loaded) */
 void spu_ram_changed(void);
+/* cdrom.c, around a change of what the CD input plays: spu_xa_sync before an XA sector looks at
+ * the play cursor (it is the SPU's at the sector's cycle after it); spu_cd_changed after the CD
+ * volumes or mute (what = SPU_CD_VOL) or the queue (SPU_CD_XA) changed. */
+enum { SPU_CD_VOL, SPU_CD_XA };
+void spu_xa_sync(Psx *psx);
+void spu_cd_changed(Psx *psx, int what);
+/* The CD input's queue the mix reads: the CD's own (NULL), or the front's while the SPU runs on
+ * another core (cdrom.c) */
+extern const s16 *cd_xa_src;
+
+/* The SPU on another core (psxrt's ME). The CPU's side, the front, keeps the registers the game
+ * writes (regs, ctrl, the transfer and IRQ addresses) and answers their reads; every write, SPU
+ * RAM transfer, CD input change and vblank flush goes as an event, stamped with the CPU's cycle,
+ * into a ring that the back (an Spu on a Psx of its own, bk) applies in order with the same code
+ * at the same cycles. A read of what the mix changes (envelopes, ENDX, levels, SPUSTAT, SPU RAM)
+ * waits until the back applied every event and ran up to the read's cycle. Between events the
+ * back may run ahead up to the last beacon, the CPU's time: no event comes earlier. W + X (every
+ * write syncs, the XA cursor on the SPU clock) make the mix the same wherever it is cut, so the
+ * audio is inline's bit for bit. An IRQ enable (SPUCNT bit 6) brings the SPU back inline. */
+typedef struct {
+    u64 cycle;
+    u32 addr, v; /* addr: a port 1F801C00-1F801FFF, or SPU_EV_* */
+} SpuEv;
+enum { SPU_EV_DMAW = 1, SPU_EV_DMAR, SPU_EV_CD, SPU_EV_XARD, SPU_EV_XAWR, SPU_EV_FLUSH };
+enum { SPU_ME_BEACON, SPU_ME_WAIT, SPU_ME_FULL, SPU_ME_OFF };
+typedef struct SpuMe {
+    SpuEv *ring;          /* size events, a power of two (the PSP: uncached) */
+    u32 size;
+    volatile u32 *wr, *rd; /* events pushed (the front), applied (the back); free-running */
+    Psx *bk;              /* the back's Psx, as the back uses it */
+    const Psx *bk_view;   /* the same, as the front reads it after a wait (the PSP: uncached) */
+    const u8 *ram_view;   /* SPU RAM, as the front reads it after a wait */
+    const s16 *xa_view;   /* the front's CD queue, as the back reads it */
+    /* WAIT: on return the back applied every event and ran up to cycle, and the views show it;
+     * BEACON: the back may run up to cycle; FULL: the ring is full, make room; OFF: the back stops */
+    void (*kick)(struct SpuMe *m, u64 cycle, int why);
+    void (*wb)(const void *p, u32 n); /* the front's writes in p..p+n to RAM before an event says so (NULL: none) */
+    void *user;
+    u32 waits, fulls, offs; /* the front's counts: reads that waited, full rings, IRQ enables */
+    u64 clean_at;         /* a wait at this cycle, no event that writes SPU RAM since (~0: none) */
+} SpuMe;
+extern SpuMe *spu_me; /* NULL: the SPU runs inline */
+/* The SPU moves to m's back from here; 0 (and it stays inline) when the host's mixer or the IRQ is on.
+ * m->bk is set up from the Psx; m->bk->host must be set by the caller after (audio from the back). */
+int spu_me_on(Psx *psx, SpuMe *m);
+/* Back inline: the back runs up to the CPU's time, its state becomes the Psx's */
+void spu_me_off(Psx *psx);
+/* The back: every event pushed applied in order, then the mix up to `until` (no later than a beacon
+ * or a wait's cycle), at most `max` samples (0: no limit); 1 when it got there */
+int spu_me_run(SpuMe *m, u64 until, u32 max);
+static inline void spu_beacon(Psx *psx)
+{
+    if (spu_me)
+        spu_me->kick(spu_me, psx->cycles, SPU_ME_BEACON);
+}
 
 /* Voices played by a mixer of the host's (the PSP's sceSasCore on the Media Engine). Mode 0: the
  * SPU mixes every voice; 1: the host may take voices at key on; 2: the host takes them and the

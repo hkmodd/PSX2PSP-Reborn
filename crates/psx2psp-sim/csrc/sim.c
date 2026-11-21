@@ -73,6 +73,67 @@ static const u8 *ran_ram;
 static u32 watchw_at[8], watchw_val[8], watchw_pc, watchw_frame;
 static int nwatchw;
 
+/* PSX2PSP_SIM_SPUME=1|r<seed>: the SPU through psxrt's front and back (SpuMe, core/psx.h) in this
+ * thread, as the PSP's ME runs it. 1: the back runs up to every beacon; r: it runs at random
+ * beacons, a random number of samples ahead, so the mix is cut where inline never cuts it. The
+ * audio (PSX2PSP_SIM_AUDIO) must be inline's bit for bit. */
+static SpuMe sme;
+static Psx sme_bk;
+static PsxHost sme_host;
+static SpuEv sme_ring[1024];
+static volatile u32 sme_wr, sme_rd;
+static int sme_random;
+static u32 sme_seed, sme_runs;
+
+static u32 sme_rand(void) { return sme_seed = sme_seed * 1664525u + 1013904223u; }
+
+static void sme_kick(SpuMe *m, u64 cycle, int why)
+{
+    if (why == SPU_ME_OFF)
+        return;
+    if (why == SPU_ME_BEACON) {
+        if (sme_random && (sme_rand() >> 28) > 3) /* 1 in 4 */
+            return;
+        sme_runs++;
+        spu_me_run(m, cycle, sme_random ? 1 + (sme_rand() >> 23) : 0);
+        return;
+    }
+    spu_me_run(m, cycle, 0);
+}
+
+static void sme_on(Sim *s)
+{
+    const char *e = getenv("PSX2PSP_SIM_SPUME");
+    if (!e)
+        return;
+    sme_random = *e == 'r';
+    sme_seed = sme_random ? (u32)strtoul(e + 1, NULL, 10) : 0;
+    sme.ring = sme_ring, sme.size = sizeof sme_ring / sizeof sme_ring[0];
+    sme.wr = &sme_wr, sme.rd = &sme_rd;
+    sme.bk = &sme_bk, sme.bk_view = &sme_bk;
+    sme.ram_view = s->spu_ram;
+    sme.xa_view = s->psx.cd.xa_fifo;
+    sme.kick = sme_kick;
+    if (!spu_me_on(&s->psx, &sme)) {
+        log_line(s, "spume: refused (host mixer or IRQ on)");
+        return;
+    }
+    sme_host = s->host;
+    sme_host.log = NULL; /* the ME has no log */
+    sme_bk.host = &sme_host;
+    log_line(s, sme_random ? "spume: on, the back runs at random beacons" : "spume: on, the back runs at every beacon");
+}
+
+static void sme_report(Sim *s)
+{
+    if (!sme.kick)
+        return;
+    char line[160];
+    snprintf(line, sizeof line, "spume: %s; waits %u, ring full %u, IRQ fallbacks %u, beacon runs %u", spu_me ? "on" : "off",
+             (unsigned)sme.waits, (unsigned)sme.fulls, (unsigned)sme.offs, (unsigned)sme_runs);
+    log_line(s, line);
+}
+
 Sim *sim_new(void *user, ReadFn rd, u32 disc_end, TextFn tty, TextFn log)
 {
     Sim *s = (Sim *)calloc(1, sizeof(Sim));
@@ -122,6 +183,7 @@ Sim *sim_new(void *user, ReadFn rd, u32 disc_end, TextFn tty, TextFn log)
         sim_ge = 1;
         ge_shadow_init(&s->psx);
     }
+    sme_on(s);
     return s;
 }
 
@@ -129,6 +191,9 @@ static void watch_reset(void);
 
 void sim_free(Sim *s)
 {
+    sme_report(s);
+    if (spu_me) /* what the back mixed after the last vblank stays unplayed, as inline */
+        spu_me_off(&s->psx);
     watch_reset();
     free(s);
 }

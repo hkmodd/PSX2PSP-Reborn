@@ -4,10 +4,11 @@
  * cdrom.c), the reverb unit, the capture buffers and the IRQ address; mixed at 44100 Hz into
  * PsxHost.audio.
  *
- * The SPU runs lazily: up to the CPU's time at every vblank and when the guest keys voices on or
- * off or reads what the voices did (ENDX, envelope levels), in chunks of up to SPU_CHUNK samples:
- * voice by voice over the chunk (each voice's output is the next one's pitch modulation), then the
- * mix sample by sample. Other register writes take effect at the next sync.
+ * The SPU runs lazily: up to the CPU's time at every vblank, before every write and before every
+ * read of what the mix changes, in chunks of up to SPU_CHUNK samples: voice by voice over the chunk
+ * (each voice's output is the next one's pitch modulation), then the mix sample by sample. So a
+ * write takes effect at its own cycle and the output does not depend on where the mix is cut,
+ * which lets it run on another core (SpuMe, psx.h).
  *
  * Voice decode, ADSR and the XA decoder in cdrom.c follow RecompOne's Spu.cs/XaAudio.cs:
  * https://github.com/BlackLabelHQ/RecompOne, under this licence:
@@ -857,27 +858,49 @@ static void status(Spu *s)
     s->stat = (u16)((s->stat & 0x840) | (s->ctrl & 0x3F) | ((s->ctrl >> 5) & 1) << 7 | (mode == 2) << 8 | (mode == 3) << 9);
 }
 
-u16 spu_read(Psx *psx, u32 addr)
+/* What the mix changes: a voice's envelope level and repeat address, its current volumes, ENDX,
+ * SPUSTAT (the capture half), the current main volumes. */
+static int is_state(u32 addr)
 {
-    Spu *s = &psx->spu;
     u32 off = addr - 0x1F801C00u;
-    if (off < 0x180 && (off & 0xC) == 0xC) {
-        sync(psx);
-        SpuVoice *v = &s->v[off >> 4];
+    return (off < 0x180 && (off & 0xC) == 0xC) || (addr >= 0x1F801E00 && addr < 0x1F801E60) || addr == 0x1F801D9C || addr == 0x1F801D9E ||
+           addr == 0x1F801DAE || addr == 0x1F801DB8 || addr == 0x1F801DBA;
+}
+
+static u16 state(const Spu *s, u32 addr)
+{
+    u32 off = addr - 0x1F801C00u;
+    if (off < 0x180) {
+        const SpuVoice *v = &s->v[off >> 4];
         return (off & 2) ? (u16)(v->repeat >> 3) : (u16)v->env;
     }
-    if (addr >= 0x1F801E00 && addr < 0x1F801E60) { /* current voice volumes */
-        SpuSweep *w = &s->v[(addr - 0x1F801E00) >> 2].vol[(addr >> 1) & 1];
-        return (u16)w->level;
-    }
+    if (addr >= 0x1F801E00 && addr < 0x1F801E60) /* current voice volumes */
+        return (u16)s->v[(addr - 0x1F801E00) >> 2].vol[(addr >> 1) & 1].level;
     switch (addr) {
-    case 0x1F801D9C: sync(psx); return (u16)s->endx;
-    case 0x1F801D9E: sync(psx); return (u16)(s->endx >> 16);
-    case 0x1F801DA6: return (u16)(s->xfer_addr >> 3);
-    case 0x1F801DAA: return s->ctrl;
+    case 0x1F801D9C: return (u16)s->endx;
+    case 0x1F801D9E: return (u16)(s->endx >> 16);
     case 0x1F801DAE: return s->stat;
     case 0x1F801DB8: return (u16)s->main[0].level;
-    case 0x1F801DBA: return (u16)s->main[1].level;
+    }
+    return (u16)s->main[1].level; /* 1F801DBA */
+}
+
+static void me_wait(Psx *psx);
+
+/* A read of what the mix changes is the mix's at the read's cycle, wherever the syncs fall */
+u16 spu_read(Psx *psx, u32 addr)
+{
+    if (is_state(addr)) {
+        if (!spu_me) {
+            sync(psx);
+            return state(&psx->spu, addr);
+        }
+        me_wait(psx);
+        return state(&spu_me->bk_view->spu, addr);
+    }
+    switch (addr) {
+    case 0x1F801DA6: return (u16)(psx->spu.xfer_addr >> 3);
+    case 0x1F801DAA: return psx->spu.ctrl;
     }
     return R(addr);
 }
@@ -899,7 +922,7 @@ static void transfer(Psx *psx, u16 v)
     s->xfer_addr = (a + 2) & 0x7FFFF;
 }
 
-void spu_write(Psx *psx, u32 addr, u16 v)
+static void write_reg(Psx *psx, u32 addr, u16 v)
 {
     Spu *s = &psx->spu;
     u32 off = addr - 0x1F801C00u;
@@ -955,30 +978,228 @@ void spu_write(Psx *psx, u32 addr, u16 v)
     }
 }
 
-void spu_dma_write(Psx *psx, u32 v)
+static void spu_xfer_in(Psx *psx, u32 v)
 {
     sync(psx); /* the voices read SPU RAM as it was before the transfer's cycle */
     transfer(psx, (u16)v);
     transfer(psx, (u16)(v >> 16));
 }
 
-u32 spu_dma_read(Psx *psx)
+/* Two halfwords from SPU RAM at the transfer address (`ram`: as the caller sees it) */
+static u32 dma_take(Spu *s, const u8 *ram)
 {
-    Spu *s = &psx->spu;
     u32 v = 0;
-    sync(psx); /* the capture buffers up to the transfer's cycle */
     for (int i = 0; i < 2; i++) {
         u32 a = s->xfer_addr & 0x7FFFE;
-        v |= (u32)(s->ram[a] | s->ram[a + 1] << 8) << (16 * i);
+        v |= (u32)(ram[a] | ram[a + 1] << 8) << (16 * i);
         s->xfer_addr = (s->xfer_addr + 2) & 0x7FFFF;
     }
     return v;
 }
 
+static u32 spu_xfer_out(Psx *psx)
+{
+    sync(psx); /* the capture buffers up to the transfer's cycle */
+    return dma_take(&psx->spu, psx->spu.ram);
+}
+
+/* ---- the SPU on another core (psx.h, SpuMe) ---- */
+
+SpuMe *spu_me;
+
+/* The ring's order between the cores: an event's words before its index */
+#if defined(__mips__)
+#define SPU_ME_SYNC() __asm__ volatile("sync" : : : "memory")
+#elif defined(__GNUC__)
+#define SPU_ME_SYNC() __asm__ volatile("" : : : "memory")
+#else
+#define SPU_ME_SYNC() ((void)0)
+#endif
+
+/* The front: an event at the CPU's cycle; a full ring waits for the back to make room. */
+static void push(Psx *psx, u32 addr, u32 v)
+{
+    SpuMe *m = spu_me;
+    u32 w = *m->wr;
+    if (w - *m->rd >= m->size) {
+        m->fulls++;
+        m->kick(m, psx->cycles, SPU_ME_FULL);
+    }
+    SpuEv *e = &m->ring[w & (m->size - 1)];
+    e->cycle = psx->cycles, e->addr = addr, e->v = v;
+    SPU_ME_SYNC();
+    *m->wr = w + 1;
+    if (addr == 0x1F801DA8 || addr == SPU_EV_DMAW)
+        m->clean_at = ~(u64)0;
+}
+
+/* The front: the back applied every event and ran up to the CPU's cycle */
+static void me_wait(Psx *psx)
+{
+    SpuMe *m = spu_me;
+    m->waits++;
+    m->kick(m, psx->cycles, SPU_ME_WAIT);
+    m->clean_at = psx->cycles;
+}
+
+/* The back: one event, at its cycle (never earlier than where the back is) */
+static void apply(Psx *bk, const SpuEv *e)
+{
+    u32 a = e->addr;
+    Cdrom *cd = &bk->cd;
+    if (e->cycle > bk->cycles)
+        bk->cycles = e->cycle;
+    if (a >= 0x1F801C00u) {
+        write_reg(bk, a, (u16)e->v);
+        return;
+    }
+    switch (a & 0xFF) {
+    case SPU_EV_DMAW: spu_xfer_in(bk, e->v); break;
+    case SPU_EV_DMAR: spu_xfer_out(bk); break;
+    case SPU_EV_CD:
+        sync(bk);
+        cd->muted = (int)(a >> 8 & 1);
+        for (int k = 0; k < 4; k++)
+            cd->vol[k] = (u8)(e->v >> (8 * k));
+        break;
+    case SPU_EV_XARD: sync(bk), cd->xa_on = (u8)(a >> 8 & 1), cd->xa_rd = e->v; break;
+    case SPU_EV_XAWR: sync(bk), cd->xa_wr = e->v; break;
+    case SPU_EV_FLUSH: sync(bk), flush(bk); break;
+    }
+}
+
+int spu_me_run(SpuMe *m, u64 until, u32 max)
+{
+    Psx *bk = m->bk;
+    u32 r = *m->rd;
+    for (u32 w = *m->wr; r != w; w = *m->wr) {
+        SPU_ME_SYNC();
+        apply(bk, &m->ring[r & (m->size - 1)]);
+        *m->rd = ++r;
+    }
+    u64 to = until;
+    if (max && to > bk->spu.last + (u64)max * CYCLES_PER_SAMPLE)
+        to = bk->spu.last + (u64)max * CYCLES_PER_SAMPLE;
+    if (to > bk->cycles) {
+        bk->cycles = to;
+        sync(bk);
+    }
+    return to == until || bk->cycles >= until;
+}
+
+int spu_me_on(Psx *psx, SpuMe *m)
+{
+    if (hw_mode || (psx->spu.ctrl & 0x40))
+        return 0;
+    Psx *bk = m->bk;
+    *bk = *psx;
+    bk->trace = 0;
+    psx->spu.nout = 0; /* what is mixed and not out yet goes out from the back */
+    *m->wr = *m->rd = 0;
+    m->clean_at = ~(u64)0;
+    cd_xa_src = m->xa_view;
+    spu_me = m;
+    return 1;
+}
+
+void spu_me_off(Psx *psx)
+{
+    SpuMe *m = spu_me;
+    if (!m)
+        return;
+    m->kick(m, psx->cycles, SPU_ME_WAIT);
+    const Psx *b = m->bk_view;
+    psx->spu = b->spu;
+    psx->cd.xa_on = b->cd.xa_on, psx->cd.xa_rd = b->cd.xa_rd;
+    spu_me = NULL;
+    cd_xa_src = NULL;
+    m->kick(m, psx->cycles, SPU_ME_OFF);
+}
+
+/* ---- the ports: inline, or the front ---- */
+
+void spu_write(Psx *psx, u32 addr, u16 v)
+{
+    if (spu_me) {
+        if (addr != 0x1F801DAA || !(v & 0x40)) {
+            Spu *s = &psx->spu;
+            R(addr) = v;
+            switch (addr) {
+            case 0x1F801DA4: s->irq_addr = (u32)v << 3; break;
+            case 0x1F801DA6: s->xfer_addr = (u32)v << 3; break;
+            case 0x1F801DA8: s->xfer_addr = ((s->xfer_addr & 0x7FFFE) + 2) & 0x7FFFF; break;
+            case 0x1F801DAA: s->ctrl = v; break;
+            }
+            push(psx, addr, v);
+            return;
+        }
+        spu_me->offs++; /* the IRQ: the mix at the CPU's pace from here */
+        spu_me_off(psx);
+    }
+    write_reg(psx, addr, v);
+}
+
+void spu_dma_write(Psx *psx, u32 v)
+{
+    if (!spu_me) {
+        spu_xfer_in(psx, v);
+        return;
+    }
+    Spu *s = &psx->spu;
+    for (int i = 0; i < 2; i++)
+        s->xfer_addr = ((s->xfer_addr & 0x7FFFE) + 2) & 0x7FFFF;
+    push(psx, SPU_EV_DMAW, v);
+}
+
+u32 spu_dma_read(Psx *psx)
+{
+    if (!spu_me)
+        return spu_xfer_out(psx);
+    if (spu_me->clean_at != psx->cycles) /* the words of one transfer after the first: nothing new */
+        me_wait(psx);
+    u32 v = dma_take(&psx->spu, spu_me->ram_view);
+    push(psx, SPU_EV_DMAR, 0);
+    return v;
+}
+
 void spu_run(Psx *psx)
 {
+    if (spu_me) {
+        push(psx, SPU_EV_FLUSH, 0);
+        return;
+    }
     sync(psx);
     flush(psx);
 }
 
-void spu_sync(Psx *psx) { sync(psx); }
+void spu_sync(Psx *psx)
+{
+    if (!spu_me) /* the change goes to the back as an event at its cycle */
+        sync(psx);
+}
+
+void spu_xa_sync(Psx *psx)
+{
+    if (!spu_me) {
+        sync(psx);
+        return;
+    }
+    me_wait(psx);
+    psx->cd.xa_on = spu_me->bk_view->cd.xa_on, psx->cd.xa_rd = spu_me->bk_view->cd.xa_rd;
+}
+
+void spu_cd_changed(Psx *psx, int what)
+{
+    SpuMe *m = spu_me;
+    if (!m)
+        return;
+    Cdrom *cd = &psx->cd;
+    if (what == SPU_CD_VOL) {
+        push(psx, SPU_EV_CD | (u32)(cd->muted != 0) << 8, (u32)cd->vol[0] | (u32)cd->vol[1] << 8 | (u32)cd->vol[2] << 16 | (u32)cd->vol[3] << 24);
+        return;
+    }
+    if (m->wb) /* the samples in RAM before the back may read them */
+        m->wb(cd->xa_fifo, sizeof cd->xa_fifo);
+    push(psx, SPU_EV_XARD | (u32)(cd->xa_on != 0) << 8, cd->xa_rd);
+    push(psx, SPU_EV_XAWR, cd->xa_wr);
+}

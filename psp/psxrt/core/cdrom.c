@@ -274,8 +274,8 @@ static void command(Psx *psx, u8 c)
         later = 0x2000;
         ack = psx->cycles + INIT_ACK;
         break;
-    case 0x0B: spu_sync(psx), cd->muted = 1; resp_stat(psx, 3, ack); break;
-    case 0x0C: spu_sync(psx), cd->muted = 0; resp_stat(psx, 3, ack); break;
+    case 0x0B: spu_sync(psx), cd->muted = 1, spu_cd_changed(psx, SPU_CD_VOL); resp_stat(psx, 3, ack); break;
+    case 0x0C: spu_sync(psx), cd->muted = 0, spu_cd_changed(psx, SPU_CD_VOL); resp_stat(psx, 3, ack); break;
     case 0x0D: /* Setfilter */
         cd->filter_file = p[0], cd->filter_chan = p[1];
         resp_stat(psx, 3, ack);
@@ -475,6 +475,7 @@ void cd_write(Psx *psx, int reg, u8 v)
         if (v & 0x20) {
             spu_sync(psx); /* the new volumes from this cycle on */
             memcpy(cd->vol, cd->vol_next, 4);
+            spu_cd_changed(psx, SPU_CD_VOL);
         }
         break;
     }
@@ -605,7 +606,7 @@ static void xa_sector(Psx *psx, const u8 *raw)
             cd->xa_prev[ch][0] = h0, cd->xa_prev[ch][1] = h1;
         }
     }
-    spu_sync(psx); /* the samples before this sector's cycle are mixed without it */
+    spu_xa_sync(psx); /* the samples before this sector's cycle are mixed without it; the cursor is theirs */
     if (!cd->xa_on || (s32)(cd->xa_wr - cd->xa_rd) < 0) { /* a stream starts, or goes on after it ran dry */
         xa_stop(cd);
         cd->xa_on = 1;
@@ -622,11 +623,15 @@ static void xa_sector(Psx *psx, const u8 *raw)
         cd->xa_phase -= 0x10000;
         cd->xa_last[0] = (s16)l, cd->xa_last[1] = (s16)r;
     }
+    spu_cd_changed(psx, SPU_CD_XA);
 }
+
+const s16 *cd_xa_src;
 
 void cd_audio(Psx *psx, s32 *l, s32 *r, int n)
 {
     Cdrom *cd = &psx->cd;
+    const s16 *fifo = cd_xa_src ? cd_xa_src : cd->xa_fifo;
     const s32 v0 = cd->vol[0], v1 = cd->vol[1], v2 = cd->vol[2], v3 = cd->vol[3];
     const int muted = cd->muted; /* the samples are used up all the same */
     for (int k = 0; k < n; k++) {
@@ -637,7 +642,7 @@ void cd_audio(Psx *psx, s32 *l, s32 *r, int n)
             if (lead > 0) {
                 u32 i = rd % CD_XA_FIFO;
                 if (!muted)
-                    a = cd->xa_fifo[2 * i], b = cd->xa_fifo[2 * i + 1];
+                    a = fifo[2 * i], b = fifo[2 * i + 1];
             } else if (-lead >= CD_XA_LOST) {
                 xa_stop(cd);
             }

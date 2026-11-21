@@ -177,6 +177,7 @@ void psx_update(Psx *psx)
     MARK(UPD_CD);
     sio_update(psx);
     MARK(UPD_SIO);
+    spu_beacon(psx); /* the SPU on another core may run up to here */
 #undef MARK
 }
 
