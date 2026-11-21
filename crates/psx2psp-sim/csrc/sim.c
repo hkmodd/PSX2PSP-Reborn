@@ -134,6 +134,84 @@ static void sme_report(Sim *s)
     log_line(s, line);
 }
 
+/* PSX2PSP_SIM_MEWALK=1: the GPU's lists as psxrt's ME walks them (psp/psxrt/me.c, me_walk and
+ * walk_end): on a copy of the Psx with its own Gpu, and the CPU goes on until an entry of the GPU
+ * waits for it (gpu_sync), with GPUSTAT read from gpu_list_scan meanwhile and the walk's GPU IRQ
+ * raised at the wait. Here the walk runs whole at the kick and its Gpu comes back at the wait.
+ * Pictures and audio must be the walk on the CPU's; the waits by cause are the PSP's (2:1 gp1 to
+ * vblank on Sheep Dog, as its L2c log). */
+static Psx mw_psx, *mw_game;
+static PsxHost mw_host;
+static u32 mw_writes, mw_walks, mw_cpu_walks, mw_waits[GPU_SYNC_N], mw_stat_bad, mw_words_bad;
+static int mw_init;
+
+static void mw_sync(int why)
+{
+    if (!gpu_me_busy)
+        return;
+    Psx *psx = mw_game;
+    psx->gpu = mw_psx.gpu;
+    gpu_writes += mw_writes;
+    if (mw_psx.i_stat & (1u << IRQ_GPU))
+        psx_raise(psx, IRQ_GPU);
+    mw_stat_bad += gpu_me_stat_ok && (psx->gpu.stat != gpu_me_stat || psx->gpu.xfer);
+    mw_waits[why]++;
+    gpu_me_busy = 0;
+}
+
+static u32 mw_walk(Psx *psx, u32 addr)
+{
+    mw_sync(GPU_SYNC_DMA);
+    if (psx->trace) {
+        mw_cpu_walks++;
+        return dma_list_walk(psx, addr);
+    }
+    u32 words = gpu_list_scan(psx, addr, &gpu_me_stat, &gpu_me_stat_ok);
+    if (!mw_init)
+        mw_psx = *psx, mw_init = 1;
+    mw_psx.gpu = psx->gpu;
+    mw_psx.ram = psx->ram;
+    mw_psx.trace = 0;
+    mw_psx.i_stat = 0;
+    mw_host = *psx->host;
+    mw_host.log = NULL;
+    mw_host.usec = NULL;
+    mw_psx.host = &mw_host;
+    mw_writes = 0;
+    mw_words_bad += dma_list_walk(&mw_psx, addr) != words;
+    mw_game = psx;
+    gpu_me_head = addr;
+    gpu_me_busy = 1;
+    mw_walks++;
+    return words;
+}
+
+static void mw_on(void)
+{
+    const char *e = getenv("PSX2PSP_SIM_MEWALK");
+    if (!e)
+        return;
+    gpu_me_psx = &mw_psx;
+    gpu_me_writes = &mw_writes;
+    gpu_sync_hook = mw_sync;
+    dma_list_hook = mw_walk;
+}
+
+static void mw_report(Sim *s)
+{
+    if (!dma_list_hook)
+        return;
+    char line[256];
+    int n = snprintf(line, sizeof line, "mewalk: walks %u (%u on the CPU), words bad %u, stat bad %u, reads kept %u; waits",
+                     (unsigned)mw_walks, (unsigned)mw_cpu_walks, (unsigned)mw_words_bad, (unsigned)mw_stat_bad,
+                     (unsigned)gpu_me_reads_kept);
+    static const char *const why[GPU_SYNC_N] = {"read", "gp0", "gp1", "vblank", "dma", "ge", "other"};
+    for (int k = 0; k < GPU_SYNC_N && n < (int)sizeof line; k++)
+        n += snprintf(line + n, sizeof line - (size_t)n, " %s %u", why[k], (unsigned)mw_waits[k]);
+    log_line(s, line);
+    dma_list_hook = NULL, gpu_sync_hook = NULL, gpu_me_psx = NULL, gpu_me_writes = NULL;
+}
+
 Sim *sim_new(void *user, ReadFn rd, u32 disc_end, TextFn tty, TextFn log)
 {
     Sim *s = (Sim *)calloc(1, sizeof(Sim));
@@ -184,6 +262,7 @@ Sim *sim_new(void *user, ReadFn rd, u32 disc_end, TextFn tty, TextFn log)
         ge_shadow_init(&s->psx);
     }
     sme_on(s);
+    mw_on();
     return s;
 }
 
@@ -192,6 +271,7 @@ static void watch_reset(void);
 void sim_free(Sim *s)
 {
     sme_report(s);
+    mw_report(s);
     if (spu_me) /* what the back mixed after the last vblank stays unplayed, as inline */
         spu_me_off(&s->psx);
     watch_reset();
