@@ -344,7 +344,9 @@ void (*gpu_sync_hook)(int why);
 Psx *gpu_me_psx;
 u32 *gpu_me_writes;
 volatile int gpu_me_busy;
-volatile u32 gpu_me_head;
+volatile u32 gpu_me_head[2];
+int gpu_me_keep04;
+u32 gpu_me_gp1_04, gpu_me_gp1_kept;
 static int poly_slow; /* read only with a clock (never on the ME), so never written there */
 
 static void draw_polygon(Psx *psx, const u32 *c)
@@ -809,8 +811,26 @@ void gpu_picture(const Psx *psx, int w, int h, int *x0, int *y0, int *x1, int *y
         *x0 = c, *x1 = d;
 }
 
+static void gp1_dir(Gpu *g, u32 v)
+{
+    g->dma_dir = v & 3;
+    g->stat = (g->stat & ~0x60000000u) | ((v & 3) << 29);
+}
+
+void gpu_me_gp1_done(Psx *psx)
+{
+    if (gpu_me_gp1_04)
+        gp1_dir(&psx->gpu, gpu_me_gp1_04), gpu_me_gp1_04 = 0;
+}
+
 void gpu_gp1(Psx *psx, u32 v)
 {
+    if ((v >> 24) == 0x04 && gpu_me_busy && gpu_me_keep04 && psx != gpu_me_psx) {
+        gpu_me_gp1_04 = v;
+        gpu_me_stat = (gpu_me_stat & ~0x60000000u) | ((v & 3) << 29);
+        gpu_me_gp1_kept++;
+        return;
+    }
     gpu_sync(psx, GPU_SYNC_GP1);
     Gpu *g = &psx->gpu;
     switch (v >> 24) {
@@ -821,10 +841,7 @@ void gpu_gp1(Psx *psx, u32 v)
         g->stat = (g->stat & ~(1u << 23)) | ((v & 1) << 23);
         g->disp_enabled = !(v & 1);
         break;
-    case 0x04:
-        g->dma_dir = v & 3;
-        g->stat = (g->stat & ~0x60000000u) | ((v & 3) << 29);
-        break;
+    case 0x04: gp1_dir(g, v); break;
     case 0x05: {
         int x = (int)(v & 0x3FE), y = (int)((v >> 10) & 0x1FF);
         if (g->disp_x != x || g->disp_y != y) {
@@ -889,10 +906,16 @@ static u32 list_rd(const Psx *psx, u32 a)
 /* The words as dma_list_walk hands them to gpu_gp0 (or gpu_gp0_packet, the renderer's packet: the
  * same commands): each command's length from its first word (cmd_words), a polyline to its
  * terminator or a full cmd[], as gpu_gp0 ends it. A command's texpage change counts once it is whole. */
-u32 gpu_list_scan(const Psx *psx, u32 addr, u32 *stat, u32 *stat_ok)
+void gpu_scan_from(const Psx *psx, GpuScan *s)
 {
     const Gpu *g = &psx->gpu;
-    u32 words = 0, st = g->stat, tp = g->texpage, ok = !g->ncmd && !g->xfer;
+    s->stat = g->stat, s->tp = g->texpage, s->ok = !g->ncmd && !g->xfer, s->open = 0;
+}
+
+u32 gpu_list_scan(const Psx *psx, u32 addr, GpuScan *s)
+{
+    const Gpu *g = &psx->gpu;
+    u32 words = 0, st = s->stat, tp = s->tp, ok = s->ok && !s->open;
     /* the command's words still to come; 1 + the texpage word's index among them (0: none); the
      * texpage it sets; the polyline's words so far (0: none) */
     u32 left = 0, tpw = 0, tpv = 0, line = 0;
@@ -946,7 +969,7 @@ u32 gpu_list_scan(const Psx *psx, u32 addr, u32 *stat, u32 *stat_ok)
             break;
         addr &= 0x1FFFFC;
     }
-    *stat = st, *stat_ok = ok;
+    s->stat = st, s->tp = tp, s->ok = ok, s->open = left || line;
     return words;
 }
 

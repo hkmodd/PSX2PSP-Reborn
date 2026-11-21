@@ -579,20 +579,36 @@ extern u32 gpu_writes;  /* VRAM writes so far (draw commands and transfers): wha
  * counts its VRAM writes in *gpu_me_writes, on the ME's side. All three NULL everywhere else.
  * gpu_me_busy is nonzero while a walk is in flight (set and cleared by me.c, on the CPU): code
  * that must not call out (io_fast.c) leaves the GPU's state alone while it is. */
-enum { GPU_SYNC_READ, GPU_SYNC_GP0, GPU_SYNC_GP1, GPU_SYNC_VBLANK, GPU_SYNC_DMA, GPU_SYNC_GE, GPU_SYNC_OTHER, GPU_SYNC_N };
+/* Why: the GPU's entries; OTC over a list in flight; a list kicked with two in flight (KICK3) or
+ * after one the scan could not follow (UNSCANNED), so not queued behind it. */
+enum { GPU_SYNC_READ, GPU_SYNC_GP0, GPU_SYNC_GP1, GPU_SYNC_VBLANK, GPU_SYNC_DMA, GPU_SYNC_GE, GPU_SYNC_OTHER,
+       GPU_SYNC_OTC, GPU_SYNC_KICK3, GPU_SYNC_UNSCANNED, GPU_SYNC_N };
 extern void (*gpu_sync_hook)(int why);
 extern Psx *gpu_me_psx;
 extern u32 *gpu_me_writes;
+/* walks in flight: 1, or 2 with a list queued behind the first (the hook's, gpu_me_keep04) */
 extern volatile int gpu_me_busy;
-extern volatile u32 gpu_me_head; /* the walk's first word, physical (me.c; core/dma.c's OTC) */
+extern volatile u32 gpu_me_head[2]; /* each walk's first word, physical (me.c; core/dma.c's OTC) */
 extern u32 dma_otc_kept, dma_otc_synced; /* OTCs with a walk in flight that went on, that waited for it */
-/* GPUSTAT with a walk in flight: gpu_list_scan's for the list walked (me.c sets both at the kick),
- * read without waiting while gpu_me_stat_ok; gpu_me_reads_kept counts such reads (me.c clears it). */
+/* GPUSTAT with a walk in flight: gpu_list_scan's for the last list kicked (me.c sets both at the
+ * kick), read without waiting while gpu_me_stat_ok; gpu_me_reads_kept counts such reads (me.c clears it). */
 extern u32 gpu_me_stat, gpu_me_stat_ok, gpu_me_reads_kept;
-/* The GPU's linked list from addr, read ahead of its walk: its words (dma_list_walk's) and, in *stat,
- * GPUSTAT as the walk leaves it; *stat_ok 0 when that depends on what the scan does not follow (an
- * IRQ command, an image transfer, a command or transfer in progress at the start). */
-u32 gpu_list_scan(const Psx *psx, u32 addr, u32 *stat, u32 *stat_ok);
+/* With gpu_me_keep04 (a hook that queues lists), GP1 04 with a walk in flight does not wait: no walk
+ * reads or writes the DMA direction. It goes into gpu_me_stat at once and into the Gpu when the walks
+ * are done (gpu_me_gp1_done, the hook's, after their state is back); gpu_me_gp1_kept counts them. */
+extern int gpu_me_keep04;
+extern u32 gpu_me_gp1_04, gpu_me_gp1_kept;
+void gpu_me_gp1_done(Psx *psx);
+/* The GPU's state a list starts from and, after gpu_list_scan, the one its walk leaves: GPUSTAT,
+ * the texpage, ok (0 when GPUSTAT depends on what the scan does not follow: an IRQ command, an
+ * image transfer, a command or transfer in progress at the start) and open (a command or polyline
+ * left unfinished at the end, so the next list's start is not known). */
+typedef struct {
+    u32 stat, tp, ok, open;
+} GpuScan;
+void gpu_scan_from(const Psx *psx, GpuScan *s);
+/* The GPU's linked list from addr, read ahead of its walk from *s: its words (dma_list_walk's). */
+u32 gpu_list_scan(const Psx *psx, u32 addr, GpuScan *s);
 static inline void gpu_sync(const Psx *psx, int why)
 {
     if (gpu_sync_hook && psx != gpu_me_psx)

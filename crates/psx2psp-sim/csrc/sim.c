@@ -139,50 +139,67 @@ static void sme_report(Sim *s)
  * waits for it (gpu_sync), with GPUSTAT read from gpu_list_scan meanwhile and the walk's GPU IRQ
  * raised at the wait. Here the walk runs whole at the kick and its Gpu comes back at the wait.
  * Pictures and audio must be the walk on the CPU's; the waits by cause are the PSP's (2:1 gp1 to
- * vblank on Sheep Dog, as its L2c log). */
+ * vblank on Sheep Dog, as its L2c log).
+ * PSX2PSP_SIM_MEWALK=q2: me.c's list queue, one list behind the walk in flight. A kick with one walk
+ * in flight whose scan ends known (ok, nothing open) is walked after it on the same copy, scanned
+ * from that end (GPUSTAT with any GP1 04 kept since); GP1 04 waits for neither. A third kick, or
+ * one behind a list the scan could not follow, waits (KICK3, UNSCANNED), as do the barriers. */
 static Psx mw_psx, *mw_game;
 static PsxHost mw_host;
-static u32 mw_writes, mw_walks, mw_cpu_walks, mw_waits[GPU_SYNC_N], mw_stat_bad, mw_words_bad;
-static int mw_init;
+static GpuScan mw_next; /* the end of the last list kicked: where a queued one starts */
+static u32 mw_writes, mw_walks, mw_cpu_walks, mw_cpu_busy, mw_queued, mw_waits[GPU_SYNC_N], mw_pairs[GPU_SYNC_N], mw_stat_bad, mw_words_bad;
+static int mw_init, mw_q;
 
 static void mw_sync(int why)
 {
     if (!gpu_me_busy)
         return;
     Psx *psx = mw_game;
+    mw_pairs[why] += gpu_me_busy == 2;
     psx->gpu = mw_psx.gpu;
     gpu_writes += mw_writes;
     if (mw_psx.i_stat & (1u << IRQ_GPU))
         psx_raise(psx, IRQ_GPU);
+    gpu_me_busy = 0;
+    gpu_me_gp1_done(psx);
     mw_stat_bad += gpu_me_stat_ok && (psx->gpu.stat != gpu_me_stat || psx->gpu.xfer);
     mw_waits[why]++;
-    gpu_me_busy = 0;
 }
 
 static u32 mw_walk(Psx *psx, u32 addr)
 {
-    mw_sync(GPU_SYNC_DMA);
+    int queue = mw_q && gpu_me_busy == 1 && !psx->trace && psx == mw_game && gpu_me_stat_ok && !mw_next.open;
+    if (!queue)
+        mw_sync(!mw_q ? GPU_SYNC_DMA : gpu_me_busy == 2 ? GPU_SYNC_KICK3 : GPU_SYNC_UNSCANNED);
     if (psx->trace) {
-        mw_cpu_walks++;
+        mw_cpu_walks++, mw_cpu_busy += gpu_me_busy != 0; /* 0: the drain above */
         return dma_list_walk(psx, addr);
     }
-    u32 words = gpu_list_scan(psx, addr, &gpu_me_stat, &gpu_me_stat_ok);
-    if (!mw_init)
-        mw_psx = *psx, mw_init = 1;
-    mw_psx.gpu = psx->gpu;
-    mw_psx.ram = psx->ram;
-    mw_psx.trace = 0;
-    mw_psx.i_stat = 0;
-    mw_host = *psx->host;
-    mw_host.log = NULL;
-    mw_host.usec = NULL;
-    mw_psx.host = &mw_host;
-    mw_writes = 0;
+    GpuScan sc = mw_next;
+    if (queue)
+        sc.stat = gpu_me_stat; /* with a GP1 04 kept */
+    else
+        gpu_scan_from(psx, &sc);
+    u32 words = gpu_list_scan(psx, addr, &sc);
+    mw_next = sc, gpu_me_stat = sc.stat, gpu_me_stat_ok = sc.ok;
+    if (!queue) {
+        if (!mw_init)
+            mw_psx = *psx, mw_init = 1;
+        mw_psx.gpu = psx->gpu;
+        mw_psx.ram = psx->ram;
+        mw_psx.trace = 0;
+        mw_psx.i_stat = 0;
+        mw_host = *psx->host;
+        mw_host.log = NULL;
+        mw_host.usec = NULL;
+        mw_psx.host = &mw_host;
+        mw_writes = 0;
+    }
     mw_words_bad += dma_list_walk(&mw_psx, addr) != words;
     mw_game = psx;
-    gpu_me_head = addr;
-    gpu_me_busy = 1;
-    mw_walks++;
+    gpu_me_head[gpu_me_busy] = addr;
+    gpu_me_busy++;
+    mw_walks++, mw_queued += queue;
     return words;
 }
 
@@ -191,6 +208,7 @@ static void mw_on(void)
     const char *e = getenv("PSX2PSP_SIM_MEWALK");
     if (!e)
         return;
+    mw_q = gpu_me_keep04 = e[0] == 'q';
     gpu_me_psx = &mw_psx;
     gpu_me_writes = &mw_writes;
     gpu_sync_hook = mw_sync;
@@ -201,15 +219,18 @@ static void mw_report(Sim *s)
 {
     if (!dma_list_hook)
         return;
-    char line[256];
-    int n = snprintf(line, sizeof line, "mewalk: walks %u (%u on the CPU), words bad %u, stat bad %u, reads kept %u; waits",
-                     (unsigned)mw_walks, (unsigned)mw_cpu_walks, (unsigned)mw_words_bad, (unsigned)mw_stat_bad,
-                     (unsigned)gpu_me_reads_kept);
-    static const char *const why[GPU_SYNC_N] = {"read", "gp0", "gp1", "vblank", "dma", "ge", "other"};
+    char line[448];
+    int n = snprintf(line, sizeof line,
+                     "mewalk%s: walks %u (%u on the CPU, %u of them with walks in flight, %u queued), words bad %u, stat bad %u, reads kept %u, gp1 04 kept %u; waits",
+                     mw_q ? " q2" : "", (unsigned)mw_walks, (unsigned)mw_cpu_walks, (unsigned)mw_cpu_busy, (unsigned)mw_queued, (unsigned)mw_words_bad,
+                     (unsigned)mw_stat_bad, (unsigned)gpu_me_reads_kept, (unsigned)gpu_me_gp1_kept);
+    static const char *const why[GPU_SYNC_N] = {"read", "gp0", "gp1", "vblank", "dma", "ge", "other", "otc", "kick3", "unscanned"};
     for (int k = 0; k < GPU_SYNC_N && n < (int)sizeof line; k++)
         n += snprintf(line + n, sizeof line - (size_t)n, " %s %u", why[k], (unsigned)mw_waits[k]);
+    for (int k = 0; mw_q && k < GPU_SYNC_N && n < (int)sizeof line; k++) /* of them, with a list queued */
+        n += snprintf(line + n, sizeof line - (size_t)n, "%s%u", k ? "/" : "; with two in flight ", (unsigned)mw_pairs[k]);
     log_line(s, line);
-    dma_list_hook = NULL, gpu_sync_hook = NULL, gpu_me_psx = NULL, gpu_me_writes = NULL;
+    dma_list_hook = NULL, gpu_sync_hook = NULL, gpu_me_psx = NULL, gpu_me_writes = NULL, gpu_me_keep04 = 0;
 }
 
 Sim *sim_new(void *user, ReadFn rd, u32 disc_end, TextFn tty, TextFn log)

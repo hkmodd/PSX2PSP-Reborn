@@ -76,14 +76,16 @@ static int otc_on_walk(Psx *psx)
     const DmaChan *c = &psx->dma.ch[6];
     u32 bs = c->bcr & 0xFFFF, top = c->madr & 0x1FFFFC;
     u32 words = ((c->chcr >> 9) & 3) == 0 ? (bs ? bs : 0x10000) : bs * (c->bcr >> 16);
-    u32 a = gpu_me_head;
-    for (int k = 0; k < 4; k++) {
-        if (((top - a) & 0x1FFFFC) < 4 * words || words >= 0x80000)
-            return dma_otc_synced++, 1;
-        u32 h = rd(psx, a);
-        if (h & 0x800000)
-            break;
-        a = h & 0x1FFFFC;
+    for (int w = 0; w < gpu_me_busy && w < 2; w++) { /* each walk in flight */
+        u32 a = gpu_me_head[w];
+        for (int k = 0; k < 4; k++) {
+            if (((top - a) & 0x1FFFFC) < 4 * words || words >= 0x80000)
+                return dma_otc_synced++, 1;
+            u32 h = rd(psx, a);
+            if (h & 0x800000)
+                break;
+            a = h & 0x1FFFFC;
+        }
     }
     dma_otc_kept++;
     return 0;
@@ -94,8 +96,12 @@ static void run(Psx *psx, int ch)
 {
     const PsxHost *h = psx->host;
     u32 t = h->usec ? h->usec(h->user) : 0;
-    if (ch == 2 || (ch == 6 && otc_on_walk(psx))) /* the ME's last walk done: the GPU's state, the list OTC would clear */
+    /* the ME's walks done: the GPU's state for a block, the lists OTC would clear. A list goes to
+     * dma_list_hook, which waits for them or queues it (me.c). */
+    if (ch == 2 && ((psx->dma.ch[2].chcr >> 9) & 3) != 2)
         gpu_sync(psx, GPU_SYNC_DMA);
+    else if (ch == 6 && otc_on_walk(psx))
+        gpu_sync(psx, GPU_SYNC_OTC);
     if (ch == 2 && h->gpu_dma)
         h->gpu_dma(h->user, 0);
     transfer(psx, ch);
