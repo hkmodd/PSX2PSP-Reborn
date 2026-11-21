@@ -274,8 +274,8 @@ static void command(Psx *psx, u8 c)
         later = 0x2000;
         ack = psx->cycles + INIT_ACK;
         break;
-    case 0x0B: cd->muted = 1; resp_stat(psx, 3, ack); break;
-    case 0x0C: cd->muted = 0; resp_stat(psx, 3, ack); break;
+    case 0x0B: spu_sync(psx), cd->muted = 1; resp_stat(psx, 3, ack); break;
+    case 0x0C: spu_sync(psx), cd->muted = 0; resp_stat(psx, 3, ack); break;
     case 0x0D: /* Setfilter */
         cd->filter_file = p[0], cd->filter_chan = p[1];
         resp_stat(psx, 3, ack);
@@ -472,8 +472,10 @@ void cd_write(Psx *psx, int reg, u8 v)
         break;
     case 3 << 2 | 2: cd->vol_next[1] = v; break;
     case 3 << 2 | 3:
-        if (v & 0x20)
+        if (v & 0x20) {
+            spu_sync(psx); /* the new volumes from this cycle on */
             memcpy(cd->vol, cd->vol_next, 4);
+        }
         break;
     }
 }
@@ -533,6 +535,21 @@ u32 cd_dma_word(Psx *psx)
 
 static s32 clamp16(s32 x) { return x < -0x8000 ? -0x8000 : x > 0x7FFF ? 0x7FFF : x; }
 
+/* The XA play cursor (cd_audio) runs on the SPU's sample clock, one sample each. A sector that
+ * finds the cursor dry (a stream starts, or the drive fell behind) plays CD_XA_LEAD samples after
+ * its arrival; the sectors after it follow on, so the delay from a sector's arrival to its sound is
+ * the same through a film and does not grow with each underflow. The cursor stops CD_XA_LOST
+ * samples past the last one. Every sector arrives after the SPU ran up to its cycle, so what plays
+ * depends on cycles only, not on where the mix is cut. */
+#define CD_XA_LEAD 1176 /* 26.7 ms: half a sector of 37.8 kHz stereo */
+#define CD_XA_LOST (CD_XA_FIFO / 2)
+
+static void xa_stop(Cdrom *cd)
+{
+    cd->xa_on = 0;
+    cd->xa_rd = cd->xa_wr;
+}
+
 static void xa_push(Cdrom *cd, s32 l, s32 r)
 {
     if (cd->xa_wr - cd->xa_rd >= CD_XA_FIFO)
@@ -588,6 +605,13 @@ static void xa_sector(Psx *psx, const u8 *raw)
             cd->xa_prev[ch][0] = h0, cd->xa_prev[ch][1] = h1;
         }
     }
+    spu_sync(psx); /* the samples before this sector's cycle are mixed without it */
+    if (!cd->xa_on || (s32)(cd->xa_wr - cd->xa_rd) < 0) { /* a stream starts, or goes on after it ran dry */
+        xa_stop(cd);
+        cd->xa_on = 1;
+        for (int i = 0; i < CD_XA_LEAD; i++)
+            xa_push(cd, 0, 0);
+    }
     u32 step = (u32)(((u64)rate << 16) / 44100);
     for (int i = 0; i < n[0]; i++) {
         s32 l = pcm[0][i], r = stereo ? pcm[1][i] : l;
@@ -603,19 +627,22 @@ static void xa_sector(Psx *psx, const u8 *raw)
 void cd_audio(Psx *psx, s32 *l, s32 *r, int n)
 {
     Cdrom *cd = &psx->cd;
-    u32 have = cd->xa_wr - cd->xa_rd, k = 0, m = have < (u32)n ? have : (u32)n;
-    if (cd->muted) { /* the samples are used up all the same */
-        cd->xa_rd += m;
-    } else {
-        const s32 v0 = cd->vol[0], v1 = cd->vol[1], v2 = cd->vol[2], v3 = cd->vol[3];
-        for (u32 rd = cd->xa_rd; k < m; k++, rd++) {
-            u32 i = rd % CD_XA_FIFO;
-            s32 a = cd->xa_fifo[2 * i], b = cd->xa_fifo[2 * i + 1];
-            l[k] = clamp16((a * v0 + b * v2) >> 7); /* LL, RL: 0x80 is 100% */
-            r[k] = clamp16((a * v1 + b * v3) >> 7); /* LR, RR */
+    const s32 v0 = cd->vol[0], v1 = cd->vol[1], v2 = cd->vol[2], v3 = cd->vol[3];
+    const int muted = cd->muted; /* the samples are used up all the same */
+    for (int k = 0; k < n; k++) {
+        s32 a = 0, b = 0;
+        if (cd->xa_on) {
+            u32 rd = cd->xa_rd++;
+            s32 lead = (s32)(cd->xa_wr - rd);
+            if (lead > 0) {
+                u32 i = rd % CD_XA_FIFO;
+                if (!muted)
+                    a = cd->xa_fifo[2 * i], b = cd->xa_fifo[2 * i + 1];
+            } else if (-lead >= CD_XA_LOST) {
+                xa_stop(cd);
+            }
         }
-        cd->xa_rd += m;
+        l[k] = clamp16((a * v0 + b * v2) >> 7); /* LL, RL: 0x80 is 100% */
+        r[k] = clamp16((a * v1 + b * v3) >> 7); /* LR, RR */
     }
-    for (k = cd->muted ? 0 : m; k < (u32)n; k++)
-        l[k] = r[k] = 0;
 }

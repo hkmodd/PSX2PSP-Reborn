@@ -161,7 +161,8 @@ typedef struct Cdrom {
     s16 xa_last[2];
     u32 xa_phase; /* 16.16 position between xa_last and the next decoded sample */
     s16 xa_fifo[CD_XA_FIFO * 2];
-    u32 xa_rd, xa_wr;
+    u32 xa_rd, xa_wr; /* xa_rd: the play cursor, one sample per SPU sample while xa_on */
+    int xa_on; /* the cursor runs: a stream plays, CD_XA_LEAD samples after its sectors arrive */
     u8 vol[4]; /* LL LR RL RR */
     u8 vol_next[4];
     int muted;
@@ -626,6 +627,8 @@ void spu_write(Psx *psx, u32 addr, u16 v);
 void spu_dma_write(Psx *psx, u32 v);
 u32 spu_dma_read(Psx *psx);
 void spu_run(Psx *psx);
+/* Runs the SPU up to the CPU's time: before a change of what it mixes from outside its ports */
+void spu_sync(Psx *psx);
 /* SPU RAM was written other than through the SPU's ports (a snapshot loaded) */
 void spu_ram_changed(void);
 

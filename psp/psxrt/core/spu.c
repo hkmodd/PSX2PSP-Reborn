@@ -903,6 +903,9 @@ void spu_write(Psx *psx, u32 addr, u16 v)
 {
     Spu *s = &psx->spu;
     u32 off = addr - 0x1F801C00u;
+    /* every write takes effect at its own cycle: the mix up to it uses the registers before it,
+     * whatever renders it and wherever the other syncs fall (the ME renders ahead on the same rule) */
+    sync(psx);
     R(addr) = v;
     if (off < 0x180) {
         SpuVoice *vc = &s->v[off >> 4];
@@ -926,14 +929,12 @@ void spu_write(Psx *psx, u32 addr, u16 v)
     case 0x1F801D82: set_volume(&s->main[1], v); break;
     case 0x1F801D88:
     case 0x1F801D8A:
-        sync(psx);
         for (int i = 0; i < 16; i++)
             if (v >> i & 1)
                 key_on(psx, i + (addr == 0x1F801D8A) * 16);
         break;
     case 0x1F801D8C:
     case 0x1F801D8E:
-        sync(psx);
         for (int i = 0; i < 16; i++)
             if (v >> i & 1)
                 key_off(psx, i + (addr == 0x1F801D8E) * 16);
@@ -943,7 +944,6 @@ void spu_write(Psx *psx, u32 addr, u16 v)
     case 0x1F801DA6: s->xfer_addr = (u32)v << 3; break;
     case 0x1F801DA8: transfer(psx, v); break;
     case 0x1F801DAA:
-        sync(psx);
         if ((v & 0x40) && !(s->ctrl & 0x40)) {
             static int told;
             if (!told++)
@@ -957,6 +957,7 @@ void spu_write(Psx *psx, u32 addr, u16 v)
 
 void spu_dma_write(Psx *psx, u32 v)
 {
+    sync(psx); /* the voices read SPU RAM as it was before the transfer's cycle */
     transfer(psx, (u16)v);
     transfer(psx, (u16)(v >> 16));
 }
@@ -965,6 +966,7 @@ u32 spu_dma_read(Psx *psx)
 {
     Spu *s = &psx->spu;
     u32 v = 0;
+    sync(psx); /* the capture buffers up to the transfer's cycle */
     for (int i = 0; i < 2; i++) {
         u32 a = s->xfer_addr & 0x7FFFE;
         v |= (u32)(s->ram[a] | s->ram[a + 1] << 8) << (16 * i);
@@ -978,3 +980,5 @@ void spu_run(Psx *psx)
     sync(psx);
     flush(psx);
 }
+
+void spu_sync(Psx *psx) { sync(psx); }
