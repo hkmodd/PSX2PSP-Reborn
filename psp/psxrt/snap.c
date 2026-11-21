@@ -27,7 +27,7 @@ typedef struct {
     u32 version;
     u32 layout[10]; /* structure sizes */
     char disc_id[16];
-    u32 dir_hash; /* FNV-1a of the code directory and its range */
+    u32 dir_hash; /* FNV-1a of the translated code: its range and each executable's identity (header()) */
     u32 host_pc, frames;
     u32 mdec_words;
 } SnapHeader;
@@ -47,8 +47,16 @@ static void header(SnapHeader *h, const DiscInfo *info)
     u32 l[10] = {sizeof(Psx), sizeof(Cpu), sizeof(Gte), sizeof(Dma), sizeof(Timers), sizeof(Cdrom), sizeof(Gpu), sizeof(Spu), sizeof(Sio), sizeof(Mdec) | sizeof(Bios) << 16};
     memcpy(h->layout, l, sizeof l);
     memcpy(h->disc_id, info->disc_id, sizeof h->disc_id);
-    u32 range[8] = {info->code_base, info->code_size, info->flags, info->fl_offset, info->fl_stored, info->fl_len, info->fl_host, info->fl_arena};
-    h->dir_hash = fnv(fnv(0x811C9DC5u, range, sizeof range), info->dir, info->images * (u32)sizeof(CodeEntry));
+    /* the code the machine runs, not where DATA.PSAR keeps it: a new disc packing or deflate level
+     * moves every offset and keeps the snapshot */
+    u32 range[6] = {info->code_base, info->code_size, info->flags, info->fl_len, info->fl_host, info->fl_arena};
+    u32 hash = fnv(0x811C9DC5u, range, sizeof range);
+    for (u32 i = 0; i < info->images; i++) {
+        const CodeEntry *e = &info->dir[i];
+        u32 id[7] = {e->text_addr, e->text_size, e->hash, e->host_base, e->code_len, e->head_hash, e->patch_groups};
+        hash = fnv(fnv(hash, id, sizeof id), e->name, sizeof e->name);
+    }
+    h->dir_hash = hash;
 }
 
 static int put(SceUID fd, const void *p, u32 n) { return sceIoWrite(fd, p, n) == (int)n ? 0 : -1; }
