@@ -574,6 +574,8 @@ extern void (*gpu_sync_hook)(int why);
 extern Psx *gpu_me_psx;
 extern u32 *gpu_me_writes;
 extern volatile int gpu_me_busy;
+extern volatile u32 gpu_me_head; /* the walk's first word, physical (me.c; core/dma.c's OTC) */
+extern u32 dma_otc_kept, dma_otc_synced; /* OTCs with a walk in flight that went on, that waited for it */
 static inline void gpu_sync(const Psx *psx, int why)
 {
     if (gpu_sync_hook && psx != gpu_me_psx)

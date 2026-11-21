@@ -344,6 +344,7 @@ void (*gpu_sync_hook)(int why);
 Psx *gpu_me_psx;
 u32 *gpu_me_writes;
 volatile int gpu_me_busy;
+volatile u32 gpu_me_head;
 static int poly_slow; /* read only with a clock (never on the ME), so never written there */
 
 static void draw_polygon(Psx *psx, const u32 *c)

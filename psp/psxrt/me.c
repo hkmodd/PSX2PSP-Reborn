@@ -459,6 +459,7 @@ static u32 me_walk(Psx *psx, u32 addr)
     ctl->sc_us = now();
     sceKernelDcacheWritebackAll();
     kick(JOB_WALK, (u32)&mj.psx, addr);
+    gpu_me_head = addr;
     gpu_me_busy = 1;
     t_kick = now();
     st.walks++, st.head_us += t_kick - t0;
@@ -557,8 +558,9 @@ int me_log(char *line, int cap)
             n += snprintf(line + n, (size_t)(cap - n), "%s%s %u/%u", k ? ", " : "", why_name[k], (unsigned)st.waits[k],
                           (unsigned)(st.wait_us[k] / 1000));
         if (n < cap)
-            n += snprintf(line + n, (size_t)(cap - n), " n/ms); list calls %u, stalls %u, polls %u\n", (unsigned)st.rpcs,
-                          (unsigned)st.stalls, (unsigned)st.polls);
+            n += snprintf(line + n, (size_t)(cap - n), " n/ms); list calls %u, stalls %u, polls %u; otc kept %u synced %u\n",
+                          (unsigned)st.rpcs, (unsigned)st.stalls, (unsigned)st.polls, (unsigned)dma_otc_kept, (unsigned)dma_otc_synced);
+        dma_otc_kept = dma_otc_synced = 0;
         beat0 = b;
     }
     u32 lost = st.lost;

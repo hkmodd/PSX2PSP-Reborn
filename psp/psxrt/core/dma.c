@@ -63,12 +63,38 @@ static u32 dev_read(Psx *psx, int ch)
 
 static void transfer(Psx *psx, int ch);
 
+u32 dma_otc_kept, dma_otc_synced;
+
+/* OTC with an ME walk in flight: whether it clears what the walk reads, the walk's head or one of
+ * the next three links in the table OTC writes, [MADR - 4 (words - 1), MADR]. PsyQ's loop is
+ * DrawOTag(ot[cur]); cur ^= 1; ClearOTagR(ot[cur]): the other table, and the CPU goes on. The links
+ * catch a head ahead of the table (DrawOTagEnv's packet) with one table. OTC writes no packet. */
+static int otc_on_walk(Psx *psx)
+{
+    if (!gpu_me_busy)
+        return 0;
+    const DmaChan *c = &psx->dma.ch[6];
+    u32 bs = c->bcr & 0xFFFF, top = c->madr & 0x1FFFFC;
+    u32 words = ((c->chcr >> 9) & 3) == 0 ? (bs ? bs : 0x10000) : bs * (c->bcr >> 16);
+    u32 a = gpu_me_head;
+    for (int k = 0; k < 4; k++) {
+        if (((top - a) & 0x1FFFFC) < 4 * words || words >= 0x80000)
+            return dma_otc_synced++, 1;
+        u32 h = rd(psx, a);
+        if (h & 0x800000)
+            break;
+        a = h & 0x1FFFFC;
+    }
+    dma_otc_kept++;
+    return 0;
+}
+
 /* a transfer is rare next to the clock read that times it */
 static void run(Psx *psx, int ch)
 {
     const PsxHost *h = psx->host;
     u32 t = h->usec ? h->usec(h->user) : 0;
-    if (ch == 2 || ch == 6) /* the ME's last walk done: the GPU's state, and the list in RAM OTC may clear */
+    if (ch == 2 || (ch == 6 && otc_on_walk(psx))) /* the ME's last walk done: the GPU's state, the list OTC would clear */
         gpu_sync(psx, GPU_SYNC_DMA);
     if (ch == 2 && h->gpu_dma)
         h->gpu_dma(h->user, 0);
