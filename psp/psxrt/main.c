@@ -181,8 +181,9 @@ static volatile u32 rec_w; /* stereo samples recorded */
 static void rec_save(void);
 static volatile int sas_on; /* spu_mode, once sceSasCore runs */
 /* psxrt.me beside the EBOOT: the Media Engine is psxrt's (me.h); sceSasCore runs on the ME, so the
- * SPU then mixes every voice whatever psxrt.spu says */
-static int me_want;
+ * SPU then mixes every voice whatever psxrt.spu says, on the ME too (me_spu_on) unless psxrt.spu
+ * says "cpu" (spu_cpu) */
+static int me_want, spu_cpu;
 /* psxrt.watch beside the EBOOT: PS1 RAM words logged once a second, last value and the sum of
  * the values seen at each display flip (a per-frame variable summed over the game's frames) */
 #define WATCH_MAX 8
@@ -338,7 +339,8 @@ static void open_log(const char *eboot)
         char word[16] = {0};
         sceIoRead(fd, word, sizeof word - 1);
         sceIoClose(fd);
-        spu_mode = !strncmp(word, "cpu", 3) ? 0 : !strncmp(word, "both", 4) ? 2 : 1;
+        spu_cpu = !strncmp(word, "cpu", 3);
+        spu_mode = spu_cpu ? 0 : !strncmp(word, "both", 4) ? 2 : 1;
     }
     snprintf(slash + 1, sizeof path - (size_t)(slash + 1 - path), "psxrt.me");
     fd = sceIoOpen(path, PSP_O_RDONLY, 0);
@@ -1515,7 +1517,11 @@ void runtime_snapshot(u32 host_pc)
     u32 t = sceKernelGetSystemTimeLow();
     if (psx.gpu.renderer)
         ge_read(0, 0, VRAM_W, VRAM_H);
+    int spu_back = spu_me != NULL; /* the SPU's state inline for the file, then back to the ME */
+    spu_me_off(&psx);
     int r = snap_save(path, &psx, &disc_info, host_pc, frames);
+    if (spu_back)
+        me_spu_on(&psx);
     say("snapshot %s at frame %u: %s (%u ms)", path, (unsigned)frames, r ? "FAILED" : "saved", (unsigned)((sceKernelGetSystemTimeLow() - t) / 1000));
     log_flush();
 }
@@ -1662,6 +1668,8 @@ int main(int argc, char **argv)
     }
     if (!resume && psx_boot(&psx) < 0)
         halt("cannot boot the disc (SYSTEM.CNF / boot EXE)");
+    if (me_want && !spu_cpu)
+        say("SPU: %s", me_spu_on(&psx) ? "the mix on the ME (psxrt.spu \"cpu\": on the CPU)" : "the mix on the CPU (the ME is off or the SPU's IRQ is on)");
     present(&psx, "booting");
     log_flush();
     log_keep();
