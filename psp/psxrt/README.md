@@ -13,7 +13,7 @@ the PC simulator `crates/psx2psp-sim` builds, so a fix lands on both):
 |---|---|
 | PS1 RAM 2 MB + scratchpad + context + dispatch table at 0x09800000-0x09C00FFF | reserved first, `PSP_SMEM_Addr` (`docs/recomp/S0.md`); if refused, a filler block takes the memory below it |
 | VRAM, SPU RAM, MDEC buffers | ordinary `PSP_SMEM_Low` blocks |
-| Disc | `disc.c`: DATA.PSAR of its own EBOOT (argv[0]), two inflated blocks cached |
+| Disc | `disc.c`: DATA.PSAR of its own EBOOT (argv[0]), three blocks cached, each sector inflated when the drive delivers it (a sector the XA filter drops only has its head read) |
 | Boot | `psx_boot`: HLE BIOS reads SYSTEM.CNF and loads the EXE |
 | CPU | translated code from DATA.PSAR (`native.c`, `trampolines.S`); the core's interpreter between translations, or for everything when the EBOOT has no code |
 | Display | the PS1 display area of VRAM is drawn by the GE as a 5551 texture scaled to 480x272; 24-bit modes (MDEC movies) are converted to an 8888 texture first |
@@ -122,7 +122,7 @@ The log's `-- sas` line counts, per second:
 
 In `both` mode it also gives the RMS of both mixes.
 
-## DATA.PSAR (version 9)
+## DATA.PSAR (version 10)
 
 Little endian, written by `write_native_psar` in `crates/psx2psp-engine`; offsets are from the
 start of DATA.PSAR:
@@ -130,7 +130,7 @@ start of DATA.PSAR:
 | Offset | Size | Field |
 |---|---|---|
 | 0x00 | 8 | `PSXRTDAT` |
-| 0x08 | 4 | version (6) |
+| 0x08 | 4 | version (10) |
 | 0x0C | 4 | header length (0xE8) |
 | 0x10 | 16 | disc ID, NUL padded (`SLES02895`) |
 | 0x20 | 128 | title, UTF-8, NUL padded |
@@ -157,9 +157,12 @@ A game of more than one disc has a disc table of 0x20 bytes per disc (disc 1 fir
 (16, NUL padded), raw sectors, offset of its block index, blocks, zero. Each disc's blocks and
 index are stored as disc 1's.
 
-The index holds blocks + 1 offsets: block i is `index[i]..index[i+1]`. A block is raw deflate,
-or stored as is when deflate would not make it smaller (its length is then the raw length; only
-the last block may be shorter than 16 sectors).
+The index holds blocks + 1 offsets: block i is `index[i]..index[i+1]`. A block of n sectors
+(16, or fewer for the last one) is stored as is when packing would not make it smaller (its
+length is then n * 2352), or packed: n u16 body lengths, the n sector heads of 24 bytes as is
+(sync, header, XA subheader), then the n bodies (the other 2328 bytes), each raw deflate on its
+own, or stored when its length is 2328. A sector is inflated alone, when the drive delivers it;
+a sector the drive's XA filter drops is never inflated, as its head is enough to drop it.
 
 The blocks are followed by each translated executable's code, dispatch-table slice (one word
 per text word: a host address, or MISS) and patch table, stored the same way, then the

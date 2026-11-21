@@ -119,7 +119,15 @@ static void sector(Psx *psx)
     cd->read_due += period(cd);
     if (cd->read_due <= psx->cycles)
         cd->read_due = psx->cycles + period(cd);
-    if (!psx->host->read_sector || psx->host->read_sector(psx->host->user, cd->pos, raw) < 0) {
+    /* a sector the XA filter drops is not read past its subheader */
+    const PsxHost *h = psx->host;
+    int got = h->read_head ? h->read_head(h->user, cd->pos, raw) : -2;
+    if (got == 0 && (cd->mode & 0x08) && (raw[18] & 0x04) && (raw[18] & 0x40) && raw[15] == 2 &&
+        (raw[16] != cd->filter_file || raw[17] != cd->filter_chan)) {
+        cd->pos++;
+        return; /* filtered out, as below */
+    }
+    if (got == -1 || !h->read_sector || h->read_sector(h->user, cd->pos, raw) < 0) {
         psx_log(psx, "cd: read past the end at LBA %u", cd->pos);
         stop_reading(cd);
         cd->stat |= ST_ERROR;

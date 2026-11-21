@@ -1,14 +1,17 @@
 /*
  * psxrt: the PS1 disc, read from DATA.PSAR of the runtime's own EBOOT. The converter stores the
- * image as blocks of 16 raw sectors, each raw deflate or stored, behind an index of offsets
- * (README.md, "DATA.PSAR"). Three inflated blocks are kept: a CD reads sequentially, and a seek
- * back to the block before (file headers, XA interleave) does not inflate again. After a block
- * is served, a worker thread reads and inflates the next one into the third slot, with its own
- * file and zlib stream. Its priority is above the CPU thread's: a game that streams while the CPU
- * thread never sleeps (a level loading as it plays) would otherwise wait for every block, read and
- * inflate both. Above it, the worker's file read overlaps the frame (the thread blocks in the
- * driver) and only the inflate takes the CPU. If the CPU thread needs the block in flight it waits
- * for it. After the blocks come the translated executables (native.c), read with
+ * image as blocks of 16 raw sectors behind an index of offsets (README.md, "DATA.PSAR"): each
+ * block stored as is, or packed, its sectors' heads (sync, header, XA subheader) as is and their
+ * bodies deflated one by one. Three blocks are kept: a CD reads sequentially, and a seek back to
+ * the block before (file headers, XA interleave) does not read again. A packed block is read
+ * whole and its sectors inflated only as the drive delivers them: the drive passes over every
+ * sector of an XA interleave and keeps the 1 in 8 its filter selects (disc_read_head), so
+ * inflating whole blocks spent the CPU on sectors nobody took (38 ms a second in a Sheep Dog
+ * level for 1 sector in 4). After a block is served, a worker thread reads the next one into the
+ * third slot, with its own file. Its priority is above the CPU thread's: a game that streams
+ * while the CPU thread never sleeps (a level loading as it plays) would otherwise wait for every
+ * block. Its file read overlaps the frame (the thread blocks in the driver). If the CPU thread
+ * needs the block in flight it waits for it. After the blocks come the translated executables (native.c), read with
  * disc_blob(), or by a second worker below the CPU thread (disc_ahead) while it sleeps. A game of more than one disc has each disc's blocks and index, listed in the disc
  * table; disc_select() changes the one in the drive.
  */
@@ -23,7 +26,9 @@
 #include <zlib.h>
 
 #define MAGIC "PSXRTDAT"
-#define VERSION 9
+#define VERSION 10
+#define HEAD 24          /* bytes of a sector a packed block keeps as is */
+#define BODY (RAW - HEAD) /* the rest, deflated or stored */
 #define HEADER_LEN 0xE8
 #define BLOCK_SECTORS 16
 #define RAW 2352
@@ -59,7 +64,11 @@ typedef struct {
 typedef struct {
     int block; /* -1 empty */
     u32 used;  /* last use, for LRU */
+    u32 n;     /* its sectors */
+    u32 have;  /* bit s: sector s is in data[] (all of them for a block stored as is) */
+    u32 packed;
     u8 data[BLOCK_LEN];
+    u8 z[BLOCK_LEN]; /* a packed block: n u16 body lengths, n heads, the bodies */
 } Cached;
 
 /* A file and a zlib stream: one for the CPU thread, one for the worker. */
@@ -355,37 +364,59 @@ static int load(Reader *r, Cached *c, u32 b)
 {
     u32 off = offsets[b], len = offsets[b + 1] - offsets[b];
     u32 n = sectors - b * BLOCK_SECTORS;
-    u32 raw_len = (n < BLOCK_SECTORS ? n : BLOCK_SECTORS) * RAW;
-    u32 t0 = sceKernelGetSystemTimeLow(), t1;
+    n = n < BLOCK_SECTORS ? n : BLOCK_SECTORS;
+    u32 raw_len = n * RAW, t0 = sceKernelGetSystemTimeLow();
     c->block = -1;
     if (offsets[b + 1] < off || len > raw_len) {
         fail(r, b, "bad index", 0);
         return -1;
     }
-    if (len == raw_len) {
-        if (!read_at(r, off, c->data, len))
-            goto io;
-        t1 = sceKernelGetSystemTimeLow();
-    } else {
-        if (!read_at(r, off, r->zbuf, len))
-            goto io;
-        t1 = sceKernelGetSystemTimeLow();
-        inflateReset(&r->zs);
-        r->zs.next_in = r->zbuf, r->zs.avail_in = len;
-        r->zs.next_out = c->data, r->zs.avail_out = raw_len;
-        int z = inflate(&r->zs, Z_FINISH);
-        if (z != Z_STREAM_END || r->zs.avail_out) {
-            fail(r, b, "inflate failed", z);
+    c->n = n, c->packed = len != raw_len, c->have = c->packed ? 0 : (1u << n) - 1;
+    if (!read_at(r, off, c->packed ? c->z : c->data, len)) {
+        fail(r, b, "read error", 0);
+        return -1;
+    }
+    if (c->packed) { /* the lengths must add up to the block */
+        u32 sum = n * (2 + HEAD);
+        for (u32 i = 0; i < n; i++) {
+            u32 l = c->z[2 * i] | c->z[2 * i + 1] << 8;
+            sum += l > BODY ? len + 1 : l;
+        }
+        if (sum != len) {
+            fail(r, b, "bad block", (int)sum);
             return -1;
         }
     }
     c->block = (int)b;
-    disc_stats.us_read[r->who] += t1 - t0;
-    disc_stats.us_inflate[r->who] += sceKernelGetSystemTimeLow() - t1;
+    disc_stats.us_read[r->who] += sceKernelGetSystemTimeLow() - t0;
     return 0;
-io:
-    fail(r, b, "read error", 0);
-    return -1;
+}
+
+/* Sector `s` of `c` in its data[]: inflated from the packed block the first time. 0, or -1. */
+static int unpack(Cached *c, u32 s)
+{
+    if (c->have >> s & 1)
+        return 0;
+    u32 t0 = sceKernelGetSystemTimeLow(), at = c->n * (2 + HEAD), len = 0;
+    for (u32 i = 0; i <= s; i++)
+        at += len, len = c->z[2 * i] | c->z[2 * i + 1] << 8;
+    u8 *dst = c->data + s * RAW;
+    memcpy(dst, c->z + 2 * c->n + s * HEAD, HEAD);
+    if (len == BODY) {
+        memcpy(dst + HEAD, c->z + at, BODY);
+    } else {
+        inflateReset(&rd.zs);
+        rd.zs.next_in = c->z + at, rd.zs.avail_in = len;
+        rd.zs.next_out = dst + HEAD, rd.zs.avail_out = BODY;
+        int z = inflate(&rd.zs, Z_FINISH);
+        if (z != Z_STREAM_END || rd.zs.avail_out) {
+            fail(&rd, (u32)c->block, "inflate failed", z);
+            return -1;
+        }
+    }
+    c->have |= 1u << s;
+    disc_stats.us_inflate[0] += sceKernelGetSystemTimeLow() - t0;
+    return 0;
 }
 
 /* The slot holding block `b` (the worker's only once it is done), or NULL. */
@@ -409,12 +440,14 @@ static Cached *victim(const Cached *keep)
     return v;
 }
 
-int disc_read_sector(void *user, u32 lba, u8 *raw)
+/* The slot holding the block of `lba` (read now if no slot has it), the read-ahead of the next
+ * one started; NULL outside the image or on a read error. Its sector in the block in *s. */
+static Cached *slot(u32 lba, u32 *s)
 {
-    (void)user;
     if (lba < PREGAP || lba - PREGAP >= sectors)
-        return -1;
-    u32 s = lba - PREGAP, b = s / BLOCK_SECTORS;
+        return NULL;
+    u32 b = (lba - PREGAP) / BLOCK_SECTORS;
+    *s = (lba - PREGAP) % BLOCK_SECTORS;
     if (pf_busy) { /* collected if done; the block in flight is waited for */
         int done = sceKernelPollSema(pf_done, 1) >= 0;
         if (!done && pf_block == b) {
@@ -436,14 +469,35 @@ int disc_read_sector(void *user, u32 lba, u8 *raw)
         c = victim(NULL);
         disc_stats.loads++;
         if (load(&rd, c, b) < 0)
-            return -1;
+            return NULL;
     }
     c->used = ++clock;
-    memcpy(raw, c->data + (s % BLOCK_SECTORS) * RAW, RAW);
     if (pf_req >= 0 && !pf_busy && b + 1 < blocks && !find((int)b + 1)) {
         /* as recent as `c`: a miss before b + 1 is asked for does not evict it */
         pf_slot = victim(c), pf_slot->block = -1, pf_slot->used = clock, pf_block = b + 1, pf_busy = 1;
         sceKernelSignalSema(pf_req, 1);
     }
+    return c;
+}
+
+int disc_read_sector(void *user, u32 lba, u8 *raw)
+{
+    (void)user;
+    u32 s;
+    Cached *c = slot(lba, &s);
+    if (!c || unpack(c, s) < 0)
+        return -1;
+    memcpy(raw, c->data + s * RAW, RAW);
+    return 0;
+}
+
+int disc_read_head(void *user, u32 lba, u8 *head)
+{
+    (void)user;
+    u32 s;
+    Cached *c = slot(lba, &s);
+    if (!c)
+        return -1;
+    memcpy(head, c->have >> s & 1 ? c->data + s * RAW : c->z + 2 * c->n + s * HEAD, HEAD);
     return 0;
 }

@@ -1574,6 +1574,7 @@ int main(int argc, char **argv)
     sceKernelDcacheWritebackInvalidateRange(rgb24_tex, 512 * 512 * 4);
     rgb24_un = (u32 *)((u32)rgb24_tex | 0x40000000u);
     host.read_sector = disc_read_sector;
+    host.read_head = disc_read_head;
     host.disc_end = 150 + disc_info.sectors;
     host.disc_select = host_disc_select;
     host.discs = disc_info.discs;

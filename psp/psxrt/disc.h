@@ -45,9 +45,9 @@ typedef struct DiscInfo {
 /* DiscInfo.flags: the player changes the disc, not the core (patch database `disc_swap = manual`). */
 #define DISC_MANUAL_DISC 2u
 
-/* Disc blocks since boot: inflated by the CPU thread, inflated ahead by the worker (and how many
- * of those the CPU thread had to wait for); microseconds reading the file and inflating, by the
- * CPU thread [0] and the worker [1]. */
+/* Disc blocks since boot: read by the CPU thread, read ahead by the worker (and how many of those
+ * the CPU thread had to wait for); microseconds reading the file, by the CPU thread [0] and the
+ * worker [1], and inflating (sectors as they are delivered on the CPU thread [0]; code blobs). */
 typedef struct DiscStats {
     u32 loads, prefetched, waited;
     u32 us_read[2], us_inflate[2];
@@ -65,6 +65,8 @@ u32 disc_select(u32 n);
 const char *disc_name(u32 n);
 /* PsxHost.read_sector: 0, or -1 outside the image or on a read error (reported to disc_log). */
 int disc_read_sector(void *user, u32 lba, u8 *raw);
+/* PsxHost.read_head: the sector's first 24 bytes, without inflating it. 0, or -1 as above. */
+int disc_read_head(void *user, u32 lba, u8 *head);
 /* Reads `raw_len` bytes stored at `off` (`stored` bytes, raw deflate unless equal) into `dst`:
  * 0, or -1. */
 int disc_blob(u32 off, u32 stored, void *dst, u32 raw_len);

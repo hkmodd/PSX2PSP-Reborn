@@ -72,6 +72,10 @@ typedef struct PsxHost {
     int (*disc_select)(void *user, u32 n);
     u32 discs;
     int auto_swap; /* nonzero: the core changes the disc when the game waits for one (cdrom.c) */
+    /* Optional: the first 24 bytes of the sector at `lba` (sync, header, XA subheader), as
+     * read_sector gives them, without the rest: the drive reads the whole sector only when its
+     * filter keeps it. 0, or -1 past the end. NULL: read_sector serves both. */
+    int (*read_head)(void *user, u32 lba, u8 *head);
 } PsxHost;
 
 /* ---- CPU state, shared by the interpreter and the translated code's context ---- */

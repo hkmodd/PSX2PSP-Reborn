@@ -831,7 +831,7 @@ pub const NATIVE_RUNTIME: &[u8] = include_bytes!("../../../resources/psxrt.prx")
 ///   raw sectors 4, index offset 4, blocks 4, zero 4). The header's first-disc fields stay, so a
 ///   one-disc set has no table.
 pub const NATIVE_PSAR_MAGIC: [u8; 8] = *b"PSXRTDAT";
-pub const NATIVE_PSAR_VERSION: u32 = 9;
+pub const NATIVE_PSAR_VERSION: u32 = 10;
 /// magic 8, version 4, header length 4, disc ID 16, title 128, disc sectors 4, sectors per block
 /// 4, index offset 4, block count 4, code directory offset 4, code images 4, host address of the
 /// code 4, code size 4 (these four written once the code is), flags 4 ([`NATIVE_FLAG_PAL60`]),
@@ -861,6 +861,59 @@ pub const NATIVE_FLAG_MANUAL_DISC: u32 = 2;
 pub const NATIVE_CODE_ENTRY_LEN: usize = 0x40;
 /// Raw sectors per block of a native DATA.PSAR (as PSISOIMG: 0x9300 bytes).
 pub const NATIVE_BLOCK_SECTORS: u32 = 16;
+/// Bytes at the start of each sector a packed block keeps as is: sync, header and XA subheader,
+/// all the CD drive needs to filter a sector out ([`native_block_pack`]).
+pub const NATIVE_SECTOR_HEAD: usize = 24;
+
+/// One block of a native DATA.PSAR. A packed block is, for its n sectors: n body lengths (u16),
+/// n heads of [`NATIVE_SECTOR_HEAD`] bytes as is, then the bodies (the rest of each sector),
+/// each raw deflate on its own, or stored when its length is the body's. The runtime inflates
+/// only the sectors the drive delivers: the CD reads every sector of an XA interleave and its
+/// filter keeps 1 of 8, and inflating whole blocks spent 38 ms a second of the PSP's CPU in a
+/// Sheep Dog level for the 1 in 4 sectors the game took. The block is stored as is instead
+/// when packing would not make it smaller (its length is then the raw length).
+pub fn native_block_pack(raw: &[u8], level: u8) -> Vec<u8> {
+    let n = raw.len() / SECTOR;
+    assert_eq!(raw.len(), n * SECTOR, "a block is whole sectors");
+    let bodies: Vec<Vec<u8>> = raw
+        .chunks(SECTOR)
+        .map(|s| {
+            let z = miniz_oxide::deflate::compress_to_vec(&s[NATIVE_SECTOR_HEAD..], level);
+            if z.len() < SECTOR - NATIVE_SECTOR_HEAD { z } else { s[NATIVE_SECTOR_HEAD..].to_vec() }
+        })
+        .collect();
+    let mut out = Vec::with_capacity(raw.len());
+    bodies.iter().for_each(|b| out.extend_from_slice(&(b.len() as u16).to_le_bytes()));
+    raw.chunks(SECTOR).for_each(|s| out.extend_from_slice(&s[..NATIVE_SECTOR_HEAD]));
+    bodies.iter().for_each(|b| out.extend_from_slice(b));
+    if out.len() < raw.len() { out } else { raw.to_vec() }
+}
+
+/// The `sectors` raw sectors of a block [`native_block_pack`] wrote, or None if it is malformed.
+pub fn native_block_unpack(data: &[u8], sectors: usize) -> Option<Vec<u8>> {
+    let raw_len = sectors * SECTOR;
+    if data.len() == raw_len {
+        return Some(data.to_vec());
+    }
+    let body = SECTOR - NATIVE_SECTOR_HEAD;
+    let heads = 2 * sectors;
+    let mut at = heads + sectors * NATIVE_SECTOR_HEAD;
+    let mut out = Vec::with_capacity(raw_len);
+    for i in 0..sectors {
+        let len = u16::from_le_bytes([*data.get(2 * i)?, *data.get(2 * i + 1)?]) as usize;
+        let z = data.get(at..at + len)?;
+        at += len;
+        out.extend_from_slice(data.get(heads + i * NATIVE_SECTOR_HEAD..heads + (i + 1) * NATIVE_SECTOR_HEAD)?);
+        if len == body {
+            out.extend_from_slice(z);
+        } else {
+            let b = miniz_oxide::inflate::decompress_to_vec(z).ok()?;
+            (b.len() == body).then_some(())?;
+            out.extend(b);
+        }
+    }
+    (at == data.len()).then_some(out)
+}
 
 /// Header of a native DATA.PSAR; the index follows it. Disc ID and title are NUL-padded and cut
 /// (on a char boundary) to leave room for their NUL.
@@ -1684,10 +1737,7 @@ fn write_native_blocks<W: Write + Seek>(
         patches.iter().for_each(|p| p.apply(at, buf));
         let out: Vec<Vec<u8>> = buf
             .par_chunks(block_len)
-            .map(|raw| {
-                let z = miniz_oxide::deflate::compress_to_vec(raw, level);
-                if z.len() < raw.len() { z } else { raw.to_vec() }
-            })
+            .map(|raw| native_block_pack(raw, level))
             .collect();
         for data in &out {
             index.extend_from_slice(&psar_offset(pos)?.to_le_bytes());
@@ -2041,6 +2091,41 @@ mod tests {
         let p = dir.join(name);
         std::fs::write(&p, body).unwrap();
         p
+    }
+
+    #[test]
+    fn native_block_keeps_heads_and_inflates_per_sector() {
+        // 16 sectors: zeros (deflate), noise (stored body), and a short last block of 3.
+        let mut x = 0x1234_5678u32;
+        let mut raw = vec![0u8; 16 * SECTOR];
+        for (i, s) in raw.chunks_mut(SECTOR).enumerate() {
+            s[..12].copy_from_slice(&[0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0]);
+            s[15] = 2;
+            s[16..24].copy_from_slice(&[1, i as u8 & 7, 0x64, 1, 1, i as u8 & 7, 0x64, 1]);
+            if i % 3 == 1 {
+                s[24..].iter_mut().for_each(|b| {
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    *b = x as u8;
+                });
+            }
+        }
+        let z = native_block_pack(&raw, 5);
+        assert!(z.len() < raw.len());
+        let heads = &z[32..32 + 16 * NATIVE_SECTOR_HEAD];
+        for (i, s) in raw.chunks(SECTOR).enumerate() {
+            assert_eq!(heads[i * NATIVE_SECTOR_HEAD..][..NATIVE_SECTOR_HEAD], s[..NATIVE_SECTOR_HEAD], "head {i} as is");
+            let len = u16::from_le_bytes([z[2 * i], z[2 * i + 1]]) as usize;
+            assert_eq!(len == SECTOR - NATIVE_SECTOR_HEAD, i % 3 == 1, "noise stored, zeros deflated: {i}");
+        }
+        assert_eq!(native_block_unpack(&z, 16).unwrap(), raw);
+        assert_eq!(native_block_unpack(&z[..z.len() - 1], 16), None);
+        let short = native_block_pack(&raw[..3 * SECTOR], 5);
+        assert_eq!(native_block_unpack(&short, 3).unwrap(), raw[..3 * SECTOR]);
+        // All noise: packing would grow it, so the block is stored as is.
+        let noise: Vec<u8> = raw[SECTOR..2 * SECTOR].repeat(2);
+        assert_eq!(native_block_pack(&noise, 5), noise);
     }
 
     #[test]
@@ -2472,7 +2557,7 @@ mod tests {
         assert_eq!(pbp.range(Section::DataPsar).start % 0x10, 0);
         let head = native_psar_header("SLES02895", "Sheep Dog 'n' Wolf", 40, 0);
         assert_eq!(psar[..NATIVE_PSAR_HEADER_LEN], head);
-        assert_eq!(psar[..16], *b"PSXRTDAT\x09\0\0\0\xE8\0\0\0");
+        assert_eq!(psar[..16], *b"PSXRTDAT\x0A\0\0\0\xE8\0\0\0");
         assert_eq!(&psar[0x10..0x1A], b"SLES02895\0");
         assert_eq!(&psar[0x20..0x33], b"Sheep Dog 'n' Wolf\0");
         let word = |at: usize| u32::from_le_bytes(psar[at..at + 4].try_into().unwrap()) as usize;
@@ -2492,10 +2577,8 @@ mod tests {
             let len = (40 - 16 * i).min(16) * SECTOR;
             if data.len() == len {
                 assert_eq!(i, 1, "only the noise is stored");
-                back.extend_from_slice(data);
-            } else {
-                back.extend(miniz_oxide::inflate::decompress_to_vec(data).unwrap());
             }
+            back.extend(native_block_unpack(data, len / SECTOR).unwrap());
         }
         assert_eq!(back, raw);
         assert_eq!((rep.stats.blocks, rep.stats.raw_bytes, rep.stats.stored_bytes), (3, raw.len() as u64, psar.len() as u64));
@@ -2540,7 +2623,7 @@ mod tests {
             for i in 0..blocks {
                 let (s, e) = (word(index + 4 * i), word(index + 4 * i + 4));
                 let len = (sectors - 16 * i).min(16) * SECTOR;
-                out.extend(if e - s == len { psar[s..e].to_vec() } else { miniz_oxide::inflate::decompress_to_vec(&psar[s..e]).unwrap() });
+                out.extend(native_block_unpack(&psar[s..e], len / SECTOR).unwrap());
             }
             (psar[e..e + 16].to_vec(), out)
         };
