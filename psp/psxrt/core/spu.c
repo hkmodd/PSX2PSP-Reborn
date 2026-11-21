@@ -134,17 +134,31 @@ static void (*hw_tick)(int pending);
 static u32 hw;              /* voices the host plays */
 static u32 hw_env;          /* of those, the ones taken mid-play: their envelope is in the volume */
 static u32 hw_tried;        /* voices offered mid-play since their key on */
-static int hw_at;           /* the sample of the chunk a voice is at, for events from block_end */
 static SpuHwVoice hw_v[24];
-static u32 hw_dirty[16];    /* 1 KB pages written by transfers */
 static u64 hw_e[2], hw_en; /* mode 2: what the SPU's own mix of those voices sums to */
+
+/* What the mix writes with the host's mixer off: with the SPU on another core (SpuMe) only that
+ * core writes it, so it has cache lines of its own, as have render's chunk arrays (the PC sim runs
+ * the back in the front's thread). */
+#ifdef __GNUC__
+#define MX_LINES __attribute__((aligned(64))) /* on arrays: sizes a multiple of 64 bytes */
+#else
+#define MX_LINES
+#endif
+static struct MX_LINES { /* on the type: its size whole lines too */
+    u32 hw_dirty[16]; /* 1 KB pages written by transfers */
+    int hw_at;        /* the sample of the chunk a voice is at, for events from block_end */
+    u32 rz_lo;        /* rev_silent: the area looked at (its first byte), ~0u: none */
+    const u8 *rz_ram;
+    int rz_zero;
+} mx = {.rz_lo = ~0u};
 
 void spu_hw_mode(int mode, int (*voice)(int voice, int ev, int pending), void (*tick)(int pending))
 {
     hw_mode = voice ? mode : 0;
     hw_voice = voice, hw_tick = tick;
     hw = hw_env = hw_tried = 0;
-    memset(hw_dirty, 0xFF, sizeof hw_dirty); /* the host's copy starts from all of SPU RAM */
+    memset(mx.hw_dirty, 0xFF, sizeof mx.hw_dirty); /* the host's copy starts from all of SPU RAM */
 }
 
 u32 spu_hw_voices(void) { return hw; }
@@ -208,7 +222,7 @@ int spu_hw_dirty(u32 pages[16])
 {
     u32 any = 0;
     for (int k = 0; k < 16; k++)
-        any |= pages[k] = hw_dirty[k], hw_dirty[k] = 0;
+        any |= pages[k] = mx.hw_dirty[k], mx.hw_dirty[k] = 0;
     return any != 0;
 }
 
@@ -381,7 +395,7 @@ static void adopt(Psx *psx, int i)
     SpuHwVoice *h = &hw_v[i];
     h->unfit = fit(s, i, s->v[i].addr, h);
     h->adopted = 1;
-    if (hw_voice(i, SPU_HW_ON, s->nout + hw_at))
+    if (hw_voice(i, SPU_HW_ON, s->nout + mx.hw_at))
         hw |= bit, hw_env |= bit;
 }
 
@@ -556,7 +570,7 @@ static void voice(Psx *psx, int i, int n, const s16 *mod, s16 *out, int need_out
         k++;
         if (c >= 28u << 12) {
             v->counter = c - (28u << 12);
-            hw_at = k;
+            mx.hw_at = k;
             block_end(psx, v, i);
             if (hw_mode == 1 && (hw & bit)) { /* the host took it at its loop */
                 if (need_out)
@@ -633,27 +647,24 @@ static s32 rv_apf(Spu *s, const Rv *w, s32 x, int m, int d, int vol)
  * after something may have written it: a transfer into it (transfer), a chunk with the reverb's
  * writes on (here), new RAM (spu_ram_changed). Sheep Dog's FMVs play with the writes off, the
  * output volumes up and 18 KB of zeros: ~1000 cycles a step for nothing, 22050 steps a second. */
-static u32 rz_lo = ~0u; /* the area looked at (its first byte), ~0u: none */
-static const u8 *rz_ram;
-static int rz_zero;
-void spu_ram_changed(void) { rz_lo = ~0u; }
+void spu_ram_changed(void) { mx.rz_lo = ~0u; }
 
 static int rev_silent(const Spu *s)
 {
     u32 a = (u32)G(0x1F801DA2) * 8;
     if (s->ctrl & 0x80) {
-        rz_lo = ~0u;
+        mx.rz_lo = ~0u;
         return 0;
     }
     if (a < 0x1000)
         return 0;
-    if (a != rz_lo || s->ram != rz_ram) {
+    if (a != mx.rz_lo || s->ram != mx.rz_ram) {
         u32 w = 0;
         for (u32 p = a; p < 0x80000 && !w; p += 4)
             memcpy(&w, s->ram + p, 4);
-        rz_lo = a, rz_ram = s->ram, rz_zero = !w;
+        mx.rz_lo = a, mx.rz_ram = s->ram, mx.rz_zero = !w;
     }
-    return rz_zero;
+    return mx.rz_zero;
 }
 
 static void reverb(Spu *s, s32 inl, s32 inr, int silent)
@@ -693,8 +704,8 @@ static void flush(Psx *psx)
 
 static void render(Psx *psx, int n)
 {
-    static s32 dl[SPU_CHUNK], dr[SPU_CHUNK], rl[SPU_CHUNK], rr[SPU_CHUNK];
-    static s16 noise[SPU_CHUNK], va[SPU_CHUNK], vb[SPU_CHUNK], cap1[SPU_CHUNK], cap3[SPU_CHUNK];
+    static s32 dl[SPU_CHUNK] MX_LINES, dr[SPU_CHUNK] MX_LINES, rl[SPU_CHUNK] MX_LINES, rr[SPU_CHUNK] MX_LINES;
+    static s16 noise[SPU_CHUNK] MX_LINES, va[SPU_CHUNK] MX_LINES, vb[SPU_CHUNK] MX_LINES, cap1[SPU_CHUNK] MX_LINES, cap3[SPU_CHUNK] MX_LINES;
     Spu *s = &psx->spu;
     size_t bytes = (size_t)n * sizeof dl[0];
     u32 pmon = G(0x1F801D90) | (u32)G(0x1F801D92) << 16;
@@ -724,7 +735,7 @@ static void render(Psx *psx, int n)
         if (hw && hw_tick)
             hw_tick(s->nout);
     }
-    static s32 hl[SPU_CHUNK], hr[SPU_CHUNK]; /* mode 2: the host's voices as the SPU mixes them */
+    static s32 hl[SPU_CHUNK] MX_LINES, hr[SPU_CHUNK] MX_LINES; /* mode 2: the host's voices as the SPU mixes them */
     int both = hw_mode == 2 && hw;
     if (both)
         memset(hl, 0, bytes), memset(hr, 0, bytes);
@@ -776,7 +787,7 @@ static void render(Psx *psx, int n)
     u32 capture = s->capture;
     int nout = s->nout, odd = s->rev_odd;
     s32 ril = s->rev_in[0], rir = s->rev_in[1];
-    static s32 xl[SPU_CHUNK], xr[SPU_CHUNK]; /* nothing in the loop touches the CD's queue */
+    static s32 xl[SPU_CHUNK] MX_LINES, xr[SPU_CHUNK] MX_LINES; /* nothing in the loop touches the CD's queue */
     cd_audio(psx, xl, xr, n);
     for (int k = 0; k < n; k++) {
         s32 cl = xl[k], cr = xr[k];
@@ -913,9 +924,9 @@ static void transfer(Psx *psx, u16 v)
         for (int i = 0; i < 24; i++)
             if ((hw >> i & 1) && a >= hw_v[i].start && a < hw_v[i].end)
                 hw_release(psx, i, 0, 1);
-    hw_dirty[a >> 15] |= 1u << (a >> 10 & 31);
-    if (a >= rz_lo) /* into the reverb's area: what it holds is looked at again */
-        rz_lo = ~0u;
+    mx.hw_dirty[a >> 15] |= 1u << (a >> 10 & 31);
+    if (a >= mx.rz_lo) /* into the reverb's area: what it holds is looked at again */
+        mx.rz_lo = ~0u;
     wr16(s->ram, a, v);
     if ((s->ctrl & 0x40) && a == s->irq_addr)
         irq(psx);
@@ -1021,9 +1032,10 @@ static void push(Psx *psx, u32 addr, u32 v)
 {
     SpuMe *m = spu_me;
     u32 w = *m->wr;
-    if (w - *m->rd >= m->size) {
+    if (w - m->rd_seen >= m->size && w - (m->rd_seen = *m->rd) >= m->size) {
         m->fulls++;
         m->kick(m, psx->cycles, SPU_ME_FULL);
+        m->rd_seen = *m->rd;
     }
     SpuEv *e = &m->ring[w & (m->size - 1)];
     e->cycle = psx->cycles, e->addr = addr, e->v = v;
@@ -1095,7 +1107,7 @@ int spu_me_on(Psx *psx, SpuMe *m)
     *bk = *psx;
     bk->trace = 0;
     psx->spu.nout = 0; /* what is mixed and not out yet goes out from the back */
-    *m->wr = *m->rd = 0;
+    *m->wr = *m->rd = m->rd_seen = 0;
     m->clean_at = ~(u64)0;
     cd_xa_src = m->xa_view;
     spu_me = m;

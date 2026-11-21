@@ -76,6 +76,39 @@ typedef struct {
 
 static volatile MeCtl *ctl; /* written by the SC before the boot, only read after */
 
+/* The SPU on the ME (core/psx.h, SpuMe): the line after MeCtl, uncached too. The SC asks for the
+ * back (on), publishes how far the CPU is (the beacon: lo before hi, so a torn read is never past
+ * it) and asks for a wait (req: the back applied every event and ran up to req_hi:lo); the ME
+ * answers on_ack and ack, applies the ring between jobs and mixes up to the beacon, SPU_STEP samples
+ * a look, and puts what the SPU gives out in aout (aw), which the SC hands to the host (ar). */
+typedef struct {
+    u32 on, b_lo, b_hi, req, req_lo, req_hi, ar, wr, sc_pad[8];
+    u32 on_ack, ack, aw, rd, drops, steps, me_pad[10];
+} SpuCtl;
+
+#define SPU_STEP 64   /* samples the ME mixes between two looks at a job */
+#define SPU_RING 4096 /* events */
+#define AOUT 4096     /* stereo samples from the ME's SPU to the SC, a power of two */
+#define AOUT_CYCLES (368u * 768u) /* the SC hands the ME's audio to the host every half frame or so */
+#define UNC(p) ((void *)(0x40000000u | (u32)(p)))
+
+static volatile SpuCtl *spc;
+static SpuMe sme; /* the SC writes it; the ME only reads its constants */
+static SpuEv spu_ring[SPU_RING] __attribute__((aligned(64))); /* uncached on both sides */
+static u32 aout[AOUT] __attribute__((aligned(64)));           /* L | R << 16; uncached on both sides */
+static struct {
+    Psx psx;
+} __attribute__((aligned(64))) sbk; /* the back: only the ME writes it while the SPU is on */
+static PsxHost sbk_host;            /* the back's: the audio to aout, nothing else */
+
+/* The SC's: the SPU's back is on (sme in spu_me), it runs on the SC because the ME stopped */
+static int spu_on, spu_local;
+static u32 spu_req;
+static u64 aout_at;
+static struct {
+    u32 wait_us, wait_max, ev0, drops0, steps0, lost;
+} ss;
+
 /* ---- the ME's side ---- */
 
 void me_handler(void);
@@ -193,6 +226,60 @@ static void me_job(volatile MeCtl *c)
     }
 }
 
+/* The back's audio (PsxHost.audio, on the ME): into aout; what finds it full is dropped, counted */
+static void me_spu_out(void *user, const s16 *s, int n)
+{
+    (void)user;
+    volatile SpuCtl *p = spc;
+    volatile u32 *o = UNC(aout);
+    u32 w = p->aw, r = p->ar;
+    for (int i = 0; i < n; i++, w++) {
+        if (w - r >= AOUT && w - (r = p->ar) >= AOUT) {
+            p->drops += (u32)(n - i);
+            break;
+        }
+        o[w & (AOUT - 1)] = (u16)s[2 * i] | (u32)(u16)s[2 * i + 1] << 16;
+    }
+    __asm__ volatile("sync");
+    p->aw = w;
+}
+
+/* One look at the SPU between jobs: an on or off answered (the caches cleared, so the ME reads
+ * what the SC set up and the SC what the ME wrote), a wait answered (every event applied and the
+ * mix up to req, all of it in RAM before the ack), or SPU_STEP samples more up to the beacon. The
+ * beacon is read before the ring's index, so every event earlier than it is seen. 0: nothing to do. */
+static int me_spu_step(void)
+{
+    volatile SpuCtl *p = spc;
+    u32 o = p->on;
+    if (o != p->on_ack) {
+        me_dcache_wbinv_all();
+        p->on_ack = o;
+        return 1;
+    }
+    if (!o)
+        return 0;
+    u32 q = p->req;
+    if (q != p->ack) {
+        spu_me_run(&sme, (u64)p->req_hi << 32 | p->req_lo, 0);
+        me_dcache_wbinv_all();
+        p->ack = q;
+        return 1;
+    }
+    u32 hi, lo;
+    do
+        hi = p->b_hi, lo = p->b_lo;
+    while (p->b_hi != hi);
+    __asm__ volatile("sync");
+    u64 c0 = sbk.psx.cycles;
+    u32 r0 = p->rd;
+    spu_me_run(&sme, (u64)hi << 32 | lo, SPU_STEP);
+    if (sbk.psx.cycles == c0 && p->rd == r0)
+        return 0;
+    p->steps++;
+    return 1;
+}
+
 static void me_main(volatile MeCtl *c) __attribute__((noreturn, used));
 static void me_main(volatile MeCtl *c)
 {
@@ -200,10 +287,12 @@ static void me_main(volatile MeCtl *c)
     c->alive = ME_ALIVE;
     for (;;) {
         u32 seq = c->seq;
-        if (seq == c->done) { /* idle: one uncached look every few microseconds */
-            c->beat++;
-            for (u32 i = 0; i < 1000; i++)
-                __asm__ volatile("nop");
+        if (seq == c->done) { /* the SPU between jobs, or idle: one uncached look every few microseconds */
+            if (!me_spu_step()) {
+                c->beat++;
+                for (u32 i = 0; i < 1000; i++)
+                    __asm__ volatile("nop");
+            }
             continue;
         }
         c->ack = seq;
@@ -229,7 +318,7 @@ typedef struct {
 } __attribute__((aligned(64))) MeJob;
 
 static MeJob mj;
-static u8 ctl_mem[128] __attribute__((aligned(64)));
+static u8 ctl_mem[sizeof(MeCtl) + sizeof(SpuCtl)] __attribute__((aligned(64)));
 static int on, dead, mj_init;
 static u32 seq, kicked_job, beat0, pings, pings_ok, late, n_dead;
 static u32 st_seen, rpc_seen;
@@ -270,6 +359,11 @@ static void me_dead(void)
     dma_list_hook = NULL;
     gpu_sync_hook = NULL;
     dead = 1, n_dead++;
+    if (spu_on && !spu_local) { /* the SPU's back on the SC from here, from what the ME left in RAM */
+        spu_local = 1, ss.lost++;
+        sme.bk_view = &sbk.psx;
+        sme.ram_view = sbk.psx.spu.ram;
+    }
 }
 
 /* A ping's answer, counted once */
@@ -454,12 +548,113 @@ static u32 me_walk(Psx *psx, u32 addr)
     return words;
 }
 
+/* ---- the SPU's back on the ME (SpuMe's kick, the SC's side) ---- */
+
+/* *a == v within ME_TIMEOUT; the ME off (and the SPU's back on the SC) when not */
+static void spu_ack_wait(volatile u32 *a, u32 v)
+{
+    u32 t = now();
+    for (u32 i = 0; *a != v; i++)
+        if (!(i & 255) && now() - t > ME_TIMEOUT) {
+            me_dead();
+            return;
+        }
+}
+
+/* What the back gave out since the last time, to the host's audio */
+static void aout_drain(void)
+{
+    const PsxHost *h = ((Psx *)sme.user)->host;
+    u32 r = spc->ar, w = spc->aw;
+    while (r != w) {
+        u32 i = r & (AOUT - 1), n = w - r;
+        if (n > AOUT - i)
+            n = AOUT - i;
+        if (h->audio)
+            h->audio(h->user, (const s16 *)UNC(aout + i), (int)n);
+        r += n;
+    }
+    spc->ar = r;
+}
+
+static void spu_wb(const void *p, u32 n) { sceKernelDcacheWritebackRange(p, n); }
+
+static void spu_kick(SpuMe *m, u64 cycle, int why)
+{
+    volatile SpuCtl *p = spc;
+    switch (why) {
+    case SPU_ME_BEACON:
+        if (!spu_local) {
+            p->b_lo = (u32)cycle;
+            __asm__ volatile("sync");
+            p->b_hi = (u32)(cycle >> 32);
+        }
+        if (cycle >= aout_at) {
+            aout_at = cycle + AOUT_CYCLES;
+            if (spu_local)
+                spu_me_run(m, cycle, 0);
+            aout_drain();
+        }
+        return;
+    case SPU_ME_OFF:
+        if (!spu_local) {
+            p->on = 0;
+            spu_ack_wait(&p->on_ack, 0);
+        }
+        aout_drain();
+        sceKernelDcacheWritebackInvalidateAll(); /* no line of what the back wrote older than RAM */
+        spu_on = 0;
+        return;
+    }
+    /* WAIT, FULL: a walk in flight first (the ME runs one job at a time), then the back up to cycle */
+    u32 t0 = now();
+    me_sync(GPU_SYNC_OTHER);
+    if (!spu_local) {
+        p->req_lo = (u32)cycle, p->req_hi = (u32)(cycle >> 32);
+        __asm__ volatile("sync");
+        p->req = ++spu_req;
+        spu_ack_wait(&p->ack, spu_req);
+    }
+    if (spu_local)
+        spu_me_run(m, cycle, 0);
+    u32 us = now() - t0;
+    ss.wait_us += us;
+    if (us > ss.wait_max)
+        ss.wait_max = us;
+}
+
+int me_spu_on(Psx *psx)
+{
+    if (!on || dead || spu_me)
+        return 0;
+    SpuMe *m = &sme;
+    m->ring = UNC(spu_ring), m->size = SPU_RING;
+    m->wr = &spc->wr, m->rd = &spc->rd;
+    m->bk = &sbk.psx, m->bk_view = UNC(&sbk.psx);
+    m->ram_view = UNC(psx->spu.ram), m->xa_view = UNC(psx->cd.xa_fifo);
+    m->kick = spu_kick, m->wb = spu_wb, m->user = psx;
+    if (!spu_me_on(psx, m))
+        return 0;
+    memset(&sbk_host, 0, sizeof sbk_host);
+    sbk_host.audio = me_spu_out;
+    sbk.psx.host = &sbk_host;
+    spc->ar = spc->aw = 0; /* the ME writes aw only while on */
+    spc->b_lo = (u32)psx->cycles, spc->b_hi = (u32)(psx->cycles >> 32);
+    aout_at = psx->cycles + AOUT_CYCLES;
+    spu_on = 1;
+    sceKernelDcacheWritebackInvalidateAll(); /* the back, the views' memory and SPU RAM in RAM for the ME */
+    spc->on = 1;
+    spu_ack_wait(&spc->on_ack, 1);
+    return 1;
+}
+
 static int boot(u32 unlock, u32 *us, u32 *bad)
 {
     const u32 *h = (const u32 *)(void *)me_handler;
     u32 words = (u32)(me_handler_end - h);
     memset(ctl_mem, 0, sizeof ctl_mem);
     ctl = (volatile MeCtl *)(0x40000000u | (u32)ctl_mem);
+    spc = (volatile SpuCtl *)(0x40000000u | (u32)(ctl_mem + sizeof(MeCtl)));
     sceKernelDcacheWritebackInvalidateAll(); /* ctl in RAM for the ME; no cached line of ctl_mem left */
     *bad = 0;
     for (u32 pass = 0; pass < 2; pass++)
@@ -518,7 +713,7 @@ int me_log(char *line, int cap)
         return 0;
     int n;
     if (dead) {
-        n = snprintf(line, (size_t)cap, "-- me: off, no answer in %u ms (%u times, %u in a walk; job %u, err %X): the lists walk on the CPU\n",
+        n = snprintf(line, (size_t)cap, "-- me: off, no answer in %u ms (%u times, %u in a walk; job %u, err %X): the lists walk on the CPU",
                      (unsigned)(ME_TIMEOUT / 1000), (unsigned)n_dead, (unsigned)st.lost, (unsigned)kicked_job, (unsigned)ctl->err);
     } else {
         u32 b = ctl->beat;
@@ -544,12 +739,24 @@ int me_log(char *line, int cap)
             n += snprintf(line + n, (size_t)(cap - n), "%s%s %u/%u", k ? ", " : "", why_name[k], (unsigned)st.waits[k],
                           (unsigned)(st.wait_us[k] / 1000));
         if (n < cap)
-            n += snprintf(line + n, (size_t)(cap - n), " n/ms); list calls %u, stalls %u, polls %u; otc kept %u synced %u; reads kept %u, lists unscanned %u, stat bad %u\n",
+            n += snprintf(line + n, (size_t)(cap - n), " n/ms); list calls %u, stalls %u, polls %u; otc kept %u synced %u; reads kept %u, lists unscanned %u, stat bad %u",
                           (unsigned)st.rpcs, (unsigned)st.stalls, (unsigned)st.polls, (unsigned)dma_otc_kept, (unsigned)dma_otc_synced,
                           (unsigned)gpu_me_reads_kept, (unsigned)st.unscanned, (unsigned)st.stat_bad);
         dma_otc_kept = dma_otc_synced = gpu_me_reads_kept = 0;
         beat0 = b;
     }
+    if (n < cap && (spu_on || sme.offs || ss.lost)) { /* the SPU's back: the CPU's waits for it, n and time */
+        u32 ev = spc->wr, dr = spc->drops, sp = spc->steps;
+        n += snprintf(line + n, (size_t)(cap - n),
+                      "; spu %s: waits %u (%u full) in %u ms, max %u us, events %u, ME steps %u, out drops %u, IRQ offs %u, lost %u",
+                      !spu_on ? "inline" : spu_local ? "on the CPU" : "on the ME", (unsigned)sme.waits, (unsigned)sme.fulls,
+                      (unsigned)(ss.wait_us / 1000), (unsigned)ss.wait_max, (unsigned)(ev - ss.ev0), (unsigned)(sp - ss.steps0),
+                      (unsigned)(dr - ss.drops0), (unsigned)sme.offs, (unsigned)ss.lost);
+        sme.waits = sme.fulls = 0;
+        ss.wait_us = ss.wait_max = 0, ss.ev0 = ev, ss.drops0 = dr, ss.steps0 = sp;
+    }
+    if (n < cap)
+        n += snprintf(line + n, (size_t)(cap - n), "\n");
     u32 lost = st.lost;
     memset(&st, 0, sizeof st);
     st.lost = lost;

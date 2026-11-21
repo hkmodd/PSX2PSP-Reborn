@@ -674,6 +674,7 @@ typedef struct SpuMe {
     void *user;
     u32 waits, fulls, offs; /* the front's counts: reads that waited, full rings, IRQ enables */
     u64 clean_at;         /* a wait at this cycle, no event that writes SPU RAM since (~0: none) */
+    u32 rd_seen;          /* *rd as the front last read it: the room it knows of without a read */
 } SpuMe;
 extern SpuMe *spu_me; /* NULL: the SPU runs inline */
 /* The SPU moves to m's back from here; 0 (and it stays inline) when the host's mixer or the IRQ is on.

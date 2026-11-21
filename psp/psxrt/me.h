@@ -18,6 +18,11 @@ int me_start(char *msg, int cap);
 /* once a second, from the vblank: the "-- me" line (beat, pings, the walks, the CPU's waits for
  * them by cause, list calls, stalls), its length; 0 when the ME is off */
 int me_log(char *line, int cap);
+/* The SPU's mix to the ME (core/psx.h, SpuMe) from the Psx's state now: 1 when it went (the ME
+ * runs psxrt's loop and the SPU's IRQ is off); after a boot or a snapshot's load. spu_me_off
+ * brings it back inline (before a snapshot's save). */
+struct Psx;
+int me_spu_on(struct Psx *psx);
 /* the ME back in reset and the hooks NULL (the exit callback); nothing when it is off */
 void me_stop(void);
 
